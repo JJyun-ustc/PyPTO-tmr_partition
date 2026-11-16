@@ -1,0 +1,29 @@
+Internal ctest changing into directory: /data/aicpu-cluster-study/official-worktree/runtime/tests/ut/cpp/build
+Test project /data/aicpu-cluster-study/official-worktree/runtime/tests/ut/cpp/build
+    Start 294: test_a2a3_tmr_aicore_completion_mailbox
+    Start 298: test_a2a3_tmr_orchestrator_fanin
+1/5 Test #294: test_a2a3_tmr_aicore_completion_mailbox ...   Passed    0.01 sec
+    Start 299: test_a2a3_tmr_ready_queue
+2/5 Test #299: test_a2a3_tmr_ready_queue .................   Passed    0.01 sec
+    Start 301: test_a2a3_tmr_shared_memory
+3/5 Test #301: test_a2a3_tmr_shared_memory ...............   Passed    0.32 sec
+    Start 303: test_a2a3_tmr_task_state
+4/5 Test #303: test_a2a3_tmr_task_state ..................***Exception: SegFault  1.09 sec
+Running main() from /data/aicpu-cluster-study/official-worktree/runtime/tests/ut/cpp/build/_deps/googletest-src/googletest/src/gtest_main.cc
+[==========] Running 6 tests from 1 test suite.
+[----------] Global test environment set-up.
+[----------] 6 tests from TaskStateTest
+[ RUN      ] TaskStateTest.FullLifecycleThroughAPI
+
+5/5 Test #298: test_a2a3_tmr_orchestrator_fanin ..........   Passed    1.86 sec
+
+80% tests passed, 1 tests failed out of 5
+
+Label Time Summary:
+no_hardware    =   3.29 sec*proc (5 tests)
+
+Total Test time (real) =   1.88 sec
+
+The following tests FAILED:
+	303 - test_a2a3_tmr_task_state (SEGFAULT)
+Errors while running CTest

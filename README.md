@@ -1,13 +1,14 @@
 # PyPTO TMR：AICPU cluster 二分放置实验
 
 本仓库保存基于完整 PyPTO 系统的 Ascend 910B2 AICPU cluster 放置研究。
-最新版本采用固定 256 节点校准、冻结参数、禁止跨侧领取和 8 节点快照批次。
+最新 v7 采用有界小组偏好复用、ready 时最终绑定、低频单写者摘要和受限跨侧领取。
 这里的 cluster 是 **AICPU cluster**，不是 AI Core 组。
 
+- [完整算法与状态记账](docs/zh/experiments/tmr-cluster/algorithm.md)
 - [中文实验说明](docs/zh/experiments/tmr-cluster/experiment.md)
 - [环境与复现步骤](docs/zh/experiments/tmr-cluster/environment.md)
 - [Python 环境版本记录](docs/zh/experiments/tmr-cluster/environment-observed.json)
-- [2026-11-16 原始结果与逐轮数据](official-results/v6-simplified-20261116/summary.json)
+- [2026-11-16 原始结果与逐轮数据](official-results/v7-control-20261116/summary.json)
 - [源码来源与版本](docs/zh/experiments/tmr-cluster/source-provenance.json)
 
 ## 获取完整代码
@@ -26,14 +27,15 @@ runtime。`main` 的 runtime 子模块固定引用该分支的具体提交。此
 
 当前卡上重新配对测量，各策略 30 轮、两批反序，单位为 device_wall 中位数：
 
-| 规模 | 原自动策略 | 简化后的自动策略 | 新版 Shared | 新自动相对 Shared |
+| 规模 | v6 自动策略 | v7 自动策略 | v7 Shared | v7 自动相对 Shared |
 | --- | ---: | ---: | ---: | ---: |
-| Case0，1000 节点 | 1.419 ms | 1.197 ms | 1.047 ms | +14.32% |
-| Scale，4096 节点 | 6.629 ms | 5.809 ms | 4.913 ms | +18.23% |
+| Case0，1000 节点 | 1.199 ms | 1.013 ms | 1.050 ms | −3.60% |
+| Scale，4096 节点 | 5.783 ms | 3.915 ms | 4.820 ms | −18.79% |
 
-新版比原自动策略降低 15.66% / 12.37%，但尚未超过 Shared。
-这是合并修改的效果，没有逐项消融；本次实现的是快照批处理，**不是并行评分**。
-实验未持有独占设备锁，不同物理卡的历史结果不合并；O 始终固定在 CPU 7。
+v7 自动策略相对本轮新鲜 v6 基线降低 15.58% / 32.31%。分阶段结果显示主要改善
+出现在低频摘要组合；延迟绑定单独叠加未显示收益，跨侧领取尚无独立加速证据。
+190 个相关 C++ 测试、15 个板上回归通过；仿真场景因缺少 g++-15 未完成。
+实验未持有独占设备锁；不合并不同卡的历史数据，O 始终固定在 CPU 7。
 
 环境文件记录依赖、工具链和复现步骤，不是容器镜像或系统磁盘备份。
 虚拟环境、缓存、编译产物和凭据不随源码上传；驱动/CANN 需要在目标机器另行安装。

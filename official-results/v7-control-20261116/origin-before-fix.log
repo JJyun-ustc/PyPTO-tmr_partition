@@ -1,0 +1,35 @@
+Running main() from /data/aicpu-cluster-study/official-worktree/runtime/tests/ut/cpp/build/_deps/googletest-src/googletest/src/gtest_main.cc
+Note: Google Test filter = *UnknownReleaseTimestamp*
+[==========] Running 1 test from 1 test suite.
+[----------] Global test environment set-up.
+[----------] 1 test from SchedulerStateTest
+[ RUN      ] SchedulerStateTest.UnknownReleaseTimestampDoesNotChangeSchedulerOriginToOrchestrator
+/data/aicpu-cluster-study/official-worktree/runtime/tests/ut/cpp/a2a3/runtime/tensormap_and_ringbuffer/test_scheduler_state.cpp:736: Failure
+Expected equality of these values:
+  consumer.payload->placement.reserved & simpler::tmr::PARTITION_FROM_O
+    Which is: 2
+  0u
+    Which is: 0
+
+/data/aicpu-cluster-study/official-worktree/runtime/tests/ut/cpp/a2a3/runtime/tensormap_and_ringbuffer/test_scheduler_state.cpp:737: Failure
+Expected equality of these values:
+  consumer.payload->placement.release_cluster
+    Which is: '\x1' (1)
+  0
+
+/data/aicpu-cluster-study/official-worktree/runtime/tests/ut/cpp/a2a3/runtime/tensormap_and_ringbuffer/test_scheduler_state.cpp:738: Failure
+Expected equality of these values:
+  consumer.task->target_aicpu_cluster
+    Which is: 1
+  0
+
+[  FAILED  ] SchedulerStateTest.UnknownReleaseTimestampDoesNotChangeSchedulerOriginToOrchestrator (49 ms)
+[----------] 1 test from SchedulerStateTest (50 ms total)
+
+[----------] Global test environment tear-down
+[==========] 1 test from 1 test suite ran. (50 ms total)
+[  PASSED  ] 0 tests.
+[  FAILED  ] 1 test, listed below:
+[  FAILED  ] SchedulerStateTest.UnknownReleaseTimestampDoesNotChangeSchedulerOriginToOrchestrator
+
+ 1 FAILED TEST

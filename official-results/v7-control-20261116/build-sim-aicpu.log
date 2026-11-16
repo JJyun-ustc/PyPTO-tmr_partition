@@ -1,0 +1,32 @@
+[0/2] Re-checking globbed directories...
+[1/14] Building CXX object CMakeFiles/aicpu_kernel.dir/data/aicpu-cluster-study/official-worktree/runtime/src/a2a3/runtime/tensormap_and_ringbuffer/aicpu/aicpu_executor.cpp.o
+[2/14] Building CXX object CMakeFiles/aicpu_kernel.dir/data/aicpu-cluster-study/official-worktree/runtime/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/ring_buffer.cpp.o
+[3/14] Building CXX object CMakeFiles/aicpu_kernel.dir/data/aicpu-cluster-study/official-worktree/runtime/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/orchestrator.cpp.o
+[4/14] Building CXX object CMakeFiles/aicpu_kernel.dir/data/aicpu-cluster-study/official-worktree/runtime/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/runtime_core.cpp.o
+[5/14] Building CXX object CMakeFiles/aicpu_kernel.dir/data/aicpu-cluster-study/official-worktree/runtime/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler.cpp.o
+[6/14] Building CXX object CMakeFiles/aicpu_kernel.dir/data/aicpu-cluster-study/official-worktree/runtime/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler_cold_path.cpp.o
+[7/14] Building CXX object CMakeFiles/aicpu_kernel.dir/data/aicpu-cluster-study/official-worktree/runtime/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler_completion.cpp.o
+[8/14] Building CXX object CMakeFiles/aicpu_kernel.dir/data/aicpu-cluster-study/official-worktree/runtime/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/shared/runtime.cpp.o
+[9/14] Building CXX object CMakeFiles/aicpu_kernel.dir/data/aicpu-cluster-study/official-worktree/runtime/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/shared/runtime_init.cpp.o
+/data/aicpu-cluster-study/official-worktree/runtime/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/shared/runtime_init.cpp: In function ‘RuntimeContext* runtime_init_data_from_layout(DeviceArena&, const RuntimeArenaLayout&, RuntimeMode, void*, uint64_t, void*, const uint64_t*)’:
+/data/aicpu-cluster-study/official-worktree/runtime/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/shared/runtime_init.cpp:638:11: warning: ‘void* memset(void*, int, size_t)’ clearing an object of type ‘RuntimeContext’ {aka ‘struct RuntimeContext’} with no trivial copy-assignment; use value-initialization instead [-Wclass-memaccess]
+  638 |     memset(rt, 0, sizeof(*rt));
+      |     ~~~~~~^~~~~~~~~~~~~~~~~~~~
+In file included from /data/aicpu-cluster-study/official-worktree/runtime/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/shared/runtime_init.cpp:28:
+/data/aicpu-cluster-study/official-worktree/runtime/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/runtime_core.h:155:8: note: ‘RuntimeContext’ {aka ‘struct RuntimeContext’} declared here
+  155 | struct RuntimeContext {
+      |        ^~~~~~~~~~~~~~
+/data/aicpu-cluster-study/official-worktree/runtime/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/shared/runtime_init.cpp:664:11: warning: ‘void* memset(void*, int, size_t)’ clearing an object of type ‘struct AICoreCompletionMailbox’ with no trivial copy-assignment; use value-initialization instead [-Wclass-memaccess]
+  664 |     memset(mailbox, 0, sizeof(*mailbox));
+      |     ~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+In file included from /data/aicpu-cluster-study/official-worktree/runtime/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/runtime_types.h:37,
+                 from /data/aicpu-cluster-study/official-worktree/runtime/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/ring_buffer.h:41,
+                 from /data/aicpu-cluster-study/official-worktree/runtime/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/orchestrator.h:32,
+                 from /data/aicpu-cluster-study/official-worktree/runtime/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/shared/runtime_init.cpp:27:
+/data/aicpu-cluster-study/official-worktree/runtime/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/aicore_completion_mailbox.h:90:8: note: ‘struct AICoreCompletionMailbox’ declared here
+   90 | struct AICoreCompletionMailbox {
+      |        ^~~~~~~~~~~~~~~~~~~~~~~
+[10/14] Building CXX object CMakeFiles/aicpu_kernel.dir/data/aicpu-cluster-study/official-worktree/runtime/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler_dispatch.cpp.o
+[11/14] Building CXX object CMakeFiles/aicpu_kernel.dir/data/aicpu-cluster-study/official-worktree/runtime/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/shared/shared_memory.cpp.o
+[12/14] Building CXX object CMakeFiles/aicpu_kernel.dir/data/aicpu-cluster-study/official-worktree/runtime/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/shared/tensormap.cpp.o
+[13/14] Linking CXX shared library libaicpu_kernel.so

@@ -1,0 +1,1446 @@
+--- a/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/async_wait.h
++++ b/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/async_wait.h
+@@ -183,9 +183,7 @@
+         int32_t *deferred_release_count{nullptr};
+         int32_t deferred_release_capacity{0};
+         int32_t inline_completed{0};
+-#if SIMPLER_SCHED_PROFILING
+         int32_t thread_idx{0};
+-#endif
+ 
+         bool can_inline_complete() const { return sched != nullptr; }
+     };
+@@ -300,11 +298,7 @@
+     AsyncPollResult poll_and_complete(
+         AICoreCompletionMailbox *aicore_mailbox, SchedulerState *sched,
+         ChipTaskSlotState **deferred_release_slot_states, int32_t &deferred_release_count,
+-        int32_t deferred_release_capacity
+-#if SIMPLER_SCHED_PROFILING
+-        ,
+-        int thread_idx
+-#endif
++        int32_t deferred_release_capacity, int thread_idx = 0
+     );
+ 
+     // Report a bounded snapshot of completions that can still block a task.
+--- a/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/aicpu_cluster_partition.h
++++ b/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/aicpu_cluster_partition.h
+@@ -17,7 +17,12 @@
+ constexpr uint32_t PARTITION_OBSERVED = 8u;
+ constexpr uint32_t PARTITION_IDLE_AT_PUBLISH = 16u;
+ constexpr uint64_t PARTITION_CALIBRATION_NODES = 256;
+-constexpr uint64_t PARTITION_BATCH_NODES = 8;
++constexpr uint64_t PARTITION_BATCH_NODES = 64;
++constexpr uint32_t PARTITION_GROUP_LIMIT = 8;
++constexpr uint32_t PARTITION_GROUP_SLOTS = 64;
++constexpr uint64_t PARTITION_GROUP_LIFETIME = 32;
++constexpr uint32_t PARTITION_STEAL_CHECK_LOOPS = 32;
++constexpr uint32_t PARTITION_STEAL_COOLDOWN_LOOPS = 128;
+ constexpr uint64_t PARTITION_QUEUE_WEIGHT_NUM = 1;
+ constexpr uint64_t PARTITION_QUEUE_WEIGHT_DEN = 2;
+ constexpr uint64_t PARTITION_RESOURCE_WEIGHT_NUM = 1;
+@@ -26,15 +31,21 @@
+ constexpr uint64_t PARTITION_FUTURE_WEIGHT_DEN = 4;
+ 
+ struct AdaptiveTaskState {
+-    uint64_t scope{0}, submit_tick{0}, release_tick{0};
++    uint32_t scope{0}, group{0};
++    uint64_t submit_tick{0}, release_tick{0};
+     uint32_t ready_depth{0};
+-    int32_t release_cluster{-1};
++    int8_t release_cluster{-1};
+     std::atomic<int32_t> dispatch_cluster{-1};
+-    uint32_t reserved{0};
++    uint8_t reserved{0};
++    // O owns group identity and preference; queue target is separate in ChipTask.
++    int8_t preferred_cluster{-1};
++    int8_t ready_writer{PARTITION_THREADS - 1};
+     void reset() {
+         scope = submit_tick = release_tick = 0;
+         ready_depth = reserved = 0;
+-        release_cluster = -1;
++        release_cluster = preferred_cluster = -1;
++        group = 0;
++        ready_writer = PARTITION_THREADS - 1;
+         dispatch_cluster.store(-1, std::memory_order_relaxed);
+     }
+ };
+@@ -79,54 +90,88 @@
+     }
+ };
+ struct PartitionTrace {
+-    uint64_t ticks[6]{}, calls[6]{};
+-};
++    uint64_t ticks[8]{}, calls[8]{};
++};
++// One publisher owns each row, including the dedicated O row. Monotone
++// counters use load/store, with no cross-S fetch_add or cache-line sharing.
++struct PartitionSummarySample {
++    uint64_t released[2]{}, queued[2]{}, taken[2]{};
++};
++struct alignas(64) PartitionSummary {
++    std::atomic<uint64_t> version{0};
++    std::atomic<uint64_t> resources{0};  // capacity/free/idle: three 8-bit fields
++    std::atomic<uint64_t> released[2]{}, queued[2]{}, taken[2]{};
++    static void add(std::atomic<uint64_t> &counter, uint64_t units) {
++        counter.store(counter.load(std::memory_order_relaxed) + units, std::memory_order_relaxed);
++    }
++    void begin_write() { version.fetch_add(1, std::memory_order_acq_rel); }
++    void end_write() { version.fetch_add(1, std::memory_order_release); }
++    bool read(PartitionSummarySample &out) const {
++        uint64_t before = version.load(std::memory_order_acquire);
++        if (before & 1) return false;
++        PartitionSummarySample sample;
++        for (int c = 0; c < 2; ++c) {
++            sample.released[c] = released[c].load(std::memory_order_relaxed);
++            sample.queued[c] = queued[c].load(std::memory_order_relaxed);
++            sample.taken[c] = taken[c].load(std::memory_order_relaxed);
++        }
++        std::atomic_thread_fence(std::memory_order_acquire);
++        if (before != version.load(std::memory_order_relaxed)) return false;
++        out = sample;
++        return true;
++    }
++    void reset() {
++        version.store(0, std::memory_order_relaxed);
++        resources.store(0, std::memory_order_relaxed);
++        for (int c = 0; c < 2; ++c) {
++            released[c].store(0, std::memory_order_relaxed);
++            queued[c].store(0, std::memory_order_relaxed);
++            taken[c].store(0, std::memory_order_relaxed);
++        }
++    }
++};
++static_assert(sizeof(PartitionSummary) == 64);
+ struct alignas(64) PartitionThread {
+     std::atomic<int32_t> cluster{-1};
+-    std::atomic<uint32_t> capacity[PARTITION_SHAPES]{}, free_slots[PARTITION_SHAPES]{}, idle_slots[PARTITION_SHAPES]{};
++    PartitionSummary summary[PARTITION_SHAPES];
+     std::atomic<uint64_t> started[PARTITION_SHAPES]{};
+     PartitionBucket samples[PARTITION_SHAPES];
++    uint64_t steal_checks{0}, steal_attempts{0}, remote_blocks{0};
+     alignas(64) PartitionTrace trace;
+     void reset() {
+         trace = PartitionTrace{};
++        steal_checks = steal_attempts = remote_blocks = 0;
+         cluster.store(-1, std::memory_order_relaxed);
+         for (int i = 0; i < PARTITION_SHAPES; ++i) {
+-            capacity[i].store(0, std::memory_order_relaxed);
+-            free_slots[i].store(0, std::memory_order_relaxed);
+-            idle_slots[i].store(0, std::memory_order_relaxed);
++            summary[i].reset();
+             started[i].store(0, std::memory_order_relaxed);
+             samples[i].reset();
+         }
+     }
+ };
+-// A publication cell has independent ownership traffic from other resource shapes.
++// Side queue hints occupy independent cache lines and have one designated writer.
+ struct alignas(64) PartitionReadyCounter {
+     std::atomic<uint64_t> value{0};
+     uint64_t load(std::memory_order order = std::memory_order_seq_cst) const { return value.load(order); }
+     void store(uint64_t n, std::memory_order order = std::memory_order_seq_cst) { value.store(n, order); }
+-    uint64_t fetch_add(uint64_t n, std::memory_order order = std::memory_order_seq_cst) {
+-        return value.fetch_add(n, order);
+-    }
+ };
+ static_assert(sizeof(PartitionReadyCounter) == 64);
+ struct PartitionShared {
+     std::atomic<bool> enabled{false};
+     std::atomic<bool> calibration_done{false};
+     int32_t schedulers[2]{}, orchestrator_cluster{-1};
+-    PartitionReadyCounter ready_published[2][PARTITION_SHAPES]{};
+-    std::atomic<uint32_t> idle_mask[2][PARTITION_SHAPES]{};
++    // Only the lowest-index S on each side writes its queue hint.
++    // Low 32 bits: entries; high bits: that leader has idle resource.
++    PartitionReadyCounter side_queue[2][PARTITION_SHAPES]{};
+     PartitionThread threads[PARTITION_THREADS];
+     void reset() {
+         enabled.store(false, std::memory_order_relaxed);
+         calibration_done.store(false, std::memory_order_relaxed);
+         schedulers[0] = schedulers[1] = 0;
+         orchestrator_cluster = -1;
+-        for (auto &cluster : ready_published)
+-            for (auto &count : cluster)
+-                count.store(0, std::memory_order_relaxed);
+-        for (auto &cluster : idle_mask)
+-            for (auto &mask : cluster)
+-                mask.store(0, std::memory_order_relaxed);
++        for (auto &cluster : side_queue)
++            for (auto &hint : cluster)
++                hint.store(0, std::memory_order_relaxed);
+         for (auto &thread : threads)
+             thread.reset();
+     }
+@@ -135,6 +180,20 @@
+     uint64_t blocked[2]{}, ready[2]{};
+     uint32_t capacity[2]{}, free[2]{}, idle[2]{}, schedulers[2]{};
+ };
++inline int partition_ready_side(int preferred, int source, const uint64_t depth[2], const int32_t schedulers[2]) {
++    int c = source >= 0 && source < 2 ? source : preferred;
++    if (c < 0 || c > 1) c = schedulers[0] ? 0 : 1;
++    if (!schedulers[c]) return schedulers[1 - c] ? 1 - c : c;
++    int other = 1 - c;
++    if (schedulers[other] && depth[c] >= 4 &&
++        depth[c] * schedulers[other] > depth[other] * schedulers[c] + 2u * schedulers[c] * schedulers[other])
++        return other;
++    return c;
++}
++// Queue depth is advisory. The actual pop and range claim remain atomic.
++inline bool partition_may_steal(uint64_t local, uint64_t remote, int local_s, int remote_s) {
++    return local == 0 && local_s > 0 && remote_s > 0 && remote >= static_cast<uint64_t>(2 * remote_s + 2);
++}
+ struct PartitionDecision {
+     int32_t cluster{-1};
+     uint64_t score_ns[2]{};
+@@ -146,7 +205,42 @@
+     uint64_t dependency[2][2]{{250, 750}, {750, 250}};
+     uint64_t idle_pickup[2]{};
+ };
++// Bounded O-local table: no shared member counter and no scope-wide grouping.
++struct PartitionGroup {
++    uint64_t id{0}, scope{0}, born{0};
++    uint32_t members{0};
++};
+ struct ClusterPartitioner {
++    PartitionSummarySample summary_cache[PARTITION_THREADS][PARTITION_SHAPES]{};
++    PartitionGroup groups[PARTITION_GROUP_SLOTS]{};
++    uint64_t next_group{0}, inherited_decisions{0}, full_decisions{0};
++    bool can_inherit(const AdaptiveTaskState &producer, uint64_t scope) const {
++        if (!producer.group) return false;
++        const auto &g = groups[producer.group % PARTITION_GROUP_SLOTS];
++        return g.id == producer.group && g.scope == scope && g.members < PARTITION_GROUP_LIMIT &&
++               decision_count() - g.born < PARTITION_GROUP_LIFETIME;
++    }
++    void join_group(AdaptiveTaskState &task, uint64_t parent, uint64_t scope) {
++        if (!parent) {
++            parent = ++next_group;
++            groups[parent % PARTITION_GROUP_SLOTS] = {parent, scope, decision_count(), 0};
++            ++full_decisions;
++        } else {
++            ++inherited_decisions;
++        }
++        ++groups[parent % PARTITION_GROUP_SLOTS].members;
++        task.group = parent;
++    }
++    PartitionDecision inherit(int cluster) {
++        PartitionDecision out;
++        out.cluster = cluster;
++        out.learned = decision_count() >= PARTITION_CALIBRATION_NODES;
++        ++decisions[cluster];
++        if (out.learned) ++learned_decisions;
++        else ++cold_decisions;
++        return out;
++    }
++
+     PartitionTrace trace;
+     PartitionWeights weights[PARTITION_SHAPES];
+     uint64_t assigned[2][PARTITION_SHAPES]{};
+@@ -221,46 +315,55 @@
+     bool needs_snapshot(int shape) const {
+         return load_batch[shape] != decision_count() / PARTITION_BATCH_NODES;
+     }
+-    // Each shape uses one advisory snapshot per eight-decision epoch. Subsequent
++    // Each shape uses one advisory snapshot per 64-decision epoch. Subsequent
+     // submissions add local reservations; scheduler progress is incorporated at
+     // the next epoch. The snapshot does not constitute a resource reservation.
+-    PartitionLoad load(const PartitionShared &shared, int shape, const uint64_t queue_depth[2]) {
++    PartitionLoad load(const PartitionShared &shared, int shape) {
+         if (needs_snapshot(shape)) {
+             auto &cached = cached_load[shape];
+             cached = PartitionLoad{};
+-            uint64_t started[2]{};
+-            for (const auto &thread : shared.threads) {
++            uint64_t released[2]{}, queued[2]{}, taken[2]{};
++            for (int t = 0; t < PARTITION_THREADS; ++t) {
++                const auto &thread = shared.threads[t];
++                const auto &row = thread.summary[shape];
++                auto &sample = summary_cache[t][shape];
++                // A racing row retains its last coherent totals; readers never spin.
++                row.read(sample);
++                for (int side = 0; side < 2; ++side) {
++                    released[side] += sample.released[side];
++                    queued[side] += sample.queued[side];
++                    taken[side] += sample.taken[side];
++                }
+                 int c = thread.cluster.load(std::memory_order_relaxed);
+                 if (c < 0 || c > 1) continue;
+-                cached.capacity[c] += thread.capacity[shape].load(std::memory_order_relaxed);
+-                cached.free[c] += thread.free_slots[shape].load(std::memory_order_relaxed);
+-                cached.idle[c] += thread.idle_slots[shape].load(std::memory_order_relaxed);
+-                started[c] += thread.started[shape].load(std::memory_order_relaxed);
++                uint64_t packed = row.resources.load(std::memory_order_relaxed);
++                cached.capacity[c] += packed & 255u;
++                cached.free[c] += (packed >> 8) & 255u;
++                cached.idle[c] += (packed >> 16) & 255u;
+             }
+             for (int c = 0; c < 2; ++c) {
+                 cached.schedulers[c] = shared.schedulers[c];
+-                uint64_t published = shared.ready_published[c][shape].load(std::memory_order_relaxed);
+-                cached.blocked[c] = assigned[c][shape] > published ? assigned[c][shape] - published : 0;
+-                uint64_t waiting = published > started[c] ? published - started[c] : 0;
+-                cached.ready[c] = waiting > queue_depth[c] ? waiting : queue_depth[c];
++                cached.blocked[c] = assigned[c][shape] > released[c] ? assigned[c][shape] - released[c] : 0;
++                uint64_t waiting = queued[c] > taken[c] ? queued[c] - taken[c] : 0;
++                uint64_t depth = shared.side_queue[c][shape].load(std::memory_order_relaxed) & 0xffffffffu;
++                cached.ready[c] = waiting > depth ? waiting : depth;
+             }
+             load_batch[shape] = decision_count() / PARTITION_BATCH_NODES;
+             ++snapshots;
+         }
+         return cached_load[shape];
+     }
+-    void commit(int cluster, int shape, uint32_t units, bool pending_wait) {
++    void commit(int cluster, int shape, uint32_t units) {
+         assigned[cluster][shape] += units;
+-        // Assignment precedes wiring/publication, so new work enters exactly one
+-        // local pressure class even if schedulers concurrently publish or start it.
+         auto &load = cached_load[shape];
+-        if (pending_wait) load.blocked[cluster] += units;
+-        else load.ready[cluster] += units;
++        // New O assignments remain local future reservations until refresh.
++        // Refresh rebuilds from totals; it never adds the old local delta again.
++        load.blocked[cluster] += units;
+     }
+     // Future reservations are block units, capped at one capacity wave per side.
+     // They do not consume free/idle slots. Pending new tasks include their own
+-    // blocks before assignment; ready publication removes existing reservations
+-    // through assigned - published, independently of dispatch snapshots.
++    // blocks before assignment; ready publication removes existing preferences
++    // through assigned - released, independently of dispatch snapshots.
+     static uint64_t future_reservation_cost(
+         const PartitionLoad &load, int c, uint32_t pending_units, uint64_t queue_ns
+     ) {
+--- a/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/orchestrator.cpp
++++ b/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/orchestrator.cpp
+@@ -1202,13 +1202,14 @@
+     payload.init(args, result, prepared.alloc_result, layout);
+ 
+     if (args.aicpu_cluster() == -2 && !cur_slot_state.task_attrs.requires_sync_start()) {
+-        uint64_t decision_begin = get_sys_cnt_aicpu();
++        uint64_t decision_begin = 0;
+         auto &feedback = sched->placement_feedback;
+         auto &partitioner = orch->cluster_partitioner;
+         bool tracing = false;
+ #if SIMPLER_DFX
+         tracing = orch->chip_swimlane_level >= ChipSwimlaneLevel::SCHED_PHASES;
+ #endif
++        if (tracing) decision_begin = get_sys_cnt_aicpu();
+         uint64_t trace_start = decision_begin;
+         auto trace_stage = [&](int stage) {
+             if (!tracing) return;
+@@ -1218,53 +1219,64 @@
+             trace_start = now;
+         };
+ 
+-        if (!feedback.enabled.load(std::memory_order_relaxed)) {
++        if (partitioner.decision_count() == 0) {
+             feedback.schedulers[0] = orch->aicpu_cluster_sched_count[0];
+             feedback.schedulers[1] = orch->aicpu_cluster_sched_count[1];
+             feedback.enabled.store(true, std::memory_order_release);
++            sched->has_cluster_targets.store(true, std::memory_order_release);
+         }
+         partitioner.calibrate_once(feedback);
+         trace_stage(0);
+         ResourceShape shape = active_mask.to_shape();
+         int shape_index = static_cast<int>(shape);
+-        uint64_t ready[2]{};
+-        if (partitioner.needs_snapshot(shape_index)) {
+-            uint64_t shared_ready = shape == ResourceShape::DUMMY ?
+-                                        sched->dummy_ready_queue.size() : sched->ready_queues[shape_index].size();
+-            int sched_total = feedback.schedulers[0] + feedback.schedulers[1];
+-            for (int c = 0; c < 2; ++c) {
+-                ready[c] = shape == ResourceShape::DUMMY ? sched->cluster_dummy_queues[c].size() :
+-                                                           sched->cluster_ready_queues[c][shape_index].size();
+-                if (sched_total) ready[c] += shared_ready * feedback.schedulers[c] / sched_total;
++        int depth = orch->scope_stack_top < 0 ? 0 : orch->scope_stack_top;
++        if (!partitioner.scope_ids[depth]) partitioner.open_scope(depth);
++        uint64_t scope = partitioner.scope_ids[depth];
++        uint32_t units = shape == ResourceShape::DUMMY ? 1 : cur_slot_state.logical_block_num;
++        uint32_t pending = 0, sources[2]{};
++        uint64_t parent_group = 0;
++        int inherited = -1;
++        // The existing reduced fanin list supplies online group membership.
++        // Once a usable parent is found, avoid further shared-state reads.
++        fanin_builder.for_each([&](ChipTaskSlotState *producer, DepFlags flags) {
++            if (!dep_has_wait(flags) || inherited >= 0) return;
++            const auto &parent = producer->payload->placement;
++            if (partitioner.can_inherit(parent, scope)) {
++                int actual = parent.dispatch_cluster.load(std::memory_order_acquire);
++                inherited = actual >= 0 ? actual : parent.preferred_cluster;
++                if (inherited >= 0 && feedback.schedulers[inherited]) parent_group = parent.group;
++                else inherited = -1;
+             }
+-        }
+-        trace_stage(1);
+-        uint32_t pending = 0, sources[2]{};
+-        fanin_builder.for_each([&](ChipTaskSlotState *producer, DepFlags flags) {
+-            if (!dep_has_wait(flags) || producer->task_state.load(std::memory_order_acquire) != CHIP_TASK_PENDING)
+-                return;
+-            pending++;
+-            int c = producer->payload->placement.dispatch_cluster.load(std::memory_order_acquire);
+-            if (c < 0) c = producer->task->target_aicpu_cluster;
+-            if (c >= 0 && c < 2) sources[c]++;
++            if (inherited >= 0 || producer->task_state.load(std::memory_order_acquire) != CHIP_TASK_PENDING) return;
++            ++pending;
++            int c = parent.dispatch_cluster.load(std::memory_order_acquire);
++            if (c < 0) c = parent.scope ? parent.preferred_cluster : producer->task->target_aicpu_cluster;
++            if (c >= 0 && c < 2) ++sources[c];
+         });
+         trace_stage(2);
+-        auto load = partitioner.load(feedback, shape_index, ready);
+-        trace_stage(3);
+-        uint32_t units = shape == ResourceShape::DUMMY ? 1 : cur_slot_state.logical_block_num;
+-        auto decision = partitioner.choose(load, pending, sources, shape_index, feedback.orchestrator_cluster, units);
++        simpler::tmr::PartitionDecision decision;
++        if (inherited >= 0) {
++            decision = partitioner.inherit(inherited);
++        } else {
++            trace_stage(1);
++            auto load = partitioner.load(feedback, shape_index);
++            trace_stage(3);
++            decision = partitioner.choose(load, pending, sources, shape_index, feedback.orchestrator_cluster, units);
++        }
+         if (decision.cluster >= 0) {
+-            task.target_aicpu_cluster = decision.cluster;
+-            sched->has_cluster_targets.store(true, std::memory_order_release);
+-            int depth = orch->scope_stack_top < 0 ? 0 : orch->scope_stack_top;
+-            if (!partitioner.scope_ids[depth]) partitioner.open_scope(depth);
+-            payload.placement.scope = partitioner.scope_ids[depth];
+-            payload.placement.submit_tick = get_sys_cnt_aicpu();
+-            uint64_t ticks = payload.placement.submit_tick - decision_begin;
+-            partitioner.decision_ticks += ticks;
+-            if (ticks > partitioner.max_decision_ticks) partitioner.max_decision_ticks = ticks;
++            // Unbound automatic tasks carry only a preference until ready.
++            task.target_aicpu_cluster = -1;
++            payload.placement.scope = scope;
++            payload.placement.preferred_cluster = decision.cluster;
++            partitioner.join_group(payload.placement, parent_group, scope);
++            if (tracing) {
++                payload.placement.submit_tick = get_sys_cnt_aicpu();
++                uint64_t ticks = payload.placement.submit_tick - decision_begin;
++                partitioner.decision_ticks += ticks;
++                if (ticks > partitioner.max_decision_ticks) partitioner.max_decision_ticks = ticks;
++            }
+             partitioner.scope_assignments[depth]++;
+-            partitioner.commit(decision.cluster, shape_index, units, pending != 0);
++            partitioner.commit(decision.cluster, shape_index, units);
+             cur_slot_state.task_attrs.set_early_resolve(false);
+         }
+         trace_stage(4);
+--- a/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler_completion.cpp
++++ b/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler_completion.cpp
+@@ -210,7 +210,7 @@
+         // `fanout_edges` is the consumer-walk count.
+         consumers_resolved = sched_->on_task_complete(slot_state, thread_idx).fanout_edges;
+ #else
+-        consumers_resolved = sched_->on_task_complete(slot_state);
++        consumers_resolved = sched_->on_task_complete(slot_state, thread_idx);
+ #endif
+ #if SIMPLER_DFX
+         if (resolve_t0 != 0) {
+--- a/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler_dispatch.cpp
++++ b/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler_dispatch.cpp
+@@ -129,29 +129,35 @@
+     uint64_t begin = tracing ? get_sys_cnt_aicpu() : 0;
+     auto &feedback = sched_->placement_feedback.threads[thread_idx];
+     auto &tracker = core_trackers_[thread_idx];
+-    feedback.cluster.store(aicpu_cluster_ids_[thread_idx], std::memory_order_relaxed);
+-    for (int i = 0; i < simpler::tmr::PARTITION_SHAPES; i++) {
++    const int side = aicpu_cluster_ids_[thread_idx];
++    feedback.cluster.store(side, std::memory_order_relaxed);
++    bool leader = true;
++    for (int t = 0; t < thread_idx; ++t)
++        if (aicpu_cluster_ids_[t] == side) leader = false;
++    for (int i = 0; i < simpler::tmr::PARTITION_SHAPES; ++i) {
+         ResourceShape shape = static_cast<ResourceShape>(i);
+-        uint32_t capacity = tracker.resource_capacity(shape);
+-        uint32_t idle = shape == ResourceShape::DUMMY ?
++        uint64_t capacity = tracker.resource_capacity(shape);
++        uint64_t idle = shape == ResourceShape::DUMMY ?
+                             1 :
+                             tracker.get_dispatchable_cores(shape, CoreTracker::DispatchPhase::IDLE).count();
+-        uint32_t pending = shape == ResourceShape::DUMMY ?
++        uint64_t pending = shape == ResourceShape::DUMMY ?
+                                0 :
+                                tracker.get_dispatchable_cores(shape, CoreTracker::DispatchPhase::PENDING).count();
+-        uint32_t available = idle + pending;
+-        if (feedback.capacity[i].load(std::memory_order_relaxed) != capacity)
+-            feedback.capacity[i].store(capacity, std::memory_order_relaxed);
+-        if (feedback.free_slots[i].load(std::memory_order_relaxed) != available)
+-            feedback.free_slots[i].store(available, std::memory_order_relaxed);
+-        uint32_t old_idle = feedback.idle_slots[i].load(std::memory_order_relaxed);
+-        if ((old_idle == 0) != (idle == 0)) {
+-            auto &mask = sched_->placement_feedback.idle_mask[aicpu_cluster_ids_[thread_idx]][i];
+-            uint32_t bit = 1u << thread_idx;
+-            if (idle) mask.fetch_or(bit, std::memory_order_relaxed);
+-            else mask.fetch_and(~bit, std::memory_order_relaxed);
+-        }
+-        if (old_idle != idle) feedback.idle_slots[i].store(idle, std::memory_order_relaxed);
++        feedback.summary[i].resources.store(
++            capacity | ((idle + pending) << 8) | (idle << 16), std::memory_order_relaxed
++        );
++        if (leader) {
++            uint64_t depth = shape == ResourceShape::DUMMY ? sched_->cluster_dummy_queues[side].size() :
++                                                             sched_->cluster_ready_queues[side][i].size() +
++                                                                 sched_->auto_ready_queues[side][i].size();
++            uint64_t common =
++                shape == ResourceShape::DUMMY ? sched_->dummy_ready_queue.size() : sched_->ready_queues[i].size();
++            int total = sched_->placement_feedback.schedulers[0] + sched_->placement_feedback.schedulers[1];
++            if (total) depth += common * sched_->placement_feedback.schedulers[side] / total;
++            sched_->placement_feedback.side_queue[side][i].store(
++                depth | (uint64_t(idle != 0) << 32), std::memory_order_relaxed
++            );
++        }
+     }
+     if (tracing) {
+         feedback.trace.ticks[0] += get_sys_cnt_aicpu() - begin;
+@@ -173,9 +179,9 @@
+ #if SIMPLER_DFX
+         record = record || chip_swimlane_level_ >= ChipSwimlaneLevel::SCHED_PHASES;
+ #endif
+-        // Automatic targets are immutable. Shared producers still publish their
+-        // actual pickup side for consumers generated after feedback is enabled.
+-        if (!adaptive && sched_->placement_feedback.enabled.load(std::memory_order_acquire)) {
++        // Actual first pickup is independent of the original placement preference.
++        // Single-block tasks have one execution side; multi-block stay bound.
++        if (adaptive || sched_->placement_feedback.enabled.load(std::memory_order_acquire)) {
+             int expected = -1;
+             metadata.dispatch_cluster.compare_exchange_strong(
+                 expected, aicpu_cluster_ids_[thread_idx], std::memory_order_release
+@@ -419,7 +425,7 @@
+ 
+ void SchedulerContext::dispatch_shape(
+     int32_t thread_idx, ChipReadyQueue *disp_queues, ResourceShape shape, CoreTracker::DispatchPhase phase,
+-    CoreTracker &tracker, bool &entered_drain, bool &made_progress, bool &try_pushed
++    CoreTracker &tracker, bool &entered_drain, bool &made_progress, bool &try_pushed, bool remote
+ ) {
+ #if SIMPLER_SCHED_PROFILING
+     auto &chip_swimlane = sched_chip_swimlane_[thread_idx];
+@@ -432,7 +438,7 @@
+     if (!cores.has_value()) return;
+ 
+     while (cores.has_value() && !entered_drain) {
+-        int want = cores.count();
++        int want = remote ? 1 : cores.count();
+         ChipTaskSlotState *batch[CoreTracker::MAX_CLUSTERS * 3];
+         int got = pop_ready_tasks_batch(disp_queues, shape, thread_idx, batch, want);
+         if (got == 0) break;
+@@ -603,9 +609,14 @@
+         flush_publish();
+         for (int i = 0; i < published_n; i++) {
+             if (published_list[i]->payload->placement.scope) {
+-                sched_->placement_feedback.threads[thread_idx].started[static_cast<int>(shape)].fetch_add(
+-                    published_counts[i], std::memory_order_relaxed
+-                );
++                auto &thread = sched_->placement_feedback.threads[thread_idx];
++                int index = static_cast<int>(shape);
++                simpler::tmr::PartitionSummary::add(thread.started[index], published_counts[i]);
++                int queue_side = published_list[i]->task->target_aicpu_cluster;
++                if (queue_side != aicpu_cluster_ids_[thread_idx]) thread.remote_blocks += published_counts[i];
++                thread.summary[index].begin_write();
++                simpler::tmr::PartitionSummary::add(thread.summary[index].taken[queue_side], published_counts[i]);
++                thread.summary[index].end_write();
+             }
+             sched_->record_published_blocks(*published_list[i], published_counts[i]);
+             sched_->propagate_dispatch_fanin(*published_list[i]);
+@@ -614,7 +625,7 @@
+         chip_swimlane.sched_dispatch_setup_cycle += (get_sys_cnt_aicpu() - t_setup_start);
+ #endif
+ 
+-        if (!dispatched_any) break;
++        if (!dispatched_any || remote) break;
+ 
+         if (!cores.has_value()) {
+             cores = is_mix ? tracker.get_cluster_offset_states() : tracker.get_dispatchable_cores(shape, phase);
+@@ -751,6 +762,24 @@
+         if (entered_drain) return;
+     }
+ 
++    if (adaptive && has_work(sched_->auto_ready_queues[cluster])) {
++        run_staging_order(
++            thread_idx, pmu_active,
++            [&](ResourceShape shape, CoreTracker::DispatchPhase phase) {
++                dispatch_shape(
++                    thread_idx, sched_->auto_ready_queues[cluster], shape, phase, tracker, entered_drain, made_progress,
++                    try_pushed
++                );
++                return entered_drain;
++            },
++            [&] {
++                return sched_->auto_ready_queues[cluster][static_cast<int>(ResourceShape::MIX)].size() > 0;
++            }
++        );
++    }
++    trace_stage(2);
++    if (entered_drain) return;
++
+     if (!adaptive || has_work(sched_->ready_queues)) {
+         run_staging_order(
+             thread_idx, pmu_active,
+@@ -766,6 +795,38 @@
+         );
+     }
+     trace_stage(4);
++    if (!adaptive || entered_drain) return;
++    auto &clock = steal_clocks_[thread_idx];
++    ++clock.loop;
++    if ((clock.loop & (simpler::tmr::PARTITION_STEAL_CHECK_LOOPS - 1)) ||
++        static_cast<int32_t>(clock.loop - clock.next) < 0)
++        return;
++    auto &feedback = sched_->placement_feedback;
++    auto &stats = feedback.threads[thread_idx];
++    ++stats.steal_checks;
++    int other = 1 - cluster;
++    for (ResourceShape shape : {ResourceShape::MIX, ResourceShape::AIC, ResourceShape::AIV}) {
++        int i = static_cast<int>(shape);
++        if (!tracker.get_dispatchable_cores(shape, CoreTracker::DispatchPhase::IDLE).has_value()) continue;
++        uint64_t local = sched_->cluster_ready_queues[cluster][i].size() +
++                         sched_->auto_ready_queues[cluster][i].size() + sched_->ready_queues[i].size() +
++                         sched_->ready_sync_queues[i].size();
++        uint64_t remote_depth = sched_->auto_ready_queues[other][i].size();
++        if (!simpler::tmr::partition_may_steal(
++                local, remote_depth, feedback.schedulers[cluster], feedback.schedulers[other]
++            ))
++            continue;
++        ++stats.steal_attempts;
++        // One attempt per cooldown; a raced/empty pop is harmless. Popped work
++        // is dispatched directly and is never enqueued onto the borrowing side.
++        clock.next = clock.loop + simpler::tmr::PARTITION_STEAL_COOLDOWN_LOOPS;
++        dispatch_shape(
++            thread_idx, sched_->auto_ready_queues[other], shape, CoreTracker::DispatchPhase::IDLE, tracker,
++            entered_drain, made_progress, try_pushed, true
++        );
++        break;
++    }
++    trace_stage(7);
+ }
+ 
+ // Stage the ALREADY-CLAIMED range [start, start+count) of consumer `c` onto
+@@ -985,7 +1046,8 @@
+     for (int s = 0; s < NUM_RESOURCE_SHAPES; s++) {
+         if (sched_->ready_sync_queues[s].size() > 0 || sched_->ready_queues[s].size() > 0 ||
+             (sched_->has_cluster_targets.load(std::memory_order_acquire) &&
+-             sched_->cluster_ready_queues[aicpu_cluster_ids_[thread_idx]][s].size() > 0)) {
++             (sched_->cluster_ready_queues[aicpu_cluster_ids_[thread_idx]][s].size() > 0 ||
++              sched_->auto_ready_queues[aicpu_cluster_ids_[thread_idx]][s].size() > 0))) {
+             return 0;
+         }
+     }
+@@ -1141,7 +1203,8 @@
+                 // sync_start Tier-0 lane; both feed dispatch_ready_tasks for this shape.
+                 size_t qsize = sched_->ready_queues[s].size() + sched_->ready_sync_queues[s].size();
+                 for (int cluster = 0; cluster < 2; cluster++) {
+-                    qsize += sched_->cluster_ready_queues[cluster][s].size();
++                    qsize +=
++                        sched_->cluster_ready_queues[cluster][s].size() + sched_->auto_ready_queues[cluster][s].size();
+                 }
+                 iter_shared_snapshot[s] = static_cast<int16_t>(std::min(qsize, kMax));
+             }
+@@ -1188,7 +1251,7 @@
+     uint32_t placement_iteration = 0;
+     while (true) {
+         if (thread_idx < sched_thread_num_ && sched_->placement_feedback.enabled.load(std::memory_order_acquire) &&
+-            ((placement_iteration++ & 7u) == 0)) {
++            ((placement_iteration++ & 63u) == 0)) {
+             publish_partition_resources(thread_idx);
+         }
+         if (completed_.load(std::memory_order_acquire)) {
+@@ -1285,11 +1348,8 @@
+         if (rt_ != nullptr && rt_->aicore_mailbox != nullptr &&
+             (sched_->async_wait_list.count > 0 || rt_->aicore_mailbox->has_pending())) {
+             AsyncPollResult poll_result = sched_->async_wait_list.poll_and_complete<false>(
+-                rt_->aicore_mailbox, sched_, deferred_release_slot_states, deferred_release_count, DEFERRED_RELEASE_CAP
+-#if SIMPLER_SCHED_PROFILING
+-                ,
++                rt_->aicore_mailbox, sched_, deferred_release_slot_states, deferred_release_count, DEFERRED_RELEASE_CAP,
+                 thread_idx
+-#endif
+             );
+             if (poll_result.error_code != SIMPLER_ERROR_NONE) {
+                 int32_t expected = SIMPLER_ERROR_NONE;
+@@ -1422,14 +1482,19 @@
+                 if (dummy_slot.payload->placement.scope) {
+                     ResourceShape original_shape = dummy_slot.active_mask.to_shape();
+                     uint64_t units = original_shape == ResourceShape::DUMMY ? 1 : dummy_slot.logical_block_num;
+-                    sched_->placement_feedback.threads[thread_idx].started[static_cast<int>(original_shape)].fetch_add(
+-                        units, std::memory_order_relaxed
++                    auto &thread = sched_->placement_feedback.threads[thread_idx];
++                    int index = static_cast<int>(original_shape);
++                    simpler::tmr::PartitionSummary::add(thread.started[index], units);
++                    thread.summary[index].begin_write();
++                    simpler::tmr::PartitionSummary::add(
++                        thread.summary[index].taken[dummy_slot.task->target_aicpu_cluster], units
+                     );
++                    thread.summary[index].end_write();
+                 }
+ #if SIMPLER_SCHED_PROFILING
+                 dummy_consumers = sched_->on_task_complete(dummy_slot, thread_idx).fanout_edges;
+ #else
+-                dummy_consumers = sched_->on_task_complete(dummy_slot);
++                dummy_consumers = sched_->on_task_complete(dummy_slot, thread_idx);
+ #endif
+ #if SIMPLER_DFX
+                 if (dummy_resolve_t0 != 0) {
+--- a/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler_context.h
++++ b/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler_context.h
+@@ -209,6 +209,10 @@
+     int32_t sched_thread_num_{0};
+     int32_t aicpu_thread_num_{0};
+     int32_t aicpu_cluster_ids_[MAX_AICPU_THREADS]{};
++    struct alignas(64) StealClock {
++        uint32_t loop{0}, next{0};
++    };
++    StealClock steal_clocks_[MAX_AICPU_THREADS]{};
+     int32_t cores_total_num_{0};
+ 
+     // Cluster-ordered worker_id lists, populated by post_handshake_init().
+@@ -370,7 +374,7 @@
+ 
+     void dispatch_shape(
+         int32_t thread_idx, ChipReadyQueue *disp_queues, ResourceShape shape, CoreTracker::DispatchPhase phase,
+-        CoreTracker &tracker, bool &entered_drain, bool &made_progress, bool &try_pushed
++        CoreTracker &tracker, bool &entered_drain, bool &made_progress, bool &try_pushed, bool remote = false
+     );
+ 
+     // Early-dispatch (Hook 1). Mirrors dispatch_ready_tasks: owns its
+--- a/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler_cold_path.cpp
++++ b/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler_cold_path.cpp
+@@ -1449,6 +1449,8 @@
+ }
+ 
+ void SchedulerContext::deinit() {
++    for (auto &clock : steal_clocks_)
++        clock = {};
+     // Reset all per-core execution state
+     for (int32_t i = 0; i < RUNTIME_MAX_WORKER; i++) {
+         core_exec_states_[i] = {};
+--- a/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler.h
++++ b/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler.h
+@@ -436,6 +436,7 @@
+     size_t off_dummy_ready_queue_slots;
+     size_t off_cluster_ready_queue_slots[2][NUM_RESOURCE_SHAPES];
+     size_t off_cluster_dummy_queue_slots[2];
++    size_t off_auto_ready_queue_slots[2][NUM_RESOURCE_SHAPES];
+     size_t off_early_dispatch_queue_slots[NUM_RESOURCE_SHAPES];
+     size_t off_early_sync_start_queue_slots;
+     size_t off_dep_pool_entries[CHIP_MAX_RING_DEPTH];
+@@ -523,6 +524,8 @@
+     // Ready queues remain global (scheduling is ring-agnostic)
+     ChipReadyQueue ready_queues[NUM_RESOURCE_SHAPES];
+     ChipReadyQueue cluster_ready_queues[2][NUM_RESOURCE_SHAPES];
++    // Only movable automatic single-block compute tasks enter these queues.
++    ChipReadyQueue auto_ready_queues[2][NUM_RESOURCE_SHAPES];
+ 
+     // Ready sync_start queues, one per shape. A ready sync_start cohort parks here
+     // instead of ready_queues[] so the dispatch loop can drain it as a strict Tier-0
+@@ -547,6 +550,8 @@
+             always_assert(cluster < 0);
+             return ready_sync_queues[static_cast<int32_t>(shape)];
+         }
++        if (cluster >= 0 && slot_state.payload->placement.scope && slot_state.logical_block_num == 1)
++            return auto_ready_queues[cluster][static_cast<int32_t>(shape)];
+         return cluster < 0 ? ready_queues[static_cast<int32_t>(shape)]
+                            : cluster_ready_queues[cluster][static_cast<int32_t>(shape)];
+     }
+@@ -570,29 +575,45 @@
+     void stamp_ready_queue(ChipTaskSlotState &slot_state) {
+         bool adaptive = slot_state.payload->placement.scope != 0;
+         bool sample = adaptive && !placement_feedback.calibration_done.load(std::memory_order_acquire);
++#if SIMPLER_DFX
++        uint64_t binding_begin =
++            adaptive && get_chip_swimlane_level() >= ChipSwimlaneLevel::SCHED_PHASES ? get_sys_cnt_aicpu() : 0;
++#endif
+         if (adaptive) {
+             auto &metadata = slot_state.payload->placement;
+-            if (sample && metadata.release_tick == 0) {
++            if (sample && metadata.ready_writer == simpler::tmr::PARTITION_THREADS - 1 &&
++                metadata.release_cluster < 0) {
+                 metadata.release_tick = get_sys_cnt_aicpu();
+                 metadata.release_cluster = placement_feedback.orchestrator_cluster;
+                 metadata.reserved |= simpler::tmr::PARTITION_FROM_O;
+             }
+-            int c = slot_state.task->target_aicpu_cluster;
+             ResourceShape shape = slot_state.active_mask.to_shape();
+             if (!(metadata.reserved & simpler::tmr::PARTITION_READY)) {
++                int pref = metadata.preferred_cluster;
++                if (pref < 0) pref = slot_state.task->target_aicpu_cluster;
++                uint64_t depth[2]{};
++                for (int side = 0; side < 2; ++side)
++                    depth[side] =
++                        placement_feedback.side_queue[side][static_cast<int>(shape)].load(std::memory_order_relaxed) &
++                        0xffffffffu;
++                int source = metadata.reserved & simpler::tmr::PARTITION_FROM_O ? -1 : metadata.release_cluster;
++                slot_state.task->target_aicpu_cluster =
++                    simpler::tmr::partition_ready_side(pref, source, depth, placement_feedback.schedulers);
+                 uint64_t units = shape == ResourceShape::DUMMY ? 1 : slot_state.logical_block_num;
+-                placement_feedback.ready_published[c][static_cast<int>(shape)].fetch_add(
+-                    units, std::memory_order_relaxed
+-                );
++                auto &row = placement_feedback.threads[metadata.ready_writer].summary[static_cast<int>(shape)];
++                row.begin_write();
++                simpler::tmr::PartitionSummary::add(row.released[pref], units);
++                simpler::tmr::PartitionSummary::add(row.queued[slot_state.task->target_aicpu_cluster], units);
++                row.end_write();
+                 metadata.reserved |= simpler::tmr::PARTITION_READY;
+             }
++            int c = slot_state.task->target_aicpu_cluster;
+             if (sample) {
+-                uint64_t depth = shape == ResourceShape::DUMMY ? cluster_dummy_queues[c].size() + dummy_ready_queue.size() :
+-                                                             cluster_ready_queues[c][static_cast<int>(shape)].size() +
+-                                                                 ready_queues[static_cast<int>(shape)].size();
++                uint64_t hint =
++                    placement_feedback.side_queue[c][static_cast<int>(shape)].load(std::memory_order_relaxed);
++                uint64_t depth = hint & 0xffffffffu;
+                 metadata.ready_depth = static_cast<uint32_t>(depth);
+-                if (depth == 0 && placement_feedback.idle_mask[c][static_cast<int>(shape)].load(std::memory_order_relaxed))
+-                    metadata.reserved |= simpler::tmr::PARTITION_IDLE_AT_PUBLISH;
++                if (depth == 0 && (hint >> 32)) metadata.reserved |= simpler::tmr::PARTITION_IDLE_AT_PUBLISH;
+             }
+         }
+ #if SIMPLER_DFX
+@@ -602,11 +623,20 @@
+ #else
+         if (sample) slot_state.payload->ready_queue_timestamp.store(get_sys_cnt_aicpu(), std::memory_order_relaxed);
+ #endif
+-    }
+-
+-    static void record_ready_origin(ChipTaskSlotState &slot_state, const ChipTaskSlotState *producer, uint64_t tick) {
+-        if (!slot_state.payload->placement.scope || producer == nullptr || tick == 0) return;
++#if SIMPLER_DFX
++        if (binding_begin) {
++            auto &trace = placement_feedback.threads[slot_state.payload->placement.ready_writer].trace;
++            trace.ticks[6] += get_sys_cnt_aicpu() - binding_begin;
++            ++trace.calls[6];
++        }
++#endif
++    }
++
++    static void
++    record_ready_origin(ChipTaskSlotState &slot_state, const ChipTaskSlotState *producer, uint64_t tick, int writer) {
++        if (!slot_state.payload->placement.scope || producer == nullptr) return;
+         auto &record = slot_state.payload->placement;
++        record.ready_writer = writer;
+         record.release_tick = tick;
+         int c = producer->payload->placement.dispatch_cluster.load(std::memory_order_acquire);
+         record.release_cluster = c >= 0 ? c : producer->task->target_aicpu_cluster;
+@@ -1172,10 +1202,11 @@
+ 
+     bool route_ready_once(
+         ChipTaskSlotState &slot_state, EarlyDispatchReleaseSink *sink = nullptr,
+-        const ChipTaskSlotState *producer = nullptr, uint64_t release_tick = 0
++        const ChipTaskSlotState *producer = nullptr, uint64_t release_tick = 0,
++        int writer = simpler::tmr::PARTITION_THREADS - 1
+     ) {
+         if (!try_claim_ready_once(slot_state)) return false;
+-        record_ready_origin(slot_state, producer, release_tick);
++        record_ready_origin(slot_state, producer, release_tick, writer);
+ 
+         // Early-dispatch: pre-staged tasks are released by doorbell
+         // here, skipping the ready-queue round-trip entirely.
+@@ -1203,7 +1234,8 @@
+ #if SIMPLER_ORCH_PROFILING || SIMPLER_SCHED_PROFILING
+     bool route_ready_once(
+         ChipTaskSlotState &slot_state, uint64_t &atomic_count, uint64_t &push_wait,
+-        EarlyDispatchReleaseSink *sink = nullptr, const ChipTaskSlotState *producer = nullptr, uint64_t release_tick = 0
++        EarlyDispatchReleaseSink *sink = nullptr, const ChipTaskSlotState *producer = nullptr,
++        uint64_t release_tick = 0, int writer = simpler::tmr::PARTITION_THREADS - 1
+     ) {
+         uint8_t flags = slot_state.lifecycle_flags.load(std::memory_order_acquire);
+         atomic_count += 1;  // lifecycle_flags load
+@@ -1219,7 +1251,7 @@
+             atomic_count += 1;  // failed lifecycle_flags CAS
+         }
+ 
+-        record_ready_origin(slot_state, producer, release_tick);
++        record_ready_origin(slot_state, producer, release_tick, writer);
+         // Early-dispatch: pre-staged tasks are released by doorbell
+         // here, skipping the ready-queue round-trip entirely.
+         bool early_handled = try_early_dispatch_release(slot_state, sink);
+@@ -1246,7 +1278,8 @@
+ 
+     bool release_fanin_and_check_ready(
+         ChipTaskSlotState &slot_state, EarlyDispatchReleaseSink *sink = nullptr,
+-        const ChipTaskSlotState *producer = nullptr, uint64_t release_tick = 0
++        const ChipTaskSlotState *producer = nullptr, uint64_t release_tick = 0,
++        int writer = simpler::tmr::PARTITION_THREADS - 1
+     ) {
+         // Atomically increment fanin_refcount and check if all producers are done
+         // ACQ_REL on fanin_refcount already synchronizes with the orchestrator's
+@@ -1254,7 +1287,7 @@
+         int32_t new_refcount = slot_state.fanin_refcount.fetch_add(1, std::memory_order_acq_rel) + 1;
+ 
+         if (new_refcount == slot_state.fanin_count) {
+-            return route_ready_once(slot_state, sink, producer, release_tick);
++            return route_ready_once(slot_state, sink, producer, release_tick, writer);
+         }
+         return false;
+     }
+@@ -1262,13 +1295,14 @@
+ #if SIMPLER_ORCH_PROFILING || SIMPLER_SCHED_PROFILING
+     bool release_fanin_and_check_ready(
+         ChipTaskSlotState &slot_state, uint64_t &atomic_count, uint64_t &push_wait,
+-        EarlyDispatchReleaseSink *sink = nullptr, const ChipTaskSlotState *producer = nullptr, uint64_t release_tick = 0
++        EarlyDispatchReleaseSink *sink = nullptr, const ChipTaskSlotState *producer = nullptr,
++        uint64_t release_tick = 0, int writer = simpler::tmr::PARTITION_THREADS - 1
+     ) {
+         int32_t new_refcount = slot_state.fanin_refcount.fetch_add(1, std::memory_order_acq_rel) + 1;
+         atomic_count += 1;  // fanin_refcount.fetch_add
+ 
+         if (new_refcount == slot_state.fanin_count) {
+-            return route_ready_once(slot_state, atomic_count, push_wait, sink, producer, release_tick);
++            return route_ready_once(slot_state, atomic_count, push_wait, sink, producer, release_tick, writer);
+         }
+         return false;
+     }
+@@ -1334,13 +1368,7 @@
+ #else
+     uint32_t
+ #endif
+-    on_task_complete(
+-        ChipTaskSlotState &slot_state
+-#if SIMPLER_SCHED_PROFILING
+-        ,
+-        int thread_idx
+-#endif
+-    ) {
++    on_task_complete(ChipTaskSlotState &slot_state, int thread_idx = simpler::tmr::PARTITION_THREADS - 1) {
+ #if SIMPLER_SCHED_PROFILING
+         CompletionStats stats = {0, 0, 0, true};
+ #else
+@@ -1397,12 +1425,14 @@
+             ChipTaskSlotState &consumer_slot = *current->slot_state;
+ #if SIMPLER_SCHED_PROFILING
+             stats.fanout_edges++;
+-            if (release_fanin_and_check_ready(consumer_slot, fanout_atomics, push_wait, &rel_sink, &slot_state, placement_release_tick)) {
++            if (release_fanin_and_check_ready(
++                    consumer_slot, fanout_atomics, push_wait, &rel_sink, &slot_state, placement_release_tick, thread_idx
++                )) {
+                 stats.tasks_enqueued++;
+             }
+ #else
+             consumer_walk_count++;
+-            release_fanin_and_check_ready(consumer_slot, &rel_sink, &slot_state, placement_release_tick);
++            release_fanin_and_check_ready(consumer_slot, &rel_sink, &slot_state, placement_release_tick, thread_idx);
+ #endif
+             current = current->next;
+         }
+@@ -1518,11 +1548,7 @@
+ AsyncWaitList::try_inline_complete_locked(AsyncWaitList::DrainCompletionSink &sink, ChipTaskSlotState &slot_state) {
+     // Return value (CompletionStats / consumer-walk count) discarded:
+     // async-wait drain path has no Resolve swimlane bar attached.
+-#if SIMPLER_SCHED_PROFILING
+     (void)sink.sched->on_task_complete(slot_state, sink.thread_idx);
+-#else
+-    (void)sink.sched->on_task_complete(slot_state);
+-#endif
+     if (*sink.deferred_release_count >= sink.deferred_release_capacity) {
+         while (*sink.deferred_release_count > 0) {
+ #if SIMPLER_SCHED_PROFILING
+@@ -1542,11 +1568,7 @@
+ template <bool Profiling>
+ inline AsyncPollResult AsyncWaitList::poll_and_complete(
+     AICoreCompletionMailbox *aicore_mailbox, SchedulerState *sched, ChipTaskSlotState **deferred_release_slot_states,
+-    int32_t &deferred_release_count, int32_t deferred_release_capacity
+-#if SIMPLER_SCHED_PROFILING
+-    ,
+-    int thread_idx
+-#endif
++    int32_t &deferred_release_count, int32_t deferred_release_capacity, int thread_idx
+ ) {
+     AsyncPollResult result;
+     if (!try_lock()) return result;
+@@ -1556,9 +1578,7 @@
+     sink.deferred_release_slot_states = deferred_release_slot_states;
+     sink.deferred_release_count = &deferred_release_count;
+     sink.deferred_release_capacity = deferred_release_capacity;
+-#if SIMPLER_SCHED_PROFILING
+     sink.thread_idx = thread_idx;
+-#endif
+ 
+     int32_t drain_err = SIMPLER_ERROR_NONE;
+     drain_aicore_completion_mailbox_locked(aicore_mailbox, sink, drain_err);
+@@ -1599,11 +1619,7 @@
+         if (entry.normal_done && entry.waiting_completion_count <= 0) {
+             // Return value (CompletionStats / consumer-walk count) discarded:
+             // deferred-completion drain has no Resolve swimlane bar attached.
+-#if SIMPLER_SCHED_PROFILING
+             (void)sched->on_task_complete(*entry.slot_state, thread_idx);
+-#else
+-            (void)sched->on_task_complete(*entry.slot_state);
+-#endif
+             // Drain deferred_release in place when the buffer fills — same
+             // overflow-drain idiom used by complete_slot_task's inline path
+             // and by try_inline_complete_locked. Without this, large bursts
+--- a/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler.cpp
++++ b/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler.cpp
+@@ -311,7 +311,7 @@
+         for (int cluster = 0; cluster < 2; cluster++) {
+             LOG_DEBUG(
+                 "  cluster %d %s: count=%" PRIu64, cluster, shape_names[i],
+-                sched->cluster_ready_queues[cluster][i].size()
++                sched->cluster_ready_queues[cluster][i].size() + sched->auto_ready_queues[cluster][i].size()
+             );
+         }
+     }
+--- a/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/shared/runtime_init.cpp
++++ b/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/shared/runtime_init.cpp
+@@ -145,6 +145,7 @@
+     for (int c = 0; c < 2; c++) {
+         for (int i = 0; i < NUM_RESOURCE_SHAPES; i++) {
+             layout.off_cluster_ready_queue_slots[c][i] = ready_queue_reserve_layout(arena, CHIP_READY_QUEUE_SIZE);
++            layout.off_auto_ready_queue_slots[c][i] = ready_queue_reserve_layout(arena, CHIP_READY_QUEUE_SIZE);
+         }
+         layout.off_cluster_dummy_queue_slots[c] = ready_queue_reserve_layout(arena, CHIP_READY_QUEUE_SIZE);
+     }
+@@ -200,6 +201,11 @@
+     for (int c = 0; c < 2; c++) {
+         for (int i = 0; i < NUM_RESOURCE_SHAPES; i++) {
+             if (!ready_queue_init_data_from_layout(
++                    &sched->auto_ready_queues[c][i], arena, layout.off_auto_ready_queue_slots[c][i],
++                    layout.ready_queue_capacity
++                ))
++                return false;
++            if (!ready_queue_init_data_from_layout(
+                     &sched->cluster_ready_queues[c][i], arena, layout.off_cluster_ready_queue_slots[c][i],
+                     layout.ready_queue_capacity
+                 )) {
+@@ -264,6 +270,7 @@
+     for (int c = 0; c < 2; c++) {
+         for (int i = 0; i < NUM_RESOURCE_SHAPES; i++) {
+             sched->cluster_ready_queues[c][i].reset_for_reuse();
++            sched->auto_ready_queues[c][i].reset_for_reuse();
+         }
+         sched->cluster_dummy_queues[c].reset_for_reuse();
+     }
+@@ -288,6 +295,9 @@
+     for (int c = 0; c < 2; c++) {
+         for (int i = 0; i < NUM_RESOURCE_SHAPES; i++) {
+             ready_queue_wire_arena_pointers(
++                &sched->auto_ready_queues[c][i], arena, layout.off_auto_ready_queue_slots[c][i]
++            );
++            ready_queue_wire_arena_pointers(
+                 &sched->cluster_ready_queues[c][i], arena, layout.off_cluster_ready_queue_slots[c][i]
+             );
+         }
+@@ -321,6 +331,7 @@
+     for (int c = 0; c < 2; c++) {
+         for (int i = 0; i < NUM_RESOURCE_SHAPES; i++) {
+             ready_queue_destroy(&sched->cluster_ready_queues[c][i]);
++            ready_queue_destroy(&sched->auto_ready_queues[c][i]);
+         }
+         ready_queue_destroy(&sched->cluster_dummy_queues[c]);
+     }
+--- a/src/a2a3/runtime/tensormap_and_ringbuffer/aicpu/aicpu_executor.cpp
++++ b/src/a2a3/runtime/tensormap_and_ringbuffer/aicpu/aicpu_executor.cpp
+@@ -1075,17 +1075,56 @@
+                     }
+                 }
+                 LOG_INFO(
+-                    "AICPU_ADAPTIVE_FINAL version=3 decisions=%llu,%llu started=%llu,%llu "
++                    "AICPU_ADAPTIVE_FINAL version=4 decisions=%llu,%llu started=%llu,%llu "
+                     "cold=%llu learned=%llu calibrations=%llu updates=%llu,%llu batch_size=%llu snapshots=%llu",
+                     static_cast<unsigned long long>(model.decisions[0]),
+                     static_cast<unsigned long long>(model.decisions[1]), static_cast<unsigned long long>(started[0]),
+                     static_cast<unsigned long long>(started[1]), static_cast<unsigned long long>(model.cold_decisions),
+                     static_cast<unsigned long long>(model.learned_decisions),
+-                    static_cast<unsigned long long>(model.calibrations), static_cast<unsigned long long>(model.updates[0]),
++                    static_cast<unsigned long long>(model.calibrations),
++                    static_cast<unsigned long long>(model.updates[0]),
+                     static_cast<unsigned long long>(model.updates[1]),
+                     static_cast<unsigned long long>(simpler::tmr::PARTITION_BATCH_NODES),
+                     static_cast<unsigned long long>(model.snapshots)
+                 );
++                LOG_INFO(
++                    "AICPU_PLACEMENT_GROUP full=%llu inherited=%llu",
++                    static_cast<unsigned long long>(model.full_decisions),
++                    static_cast<unsigned long long>(model.inherited_decisions)
++                );
++                for (int shape = 0; shape < simpler::tmr::PARTITION_SHAPES; ++shape) {
++                    uint64_t released[2]{}, queued[2]{}, taken[2]{}, actual[2]{};
++                    for (const auto &thread : rt->scheduler.placement_feedback.threads) {
++                        int cluster = thread.cluster.load(std::memory_order_relaxed);
++                        if (cluster >= 0 && cluster < 2)
++                            actual[cluster] += thread.started[shape].load(std::memory_order_relaxed);
++                        const auto &row = thread.summary[shape];
++                        for (int c = 0; c < 2; ++c) {
++                            released[c] += row.released[c].load(std::memory_order_relaxed);
++                            queued[c] += row.queued[c].load(std::memory_order_relaxed);
++                            taken[c] += row.taken[c].load(std::memory_order_relaxed);
++                        }
++                    }
++                    LOG_INFO(
++                        "AICPU_PLACEMENT_LEDGER shape=%d preferred=%llu,%llu released=%llu,%llu queued=%llu,%llu "
++                        "taken=%llu,%llu actual=%llu,%llu",
++                        shape, static_cast<unsigned long long>(model.assigned[0][shape]),
++                        static_cast<unsigned long long>(model.assigned[1][shape]),
++                        static_cast<unsigned long long>(released[0]), static_cast<unsigned long long>(released[1]),
++                        static_cast<unsigned long long>(queued[0]), static_cast<unsigned long long>(queued[1]),
++                        static_cast<unsigned long long>(taken[0]), static_cast<unsigned long long>(taken[1]),
++                        static_cast<unsigned long long>(actual[0]), static_cast<unsigned long long>(actual[1])
++                    );
++                }
++                for (int t = 0; t < sched_thread_num_; ++t) {
++                    const auto &row = rt->scheduler.placement_feedback.threads[t];
++                    LOG_INFO(
++                        "AICPU_PLACEMENT_PICKUP scheduler=%d checks=%llu attempts=%llu remote_blocks=%llu", t,
++                        static_cast<unsigned long long>(row.steal_checks),
++                        static_cast<unsigned long long>(row.steal_attempts),
++                        static_cast<unsigned long long>(row.remote_blocks)
++                    );
++                }
+                 for (int shape = 0; shape < simpler::tmr::PARTITION_SHAPES; ++shape) {
+                     const auto &w = model.weights[shape];
+                     LOG_INFO(
+@@ -1127,8 +1166,8 @@
+ #if SIMPLER_DFX
+             if (get_chip_swimlane_level() >= ChipSwimlaneLevel::SCHED_PHASES) {
+                 const char *o_names[] = {"poll", "queue_depth", "fanin", "load", "choose_commit", "wire_ready"};
+-                const char *s_names[] = {"resource_feedback", "observe",         "auto_dispatch",
+-                                         "strict_dispatch",   "shared_dispatch", "sync_dispatch"};
++                const char *s_names[] = {"resource_feedback", "observe",       "auto_dispatch", "strict_dispatch",
++                                         "shared_dispatch",   "sync_dispatch", "ready_binding", "cross_pickup"};
+                 for (int i = 0; i < 6; ++i)
+                     LOG_INFO(
+                         "AICPU_PARTITION_TRACE owner=O stage=%s calls=%llu ns=%llu", o_names[i],
+@@ -1139,7 +1178,7 @@
+                     );
+                 for (int t = 0; t < sched_thread_num_; ++t) {
+                     const auto &trace = rt->scheduler.placement_feedback.threads[t].trace;
+-                    for (int i = 0; i < 6; ++i)
++                    for (int i = 0; i < 8; ++i)
+                         LOG_INFO(
+                             "AICPU_PARTITION_TRACE owner=S%d stage=%s calls=%llu ns=%llu", t, s_names[i],
+                             static_cast<unsigned long long>(trace.calls[i]),
+--- a/tests/ut/cpp/a2a3/runtime/test_cluster_partitioner.cpp
++++ b/tests/ut/cpp/a2a3/runtime/test_cluster_partitioner.cpp
+@@ -119,15 +119,15 @@
+     shared.reset();
+     shared.schedulers[0] = shared.schedulers[1] = 2;
+     shared.threads[0].cluster.store(0);
+-    shared.threads[0].capacity[0].store(20);
++    shared.threads[0].summary[0].resources.store(20);
+     ClusterPartitioner model;
+     model.assigned[0][0] = 20;
+-    uint64_t depths[2]{};
+-    auto blocked = model.load(shared, 0, depths);
++    auto blocked = model.load(shared, 0);
+     EXPECT_EQ(ClusterPartitioner::future_reservation_cost(blocked, 0, 0, 2000), 500u);
+-    shared.ready_published[0][0].store(20);
++    shared.threads[0].summary[0].queued[0].store(20);
++    shared.threads[0].summary[0].released[0].store(20);
+     model.decisions[0] = PARTITION_BATCH_NODES;
+-    auto ready = model.load(shared, 0, depths);
++    auto ready = model.load(shared, 0);
+     EXPECT_EQ(ready.blocked[0], 0u);
+     EXPECT_EQ(ready.ready[0], 20u);
+     EXPECT_EQ(ClusterPartitioner::future_reservation_cost(ready, 0, 0, 2000), 0u);
+@@ -207,23 +207,23 @@
+     shared.reset();
+     shared.schedulers[0] = shared.schedulers[1] = 2;
+     shared.threads[0].cluster.store(0);
+-    shared.threads[0].capacity[0].store(20);
+-    ClusterPartitioner model;
+-    uint64_t depth[2]{};
+-    auto initial = model.load(shared, 0, depth);
++    shared.threads[0].summary[0].resources.store(20);
++    ClusterPartitioner model;
++    auto initial = model.load(shared, 0);
+     EXPECT_EQ(initial.ready[0] + initial.blocked[0], 0u);
+     // O commits a blocked multi-block task; concurrent S publication and
+-    // dispatch remain invisible until the next eight-decision epoch.
+-    model.commit(0, 0, 4, true);
+-    shared.ready_published[0][0].store(4);
+-    shared.threads[0].started[0].store(4);
++    // dispatch remain invisible until the next refresh epoch.
++    model.commit(0, 0, 4);
++    shared.threads[0].summary[0].queued[0].store(4);
++    shared.threads[0].summary[0].released[0].store(4);
++    shared.threads[0].summary[0].taken[0].store(4);
+     model.decisions[0] = 1;
+-    auto cached = model.load(shared, 0, depth);
++    auto cached = model.load(shared, 0);
+     EXPECT_EQ(cached.blocked[0], 4u);
+     EXPECT_EQ(cached.ready[0], 0u);
+     EXPECT_EQ(model.snapshots, 1u);
+-    model.decisions[0] = 8;
+-    auto refreshed = model.load(shared, 0, depth);
++    model.decisions[0] = PARTITION_BATCH_NODES;
++    auto refreshed = model.load(shared, 0);
+     EXPECT_EQ(refreshed.blocked[0] + refreshed.ready[0], 0u);
+     EXPECT_EQ(model.snapshots, 2u);
+ }
+@@ -233,31 +233,30 @@
+     shared.schedulers[0] = shared.schedulers[1] = 2;
+     shared.threads[0].cluster.store(0);
+     ClusterPartitioner model;
+-    uint64_t depth[2]{};
+-    (void)model.load(shared, 0, depth);
+-    model.commit(0, 0, 16, false);
+-    auto cached = model.load(shared, 0, depth);
+-    EXPECT_EQ(cached.ready[0], 16u);
+-    EXPECT_EQ(cached.blocked[0], 0u);
+-    shared.ready_published[0][0].store(16);
+-    shared.threads[0].started[0].store(6);
+-    depth[0] = 1;  // One multi-block queue entry, ten undispatched blocks.
+-    model.decisions[0] = 8;
+-    EXPECT_EQ(model.load(shared, 0, depth).ready[0], 10u);
++    (void)model.load(shared, 0);
++    model.commit(0, 0, 16);
++    auto cached = model.load(shared, 0);
++    EXPECT_EQ(cached.ready[0], 0u);
++    EXPECT_EQ(cached.blocked[0], 16u);
++    shared.threads[0].summary[0].queued[0].store(16);
++    shared.threads[0].summary[0].released[0].store(16);
++    shared.threads[0].summary[0].taken[0].store(6);
++    shared.side_queue[0][0].store(1);  // One entry, ten undispatched blocks.
++    model.decisions[0] = PARTITION_BATCH_NODES;
++    EXPECT_EQ(model.load(shared, 0).ready[0], 10u);
+ }
+ TEST(ClusterPartitioner, ShapesHaveIndependentSnapshotsWithinGlobalBatch) {
+     PartitionShared shared;
+     shared.reset();
+     ClusterPartitioner model;
+-    uint64_t depth[2]{};
+-    (void)model.load(shared, 0, depth);
+-    (void)model.load(shared, 0, depth);
+-    (void)model.load(shared, 1, depth);
+-    (void)model.load(shared, 1, depth);
++    (void)model.load(shared, 0);
++    (void)model.load(shared, 0);
++    (void)model.load(shared, 1);
++    (void)model.load(shared, 1);
+     EXPECT_EQ(model.snapshots, 2u);
+     model.decisions[0] = 7;
+     EXPECT_FALSE(model.needs_snapshot(0));
+-    model.decisions[0] = 8;
++    model.decisions[0] = PARTITION_BATCH_NODES;
+     EXPECT_TRUE(model.needs_snapshot(0));
+     EXPECT_TRUE(model.needs_snapshot(1));
+ }
+@@ -268,10 +267,10 @@
+     shared.threads[0].cluster.store(0);
+     ClusterPartitioner model;
+     model.assigned[0][0] = 100;
+-    shared.ready_published[0][0].store(40);
+-    shared.threads[0].started[0].store(10);
+-    uint64_t depth[2]{};
+-    auto load = model.load(shared, 0, depth);
++    shared.threads[0].summary[0].queued[0].store(40);
++    shared.threads[0].summary[0].released[0].store(40);
++    shared.threads[0].summary[0].taken[0].store(10);
++    auto load = model.load(shared, 0);
+     EXPECT_EQ(load.blocked[0], 60u);
+     EXPECT_EQ(load.ready[0], 30u);
+     EXPECT_EQ(load.ready[1], 0u);
+@@ -306,3 +305,91 @@
+     ASSERT_TRUE(bucket.read(sample));
+     EXPECT_EQ(sample.count[3], 20000u);
+ }
++
++TEST(ClusterPartitioner, ReadyBindingFollowsActualReleaseWithCongestionHysteresis) {
++    int32_t schedulers[2]{2, 3};
++    uint64_t empty[2]{};
++    EXPECT_EQ(partition_ready_side(0, 1, empty, schedulers), 1);
++    uint64_t balanced[2]{4, 6};
++    EXPECT_EQ(partition_ready_side(0, 1, balanced, schedulers), 1);
++    uint64_t congested[2]{0, 15};
++    EXPECT_EQ(partition_ready_side(0, 1, congested, schedulers), 0);
++    EXPECT_EQ(partition_ready_side(1, -1, empty, schedulers), 1);
++    schedulers[0] = 0;
++    EXPECT_EQ(partition_ready_side(0, 0, empty, schedulers), 1);
++}
++
++TEST(ClusterPartitioner, GroupsBoundFanoutLifetimeScopeAndSlotReuse) {
++    ClusterPartitioner model;
++    AdaptiveTaskState parent;
++    model.join_group(parent, 0, 7);
++    EXPECT_TRUE(model.can_inherit(parent, 7));
++    EXPECT_FALSE(model.can_inherit(parent, 8));
++    for (uint32_t i = 1; i < PARTITION_GROUP_LIMIT; ++i) {
++        AdaptiveTaskState child;
++        model.join_group(child, parent.group, 7);
++    }
++    EXPECT_FALSE(model.can_inherit(parent, 7));
++    model.join_group(parent, 0, 7);
++    model.decisions[0] += PARTITION_GROUP_LIFETIME;
++    EXPECT_FALSE(model.can_inherit(parent, 7));
++    model.join_group(parent, 0, 7);
++    for (uint32_t i = 0; i < PARTITION_GROUP_SLOTS; ++i) {
++        AdaptiveTaskState other;
++        model.join_group(other, 0, 7);
++    }
++    EXPECT_FALSE(model.can_inherit(parent, 7));
++}
++
++TEST(ClusterPartitioner, RacedSummaryRetainsLastCoherentLedgerWithoutDoubleReservation) {
++    PartitionShared shared;
++    shared.schedulers[0] = shared.schedulers[1] = 2;
++    ClusterPartitioner model;
++    model.assigned[0][0] = 16;
++    auto &row = shared.threads[0].summary[0];
++    row.begin_write();
++    row.released[0].store(4);
++    row.queued[1].store(4);
++    row.end_write();
++    auto first = model.load(shared, 0);
++    EXPECT_EQ(first.blocked[0], 12u);
++    EXPECT_EQ(first.ready[1], 4u);
++    row.begin_write();
++    row.released[0].store(16);
++    row.queued[1].store(16);
++    model.decisions[0] += PARTITION_BATCH_NODES;
++    auto racing = model.load(shared, 0);
++    EXPECT_EQ(racing.blocked[0], 12u);
++    EXPECT_EQ(racing.ready[1], 4u);
++    row.end_write();
++    model.decisions[0] += PARTITION_BATCH_NODES;
++    auto final = model.load(shared, 0);
++    EXPECT_EQ(final.blocked[0], 0u);
++    EXPECT_EQ(final.ready[1], 16u);
++}
++
++TEST(ClusterPartitioner, BorrowingDebitsQueueSideIndependentlyOfExecutionSide) {
++    PartitionShared shared;
++    shared.schedulers[0] = 2;
++    shared.schedulers[1] = 3;
++    ClusterPartitioner model;
++    model.assigned[0][0] = 16;
++    // O prefers 0, a releasing S queues on 1, and a cluster-0 S borrows six.
++    auto &publisher = shared.threads[2].summary[0];
++    publisher.released[0].store(16);
++    publisher.queued[1].store(16);
++    shared.threads[0].summary[0].taken[1].store(6);
++    shared.threads[0].started[0].store(6);
++    auto load = model.load(shared, 0);
++    EXPECT_EQ(load.blocked[0] + load.blocked[1], 0u);
++    EXPECT_EQ(load.ready[0], 0u);
++    EXPECT_EQ(load.ready[1], 10u);
++}
++
++TEST(ClusterPartitioner, BorrowingRequiresIdleLocalQueueAndSubstantialRemoteBacklog) {
++    EXPECT_FALSE(partition_may_steal(0, 7, 2, 3));
++    EXPECT_TRUE(partition_may_steal(0, 8, 2, 3));
++    EXPECT_FALSE(partition_may_steal(1, 100, 2, 3));
++    EXPECT_FALSE(partition_may_steal(0, 100, 2, 0));
++    EXPECT_FALSE(partition_may_steal(0, 100, 0, 3));
++}
+--- a/tests/ut/cpp/a2a3/runtime/tensormap_and_ringbuffer/test_task_state.cpp
++++ b/tests/ut/cpp/a2a3/runtime/tensormap_and_ringbuffer/test_task_state.cpp
+@@ -43,6 +43,7 @@
+     // payload, and the scheduler's release/propagate paths dereference it.
+     static constexpr int kSlotPayloadPoolSize = 16;
+     TaskPayload slot_payload_pool_[kSlotPayloadPoolSize];
++    TaskDescriptor slot_descriptors_[kSlotPayloadPoolSize]{};
+     int slot_payload_pool_idx_ = 0;
+ 
+     void SetUp() override {
+@@ -74,7 +75,11 @@
+         slot.completed_subtasks.store(0);
+         slot.total_required_subtasks = 1;
+         slot.logical_block_num = 1;
+-        TaskPayload &slot_pl = slot_payload_pool_[slot_payload_pool_idx_++ % kSlotPayloadPoolSize];
++        int index = slot_payload_pool_idx_++ % kSlotPayloadPoolSize;
++        TaskPayload &slot_pl = slot_payload_pool_[index];
++        // Ready routing requires a real descriptor, including the shared sentinel.
++        slot.task = &slot_descriptors_[index];
++        slot.task->target_aicpu_cluster = -1;
+         memset(&slot_pl, 0, sizeof(slot_pl));
+         slot.payload = &slot_pl;
+     }
+--- a/tests/ut/cpp/a2a3/runtime/tensormap_and_ringbuffer/test_scheduler_state.cpp
++++ b/tests/ut/cpp/a2a3/runtime/tensormap_and_ringbuffer/test_scheduler_state.cpp
+@@ -435,7 +435,7 @@
+     EXPECT_EQ(out[1], &slot_b);
+ }
+ 
+-TEST_F(SchedulerStateTest, AutomaticAndStrictTasksShareOnlyTheirTargetQueue) {
++TEST_F(SchedulerStateTest, AutomaticSingleBlockAndStrictTasksHaveSeparateQueues) {
+     alignas(64) ChipTaskSlotState automatic, strict;
+     init_slot(automatic, CHIP_TASK_PENDING, 1, 1);
+     init_slot(strict, CHIP_TASK_PENDING, 1, 1);
+@@ -449,9 +449,10 @@
+     ChipTaskSlotState *out[2];
+     EXPECT_EQ(sched.get_ready_tasks_batch(sched.ready_queues, ResourceShape::AIC, out, 2), 0);
+     EXPECT_EQ(sched.get_ready_tasks_batch(sched.cluster_ready_queues[1], ResourceShape::AIC, out, 2), 0);
+-    ASSERT_EQ(sched.get_ready_tasks_batch(sched.cluster_ready_queues[0], ResourceShape::AIC, out, 2), 2);
++    ASSERT_EQ(sched.get_ready_tasks_batch(sched.auto_ready_queues[0], ResourceShape::AIC, out, 2), 1);
+     EXPECT_EQ(out[0], &automatic);
+-    EXPECT_EQ(out[1], &strict);
++    ASSERT_EQ(sched.get_ready_tasks_batch(sched.cluster_ready_queues[0], ResourceShape::AIC, out, 2), 1);
++    EXPECT_EQ(out[0], &strict);
+ }
+ 
+ TEST_F(SchedulerStateTest, FrozenCalibrationKeepsReadyAccountingWithoutSampleStamp) {
+@@ -463,7 +464,7 @@
+     sched.placement_feedback.calibration_done.store(true);
+     sched.stamp_ready_queue(slot);
+     sched.stamp_ready_queue(slot);
+-    EXPECT_EQ(sched.placement_feedback.ready_published[1][0].load(), 16u);
++    EXPECT_EQ(sched.placement_feedback.threads[simpler::tmr::PARTITION_THREADS - 1].summary[0].queued[1].load(), 16u);
+     EXPECT_EQ(slot.payload->ready_queue_timestamp.load(), 0u);
+     EXPECT_EQ(slot.payload->placement.release_tick, 0u);
+ }
+@@ -677,3 +678,62 @@
+     EXPECT_EQ(tracker.count_available_blocks(ResourceShape::MIX, used_mask, false), 1);
+     EXPECT_EQ(tracker.count_available_blocks(ResourceShape::MIX, used_mask, true), 1);
+ }
++
++TEST_F(SchedulerStateTest, DeferredBindingUsesActualProducerAndAccountsExactlyOnce) {
++    alignas(64) ChipTaskSlotState producer, consumer;
++    init_slot(producer, CHIP_TASK_COMPLETED, 1, 1);
++    init_slot(consumer, CHIP_TASK_PENDING, 1, 1);
++    sched.placement_feedback.schedulers[0] = 2;
++    sched.placement_feedback.schedulers[1] = 3;
++    sched.placement_feedback.calibration_done.store(true);
++    producer.payload->placement.preferred_cluster = 0;
++    producer.payload->placement.dispatch_cluster.store(1);
++    consumer.payload->placement.scope = 1;
++    consumer.payload->placement.preferred_cluster = 0;
++    consumer.task->target_aicpu_cluster = -1;
++    // Sampling is frozen (tick=0); actual release origin is still required.
++    sched.record_ready_origin(consumer, &producer, 0, 2);
++    sched.stamp_ready_queue(consumer);
++    sched.stamp_ready_queue(consumer);
++    EXPECT_EQ(consumer.payload->placement.preferred_cluster, 0);
++    EXPECT_EQ(consumer.task->target_aicpu_cluster, 1);
++    auto &row = sched.placement_feedback.threads[2].summary[0];
++    EXPECT_EQ(row.released[0].load(), 1u);
++    EXPECT_EQ(row.queued[1].load(), 1u);
++    EXPECT_EQ(row.queued[0].load(), 0u);
++    // A subsequent foreign pickup changes execution affinity, never queue debit.
++    consumer.payload->placement.dispatch_cluster.store(0);
++    EXPECT_EQ(consumer.task->target_aicpu_cluster, 1);
++    EXPECT_EQ(&sched.ready_queue_for(consumer, ResourceShape::AIC, false), &sched.auto_ready_queues[1][0]);
++}
++
++TEST_F(SchedulerStateTest, AutomaticMultiblockAndStrictTargetsCannotEnterBorrowableQueues) {
++    alignas(64) ChipTaskSlotState wide, strict;
++    init_slot(wide, CHIP_TASK_PENDING, 1, 1);
++    init_slot(strict, CHIP_TASK_PENDING, 1, 1);
++    wide.logical_block_num = 16;
++    wide.payload->placement.scope = 1;
++    wide.task->target_aicpu_cluster = 1;
++    strict.task->target_aicpu_cluster = 1;
++    EXPECT_EQ(&sched.ready_queue_for(wide, ResourceShape::AIV, false), &sched.cluster_ready_queues[1][1]);
++    EXPECT_EQ(&sched.ready_queue_for(strict, ResourceShape::AIV, false), &sched.cluster_ready_queues[1][1]);
++}
++
++TEST_F(SchedulerStateTest, UnknownReleaseTimestampDoesNotChangeSchedulerOriginToOrchestrator) {
++    alignas(64) ChipTaskSlotState producer, consumer;
++    init_slot(producer, CHIP_TASK_COMPLETED, 1, 1);
++    init_slot(consumer, CHIP_TASK_PENDING, 1, 1);
++    sched.placement_feedback.schedulers[0] = 2;
++    sched.placement_feedback.schedulers[1] = 3;
++    sched.placement_feedback.orchestrator_cluster = 1;
++    producer.payload->placement.dispatch_cluster.store(0);
++    consumer.payload->placement.scope = 1;
++    consumer.payload->placement.preferred_cluster = 1;
++    // A shared producer can start its fanout walk before feedback is enabled.
++    // Its missing sample timestamp does not make it an O-origin publication.
++    sched.record_ready_origin(consumer, &producer, 0, 2);
++    sched.stamp_ready_queue(consumer);
++    EXPECT_EQ(consumer.payload->placement.reserved & simpler::tmr::PARTITION_FROM_O, 0u);
++    EXPECT_EQ(consumer.payload->placement.release_cluster, 0);
++    EXPECT_EQ(consumer.task->target_aicpu_cluster, 0);
++}

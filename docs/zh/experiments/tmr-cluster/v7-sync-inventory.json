@@ -1,0 +1,51 @@
+{
+  "runtime_files_updated": [
+    "docs/investigations/2026-11-aicpu-cluster-bgemm.md",
+    "docs/user/how-to/use-aicpu-cluster-placement.md",
+    "examples/a2a3/tensormap_and_ringbuffer/benchmark_bgemm/analyze_cluster_placement.py",
+    "examples/a2a3/tensormap_and_ringbuffer/benchmark_bgemm/analyze_control_costs.py",
+    "examples/a2a3/tensormap_and_ringbuffer/benchmark_bgemm/analyze_control_study.py",
+    "examples/a2a3/tensormap_and_ringbuffer/benchmark_bgemm/reproduce_cluster_study.py",
+    "examples/a2a3/tensormap_and_ringbuffer/benchmark_bgemm/run_control_stage.py",
+    "src/a2a3/runtime/tensormap_and_ringbuffer/runtime/aicpu_cluster_partition.h",
+    "tests/ut/cpp/a2a3/runtime/test_cluster_partitioner.cpp",
+    "docs/investigations/README.md",
+    "examples/a2a3/tensormap_and_ringbuffer/benchmark_bgemm/README.md",
+    "src/a2a3/runtime/tensormap_and_ringbuffer/aicpu/aicpu_executor.cpp",
+    "src/a2a3/runtime/tensormap_and_ringbuffer/runtime/async_wait.h",
+    "src/a2a3/runtime/tensormap_and_ringbuffer/runtime/orchestrator.cpp",
+    "src/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler.cpp",
+    "src/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler.h",
+    "src/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler_cold_path.cpp",
+    "src/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler_completion.cpp",
+    "src/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler_context.h",
+    "src/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler_dispatch.cpp",
+    "src/a2a3/runtime/tensormap_and_ringbuffer/runtime/shared/runtime_init.cpp",
+    "tests/ut/cpp/a2a3/runtime/tensormap_and_ringbuffer/test_scheduler_state.cpp",
+    "tests/ut/cpp/a2a3/runtime/tensormap_and_ringbuffer/test_task_state.cpp"
+  ],
+  "v7_evidence_files": 800,
+  "v7_evidence_bytes": 136939005,
+  "excluded": "compiled binaries, compile_commands.json, bytecode/cache, generic security/plog/run logs",
+  "tests_from_measured_worktree": {
+    "cpp_test_targets": 8,
+    "cpp_tests": 190,
+    "hardware_regression_cases": 15,
+    "hardware_regression_suites": {
+      "placement-dummy": 0,
+      "placement-early": 0,
+      "placement-vector": 0,
+      "spmd_multiblock_aiv": 0,
+      "spmd_multiblock_mix": 0,
+      "spmd_sync_start": 0
+    },
+    "regression_ledgers": {
+      "rows_checked": 12,
+      "status": "passed"
+    },
+    "simulation_runtime_build": "passed",
+    "simulation_scene_tests": "not completed: g++-15 absent",
+    "local_binding_scale_golden": "passed",
+    "current_binaries_match_final_measurement": true
+  }
+}

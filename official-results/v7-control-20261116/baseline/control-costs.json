@@ -1,0 +1,810 @@
+{
+  "ClusterCase0Adaptive": {
+    "device_log": "/data/aicpu-cluster-study/official-worktree/official-results/v7-control-20261116/baseline/diagnostics/device-logs/debug/device-0/device-9014_20261116082935781.log",
+    "stages": {
+      "O": {
+        "poll": {
+          "calls": 1000,
+          "ns": 21880
+        },
+        "queue_depth": {
+          "calls": 1000,
+          "ns": 22840
+        },
+        "fanin": {
+          "calls": 1000,
+          "ns": 23660
+        },
+        "load": {
+          "calls": 1000,
+          "ns": 70160
+        },
+        "choose_commit": {
+          "calls": 1000,
+          "ns": 70020
+        },
+        "wire_ready": {
+          "calls": 1000,
+          "ns": 272620
+        }
+      },
+      "S0": {
+        "resource_feedback": {
+          "calls": 220,
+          "ns": 23840
+        },
+        "observe": {
+          "calls": 121,
+          "ns": 40680
+        },
+        "auto_dispatch": {
+          "calls": 0,
+          "ns": 0
+        },
+        "strict_dispatch": {
+          "calls": 1754,
+          "ns": 335260
+        },
+        "shared_dispatch": {
+          "calls": 1754,
+          "ns": 40480
+        },
+        "sync_dispatch": {
+          "calls": 1754,
+          "ns": 314540
+        }
+      },
+      "S1": {
+        "resource_feedback": {
+          "calls": 196,
+          "ns": 17620
+        },
+        "observe": {
+          "calls": 62,
+          "ns": 19380
+        },
+        "auto_dispatch": {
+          "calls": 0,
+          "ns": 0
+        },
+        "strict_dispatch": {
+          "calls": 1564,
+          "ns": 254980
+        },
+        "shared_dispatch": {
+          "calls": 1564,
+          "ns": 65780
+        },
+        "sync_dispatch": {
+          "calls": 1564,
+          "ns": 594180
+        }
+      },
+      "S2": {
+        "resource_feedback": {
+          "calls": 140,
+          "ns": 46880
+        },
+        "observe": {
+          "calls": 217,
+          "ns": 27160
+        },
+        "auto_dispatch": {
+          "calls": 0,
+          "ns": 0
+        },
+        "strict_dispatch": {
+          "calls": 1113,
+          "ns": 395860
+        },
+        "shared_dispatch": {
+          "calls": 1113,
+          "ns": 31920
+        },
+        "sync_dispatch": {
+          "calls": 1113,
+          "ns": 161260
+        }
+      },
+      "S3": {
+        "resource_feedback": {
+          "calls": 162,
+          "ns": 15760
+        },
+        "observe": {
+          "calls": 314,
+          "ns": 34800
+        },
+        "auto_dispatch": {
+          "calls": 0,
+          "ns": 0
+        },
+        "strict_dispatch": {
+          "calls": 1291,
+          "ns": 420600
+        },
+        "shared_dispatch": {
+          "calls": 1291,
+          "ns": 24860
+        },
+        "sync_dispatch": {
+          "calls": 1291,
+          "ns": 178380
+        }
+      },
+      "S4": {
+        "resource_feedback": {
+          "calls": 169,
+          "ns": 18820
+        },
+        "observe": {
+          "calls": 286,
+          "ns": 29720
+        },
+        "auto_dispatch": {
+          "calls": 0,
+          "ns": 0
+        },
+        "strict_dispatch": {
+          "calls": 1349,
+          "ns": 406380
+        },
+        "shared_dispatch": {
+          "calls": 1349,
+          "ns": 42440
+        },
+        "sync_dispatch": {
+          "calls": 1349,
+          "ns": 183000
+        }
+      }
+    },
+    "scheduler": {
+      "resource_feedback": {
+        "sum_ns": 122920,
+        "max_thread_ns": 46880,
+        "calls": 887
+      },
+      "observe": {
+        "sum_ns": 151740,
+        "max_thread_ns": 40680,
+        "calls": 1000
+      },
+      "auto_dispatch": {
+        "sum_ns": 0,
+        "max_thread_ns": 0,
+        "calls": 0
+      },
+      "strict_dispatch": {
+        "sum_ns": 1813080,
+        "max_thread_ns": 420600,
+        "calls": 7071
+      },
+      "shared_dispatch": {
+        "sum_ns": 205480,
+        "max_thread_ns": 65780,
+        "calls": 7071
+      },
+      "sync_dispatch": {
+        "sum_ns": 1431360,
+        "max_thread_ns": 594180,
+        "calls": 7071
+      }
+    },
+    "qualification": "O stages are exclusive. S observe is nested in dispatch; threads overlap. Timer overhead is included.",
+    "O_total_ns": 481180,
+    "capture": "/data/aicpu-cluster-study/official-worktree/runtime/outputs/TestBenchmarkBgemm_ClusterCase0Adaptive_20261116_082933/chip_swimlane_records.json",
+    "tasks": 1000,
+    "orch_submit_ns": 1592000.0000000012,
+    "kernel_total_us": {
+      "aic": 8156.98,
+      "aiv": 3698.339999999996
+    }
+  },
+  "ClusterCase0Shared": {
+    "device_log": "/data/aicpu-cluster-study/official-worktree/official-results/v7-control-20261116/baseline/diagnostics/device-logs/debug/device-0/device-8861_20261116082924727.log",
+    "stages": {
+      "O": {
+        "poll": {
+          "calls": 0,
+          "ns": 0
+        },
+        "queue_depth": {
+          "calls": 0,
+          "ns": 0
+        },
+        "fanin": {
+          "calls": 0,
+          "ns": 0
+        },
+        "load": {
+          "calls": 0,
+          "ns": 0
+        },
+        "choose_commit": {
+          "calls": 0,
+          "ns": 0
+        },
+        "wire_ready": {
+          "calls": 1000,
+          "ns": 183740
+        }
+      },
+      "S0": {
+        "resource_feedback": {
+          "calls": 0,
+          "ns": 0
+        },
+        "observe": {
+          "calls": 169,
+          "ns": 61300
+        },
+        "auto_dispatch": {
+          "calls": 0,
+          "ns": 0
+        },
+        "strict_dispatch": {
+          "calls": 0,
+          "ns": 0
+        },
+        "shared_dispatch": {
+          "calls": 869,
+          "ns": 698160
+        },
+        "sync_dispatch": {
+          "calls": 869,
+          "ns": 156660
+        }
+      },
+      "S1": {
+        "resource_feedback": {
+          "calls": 0,
+          "ns": 0
+        },
+        "observe": {
+          "calls": 129,
+          "ns": 46720
+        },
+        "auto_dispatch": {
+          "calls": 0,
+          "ns": 0
+        },
+        "strict_dispatch": {
+          "calls": 0,
+          "ns": 0
+        },
+        "shared_dispatch": {
+          "calls": 677,
+          "ns": 702420
+        },
+        "sync_dispatch": {
+          "calls": 677,
+          "ns": 302020
+        }
+      },
+      "S2": {
+        "resource_feedback": {
+          "calls": 0,
+          "ns": 0
+        },
+        "observe": {
+          "calls": 204,
+          "ns": 33140
+        },
+        "auto_dispatch": {
+          "calls": 0,
+          "ns": 0
+        },
+        "strict_dispatch": {
+          "calls": 0,
+          "ns": 0
+        },
+        "shared_dispatch": {
+          "calls": 812,
+          "ns": 496940
+        },
+        "sync_dispatch": {
+          "calls": 812,
+          "ns": 124220
+        }
+      },
+      "S3": {
+        "resource_feedback": {
+          "calls": 0,
+          "ns": 0
+        },
+        "observe": {
+          "calls": 259,
+          "ns": 38460
+        },
+        "auto_dispatch": {
+          "calls": 0,
+          "ns": 0
+        },
+        "strict_dispatch": {
+          "calls": 0,
+          "ns": 0
+        },
+        "shared_dispatch": {
+          "calls": 937,
+          "ns": 562760
+        },
+        "sync_dispatch": {
+          "calls": 937,
+          "ns": 131500
+        }
+      },
+      "S4": {
+        "resource_feedback": {
+          "calls": 0,
+          "ns": 0
+        },
+        "observe": {
+          "calls": 239,
+          "ns": 36200
+        },
+        "auto_dispatch": {
+          "calls": 0,
+          "ns": 0
+        },
+        "strict_dispatch": {
+          "calls": 0,
+          "ns": 0
+        },
+        "shared_dispatch": {
+          "calls": 970,
+          "ns": 580600
+        },
+        "sync_dispatch": {
+          "calls": 970,
+          "ns": 139020
+        }
+      }
+    },
+    "scheduler": {
+      "resource_feedback": {
+        "sum_ns": 0,
+        "max_thread_ns": 0,
+        "calls": 0
+      },
+      "observe": {
+        "sum_ns": 215820,
+        "max_thread_ns": 61300,
+        "calls": 1000
+      },
+      "auto_dispatch": {
+        "sum_ns": 0,
+        "max_thread_ns": 0,
+        "calls": 0
+      },
+      "strict_dispatch": {
+        "sum_ns": 0,
+        "max_thread_ns": 0,
+        "calls": 0
+      },
+      "shared_dispatch": {
+        "sum_ns": 3040880,
+        "max_thread_ns": 702420,
+        "calls": 4265
+      },
+      "sync_dispatch": {
+        "sum_ns": 853420,
+        "max_thread_ns": 302020,
+        "calls": 4265
+      }
+    },
+    "qualification": "O stages are exclusive. S observe is nested in dispatch; threads overlap. Timer overhead is included.",
+    "O_total_ns": 183740,
+    "capture": "/data/aicpu-cluster-study/official-worktree/runtime/outputs/TestBenchmarkBgemm_ClusterCase0Shared_20261116_082922/chip_swimlane_records.json",
+    "tasks": 1000,
+    "orch_submit_ns": 1331580.000000002,
+    "kernel_total_us": {
+      "aic": 8179.080000000004,
+      "aiv": 3700.7
+    }
+  },
+  "ClusterScaleAdaptive": {
+    "device_log": "/data/aicpu-cluster-study/official-worktree/official-results/v7-control-20261116/baseline/diagnostics/device-logs/debug/device-0/device-9328_20261116082956923.log",
+    "stages": {
+      "O": {
+        "poll": {
+          "calls": 4096,
+          "ns": 83800
+        },
+        "queue_depth": {
+          "calls": 4096,
+          "ns": 87900
+        },
+        "fanin": {
+          "calls": 4096,
+          "ns": 111640
+        },
+        "load": {
+          "calls": 4096,
+          "ns": 303840
+        },
+        "choose_commit": {
+          "calls": 4096,
+          "ns": 326460
+        },
+        "wire_ready": {
+          "calls": 4096,
+          "ns": 1429820
+        }
+      },
+      "S0": {
+        "resource_feedback": {
+          "calls": 992,
+          "ns": 99120
+        },
+        "observe": {
+          "calls": 835,
+          "ns": 199020
+        },
+        "auto_dispatch": {
+          "calls": 0,
+          "ns": 0
+        },
+        "strict_dispatch": {
+          "calls": 7932,
+          "ns": 1851160
+        },
+        "shared_dispatch": {
+          "calls": 7932,
+          "ns": 171840
+        },
+        "sync_dispatch": {
+          "calls": 7932,
+          "ns": 1222240
+        }
+      },
+      "S1": {
+        "resource_feedback": {
+          "calls": 795,
+          "ns": 67760
+        },
+        "observe": {
+          "calls": 435,
+          "ns": 92060
+        },
+        "auto_dispatch": {
+          "calls": 0,
+          "ns": 0
+        },
+        "strict_dispatch": {
+          "calls": 6355,
+          "ns": 1479920
+        },
+        "shared_dispatch": {
+          "calls": 6355,
+          "ns": 291640
+        },
+        "sync_dispatch": {
+          "calls": 6355,
+          "ns": 2768380
+        }
+      },
+      "S2": {
+        "resource_feedback": {
+          "calls": 897,
+          "ns": 227260
+        },
+        "observe": {
+          "calls": 770,
+          "ns": 85440
+        },
+        "auto_dispatch": {
+          "calls": 0,
+          "ns": 0
+        },
+        "strict_dispatch": {
+          "calls": 7174,
+          "ns": 1490700
+        },
+        "shared_dispatch": {
+          "calls": 7174,
+          "ns": 167440
+        },
+        "sync_dispatch": {
+          "calls": 7174,
+          "ns": 1063040
+        }
+      },
+      "S3": {
+        "resource_feedback": {
+          "calls": 1234,
+          "ns": 95400
+        },
+        "observe": {
+          "calls": 1010,
+          "ns": 115760
+        },
+        "auto_dispatch": {
+          "calls": 0,
+          "ns": 0
+        },
+        "strict_dispatch": {
+          "calls": 9871,
+          "ns": 1671020
+        },
+        "shared_dispatch": {
+          "calls": 9871,
+          "ns": 204980
+        },
+        "sync_dispatch": {
+          "calls": 9871,
+          "ns": 1407940
+        }
+      },
+      "S4": {
+        "resource_feedback": {
+          "calls": 1220,
+          "ns": 98300
+        },
+        "observe": {
+          "calls": 1046,
+          "ns": 119360
+        },
+        "auto_dispatch": {
+          "calls": 0,
+          "ns": 0
+        },
+        "strict_dispatch": {
+          "calls": 9753,
+          "ns": 1708640
+        },
+        "shared_dispatch": {
+          "calls": 9753,
+          "ns": 225380
+        },
+        "sync_dispatch": {
+          "calls": 9753,
+          "ns": 1372160
+        }
+      }
+    },
+    "scheduler": {
+      "resource_feedback": {
+        "sum_ns": 587840,
+        "max_thread_ns": 227260,
+        "calls": 5138
+      },
+      "observe": {
+        "sum_ns": 611640,
+        "max_thread_ns": 199020,
+        "calls": 4096
+      },
+      "auto_dispatch": {
+        "sum_ns": 0,
+        "max_thread_ns": 0,
+        "calls": 0
+      },
+      "strict_dispatch": {
+        "sum_ns": 8201440,
+        "max_thread_ns": 1851160,
+        "calls": 41085
+      },
+      "shared_dispatch": {
+        "sum_ns": 1061280,
+        "max_thread_ns": 291640,
+        "calls": 41085
+      },
+      "sync_dispatch": {
+        "sum_ns": 7833760,
+        "max_thread_ns": 2768380,
+        "calls": 41085
+      }
+    },
+    "qualification": "O stages are exclusive. S observe is nested in dispatch; threads overlap. Timer overhead is included.",
+    "O_total_ns": 2343460,
+    "capture": "/data/aicpu-cluster-study/official-worktree/runtime/outputs/TestBenchmarkBgemm_ClusterScaleAdaptive_20261116_082956/chip_swimlane_records.json",
+    "tasks": 4096,
+    "orch_submit_ns": 6995859.999999962,
+    "kernel_total_us": {
+      "aic": 4061.340000000008,
+      "aiv": 3138.719999999997
+    }
+  },
+  "ClusterScaleShared": {
+    "device_log": "/data/aicpu-cluster-study/official-worktree/official-results/v7-control-20261116/baseline/diagnostics/device-logs/debug/device-0/device-9166_20261116082945224.log",
+    "stages": {
+      "O": {
+        "poll": {
+          "calls": 0,
+          "ns": 0
+        },
+        "queue_depth": {
+          "calls": 0,
+          "ns": 0
+        },
+        "fanin": {
+          "calls": 0,
+          "ns": 0
+        },
+        "load": {
+          "calls": 0,
+          "ns": 0
+        },
+        "choose_commit": {
+          "calls": 0,
+          "ns": 0
+        },
+        "wire_ready": {
+          "calls": 4096,
+          "ns": 852720
+        }
+      },
+      "S0": {
+        "resource_feedback": {
+          "calls": 0,
+          "ns": 0
+        },
+        "observe": {
+          "calls": 626,
+          "ns": 220180
+        },
+        "auto_dispatch": {
+          "calls": 0,
+          "ns": 0
+        },
+        "strict_dispatch": {
+          "calls": 0,
+          "ns": 0
+        },
+        "shared_dispatch": {
+          "calls": 4807,
+          "ns": 3122540
+        },
+        "sync_dispatch": {
+          "calls": 4807,
+          "ns": 750360
+        }
+      },
+      "S1": {
+        "resource_feedback": {
+          "calls": 0,
+          "ns": 0
+        },
+        "observe": {
+          "calls": 451,
+          "ns": 153260
+        },
+        "auto_dispatch": {
+          "calls": 0,
+          "ns": 0
+        },
+        "strict_dispatch": {
+          "calls": 0,
+          "ns": 0
+        },
+        "shared_dispatch": {
+          "calls": 3416,
+          "ns": 3045420
+        },
+        "sync_dispatch": {
+          "calls": 3416,
+          "ns": 1478700
+        }
+      },
+      "S2": {
+        "resource_feedback": {
+          "calls": 0,
+          "ns": 0
+        },
+        "observe": {
+          "calls": 841,
+          "ns": 127980
+        },
+        "auto_dispatch": {
+          "calls": 0,
+          "ns": 0
+        },
+        "strict_dispatch": {
+          "calls": 0,
+          "ns": 0
+        },
+        "shared_dispatch": {
+          "calls": 4302,
+          "ns": 2107620
+        },
+        "sync_dispatch": {
+          "calls": 4302,
+          "ns": 643860
+        }
+      },
+      "S3": {
+        "resource_feedback": {
+          "calls": 0,
+          "ns": 0
+        },
+        "observe": {
+          "calls": 1119,
+          "ns": 163700
+        },
+        "auto_dispatch": {
+          "calls": 0,
+          "ns": 0
+        },
+        "strict_dispatch": {
+          "calls": 0,
+          "ns": 0
+        },
+        "shared_dispatch": {
+          "calls": 5479,
+          "ns": 2610140
+        },
+        "sync_dispatch": {
+          "calls": 5479,
+          "ns": 769040
+        }
+      },
+      "S4": {
+        "resource_feedback": {
+          "calls": 0,
+          "ns": 0
+        },
+        "observe": {
+          "calls": 1059,
+          "ns": 163480
+        },
+        "auto_dispatch": {
+          "calls": 0,
+          "ns": 0
+        },
+        "strict_dispatch": {
+          "calls": 0,
+          "ns": 0
+        },
+        "shared_dispatch": {
+          "calls": 5703,
+          "ns": 2653740
+        },
+        "sync_dispatch": {
+          "calls": 5703,
+          "ns": 804000
+        }
+      }
+    },
+    "scheduler": {
+      "resource_feedback": {
+        "sum_ns": 0,
+        "max_thread_ns": 0,
+        "calls": 0
+      },
+      "observe": {
+        "sum_ns": 828600,
+        "max_thread_ns": 220180,
+        "calls": 4096
+      },
+      "auto_dispatch": {
+        "sum_ns": 0,
+        "max_thread_ns": 0,
+        "calls": 0
+      },
+      "strict_dispatch": {
+        "sum_ns": 0,
+        "max_thread_ns": 0,
+        "calls": 0
+      },
+      "shared_dispatch": {
+        "sum_ns": 13539460,
+        "max_thread_ns": 3122540,
+        "calls": 23707
+      },
+      "sync_dispatch": {
+        "sum_ns": 4445960,
+        "max_thread_ns": 1478700,
+        "calls": 23707
+      }
+    },
+    "qualification": "O stages are exclusive. S observe is nested in dispatch; threads overlap. Timer overhead is included.",
+    "O_total_ns": 852720,
+    "capture": "/data/aicpu-cluster-study/official-worktree/runtime/outputs/TestBenchmarkBgemm_ClusterScaleShared_20261116_082944/chip_swimlane_records.json",
+    "tasks": 4096,
+    "orch_submit_ns": 5320560.000000007,
+    "kernel_total_us": {
+      "aic": 4055.7200000000007,
+      "aiv": 3157.1200000000154
+    }
+  }
+}

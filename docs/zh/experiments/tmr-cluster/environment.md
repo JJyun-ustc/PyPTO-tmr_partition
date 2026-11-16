@@ -77,10 +77,10 @@ python -m pip install --no-build-isolation -e . -C build.tool-args="-j$PYPTO_BUI
 
 ```bash
 npu-smi info
-npu-smi info -t board -i 4 -c 0
+npu-smi info -t board -i 0 -c 0
 cd runtime
 python examples/a2a3/tensormap_and_ringbuffer/benchmark_bgemm/reproduce_cluster_study.py \
-  --device 0 --physical-card 4 --output ../official-results/reproduced-run
+  --device 0 --physical-card 0 --output ../official-results/reproduced-run
 ```
 
 该脚本先检查架构，再对四个配对用例各运行一次 golden；之后按两批反序，
@@ -104,7 +104,9 @@ ctest --test-dir tests/ut/cpp/build \
   --parallel 2 --output-on-failure
 ```
 
-被测工作区此前通过 17+32+45=94 项测试。额外回归源代码已从原工作区外围目录
+最新 v7 被测工作区通过 8 个 C++ 目标、190 项测试；上方命令只演示其中三个目标。
+15 个板上回归用例通过，详细目标和原始输出见 v7 结果目录的 verified-unit.log、
+unit-counts.json 与 regressions/。仿真运行库构建通过，仿真场景因缺少 g++-15 未完成。额外回归源代码已从原工作区外围目录
 整理到 runtime/tests/st/a2a3/tensormap_and_ringbuffer/cluster_partition_study/，
 包括自动多 block、sync-start 和 DUMMY；这些脚本通过标准 SceneTest 入口运行。
 原来的机器绝对路径没有作为复现依赖继续使用。
@@ -112,3 +114,20 @@ ctest --test-dir tests/ut/cpp/build \
 上游 GitHub CI 文件原样保留；个人仓库没有上游的 self-hosted runner 和 secrets，
 不代表全部上游 CI 可以直接运行。本次发布没有重新构建完整 PyPTO 或重跑 NPU，
 保留的是已测源码快照和原始证据，额外发布脚本会单独进行静态检查。
+
+## v7 结果与阶段复现
+
+最新证据位于 `official-results/v7-control-20261116/`，包括 v6 基线、仅组复用、
+延迟绑定、低频摘要、受限领取和最终复核的源码快照、原始计时与诊断 capture。
+阶段是累积改动，不是独立因素消融；不同构建使用各自同二进制 Shared 对照。
+驱动对当前板卡输出的完整名称 `910B2` 和拆分名称 `Ascend910` / `B2` 均作核验。
+
+```bash
+cd runtime
+source ../.claude/skills/testing/load-env.sh
+python examples/a2a3/tensormap_and_ringbuffer/benchmark_bgemm/run_control_stage.py \
+  ../official-results/new-control-study --jobs "$PYPTO_BUILD_JOBS" --physical-card 0 --device 0
+```
+
+输出目录必须全新。二进制、虚拟环境和缓存不上传；历史绝对路径仅为采集记录。
+发布副本的代码与已测工作区核对一致，本次同步不重新执行设备实验。

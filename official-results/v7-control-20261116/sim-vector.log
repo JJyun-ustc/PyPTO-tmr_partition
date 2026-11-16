@@ -1,0 +1,53 @@
+
+=== Runtime: tensormap_and_ringbuffer  Level: 2  Pipeline depth: default ===
+Traceback (most recent call last):
+  File "/data/aicpu-cluster-study/official-worktree/runtime/simpler_setup/kernel_compiler.py", line 493, in _run_subprocess
+    result = subprocess.run(cmd, check=False, capture_output=True, text=True, cwd=self.project_root)
+  File "/data/pypto-work/pypto-home/python/cpython-3.10.22-linux-aarch64-gnu/lib/python3.10/subprocess.py", line 503, in run
+    with Popen(*popenargs, **kwargs) as process:
+  File "/data/pypto-work/pypto-home/python/cpython-3.10.22-linux-aarch64-gnu/lib/python3.10/subprocess.py", line 971, in __init__
+    self._execute_child(args, executable, preexec_fn, close_fds,
+  File "/data/pypto-work/pypto-home/python/cpython-3.10.22-linux-aarch64-gnu/lib/python3.10/subprocess.py", line 1863, in _execute_child
+    raise child_exception_type(errno_num, err_msg, err_filename)
+FileNotFoundError: [Errno 2] No such file or directory: 'g++-15'
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/data/aicpu-cluster-study/official-worktree/runtime/tests/st/a2a3/tensormap_and_ringbuffer/cluster_partition_study/placement-vector/test_vector_example.py", line 76, in <module>
+    SceneTestCase.run_module(__name__)
+  File "/data/aicpu-cluster-study/official-worktree/runtime/simpler_setup/scene_test.py", line 2772, in run_module
+    callable_obj = inst.build_callable(args.platform)
+  File "/data/aicpu-cluster-study/official-worktree/runtime/simpler_setup/scene_test.py", line 2100, in build_callable
+    return self.compile_chip_callable(platform)
+  File "/data/aicpu-cluster-study/official-worktree/runtime/simpler_setup/scene_test.py", line 2049, in compile_chip_callable
+    return compile_chip_callable_spec(cls.CALLABLE, platform, cls._st_runtime, cache_key)
+  File "/data/aicpu-cluster-study/official-worktree/runtime/simpler_setup/scene_test.py", line 1915, in compile_chip_callable_spec
+    chip_callable = get_or_compile(artifact_key, compile_callable)
+  File "/data/aicpu-cluster-study/official-worktree/runtime/simpler_setup/scene_test_cache.py", line 420, in get_or_compile
+    callable_obj = compile_fn()
+  File "/data/aicpu-cluster-study/official-worktree/runtime/simpler_setup/scene_test.py", line 1894, in compile_callable
+    incores_binary = [future.result() for future in incore_futures]
+  File "/data/aicpu-cluster-study/official-worktree/runtime/simpler_setup/scene_test.py", line 1894, in <listcomp>
+    incores_binary = [future.result() for future in incore_futures]
+  File "/data/pypto-work/pypto-home/python/cpython-3.10.22-linux-aarch64-gnu/lib/python3.10/concurrent/futures/_base.py", line 451, in result
+    return self.__get_result()
+  File "/data/pypto-work/pypto-home/python/cpython-3.10.22-linux-aarch64-gnu/lib/python3.10/concurrent/futures/_base.py", line 403, in __get_result
+    raise self._exception
+  File "/data/pypto-work/pypto-home/python/cpython-3.10.22-linux-aarch64-gnu/lib/python3.10/concurrent/futures/thread.py", line 58, in run
+    result = self.fn(*self.args, **self.kwargs)
+  File "/data/aicpu-cluster-study/official-worktree/runtime/simpler_setup/scene_test.py", line 1877, in compile_one_incore
+    return get_or_compile_incore(incore_artifact_key, compile_missing_incore)
+  File "/data/aicpu-cluster-study/official-worktree/runtime/simpler_setup/scene_test_cache.py", line 453, in get_or_compile_incore
+    binary = compile_fn()
+  File "/data/aicpu-cluster-study/official-worktree/runtime/simpler_setup/scene_test.py", line 1868, in compile_missing_incore
+    binary = kc.compile_incore(
+  File "/data/aicpu-cluster-study/official-worktree/runtime/simpler_setup/kernel_compiler.py", line 621, in compile_incore
+    return self._compile_incore_sim(
+  File "/data/aicpu-cluster-study/official-worktree/runtime/simpler_setup/kernel_compiler.py", line 881, in _compile_incore_sim
+    return self._compile_to_bytes(
+  File "/data/aicpu-cluster-study/official-worktree/runtime/simpler_setup/kernel_compiler.py", line 540, in _compile_to_bytes
+    self._run_subprocess(cmd, label, error_hint, surface_diagnostics=surface_diagnostics)
+  File "/data/aicpu-cluster-study/official-worktree/runtime/simpler_setup/kernel_compiler.py", line 509, in _run_subprocess
+    raise RuntimeError(error_hint)
+RuntimeError: g++-15 not found. Please install g++-15.

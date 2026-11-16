@@ -1,0 +1,16 @@
+task-submit unavailable: results will be unlocked
+Case0Shared: golden passed
+Case0Adaptive: golden passed
+ScaleShared: golden passed
+ScaleAdaptive: golden passed
+Case0Shared: 15 timing rounds passed
+Traceback (most recent call last):
+  File "/data/aicpu-cluster-study/official-worktree/runtime/examples/a2a3/tensormap_and_ringbuffer/benchmark_bgemm/reproduce_cluster_study.py", line 181, in <module>
+    main()
+  File "/data/aicpu-cluster-study/official-worktree/runtime/examples/a2a3/tensormap_and_ringbuffer/benchmark_bgemm/reproduce_cluster_study.py", line 144, in main
+    samples[case][batch] = run_case(case, 15, False, performance / f"{case}-{batch}.log", args.device, queue)
+  File "/data/aicpu-cluster-study/official-worktree/runtime/examples/a2a3/tensormap_and_ringbuffer/benchmark_bgemm/reproduce_cluster_study.py", line 102, in run_case
+    subprocess.run(command, cwd=RUNTIME_ROOT, stdout=log, stderr=subprocess.STDOUT, check=True)
+  File "/data/pypto-work/pypto-home/python/cpython-3.10.22-linux-aarch64-gnu/lib/python3.10/subprocess.py", line 526, in run
+    raise CalledProcessError(retcode, process.args,
+subprocess.CalledProcessError: Command '['/data/aicpu-cluster-study/official-worktree/runtime/.venv/bin/python', '/data/aicpu-cluster-study/official-worktree/runtime/examples/a2a3/tensormap_and_ringbuffer/benchmark_bgemm/test_benchmark_bgemm.py', '-p', 'a2a3', '-d', '0', '--case', 'ClusterCase0Adaptive', '--manual', 'include', '--rounds', '15', '--log-level', 'timing', '--skip-golden']' returned non-zero exit status 1.

@@ -1,0 +1,67 @@
+[mono_ns=6395851637157310][T0x3fff90119420][INFO] configure_aicore_op_timeout: [device_runner_base.cpp:1666] aclrtSetOpExecuteTimeOutV2: requested=45000000 us, actual=47244640 us
+[mono_ns=6395851642562000][T0x3fff90119420][INFO] ensure_device_initialized: [device_runner_base.cpp:1724] DeviceRunner: device=0 set, streams created
+[mono_ns=6395851642617790][T0x3fff90119420][INFO] ensure_device_initialized: [device_runner_base.cpp:1731] DeviceRunner: device=0 max_block_dim=24 (cube=24, vector=48)
+[mono_ns=6395851670598630][T0x3fff90119420][INFO] BootstrapDispatcher: [load_aicpu_op.cpp:214] BootstrapDispatcher: bundled dispatcher (14472 B) + inner SO (4388976 B) uploaded; inner SO at simpler_inner_7aeac1e3c08795b7_0.so
+[mono_ns=6395851670693100][T0x3fff90119420][INFO] ensure_binaries_loaded: [device_runner_base.cpp:1926] DeviceRunner: inner SO uploaded to preinstall via dispatcher bootstrap
+[mono_ns=6395851671020090][T0x3fff90119420][INFO] Init: [load_aicpu_op.cpp:382] LoadAicpuOp::Init: JSON=/tmp/simpler_inner_7aeac1e3c08795b7_6214.json inner_basename=simpler_inner_7aeac1e3c08795b7_0.so
+[mono_ns=6395851671295980][T0x3fff90119420][INFO] Init: [load_aicpu_op.cpp:390] LoadAicpuOp: Loaded inner SO via JSON, handle=0x2aab0fc9c280
+[mono_ns=6395851671485650][T0x3fff90119420][INFO] Init: [load_aicpu_op.cpp:407] LoadAicpuOp: resolved handle for simpler_aicpu_exec (opType=simpler_aicpu_exec_7aeac1e3c08795b7): 0x2aab0fc9f550
+[mono_ns=6395851671503940][T0x3fff90119420][INFO] Init: [load_aicpu_op.cpp:407] LoadAicpuOp: resolved handle for simpler_aicpu_init (opType=simpler_aicpu_init_7aeac1e3c08795b7): 0x2aab0fc9fa40
+[mono_ns=6395851671517460][T0x3fff90119420][INFO] Init: [load_aicpu_op.cpp:407] LoadAicpuOp: resolved handle for simpler_aicpu_register_callable (opType=simpler_aicpu_register_callable_7aeac1e3c08795b7): 0x2aab0fc9ff30
+[mono_ns=6395851671524720][T0x3fff90119420][INFO] ensure_binaries_loaded: [device_runner_base.cpp:1942] DeviceRunner: inner SO registered (runtime entry handles ready)
+[mono_ns=6395851671533220][T0x3fff90119420][INFO] ensure_binaries_loaded: [device_runner_base.cpp:1955] DeviceRunner: binaries loaded
+[mono_ns=6395851671581040][T0x3fff90119420][INFO] fill_init_arch_fields: [device_runner.cpp:155] fill_init_arch_fields: device 0 nocache alias offset=0x80000000000
+[mono_ns=6395851671588860][T0x3fff90119420][INFO] ensure_aicpu_init_launched: [device_runner_base.cpp:1871] === launch_aicpu_payload simpler_aicpu_init ===
+
+=== Runtime: tensormap_and_ringbuffer  Level: 2  Pipeline depth: default ===
+  TestBenchmarkBgemm::ClusterCase0Shared ...
+[mono_ns=6395855317275480][T0x3fff90119420][INFO] register_callable_impl: [runtime_maker.cpp:313] Registering 2 kernel(s) in register_callable_impl
+[mono_ns=6395855320260010][T0x3fff90119420][TIMING] log_callable_image: Callable image: device=0 runner=0x2aab0d2588c0 chip_hash=0xd5398e222a143023 chip_dev=0x12c0c001a000 upload_bytes=632208 children=2
+[mono_ns=6395855320274820][T0x3fff90119420][TIMING] log_callable_image: Callable code: device=0 runner=0x2aab0d2588c0 chip_hash=0xd5398e222a143023 chip_dev=0x12c0c001a000 func_id=0 code_begin=0x12c0c00b3d60 code_end_exclusive=0x12c0c00b41a4 code_bytes=1092 code_fnv1a64=0x212c407e5c39dda2
+[mono_ns=6395855320279340][T0x3fff90119420][TIMING] log_callable_image: Callable code: device=0 runner=0x2aab0d2588c0 chip_hash=0xd5398e222a143023 chip_dev=0x12c0c001a000 func_id=1 code_begin=0x12c0c00b42a0 code_end_exclusive=0x12c0c00b454c code_bytes=684 code_fnv1a64=0x4c0e49fc6b5f2f9f
+[mono_ns=6395855320289190][T0x3fff90119420][INFO] register_callable_impl: [runtime_maker.cpp:339] Orchestration SO: 612304 bytes uploaded (host-only)
+[mono_ns=6395855320293740][T0x3fff90119420][TIMING] record_device_orch_callable: [device_runner_base.cpp:2425] Callable registration: device=0 runner=0x2aab0d2588c0 cid=0 chip_hash=0xd5398e222a143023 aicore_image_hash=0xe01db861de7b5371 orch_hash=0xbc5434a7c154d4f1 orch_bytes=612304
+[mono_ns=6395855320335330][T0x3fff90119420][INFO] register_callable_on_device: [device_runner_base.cpp:2340] === launch_aicpu_payload simpler_aicpu_register_callable ===
+[mono_ns=6395855321745600][T0x3fff90119420][INFO] commit_device_register: [device_runner_base.cpp:2291] AICPU callable load committed cid=0 (count=1)
+[TIMING] torch_backend_autoload setting=unset raw=null raw_truncated=false effective=enabled torch_imported=true torch_npu_loaded=false
+[mono_ns=6395857352681190][T0x3fff90119420][INFO] resolve_block_dim: [device_runner_base.cpp:3518] block_dim resolved to 24 (cube=24, vector=48)
+[mono_ns=6395857352708630][T0x3fff90119420][INFO] bind_callable_to_runtime_impl: [runtime_maker.cpp:855] RT2 bind: 4 tensors + 0 scalars, device orchestration mode
+[mono_ns=6395857352721550][T0x3fff90119420][INFO] resolve_arena_sizing: [runtime_maker.cpp:447] Ring buffer sizes: task_window=[16384, 16384, 16384, 16384] heap=[268435456, 268435456, 268435456, 268435456] dep_pool=[16384, 16384, 16384, 16384]
+[mono_ns=6395857353149330][T0x3fff90119420][INFO] copy_in_device_args: [runtime_maker.cpp:622] TIMING: args_slice = 0ms
+[mono_ns=6395857353162300][T0x3fff90119420][TIMING] emit_host_span: [STRACE] v=1 pid=6214 tid=6214 inv=1 hid=bc5434a7c154d4f1 depth=2 name=chip.run.bind.args ts=6395857353147540 dur=10970 
+[mono_ns=6395857353165710][T0x3fff90119420][INFO] apply_orch_sched_env_flags: [runtime_maker.cpp:633] Serial orchestrator-to-scheduler start gate: disabled
+[mono_ns=6395857401293450][T0x3fff90119420][INFO] ensure_static_arenas: [runtime_maker.cpp:673] TIMING: static_arena_setup = 48ms
+[mono_ns=6395857401303250][T0x3fff90119420][INFO] ensure_static_arenas: [runtime_maker.cpp:674] TIMING: gm_heap_acquire = 0ms
+[mono_ns=6395857401305530][T0x3fff90119420][INFO] ensure_static_arenas: [runtime_maker.cpp:675] TIMING: shared_mem_acquire = 0ms
+[mono_ns=6395857478612190][T0x3fff90119420][TIMING] emit_host_span: [STRACE] v=1 pid=6214 tid=6214 inv=1 hid=bc5434a7c154d4f1 depth=2 name=chip.run.bind.prebuilt ts=6395857353170680 dur=125425910 
+[mono_ns=6395857478632110][T0x3fff90119420][INFO] bind_callable_to_runtime_impl: [runtime_maker.cpp:914] Device orchestration ready: 4 tensors + 0 scalars
+[mono_ns=6395857478635480][T0x3fff90119420][INFO] bind_callable_to_runtime_impl: [runtime_maker.cpp:917] TIMING: prebuilt_runtime_arena = 126ms
+[mono_ns=6395857478637810][T0x3fff90119420][INFO] bind_callable_to_runtime_impl: [runtime_maker.cpp:918] TIMING: total_bind = 126ms
+[mono_ns=6395857478643490][T0x3fff90119420][TIMING] emit_host_span: [STRACE] v=1 pid=6214 tid=6214 inv=1 hid=bc5434a7c154d4f1 depth=1 name=chip.run.bind ts=6395857352703050 dur=125937960 
+[mono_ns=6395857478650540][T0x3fff90119420][TIMING] emit_host_span: [STRACE] v=1 pid=6214 tid=6214 inv=1 hid=bc5434a7c154d4f1 depth=1 name=chip.run.publish_image ts=6395857478647910 dur=710 
+[mono_ns=6395857519586570][T0x3fff90119420][TIMING] emit_host_span: [STRACE] v=1 pid=6214 tid=6214 inv=1 hid=bc5434a7c154d4f1 depth=1 name=chip.run.stage_inputs ts=6395857478658540 dur=40917300 
+[mono_ns=6395857520087290][T0x3fff90119420][INFO] probe_aicpu_topology: [aicpu_topology_probe.cpp:141] A2A3 AICPU topology probed for device 0: 6 user-schedulable cpu_ids
+[mono_ns=6395857520109900][T0x3fff90119420][INFO] prepare_execution: [device_runner.cpp:480] A2A3 AICPU ALLOWED_CPUS = [2, 3, 4, 5, 6, 7(last)] (active=6, launch=6, user_cpus=6)
+[mono_ns=6395857520181120][T0x3fff90119420][TIMING] emit_host_span: [STRACE] v=1 pid=6214 tid=6214 inv=1 hid=bc5434a7c154d4f1 depth=1 name=chip.run.prepare_execution ts=6395857519602740 dur=575330 
+[mono_ns=6395857524483420][T0x3fff90119420][INFO] operator(): [device_runner.cpp:825] === launch_aicore_kernel ===
+[mono_ns=6395857524998080][T0x3fff90119420][TIMING] emit_host_span: [STRACE] v=1 pid=6214 tid=6214 inv=1 hid=bc5434a7c154d4f1 depth=2 name=chip.run.runner_run.aicpu_launch ts=6395857524993540 dur=0 
+[mono_ns=6395857527516370][T0x3fff90119420][INFO] wait_run_fence: [device_runner_base.cpp:3729] === aclrtSynchronizeEventWithTimeout run completion boundaries ===
+[mono_ns=6395857527589770][T0x3fff90119420][TIMING] emit_host_span: [STRACE] v=1 pid=6214 tid=6214 inv=1 hid=bc5434a7c154d4f1 depth=1 name=chip.run.runner_run ts=6395857520204130 dur=7381570 
+[mono_ns=6395857527627880][T0x3fff90119420][INFO] copy_back_run_outputs_impl: [runtime_maker.cpp:1023] === Copying Results Back to Host ===
+[mono_ns=6395857527636070][T0x3fff90119420][INFO] copy_back_run_outputs_impl: [runtime_maker.cpp:1029] ChipTensor leases to process: 4
+[mono_ns=6395857530060590][T0x3fff90119420][INFO] copy_back_run_outputs_impl: [runtime_maker.cpp:1120] === Result Copy-Back Complete ===
+[mono_ns=6395857530077800][T0x3fff90119420][TIMING] emit_host_span: [STRACE] v=1 pid=6214 tid=6214 inv=1 hid=bc5434a7c154d4f1 depth=1 name=chip.run.validate ts=6395857527627300 dur=2447630 
+[mono_ns=6395857530083550][T0x3fff90119420][TIMING] emit_host_span: [STRACE] v=1 pid=6214 tid=6214 inv=1 hid=bc5434a7c154d4f1 depth=2 name=chip.run.runner_run.device_wall ts=0 dur=1744200 clk=dev dev_id=0 dev_start_cycle=319797989530479 dev_end_cycle=319797989617689 dev_cnt_hz=50000000
+[mono_ns=6395857530093860][T0x3fff90119420][TIMING] emit_host_span: [STRACE] v=1 pid=6214 tid=6214 inv=1 hid=bc5434a7c154d4f1 depth=3 name=chip.run.runner_run.device_wall.preamble ts=0 dur=275420 clk=dev
+[mono_ns=6395857530098320][T0x3fff90119420][TIMING] emit_host_span: [STRACE] v=1 pid=6214 tid=6214 inv=1 hid=bc5434a7c154d4f1 depth=3 name=chip.run.runner_run.device_wall.graph_build ts=123900 dur=1384980 clk=dev
+[mono_ns=6395857530106210][T0x3fff90119420][TIMING] emit_host_span: [STRACE] v=1 pid=6214 tid=6214 inv=1 hid=bc5434a7c154d4f1 depth=3 name=chip.run.runner_run.device_wall.config_validate ts=131340 dur=7439 clk=dev
+[mono_ns=6395857530110030][T0x3fff90119420][TIMING] emit_host_span: [STRACE] v=1 pid=6214 tid=6214 inv=1 hid=bc5434a7c154d4f1 depth=3 name=chip.run.runner_run.device_wall.arena_wire ts=138820 dur=13800 clk=dev
+[mono_ns=6395857530113740][T0x3fff90119420][TIMING] emit_host_span: [STRACE] v=1 pid=6214 tid=6214 inv=1 hid=bc5434a7c154d4f1 depth=3 name=chip.run.runner_run.device_wall.sm_reset ts=152680 dur=23220 clk=dev
+[mono_ns=6395857530121680][T0x3fff90119420][TIMING] emit_host_span: [STRACE] v=1 pid=6214 tid=6214 inv=1 hid=bc5434a7c154d4f1 depth=3 name=chip.run.runner_run.device_wall.post_orch ts=1509139 dur=158300 clk=dev
+[mono_ns=6395857530125300][T0x3fff90119420][TIMING] emit_host_span: [STRACE] v=1 pid=6214 tid=6214 inv=1 hid=bc5434a7c154d4f1 depth=3 name=chip.run.runner_run.device_wall.orch ts=177940 dur=1032619 clk=dev
+[mono_ns=6395857530129360][T0x3fff90119420][TIMING] emit_host_span: [STRACE] v=1 pid=6214 tid=6214 inv=1 hid=bc5434a7c154d4f1 depth=3 name=chip.run.runner_run.device_wall.sched ts=294099 dur=1012900 clk=dev
+[mono_ns=6395857530167800][T0x3fff90119420][TIMING] emit_host_span: [STRACE] v=1 pid=6214 tid=6214 inv=1 hid=bc5434a7c154d4f1 depth=2 name=chip.run.runner_run.device_boundaries ts=6395857530165430 dur=0 clk=dev dev_id=0 aic_start=6395959789393 aic_rc=0 wo_end=0 wo_rc=-1000 ts_hz=1000000
+[mono_ns=6395857530178360][T0x3fff90119420][TIMING] emit_host_span: [STRACE] v=1 pid=6214 tid=6214 inv=1 hid=bc5434a7c154d4f1 depth=1 name=chip.run.claim_release ts=6395857530176360 dur=390 
+[mono_ns=6395857530184610][T0x3fff90119420][TIMING] emit_host_span: [STRACE] v=1 pid=6214 tid=6214 inv=1 hid=bc5434a7c154d4f1 depth=0 name=chip.run ts=6395857352535640 dur=177647070 run_id=0 dispatch_id=0 slot_id=0 generation=1 run_epoch=1
+[mono_ns=6395857776884900][T0x3fff90119420][TIMING] finalize_common_impl: [device_runner_base.cpp:3012] Callable image freed: device=0 runner=0x2aab0d2588c0 chip_hash=0xd5398e222a143023 chip_dev=0x12c0c001a000 upload_bytes=632208
+  TestBenchmarkBgemm::ClusterCase0Shared PASSED

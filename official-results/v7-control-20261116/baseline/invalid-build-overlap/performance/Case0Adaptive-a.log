@@ -1,0 +1,58 @@
+[ERROR] [Orchestration] Compilation failed: In file included from src/a2a3/runtime/tensormap_and_ringbuffer/orchestration/orchestration_api.h:37:0,
+                 from examples/a2a3/tensormap_and_ringbuffer/benchmark_bgemm/kernels/orchestration/bgemm_orch.cpp:33:
+src/a2a3/runtime/tensormap_and_ringbuffer/runtime/runtime_types.h:478:1: error: static assertion failed: tensors must start at byte 640 (cache line 10, after predicate)
+ static_assert(offsetof(TaskPayload, tensors) == 640, "tensors must start at byte 640 (cache line 10, after predicate)");
+ ^~~~~~~~~~~~~
+src/a2a3/runtime/tensormap_and_ringbuffer/runtime/runtime_types.h:479:1: error: static assertion failed: scalars must immediately follow tensors
+ static_assert(
+ ^~~~~~~~~~~~~
+src/a2a3/runtime/tensormap_and_ringbuffer/runtime/runtime_types.h:483:1: error: static assertion failed: TaskPayload size = metadata(576) + predicate cache line(64) + tensors + scalars
+ static_assert(
+ ^~~~~~~~~~~~~
+
+
+=== Runtime: tensormap_and_ringbuffer  Level: 2  Pipeline depth: default ===
+Traceback (most recent call last):
+  File "/data/aicpu-cluster-study/official-worktree/runtime/examples/a2a3/tensormap_and_ringbuffer/benchmark_bgemm/test_benchmark_bgemm.py", line 154, in <module>
+    SceneTestCase.run_module(__name__)
+  File "/data/aicpu-cluster-study/official-worktree/runtime/simpler_setup/scene_test.py", line 2772, in run_module
+    callable_obj = inst.build_callable(args.platform)
+  File "/data/aicpu-cluster-study/official-worktree/runtime/simpler_setup/scene_test.py", line 2100, in build_callable
+    return self.compile_chip_callable(platform)
+  File "/data/aicpu-cluster-study/official-worktree/runtime/simpler_setup/scene_test.py", line 2049, in compile_chip_callable
+    return compile_chip_callable_spec(cls.CALLABLE, platform, cls._st_runtime, cache_key)
+  File "/data/aicpu-cluster-study/official-worktree/runtime/simpler_setup/scene_test.py", line 1915, in compile_chip_callable_spec
+    chip_callable = get_or_compile(artifact_key, compile_callable)
+  File "/data/aicpu-cluster-study/official-worktree/runtime/simpler_setup/scene_test_cache.py", line 420, in get_or_compile
+    callable_obj = compile_fn()
+  File "/data/aicpu-cluster-study/official-worktree/runtime/simpler_setup/scene_test.py", line 1893, in compile_callable
+    orch_binary = orch_future.result()
+  File "/data/pypto-work/pypto-home/python/cpython-3.10.22-linux-aarch64-gnu/lib/python3.10/concurrent/futures/_base.py", line 458, in result
+    return self.__get_result()
+  File "/data/pypto-work/pypto-home/python/cpython-3.10.22-linux-aarch64-gnu/lib/python3.10/concurrent/futures/_base.py", line 403, in __get_result
+    raise self._exception
+  File "/data/pypto-work/pypto-home/python/cpython-3.10.22-linux-aarch64-gnu/lib/python3.10/concurrent/futures/thread.py", line 58, in run
+    result = self.fn(*self.args, **self.kwargs)
+  File "/data/aicpu-cluster-study/official-worktree/runtime/simpler_setup/scene_test.py", line 1863, in compile_orchestration
+    return kc.compile_orchestration(runtime, orch["source"])
+  File "/data/aicpu-cluster-study/official-worktree/runtime/simpler_setup/kernel_compiler.py", line 750, in compile_orchestration
+    return self._compile_orchestration_shared_lib(
+  File "/data/aicpu-cluster-study/official-worktree/runtime/simpler_setup/kernel_compiler.py", line 813, in _compile_orchestration_shared_lib
+    return self._compile_to_bytes(
+  File "/data/aicpu-cluster-study/official-worktree/runtime/simpler_setup/kernel_compiler.py", line 540, in _compile_to_bytes
+    self._run_subprocess(cmd, label, error_hint, surface_diagnostics=surface_diagnostics)
+  File "/data/aicpu-cluster-study/official-worktree/runtime/simpler_setup/kernel_compiler.py", line 504, in _run_subprocess
+    raise RuntimeError(f"{label} compilation failed with exit code {result.returncode}:\n{result.stderr}")
+RuntimeError: Orchestration compilation failed with exit code 1:
+In file included from src/a2a3/runtime/tensormap_and_ringbuffer/orchestration/orchestration_api.h:37:0,
+                 from examples/a2a3/tensormap_and_ringbuffer/benchmark_bgemm/kernels/orchestration/bgemm_orch.cpp:33:
+src/a2a3/runtime/tensormap_and_ringbuffer/runtime/runtime_types.h:478:1: error: static assertion failed: tensors must start at byte 640 (cache line 10, after predicate)
+ static_assert(offsetof(TaskPayload, tensors) == 640, "tensors must start at byte 640 (cache line 10, after predicate)");
+ ^~~~~~~~~~~~~
+src/a2a3/runtime/tensormap_and_ringbuffer/runtime/runtime_types.h:479:1: error: static assertion failed: scalars must immediately follow tensors
+ static_assert(
+ ^~~~~~~~~~~~~
+src/a2a3/runtime/tensormap_and_ringbuffer/runtime/runtime_types.h:483:1: error: static assertion failed: TaskPayload size = metadata(576) + predicate cache line(64) + tensors + scalars
+ static_assert(
+ ^~~~~~~~~~~~~
+

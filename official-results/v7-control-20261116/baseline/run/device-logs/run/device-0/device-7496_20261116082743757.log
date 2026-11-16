@@ -1,0 +1,46 @@
+[INFO] CCECPU(26231,aicpu_scheduler):2026-11-16-16:27:39.661.534 [main.cpp:330][main][tid:26231] Start parameter. deviceId=0, hostPid=1936994, pidSign=000000000000000000000000000000000000000000000000, profilingMode=0, vfId=0, logLevel=1, ccecpulogLevel=-1, aicpulogLevel=-1, deviceMode=0, aicpuSchedMode=0, hostProcName=, grpNameNum=0, grpNameList=[]
+[INFO] CCECPU(26231,aicpu_scheduler):2026-11-16-16:27:39.702.140 [aicpusd_resource_limit.cpp:62][AddToCgroup][tid:26231] Add to cgroup finished, cmd:[cd /var/  && sudo ./tsdaemon_add_to_usermemory.sh memory 26231 0 0].
+[INFO] CCECPU(26231,aicpu_scheduler):2026-11-16-16:27:39.702.192 [aicpusd_interface_process.cpp:613][GetCurrentRunMode][tid:26231] Current aicpu mode is online (call from host).
+[INFO] CCECPU(26231,aicpu_scheduler):2026-11-16-16:27:39.702.238 [aicpusd_drv_manager.cpp:309][InitSocType][tid:26231] Soc type is 0, version is 1282
+[INFO] CCECPU(26231,aicpu_scheduler):2026-11-16-16:27:39.702.269 [aicpusd_drv_manager.cpp:164][GetNormalAicpuInfo][tid:26231] aicpuBitMap[252], aicpuNum[6].
+[INFO] CCECPU(26231,aicpu_scheduler):2026-11-16-16:27:39.702.281 [aicpusd_drv_manager.cpp:197][GetCcpuInfo][tid:26231] ccpuBitMap[1].
+[INFO] CCECPU(26231,aicpu_scheduler):2026-11-16-16:27:39.702.332 [aicpusd_drv_manager.cpp:115][GetNormalAicpuDCpuInfo][tid:26231] GetNormalAicpuDCpuInfo, deviceId[0], aicpu_num[6], aicpu_os_sched[1], ccpu_num[1], ccpu_os_sched[1], dcpu_num[1], dcpu_os_sched[1], tscpu_num[0], tscpu_os_sched[0].
+[INFO] CCECPU(26231,aicpu_scheduler):2026-11-16-16:27:39.702.342 [aicpusd_drv_manager.cpp:280][InitDrvMgrCaluniqueVfId][tid:26231] InitDrvMgr uniqueVfId=0, deviceId=0
+[INFO] CCECPU(26231,aicpu_scheduler):2026-11-16-16:27:39.702.349 [aicpusd_drv_manager.cpp:361][InitDrvMgr][tid:26231] host pid[1936994], host proc name[], vf id[0], first aicpu index[0], aicpu num[6], dcpu base index[1], dcpu num[1].
+[INFO] CCECPU(26231,aicpu_scheduler):2026-11-16-16:27:39.702.366 [aicpusd_drv_manager.cpp:557][CheckBindHostPid][tid:26231] Start query process host pid
+[INFO] CCECPU(26231,aicpu_scheduler):2026-11-16-16:27:39.702.384 [aicpusd_drv_manager.cpp:570][CheckBindHostPid][tid:26231] Query process host pid end, ret=0, hostpid=1936994, expect=1936994, cpType=0
+[INFO] CCECPU(26231,aicpu_scheduler):2026-11-16-16:27:39.702.398 [aicpusd_drv_manager.cpp:585][CheckBindHostPid][tid:26231] call drvQueryProcessHostPid successfully, hostpid[1936994], cpType[0]
+[INFO] CCECPU(26231,aicpu_scheduler):2026-11-16-16:27:39.702.911 [aicpusd_resource_manager.cpp:264][InitBufManager][tid:26231] Aicpu schedule SetBuffCfg successfully!
+[INFO] CCECPU(26231,aicpu_scheduler):2026-11-16-16:27:39.704.093 [aicpusd_drv_manager.cpp:430][InitDrvSchedModule][tid:26231] Enable process drv queue msg on ccpu, ret is 0.
+[INFO] CCECPU(26231,aicpu_scheduler):2026-11-16-16:27:39.704.135 [aicpusd_monitor.cpp:228][SetModelTimeoutFlag][tid:26231] Not set aicpu model timeout. Env is not set.
+[INFO] CCECPU(26231,aicpu_scheduler):2026-11-16-16:27:39.704.679 [aicpusd_monitor.cpp:158][InitMonitor][tid:26231] Init aicpu monitor successfully, taskTimeout=28s, tickFreq=50000000
+[INFO] CCECPU(26231,aicpu_scheduler):2026-11-16-16:27:39.704.854 [prof_so_manager.cpp:39][tid:26231]:dlopen libprofapi.so not success. reason: libprofapi.so: cannot open shared object file: No such file or directory
+[INFO] DRV(26231,aicpu_scheduler):2026-11-16-16:27:39.712.970 [grp_mng.c:81][bufmng] [halGrpCreate] Create grp. (grp_name=svm_share_grp_26231; grp_id=2183; max_size=0; cache_flag=0)
+[INFO] DRV(26231,aicpu_scheduler):2026-11-16-16:27:39.712.992 [grp_mng.c:144][bufmng] [halGrpAddProc] add grp succ, name:svm_share_grp_26231, pid:26231, grp_id:2183, admin:1 alloc:0 read:1 write:1 
+[INFO] DRV(26231,aicpu_scheduler):2026-11-16-16:27:39.713.179 [drv_buff_mbuf.c:65][bufmng] [mbufSetPrivFlag] Set mbuf priv flag success. (flag=0, g_mbuf_priv_flag=0)
+[INFO] DRV(26231,aicpu_scheduler):2026-11-16-16:27:39.713.189 [grp_mng.c:212][bufmng] [halGrpAttach] grp attach, grp_name:svm_share_grp_26231, grp_id:2183, timeout:0ms
+[INFO] CCECPU(26231,aicpu_scheduler):2026-11-16-16:27:39.713.226 [aicpusd_worker.cpp:73][ThreadPool][tid:26231] ThreadPool
+[INFO] CCECPU(26231,aicpu_scheduler):2026-11-16-16:27:39.715.020 [aicpusd_threads_process.cpp:62][LoadKernelSo][tid:26231] Start to preload aicpu so.
+[WARNING] CCECPU(26231,aicpu_scheduler):2026-11-16-16:27:39.715.109 [ae_kernel_lib_fwk.cc:305][LoadTfSo][tid:26231][AICPU_PROCESSER] load tensorflow so failed, ret is[11002]
+[INFO] CCECPU(26231,aicpu_scheduler):2026-11-16-16:27:39.816.230 [aicpusd_threads_process.cpp:66][LoadKernelSo][tid:26231] End to preload aicpu so.
+[INFO] CCECPU(26231,aicpu_scheduler):2026-11-16-16:27:39.816.239 [aicpusd_threads_process.cpp:82][LoadExtendKernelSo][tid:26231] Start to preload extend kernel so.
+[INFO] CCECPU(26231,aicpu_scheduler):2026-11-16-16:27:39.818.738 [aicpusd_threads_process.cpp:86][LoadExtendKernelSo][tid:26231] End to preload extend kernel so.
+[INFO] CCECPU(26231,aicpu_scheduler):2026-11-16-16:27:39.819.308 [aicpusd_period_statistic.cpp:133][SetThreadAffinity][tid:26249] aicpu bind by self success
+[INFO] CCECPU(26231,aicpu_scheduler):2026-11-16-16:27:39.821.976 [aicpusd_cust_so_manager.cpp:83][InitAicpuCustSoManager][tid:26231] Cust so manager init successfully, dir=/home/CustAiCpuUser/cust_aicpu_0_0_1936994/, runMode=0, schedMode=0.
+[INFO] CCECPU(26231,aicpu_scheduler):2026-11-16-16:27:39.821.999 [main.cpp:360][main][tid:26231] Aicpu schedule start successfully, LD_LIBRARY_PATH=/usr/lib64/aicpu_kernels/0/aicpu_kernels_device/:/usr/lib64/aicpu_kernels/0/aicpu_kernels_device/sand_box/:/home/HwHiAiUser/hs/0/runtime/lib64/:/usr/lib64/device-compat-plugin/0/:/usr/lib64/device-sw-plugin/0/device-sw-plugin/:
+[INFO] CCECPU(26231,aicpu_scheduler):2026-11-16-16:27:39.822.014 [main.cpp:371][main][tid:26231] Aicpu schedule attach and init successfully.
+[INFO] TDT(26231,aicpu_scheduler):2026-11-16-16:27:39.822.027 [tsd_event_client.cpp:374][ReportMsgToTsd][tid:26231] [TsdEventClient] Enter ReportMsgToTsd deviceid[0],hostPid[1936994],vfId[0].
+[INFO] TDT(26231,aicpu_scheduler):2026-11-16-16:27:39.822.036 [tsd_event_client.cpp:390][ReportMsgToTsd][tid:26231] [TsdEventClient] subCapabilityType[8], value[1]
+[INFO] TDT(26231,aicpu_scheduler):2026-11-16-16:27:39.822.260 [tsd_event_client.cpp:397][ReportMsgToTsd][tid:26231] [TsdEventClient] Submit event ReportMsgToTsd to tsd successfully.
+[INFO] CCECPU(26231,aicpu_scheduler):2026-11-16-16:27:39.823.934 [main.cpp:203][RegQueueScheduleModuleCallBack][tid:26231] Register queue schedule module callback successfully.
+[INFO] TDT(26231,aicpu_scheduler):2026-11-16-16:27:39.823.957 [tsd_event_client.cpp:257][TsdStartupResponse][tid:26231] [TsdEventClient] TsdStartupResponseProc to dev[0] pid[4214] hostpid[1936994] vfId[0] is running.
+[INFO] TDT(26231,aicpu_scheduler):2026-11-16-16:27:39.824.519 [tsd_event_client.cpp:276][TsdStartupResponse][tid:26231] [TsdEventClient] Submit event TSD_EVENT_START_RSP to tsd successfully.
+[INFO] CCECPU(26231,aicpu_scheduler):2026-11-16-16:27:39.824.533 [main.cpp:388][main][tid:26231] Aicpu startup response return successfully.
+[INFO] TDT(26231,aicpu_scheduler):2026-11-16-16:27:39.824.541 [tsd_event_client.cpp:221][DoLoopProcessEvent][tid:26231] [TsdEventClient] Start waiting  event, deviceId=0.
+[INFO] CCECPU(26231,aicpu_scheduler):2026-11-16-16:27:39.899.047 [aicpusd_event_process.cpp:377][ProcessSetTimeoutEvent][tid:26242] Get opTimeoutEnable[1] value[45] waitTimeoutEnable[0] value[0] from ts success.
+[INFO] CCECPU(26231,aicpu_scheduler):2026-11-16-16:27:39.899.057 [aicpusd_monitor.cpp:434][SetOpExecuteTimeOut][tid:26242] Get enable op execute timeout config from ts. timeout[45]s tickFrequency[2250000000]
+[INFO] CCECPU(26231,aicpu_scheduler):2026-11-16-16:27:39.916.992 [ae_kernel_lib_aicpu_kfc.cpp:36][operator()][tid:26243][AICPU_PROCESSER] AIKernelsLibAiCpuKFC init finish.
+[INFO] CCECPU(26231,aicpu_scheduler):2026-11-16-16:27:39.917.118 [ae_so_manager.cc:253][GetApi][tid:26243][AICPU_PROCESSER] Get api DynTileFwkKernelServerInit from so libaicpu_extend_kernels.so success.
+[INFO] CCECPU(26231,aicpu_scheduler):2026-11-16-16:27:39.933.992 [ae_so_manager.cc:253][GetApi][tid:26244][AICPU_PROCESSER] Get api simpler_aicpu_init from so simpler_inner_7aeac1e3c08795b7_0.so success.
+[INFO] CCECPU(26231,aicpu_scheduler):2026-11-16-16:27:40.497.504 [ae_so_manager.cc:253][GetApi][tid:26245][AICPU_PROCESSER] Get api simpler_aicpu_register_callable from so simpler_inner_7aeac1e3c08795b7_0.so success.
+[INFO] CCECPU(26231,aicpu_scheduler):2026-11-16-16:27:41.100.321 [ae_so_manager.cc:253][GetApi][tid:26243][AICPU_PROCESSER] Get api simpler_aicpu_exec from so simpler_inner_7aeac1e3c08795b7_0.so success.

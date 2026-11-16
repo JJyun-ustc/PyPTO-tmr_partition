@@ -2,3 +2,6 @@
 # Preserve raw STRACE evidence byte-for-byte, including trailing spaces.
 official-results/**/*.log -whitespace
 official-results/**/*.patch -whitespace
+
+# Markdown inside source snapshots is raw evidence, including hard line breaks.
+official-results/**/source/**/*.md -whitespace

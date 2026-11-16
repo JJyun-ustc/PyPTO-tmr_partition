@@ -1,0 +1,238 @@
+Running main() from /data/aicpu-cluster-study/official-worktree/runtime/tests/ut/cpp/build/_deps/googletest-src/googletest/src/gtest_main.cc
+[==========] Running 22 tests from 1 test suite.
+[----------] Global test environment set-up.
+[----------] 22 tests from ClusterPartitioner
+[ RUN      ] ClusterPartitioner.BlockedReservationsDoNotMakeIdleResourcesBusy
+[       OK ] ClusterPartitioner.BlockedReservationsDoNotMakeIdleResourcesBusy (0 ms)
+[ RUN      ] ClusterPartitioner.DependencyCostDependsOnSourceAndDestination
+[       OK ] ClusterPartitioner.DependencyCostDependsOnSourceAndDestination (0 ms)
+[ RUN      ] ClusterPartitioner.PublicationAndNotificationAreSeparatePaths
+[       OK ] ClusterPartitioner.PublicationAndNotificationAreSeparatePaths (0 ms)
+[ RUN      ] ClusterPartitioner.QueueResourceAndExtraRemoteEdgesHaveSeparateWeights
+[       OK ] ClusterPartitioner.QueueResourceAndExtraRemoteEdgesHaveSeparateWeights (0 ms)
+[ RUN      ] ClusterPartitioner.FutureReservationsNormalizeCapacityAndBoundDistantWork
+[       OK ] ClusterPartitioner.FutureReservationsNormalizeCapacityAndBoundDistantWork (0 ms)
+[ RUN      ] ClusterPartitioner.BlockedFanoutCanUsePeerWithoutMarkingResourcesBusy
+[       OK ] ClusterPartitioner.BlockedFanoutCanUsePeerWithoutMarkingResourcesBusy (0 ms)
+[ RUN      ] ClusterPartitioner.ReadyPublicationTransfersFutureReservationToReadyPressure
+[       OK ] ClusterPartitioner.ReadyPublicationTransfersFutureReservationToReadyPressure (0 ms)
+[ RUN      ] ClusterPartitioner.FixedPrefixCalibratesOnceThenFreezes
+[       OK ] ClusterPartitioner.FixedPrefixCalibratesOnceThenFreezes (0 ms)
+[ RUN      ] ClusterPartitioner.ScoredTransitionDoesNotWaitForShapeMaturity
+[       OK ] ClusterPartitioner.ScoredTransitionDoesNotWaitForShapeMaturity (0 ms)
+[ RUN      ] ClusterPartitioner.SparseAndRacingChannelsRetainPriorsWithoutRetry
+[       OK ] ClusterPartitioner.SparseAndRacingChannelsRetainPriorsWithoutRetry (0 ms)
+[ RUN      ] ClusterPartitioner.CalibrationFitsOnlyObservedChannelsAndBoundsOutliers
+[       OK ] ClusterPartitioner.CalibrationFitsOnlyObservedChannelsAndBoundsOutliers (0 ms)
+[ RUN      ] ClusterPartitioner.FixedBatchReusesSnapshotAndReservesPendingWorkLocally
+[       OK ] ClusterPartitioner.FixedBatchReusesSnapshotAndReservesPendingWorkLocally (0 ms)
+[ RUN      ] ClusterPartitioner.BatchReadyReservationsAreCountedOnceAndRefreshInBlockUnits
+[       OK ] ClusterPartitioner.BatchReadyReservationsAreCountedOnceAndRefreshInBlockUnits (0 ms)
+[ RUN      ] ClusterPartitioner.ShapesHaveIndependentSnapshotsWithinGlobalBatch
+[       OK ] ClusterPartitioner.ShapesHaveIndependentSnapshotsWithinGlobalBatch (0 ms)
+[ RUN      ] ClusterPartitioner.ReadyLedgerHasNoTransfersAndSeparatesBlockedWork
+[       OK ] ClusterPartitioner.ReadyLedgerHasNoTransfersAndSeparatesBlockedWork (0 ms)
+[ RUN      ] ClusterPartitioner.ColdStartUsesBoundedAffinityAndBalancesFutureWork
+[       OK ] ClusterPartitioner.ColdStartUsesBoundedAffinityAndBalancesFutureWork (0 ms)
+[ RUN      ] ClusterPartitioner.ConcurrentSnapshotsRemainCoherent
+[       OK ] ClusterPartitioner.ConcurrentSnapshotsRemainCoherent (11 ms)
+[ RUN      ] ClusterPartitioner.ReadyBindingFollowsActualReleaseWithCongestionHysteresis
+[       OK ] ClusterPartitioner.ReadyBindingFollowsActualReleaseWithCongestionHysteresis (0 ms)
+[ RUN      ] ClusterPartitioner.GroupsBoundFanoutLifetimeScopeAndSlotReuse
+[       OK ] ClusterPartitioner.GroupsBoundFanoutLifetimeScopeAndSlotReuse (0 ms)
+[ RUN      ] ClusterPartitioner.RacedSummaryRetainsLastCoherentLedgerWithoutDoubleReservation
+[       OK ] ClusterPartitioner.RacedSummaryRetainsLastCoherentLedgerWithoutDoubleReservation (0 ms)
+[ RUN      ] ClusterPartitioner.BorrowingDebitsQueueSideIndependentlyOfExecutionSide
+[       OK ] ClusterPartitioner.BorrowingDebitsQueueSideIndependentlyOfExecutionSide (0 ms)
+[ RUN      ] ClusterPartitioner.BorrowingRequiresIdleLocalQueueAndSubstantialRemoteBacklog
+[       OK ] ClusterPartitioner.BorrowingRequiresIdleLocalQueueAndSubstantialRemoteBacklog (0 ms)
+[----------] 22 tests from ClusterPartitioner (11 ms total)
+
+[----------] Global test environment tear-down
+[==========] 22 tests from 1 test suite ran. (11 ms total)
+[  PASSED  ] 22 tests.
+Running main() from /data/aicpu-cluster-study/official-worktree/runtime/tests/ut/cpp/build/_deps/googletest-src/googletest/src/gtest_main.cc
+[==========] Running 34 tests from 4 test suites.
+[----------] Global test environment set-up.
+[----------] 2 tests from AsyncWaitDiagnosticsTest
+[ RUN      ] AsyncWaitDiagnosticsTest.SeparatesTaskBodyAndCompletionPendingAndGuardsMailboxUnderflow
+[       OK ] AsyncWaitDiagnosticsTest.SeparatesTaskBodyAndCompletionPendingAndGuardsMailboxUnderflow (0 ms)
+[ RUN      ] AsyncWaitDiagnosticsTest.CapsDetailRowsAtSixteen
+[       OK ] AsyncWaitDiagnosticsTest.CapsDetailRowsAtSixteen (0 ms)
+[----------] 2 tests from AsyncWaitDiagnosticsTest (0 ms total)
+
+[----------] 1 test from SyncStartDrainAttemptTest
+[ RUN      ] SyncStartDrainAttemptTest.LateAckCannotSatisfyNextAttemptBarrier
+[       OK ] SyncStartDrainAttemptTest.LateAckCannotSatisfyNextAttemptBarrier (0 ms)
+[----------] 1 test from SyncStartDrainAttemptTest (0 ms total)
+
+[----------] 17 tests from SchedulerStateTest
+[ RUN      ] SchedulerStateTest.ConsumedNotReady
+[       OK ] SchedulerStateTest.ConsumedNotReady (49 ms)
+[ RUN      ] SchedulerStateTest.ConsumedTransition
+[       OK ] SchedulerStateTest.ConsumedTransition (49 ms)
+[ RUN      ] SchedulerStateTest.ConsumedHeadAdvancesAfterContendedAdvanceLock
+[       OK ] SchedulerStateTest.ConsumedHeadAdvancesAfterContendedAdvanceLock (49 ms)
+[ RUN      ] SchedulerStateTest.ConsumedNotCompletedState
+[       OK ] SchedulerStateTest.ConsumedNotCompletedState (134 ms)
+[ RUN      ] SchedulerStateTest.ConsumedIdempotent
+[       OK ] SchedulerStateTest.ConsumedIdempotent (49 ms)
+[ RUN      ] SchedulerStateTest.ContendedConsumedHeadSetsPendingAndIdleDrainAdvances
+[       OK ] SchedulerStateTest.ContendedConsumedHeadSetsPendingAndIdleDrainAdvances (49 ms)
+[ RUN      ] SchedulerStateTest.ContendedConsumedHeadIdleDrainStress
+[       OK ] SchedulerStateTest.ContendedConsumedHeadIdleDrainStress (49 ms)
+[ RUN      ] SchedulerStateTest.ReleaseProducerIncrements
+[       OK ] SchedulerStateTest.ReleaseProducerIncrements (49 ms)
+[ RUN      ] SchedulerStateTest.ReleaseProducerTriggersConsumed
+[       OK ] SchedulerStateTest.ReleaseProducerTriggersConsumed (50 ms)
+[ RUN      ] SchedulerStateTest.SubtaskCompleteSingle
+[       OK ] SchedulerStateTest.SubtaskCompleteSingle (50 ms)
+[ RUN      ] SchedulerStateTest.SubtaskCompleteMultiBlock
+[       OK ] SchedulerStateTest.SubtaskCompleteMultiBlock (50 ms)
+[ RUN      ] SchedulerStateTest.ScopeEndBatchRelease
+[       OK ] SchedulerStateTest.ScopeEndBatchRelease (50 ms)
+[ RUN      ] SchedulerStateTest.GetReadyTasksBatchDrainsSharedQueue
+[       OK ] SchedulerStateTest.GetReadyTasksBatchDrainsSharedQueue (51 ms)
+[ RUN      ] SchedulerStateTest.AutomaticSingleBlockAndStrictTasksHaveSeparateQueues
+[       OK ] SchedulerStateTest.AutomaticSingleBlockAndStrictTasksHaveSeparateQueues (50 ms)
+[ RUN      ] SchedulerStateTest.FrozenCalibrationKeepsReadyAccountingWithoutSampleStamp
+[       OK ] SchedulerStateTest.FrozenCalibrationKeepsReadyAccountingWithoutSampleStamp (50 ms)
+[ RUN      ] SchedulerStateTest.DeferredBindingUsesActualProducerAndAccountsExactlyOnce
+[       OK ] SchedulerStateTest.DeferredBindingUsesActualProducerAndAccountsExactlyOnce (50 ms)
+[ RUN      ] SchedulerStateTest.AutomaticMultiblockAndStrictTargetsCannotEnterBorrowableQueues
+[       OK ] SchedulerStateTest.AutomaticMultiblockAndStrictTargetsCannotEnterBorrowableQueues (49 ms)
+[----------] 17 tests from SchedulerStateTest (937 ms total)
+
+[----------] 14 tests from CoreTrackerTest
+[ RUN      ] CoreTrackerTest.MixPartiallyRunningClusterAdmittedAsPerCorePlacement
+[       OK ] CoreTrackerTest.MixPartiallyRunningClusterAdmittedAsPerCorePlacement (0 ms)
+[ RUN      ] CoreTrackerTest.MixPendingAcceptsFullyRunningClusterWithFreePendingSlots
+[       OK ] CoreTrackerTest.MixPendingAcceptsFullyRunningClusterWithFreePendingSlots (0 ms)
+[ RUN      ] CoreTrackerTest.MixPendingRejectsFullyRunningClusterWithOccupiedPendingSlot
+[       OK ] CoreTrackerTest.MixPendingRejectsFullyRunningClusterWithOccupiedPendingSlot (0 ms)
+[ RUN      ] CoreTrackerTest.MixIdleAndPendingDoNotDoubleAdmitFullyIdleCluster
+[       OK ] CoreTrackerTest.MixIdleAndPendingDoNotDoubleAdmitFullyIdleCluster (0 ms)
+[ RUN      ] CoreTrackerTest.MixClassifyIgnoresUnusedBusyCoreForRunningPlacement
+[       OK ] CoreTrackerTest.MixClassifyIgnoresUnusedBusyCoreForRunningPlacement (0 ms)
+[ RUN      ] CoreTrackerTest.MixClassifyAllowsPendingForUsedRunningCoresOnly
+[       OK ] CoreTrackerTest.MixClassifyAllowsPendingForUsedRunningCoresOnly (0 ms)
+[ RUN      ] CoreTrackerTest.MixClassifyAdmitsMixedUsedCoresAsPending
+[       OK ] CoreTrackerTest.MixClassifyAdmitsMixedUsedCoresAsPending (0 ms)
+[ RUN      ] CoreTrackerTest.MixClassifyRejectsOccupiedPendingSlotInUsedMask
+[       OK ] CoreTrackerTest.MixClassifyRejectsOccupiedPendingSlotInUsedMask (0 ms)
+[ RUN      ] CoreTrackerTest.MixRunningClusterHelpersUseActiveMask
+[       OK ] CoreTrackerTest.MixRunningClusterHelpersUseActiveMask (0 ms)
+[ RUN      ] CoreTrackerTest.MixRunningClusterHelpersRejectOccupiedUsedPendingSlot
+[       OK ] CoreTrackerTest.MixRunningClusterHelpersRejectOccupiedUsedPendingSlot (0 ms)
+[ RUN      ] CoreTrackerTest.CountAvailableBlocksAivIncludesFreePendingSlots
+[       OK ] CoreTrackerTest.CountAvailableBlocksAivIncludesFreePendingSlots (0 ms)
+[ RUN      ] CoreTrackerTest.CountAvailableBlocksMixCountsLogicalClusters
+[       OK ] CoreTrackerTest.CountAvailableBlocksMixCountsLogicalClusters (0 ms)
+[ RUN      ] CoreTrackerTest.CountAvailableBlocksMixRejectsOccupiedUsedPendingSlot
+[       OK ] CoreTrackerTest.CountAvailableBlocksMixRejectsOccupiedUsedPendingSlot (0 ms)
+[ RUN      ] CoreTrackerTest.CountAvailableBlocksMixIgnoresUnavailableUnusedCore
+[       OK ] CoreTrackerTest.CountAvailableBlocksMixIgnoresUnavailableUnusedCore (0 ms)
+[----------] 14 tests from CoreTrackerTest (0 ms total)
+
+[----------] Global test environment tear-down
+[==========] 34 tests from 4 test suites ran. (938 ms total)
+[  PASSED  ] 34 tests.
+Running main() from /data/aicpu-cluster-study/official-worktree/runtime/tests/ut/cpp/build/_deps/googletest-src/googletest/src/gtest_main.cc
+[==========] Running 45 tests from 1 test suite.
+[----------] Global test environment set-up.
+[----------] 45 tests from WiringTest
+[ RUN      ] WiringTest.NoFaninTaskBecomesReady
+[       OK ] WiringTest.NoFaninTaskBecomesReady (49 ms)
+[ RUN      ] WiringTest.WireTaskAllProducersEarlyFinished
+[       OK ] WiringTest.WireTaskAllProducersEarlyFinished (50 ms)
+[ RUN      ] WiringTest.WireTaskProducersPendingTaskNotReady
+[       OK ] WiringTest.WireTaskProducersPendingTaskNotReady (50 ms)
+[ RUN      ] WiringTest.DispatchPropagationMarkerPreservesLifecycleFlagsAndResets
+[       OK ] WiringTest.DispatchPropagationMarkerPreservesLifecycleFlagsAndResets (50 ms)
+[ RUN      ] WiringTest.WireTaskMixedProducerStates
+[       OK ] WiringTest.WireTaskMixedProducerStates (50 ms)
+[ RUN      ] WiringTest.WireTaskAllFlaggedPrecompletedSeedsDispatchFanin
+[       OK ] WiringTest.WireTaskAllFlaggedPrecompletedSeedsDispatchFanin (50 ms)
+[ RUN      ] WiringTest.WireTaskUnflaggedPrecompletedProducerDoesNotSeed
+[       OK ] WiringTest.WireTaskUnflaggedPrecompletedProducerDoesNotSeed (49 ms)
+[ RUN      ] WiringTest.WireTaskOneUnflaggedProducerDisqualifiesSeed
+[       OK ] WiringTest.WireTaskOneUnflaggedProducerDisqualifiesSeed (49 ms)
+[ RUN      ] WiringTest.ReducedEdgeToUnflaggedProducerStillBlocksEarlyDispatch
+[       OK ] WiringTest.ReducedEdgeToUnflaggedProducerStillBlocksEarlyDispatch (50 ms)
+[ RUN      ] WiringTest.ReducedEdgeToFlaggedProducerKeepsEarlyDispatch
+[       OK ] WiringTest.ReducedEdgeToFlaggedProducerKeepsEarlyDispatch (52 ms)
+[ RUN      ] WiringTest.EarlyDispatchWaitsForAllProducerBlocksPublished
+[       OK ] WiringTest.EarlyDispatchWaitsForAllProducerBlocksPublished (53 ms)
+[ RUN      ] WiringTest.BatchPushReportsFullInsteadOfSpinning
+[       OK ] WiringTest.BatchPushReportsFullInsteadOfSpinning (53 ms)
+[ RUN      ] WiringTest.BatchPushSucceedsAfterSpaceIsReclaimed
+[       OK ] WiringTest.BatchPushSucceedsAfterSpaceIsReclaimed (54 ms)
+[ RUN      ] WiringTest.EarlyDispatchQueueOverflowRollsBackStagingClaim
+[       OK ] WiringTest.EarlyDispatchQueueOverflowRollsBackStagingClaim (50 ms)
+[ RUN      ] WiringTest.EarlyDispatchQueueOverflowFallsBackToNormalDispatch
+[       OK ] WiringTest.EarlyDispatchQueueOverflowFallsBackToNormalDispatch (51 ms)
+[ RUN      ] WiringTest.EarlyDispatchSyncStartQueueOverflowFallsBackToSyncReadyQueue
+[       OK ] WiringTest.EarlyDispatchSyncStartQueueOverflowFallsBackToSyncReadyQueue (50 ms)
+[ RUN      ] WiringTest.LateWiredFullyPublishedProducerStillSeedsEarlyDispatch
+[       OK ] WiringTest.LateWiredFullyPublishedProducerStillSeedsEarlyDispatch (50 ms)
+[ RUN      ] WiringTest.WiringSeedEnqueuesAfterConcurrentPropagation
+[       OK ] WiringTest.WiringSeedEnqueuesAfterConcurrentPropagation (50 ms)
+[ RUN      ] WiringTest.ConcurrentBlockRangeClaimsDoNotOverlap
+[       OK ] WiringTest.ConcurrentBlockRangeClaimsDoNotOverlap (51 ms)
+[ RUN      ] WiringTest.PartialStagedReleaseRoutesRemainderToReadyQueue
+[       OK ] WiringTest.PartialStagedReleaseRoutesRemainderToReadyQueue (50 ms)
+[ RUN      ] WiringTest.EarlyDispatchDoorbellBitsHaveOneOwner
+[       OK ] WiringTest.EarlyDispatchDoorbellBitsHaveOneOwner (50 ms)
+[ RUN      ] WiringTest.EarlyDispatchClaimStaysGatedAfterRelease
+[       OK ] WiringTest.EarlyDispatchClaimStaysGatedAfterRelease (50 ms)
+[ RUN      ] WiringTest.EarlyDispatchLaunchHasSingleOwner
+[       OK ] WiringTest.EarlyDispatchLaunchHasSingleOwner (51 ms)
+[ RUN      ] WiringTest.EarlyDispatchFanoutWaitsForDoorbellPass
+[       OK ] WiringTest.EarlyDispatchFanoutWaitsForDoorbellPass (52 ms)
+[ RUN      ] WiringTest.LateStagerRingsCapturedDoorbellAfterTableReuse
+[       OK ] WiringTest.LateStagerRingsCapturedDoorbellAfterTableReuse (52 ms)
+[ RUN      ] WiringTest.EarlyDispatchReleaseConsumesDoorbellMask
+[       OK ] WiringTest.EarlyDispatchReleaseConsumesDoorbellMask (52 ms)
+[ RUN      ] WiringTest.SyncStartDoorbellPassHasOneOwner
+[       OK ] WiringTest.SyncStartDoorbellPassHasOneOwner (114 ms)
+[ RUN      ] WiringTest.SyncStartStagingFinalizeRetriesProducerFirstRendezvous
+[       OK ] WiringTest.SyncStartStagingFinalizeRetriesProducerFirstRendezvous (53 ms)
+[ RUN      ] WiringTest.SyncStartProducerReleaseCompletesStagerFirstRendezvous
+[       OK ] WiringTest.SyncStartProducerReleaseCompletesStagerFirstRendezvous (53 ms)
+[ RUN      ] WiringTest.ArmedEarlySyncDrainOwnsFinalReadyRoute
+[       OK ] WiringTest.ArmedEarlySyncDrainOwnsFinalReadyRoute (54 ms)
+[ RUN      ] WiringTest.ArmedEarlySyncDrainKeepsEveryStagerGatedAfterReady
+[       OK ] WiringTest.ArmedEarlySyncDrainKeepsEveryStagerGatedAfterReady (48 ms)
+[ RUN      ] WiringTest.EarlySyncFinishBetweenReleasePhasesRetainsOwnerCompleteState
+[       OK ] WiringTest.EarlySyncFinishBetweenReleasePhasesRetainsOwnerCompleteState (47 ms)
+[ RUN      ] WiringTest.CancelledEarlySyncDrainRoutesProducerRelease
+[       OK ] WiringTest.CancelledEarlySyncDrainRoutesProducerRelease (47 ms)
+[ RUN      ] WiringTest.ProducerReleaseTransfersReadyRouteToCancellingDrain
+[       OK ] WiringTest.ProducerReleaseTransfersReadyRouteToCancellingDrain (47 ms)
+[ RUN      ] WiringTest.EarlyDispatchBlockedByUnflaggedProducer
+[       OK ] WiringTest.EarlyDispatchBlockedByUnflaggedProducer (46 ms)
+[ RUN      ] WiringTest.UnflaggedProducerDoesNotPropagate
+[       OK ] WiringTest.UnflaggedProducerDoesNotPropagate (46 ms)
+[ RUN      ] WiringTest.FlaggedPrecompletedCreatorTransparentToEarlyDispatch
+[       OK ] WiringTest.FlaggedPrecompletedCreatorTransparentToEarlyDispatch (46 ms)
+[ RUN      ] WiringTest.OnMixedTaskCompleteNotifiesConsumers
+[       OK ] WiringTest.OnMixedTaskCompleteNotifiesConsumers (47 ms)
+[ RUN      ] WiringTest.OnTaskReleaseReleasesProducers
+[       OK ] WiringTest.OnTaskReleaseReleasesProducers (46 ms)
+[ RUN      ] WiringTest.OrderingOnlyReleasedAtWiringRetentionHeldUntilRelease
+[       OK ] WiringTest.OrderingOnlyReleasedAtWiringRetentionHeldUntilRelease (46 ms)
+[ RUN      ] WiringTest.ReleaseHonorsRetainFlagInSpillRegion
+[       OK ] WiringTest.ReleaseHonorsRetainFlagInSpillRegion (47 ms)
+[ RUN      ] WiringTest.AdvanceRingPointersScansConsumed
+[       OK ] WiringTest.AdvanceRingPointersScansConsumed (47 ms)
+[ RUN      ] WiringTest.AdvanceRingPointersStopsAtNonConsumed
+[       OK ] WiringTest.AdvanceRingPointersStopsAtNonConsumed (48 ms)
+[ RUN      ] WiringTest.AdvanceRingPointersResetsSlots
+[       OK ] WiringTest.AdvanceRingPointersResetsSlots (48 ms)
+[ RUN      ] WiringTest.NoEdgePublishRecordsDepPoolMark
+[       OK ] WiringTest.NoEdgePublishRecordsDepPoolMark (47 ms)
+[----------] 45 tests from WiringTest (2320 ms total)
+
+[----------] Global test environment tear-down
+[==========] 45 tests from 1 test suite ran. (2320 ms total)
+[  PASSED  ] 45 tests.
