@@ -47,8 +47,19 @@ def main():
         }
         report["O_total_ns"] = sum(row["ns"] for row in stages.get("O", {}).values())
         capture = re.search(r"at (\S+/deps\.json)", text)
-        if capture:
-            path = Path(capture[1]).with_name("chip_swimlane_records.json")
+        path = Path(capture[1]).with_name("chip_swimlane_records.json") if capture else None
+        if path is None:
+            # INFO-level Python logging need not print the capture path. Match
+            # the last capture completed before this case's host log closed.
+            outputs = Path(__file__).resolve().parents[4] / "outputs"
+            candidates = [
+                item
+                for item in outputs.glob(f"TestBenchmarkBgemm_{host.stem}_*/chip_swimlane_records.json")
+                if 0 <= host.stat().st_mtime - item.stat().st_mtime < 120
+            ]
+            if candidates:
+                path = max(candidates, key=lambda item: item.stat().st_mtime)
+        if path is not None:
             perf = read_perf_data(path)
             tasks = perf["tasks"]
             assert all(

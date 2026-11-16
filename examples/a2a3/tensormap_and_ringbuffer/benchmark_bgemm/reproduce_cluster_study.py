@@ -47,8 +47,11 @@ def verify_hardware(physical_card, output):
         result = subprocess.run(command, capture_output=True, text=True, check=True)
         captures.append(result.stdout + result.stderr)
     (output / "hardware-preflight.log").write_text("\n".join(captures))
-    if not re.search(r"Chip Name\s*:\s*(?:Ascend)?910B", captures[1]):
-        raise RuntimeError("This study requires 910B silicon; inspect hardware-preflight.log")
+    board = captures[1]
+    full_name = re.search(r"Chip Name\s*:\s*(?:Ascend)?910B2\b", board)
+    split_name = re.search(r"Chip Name\s*:\s*Ascend910\b", board) and re.search(r"NPU Name\s*:\s*B2\b", board)
+    if not (full_name or split_name):
+        raise RuntimeError("This study requires 910B2 silicon; inspect hardware-preflight.log")
     cann = Path(os.environ["ASCEND_HOME_PATH"])
     config = cann / f"{platform.machine()}-linux/data/platform_config/Ascend910B2.ini"
     if not config.is_file() or "Short_SoC_version=Ascend910B" not in config.read_text():

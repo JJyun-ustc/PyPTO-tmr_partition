@@ -36,7 +36,7 @@ def learning_summary(root):
             return result
 
         finals = [fields(line) for line in lines if "AICPU_ADAPTIVE_FINAL" in line]
-        if len(finals) != 1 or finals[0].get("version") not in (2, 3):
+        if len(finals) != 1 or finals[0].get("version") not in (2, 3, 4):
             raise ValueError(f"expected one supported terminal report in {device}")
         final = finals[0]
         assert sum(final["decisions"]) == sum(final["started"]) == expected
@@ -53,11 +53,19 @@ def learning_summary(root):
             assert max_updates <= (expected - 1) // 256
         else:
             assert final["cold"] == 256 and final["calibrations"] == 1
-            assert final["decisions"] == final["started"]
             assert max_updates <= 1
-            assert final["batch_size"] == 8
-            # Both AIC and AIV appear in every eight-node epoch of these cases.
-            assert final["snapshots"] == 2 * ((expected + 7) // 8)
+            if final["version"] == 3:
+                assert final["decisions"] == final["started"]
+                assert final["batch_size"] == 8
+                assert final["snapshots"] == 2 * ((expected + 7) // 8)
+            else:
+                assert final["batch_size"] == 64
+                ledgers = [fields(line) for line in lines if "AICPU_PLACEMENT_LEDGER" in line]
+                assert len(ledgers) == 4
+                for row in ledgers:
+                    assert row["preferred"] == row["released"]
+                    assert row["queued"] == row["taken"]
+                    assert sum(row["preferred"]) == sum(row["queued"]) == sum(row["actual"])
         reports[family] = {
             "final": final,
             "channel_updates": updates,

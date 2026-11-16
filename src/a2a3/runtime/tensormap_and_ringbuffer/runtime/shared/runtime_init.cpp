@@ -145,6 +145,7 @@ SchedulerState::reserve_layout(DeviceArena &arena, const int32_t dep_pool_capaci
     for (int c = 0; c < 2; c++) {
         for (int i = 0; i < NUM_RESOURCE_SHAPES; i++) {
             layout.off_cluster_ready_queue_slots[c][i] = ready_queue_reserve_layout(arena, CHIP_READY_QUEUE_SIZE);
+            layout.off_auto_ready_queue_slots[c][i] = ready_queue_reserve_layout(arena, CHIP_READY_QUEUE_SIZE);
         }
         layout.off_cluster_dummy_queue_slots[c] = ready_queue_reserve_layout(arena, CHIP_READY_QUEUE_SIZE);
     }
@@ -199,6 +200,11 @@ bool SchedulerState::init_data_from_layout(const SchedulerLayout &layout, Device
     }
     for (int c = 0; c < 2; c++) {
         for (int i = 0; i < NUM_RESOURCE_SHAPES; i++) {
+            if (!ready_queue_init_data_from_layout(
+                    &sched->auto_ready_queues[c][i], arena, layout.off_auto_ready_queue_slots[c][i],
+                    layout.ready_queue_capacity
+                ))
+                return false;
             if (!ready_queue_init_data_from_layout(
                     &sched->cluster_ready_queues[c][i], arena, layout.off_cluster_ready_queue_slots[c][i],
                     layout.ready_queue_capacity
@@ -264,6 +270,7 @@ void SchedulerState::reset_for_reuse(const SchedulerLayout &layout, void *sm_dev
     for (int c = 0; c < 2; c++) {
         for (int i = 0; i < NUM_RESOURCE_SHAPES; i++) {
             sched->cluster_ready_queues[c][i].reset_for_reuse();
+            sched->auto_ready_queues[c][i].reset_for_reuse();
         }
         sched->cluster_dummy_queues[c].reset_for_reuse();
     }
@@ -287,6 +294,9 @@ void SchedulerState::wire_arena_pointers(const SchedulerLayout &layout, DeviceAr
     ready_queue_wire_arena_pointers(&sched->dummy_ready_queue, arena, layout.off_dummy_ready_queue_slots);
     for (int c = 0; c < 2; c++) {
         for (int i = 0; i < NUM_RESOURCE_SHAPES; i++) {
+            ready_queue_wire_arena_pointers(
+                &sched->auto_ready_queues[c][i], arena, layout.off_auto_ready_queue_slots[c][i]
+            );
             ready_queue_wire_arena_pointers(
                 &sched->cluster_ready_queues[c][i], arena, layout.off_cluster_ready_queue_slots[c][i]
             );
@@ -321,6 +331,7 @@ void SchedulerState::destroy() {
     for (int c = 0; c < 2; c++) {
         for (int i = 0; i < NUM_RESOURCE_SHAPES; i++) {
             ready_queue_destroy(&sched->cluster_ready_queues[c][i]);
+            ready_queue_destroy(&sched->auto_ready_queues[c][i]);
         }
         ready_queue_destroy(&sched->cluster_dummy_queues[c]);
     }

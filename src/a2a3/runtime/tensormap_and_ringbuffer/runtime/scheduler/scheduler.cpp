@@ -311,7 +311,7 @@ void SchedulerState::print_queues() {
         for (int cluster = 0; cluster < 2; cluster++) {
             LOG_DEBUG(
                 "  cluster %d %s: count=%" PRIu64, cluster, shape_names[i],
-                sched->cluster_ready_queues[cluster][i].size()
+                sched->cluster_ready_queues[cluster][i].size() + sched->auto_ready_queues[cluster][i].size()
             );
         }
     }

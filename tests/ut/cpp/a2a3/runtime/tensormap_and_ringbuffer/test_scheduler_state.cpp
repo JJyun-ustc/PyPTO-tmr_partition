@@ -435,7 +435,7 @@ TEST_F(SchedulerStateTest, GetReadyTasksBatchDrainsSharedQueue) {
     EXPECT_EQ(out[1], &slot_b);
 }
 
-TEST_F(SchedulerStateTest, AutomaticAndStrictTasksShareOnlyTheirTargetQueue) {
+TEST_F(SchedulerStateTest, AutomaticSingleBlockAndStrictTasksHaveSeparateQueues) {
     alignas(64) ChipTaskSlotState automatic, strict;
     init_slot(automatic, CHIP_TASK_PENDING, 1, 1);
     init_slot(strict, CHIP_TASK_PENDING, 1, 1);
@@ -449,9 +449,10 @@ TEST_F(SchedulerStateTest, AutomaticAndStrictTasksShareOnlyTheirTargetQueue) {
     ChipTaskSlotState *out[2];
     EXPECT_EQ(sched.get_ready_tasks_batch(sched.ready_queues, ResourceShape::AIC, out, 2), 0);
     EXPECT_EQ(sched.get_ready_tasks_batch(sched.cluster_ready_queues[1], ResourceShape::AIC, out, 2), 0);
-    ASSERT_EQ(sched.get_ready_tasks_batch(sched.cluster_ready_queues[0], ResourceShape::AIC, out, 2), 2);
+    ASSERT_EQ(sched.get_ready_tasks_batch(sched.auto_ready_queues[0], ResourceShape::AIC, out, 2), 1);
     EXPECT_EQ(out[0], &automatic);
-    EXPECT_EQ(out[1], &strict);
+    ASSERT_EQ(sched.get_ready_tasks_batch(sched.cluster_ready_queues[0], ResourceShape::AIC, out, 2), 1);
+    EXPECT_EQ(out[0], &strict);
 }
 
 TEST_F(SchedulerStateTest, FrozenCalibrationKeepsReadyAccountingWithoutSampleStamp) {
@@ -463,7 +464,7 @@ TEST_F(SchedulerStateTest, FrozenCalibrationKeepsReadyAccountingWithoutSampleSta
     sched.placement_feedback.calibration_done.store(true);
     sched.stamp_ready_queue(slot);
     sched.stamp_ready_queue(slot);
-    EXPECT_EQ(sched.placement_feedback.ready_published[1][0].load(), 16u);
+    EXPECT_EQ(sched.placement_feedback.threads[simpler::tmr::PARTITION_THREADS - 1].summary[0].queued[1].load(), 16u);
     EXPECT_EQ(slot.payload->ready_queue_timestamp.load(), 0u);
     EXPECT_EQ(slot.payload->placement.release_tick, 0u);
 }
@@ -676,4 +677,63 @@ TEST(CoreTrackerTest, CountAvailableBlocksMixIgnoresUnavailableUnusedCore) {
 
     EXPECT_EQ(tracker.count_available_blocks(ResourceShape::MIX, used_mask, false), 1);
     EXPECT_EQ(tracker.count_available_blocks(ResourceShape::MIX, used_mask, true), 1);
+}
+
+TEST_F(SchedulerStateTest, DeferredBindingUsesActualProducerAndAccountsExactlyOnce) {
+    alignas(64) ChipTaskSlotState producer, consumer;
+    init_slot(producer, CHIP_TASK_COMPLETED, 1, 1);
+    init_slot(consumer, CHIP_TASK_PENDING, 1, 1);
+    sched.placement_feedback.schedulers[0] = 2;
+    sched.placement_feedback.schedulers[1] = 3;
+    sched.placement_feedback.calibration_done.store(true);
+    producer.payload->placement.preferred_cluster = 0;
+    producer.payload->placement.dispatch_cluster.store(1);
+    consumer.payload->placement.scope = 1;
+    consumer.payload->placement.preferred_cluster = 0;
+    consumer.task->target_aicpu_cluster = -1;
+    // Sampling is frozen (tick=0); actual release origin is still required.
+    sched.record_ready_origin(consumer, &producer, 0, 2);
+    sched.stamp_ready_queue(consumer);
+    sched.stamp_ready_queue(consumer);
+    EXPECT_EQ(consumer.payload->placement.preferred_cluster, 0);
+    EXPECT_EQ(consumer.task->target_aicpu_cluster, 1);
+    auto &row = sched.placement_feedback.threads[2].summary[0];
+    EXPECT_EQ(row.released[0].load(), 1u);
+    EXPECT_EQ(row.queued[1].load(), 1u);
+    EXPECT_EQ(row.queued[0].load(), 0u);
+    // A subsequent foreign pickup changes execution affinity, never queue debit.
+    consumer.payload->placement.dispatch_cluster.store(0);
+    EXPECT_EQ(consumer.task->target_aicpu_cluster, 1);
+    EXPECT_EQ(&sched.ready_queue_for(consumer, ResourceShape::AIC, false), &sched.auto_ready_queues[1][0]);
+}
+
+TEST_F(SchedulerStateTest, AutomaticMultiblockAndStrictTargetsCannotEnterBorrowableQueues) {
+    alignas(64) ChipTaskSlotState wide, strict;
+    init_slot(wide, CHIP_TASK_PENDING, 1, 1);
+    init_slot(strict, CHIP_TASK_PENDING, 1, 1);
+    wide.logical_block_num = 16;
+    wide.payload->placement.scope = 1;
+    wide.task->target_aicpu_cluster = 1;
+    strict.task->target_aicpu_cluster = 1;
+    EXPECT_EQ(&sched.ready_queue_for(wide, ResourceShape::AIV, false), &sched.cluster_ready_queues[1][1]);
+    EXPECT_EQ(&sched.ready_queue_for(strict, ResourceShape::AIV, false), &sched.cluster_ready_queues[1][1]);
+}
+
+TEST_F(SchedulerStateTest, UnknownReleaseTimestampDoesNotChangeSchedulerOriginToOrchestrator) {
+    alignas(64) ChipTaskSlotState producer, consumer;
+    init_slot(producer, CHIP_TASK_COMPLETED, 1, 1);
+    init_slot(consumer, CHIP_TASK_PENDING, 1, 1);
+    sched.placement_feedback.schedulers[0] = 2;
+    sched.placement_feedback.schedulers[1] = 3;
+    sched.placement_feedback.orchestrator_cluster = 1;
+    producer.payload->placement.dispatch_cluster.store(0);
+    consumer.payload->placement.scope = 1;
+    consumer.payload->placement.preferred_cluster = 1;
+    // A shared producer can start its fanout walk before feedback is enabled.
+    // Its missing sample timestamp does not make it an O-origin publication.
+    sched.record_ready_origin(consumer, &producer, 0, 2);
+    sched.stamp_ready_queue(consumer);
+    EXPECT_EQ(consumer.payload->placement.reserved & simpler::tmr::PARTITION_FROM_O, 0u);
+    EXPECT_EQ(consumer.payload->placement.release_cluster, 0);
+    EXPECT_EQ(consumer.task->target_aicpu_cluster, 0);
 }

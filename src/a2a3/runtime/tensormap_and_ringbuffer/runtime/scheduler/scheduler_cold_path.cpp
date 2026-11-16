@@ -1449,6 +1449,8 @@ int32_t SchedulerContext::post_handshake_init(Runtime *runtime) {
 }
 
 void SchedulerContext::deinit() {
+    for (auto &clock : steal_clocks_)
+        clock = {};
     // Reset all per-core execution state
     for (int32_t i = 0; i < RUNTIME_MAX_WORKER; i++) {
         core_exec_states_[i] = {};

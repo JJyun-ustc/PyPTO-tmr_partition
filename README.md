@@ -2,6 +2,7 @@
 > 请从 [main 分支](https://github.com/JJyun-ustc/PyPTO-tmr_partition/tree/main)
 > 使用递归子模块方式克隆完整 PyPTO 系统。
 > [中文实验说明](https://github.com/JJyun-ustc/PyPTO-tmr_partition/blob/main/docs/zh/experiments/tmr-cluster/experiment.md)
+> 、[完整算法与记账](https://github.com/JJyun-ustc/PyPTO-tmr_partition/blob/main/docs/zh/experiments/tmr-cluster/algorithm.md)
 > 和 [环境复现](https://github.com/JJyun-ustc/PyPTO-tmr_partition/blob/main/docs/zh/experiments/tmr-cluster/environment.md)
 > 位于 main。以下保留上游 runtime 说明。
 

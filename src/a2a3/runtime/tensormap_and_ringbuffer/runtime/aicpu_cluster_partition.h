@@ -17,7 +17,12 @@ constexpr uint32_t PARTITION_READY = 4u;
 constexpr uint32_t PARTITION_OBSERVED = 8u;
 constexpr uint32_t PARTITION_IDLE_AT_PUBLISH = 16u;
 constexpr uint64_t PARTITION_CALIBRATION_NODES = 256;
-constexpr uint64_t PARTITION_BATCH_NODES = 8;
+constexpr uint64_t PARTITION_BATCH_NODES = 64;
+constexpr uint32_t PARTITION_GROUP_LIMIT = 8;
+constexpr uint32_t PARTITION_GROUP_SLOTS = 64;
+constexpr uint64_t PARTITION_GROUP_LIFETIME = 32;
+constexpr uint32_t PARTITION_STEAL_CHECK_LOOPS = 32;
+constexpr uint32_t PARTITION_STEAL_COOLDOWN_LOOPS = 128;
 constexpr uint64_t PARTITION_QUEUE_WEIGHT_NUM = 1;
 constexpr uint64_t PARTITION_QUEUE_WEIGHT_DEN = 2;
 constexpr uint64_t PARTITION_RESOURCE_WEIGHT_NUM = 1;
@@ -26,15 +31,21 @@ constexpr uint64_t PARTITION_EXTRA_REMOTE_WAIT_NS = 128;
 constexpr uint64_t PARTITION_FUTURE_WEIGHT_DEN = 4;
 
 struct AdaptiveTaskState {
-    uint64_t scope{0}, submit_tick{0}, release_tick{0};
+    uint32_t scope{0}, group{0};
+    uint64_t submit_tick{0}, release_tick{0};
     uint32_t ready_depth{0};
-    int32_t release_cluster{-1};
+    int8_t release_cluster{-1};
     std::atomic<int32_t> dispatch_cluster{-1};
-    uint32_t reserved{0};
+    uint8_t reserved{0};
+    // O owns group identity and preference; queue target is separate in ChipTask.
+    int8_t preferred_cluster{-1};
+    int8_t ready_writer{PARTITION_THREADS - 1};
     void reset() {
         scope = submit_tick = release_tick = 0;
         ready_depth = reserved = 0;
-        release_cluster = -1;
+        release_cluster = preferred_cluster = -1;
+        group = 0;
+        ready_writer = PARTITION_THREADS - 1;
         dispatch_cluster.store(-1, std::memory_order_relaxed);
     }
 };
@@ -79,54 +90,88 @@ struct alignas(64) PartitionBucket {
     }
 };
 struct PartitionTrace {
-    uint64_t ticks[6]{}, calls[6]{};
+    uint64_t ticks[8]{}, calls[8]{};
 };
+// One publisher owns each row, including the dedicated O row. Monotone
+// counters use load/store, with no cross-S fetch_add or cache-line sharing.
+struct PartitionSummarySample {
+    uint64_t released[2]{}, queued[2]{}, taken[2]{};
+};
+struct alignas(64) PartitionSummary {
+    std::atomic<uint64_t> version{0};
+    std::atomic<uint64_t> resources{0};  // capacity/free/idle: three 8-bit fields
+    std::atomic<uint64_t> released[2]{}, queued[2]{}, taken[2]{};
+    static void add(std::atomic<uint64_t> &counter, uint64_t units) {
+        counter.store(counter.load(std::memory_order_relaxed) + units, std::memory_order_relaxed);
+    }
+    void begin_write() { version.fetch_add(1, std::memory_order_acq_rel); }
+    void end_write() { version.fetch_add(1, std::memory_order_release); }
+    bool read(PartitionSummarySample &out) const {
+        uint64_t before = version.load(std::memory_order_acquire);
+        if (before & 1) return false;
+        PartitionSummarySample sample;
+        for (int c = 0; c < 2; ++c) {
+            sample.released[c] = released[c].load(std::memory_order_relaxed);
+            sample.queued[c] = queued[c].load(std::memory_order_relaxed);
+            sample.taken[c] = taken[c].load(std::memory_order_relaxed);
+        }
+        std::atomic_thread_fence(std::memory_order_acquire);
+        if (before != version.load(std::memory_order_relaxed)) return false;
+        out = sample;
+        return true;
+    }
+    void reset() {
+        version.store(0, std::memory_order_relaxed);
+        resources.store(0, std::memory_order_relaxed);
+        for (int c = 0; c < 2; ++c) {
+            released[c].store(0, std::memory_order_relaxed);
+            queued[c].store(0, std::memory_order_relaxed);
+            taken[c].store(0, std::memory_order_relaxed);
+        }
+    }
+};
+static_assert(sizeof(PartitionSummary) == 64);
 struct alignas(64) PartitionThread {
     std::atomic<int32_t> cluster{-1};
-    std::atomic<uint32_t> capacity[PARTITION_SHAPES]{}, free_slots[PARTITION_SHAPES]{}, idle_slots[PARTITION_SHAPES]{};
+    PartitionSummary summary[PARTITION_SHAPES];
     std::atomic<uint64_t> started[PARTITION_SHAPES]{};
     PartitionBucket samples[PARTITION_SHAPES];
+    uint64_t steal_checks{0}, steal_attempts{0}, remote_blocks{0};
     alignas(64) PartitionTrace trace;
     void reset() {
         trace = PartitionTrace{};
+        steal_checks = steal_attempts = remote_blocks = 0;
         cluster.store(-1, std::memory_order_relaxed);
         for (int i = 0; i < PARTITION_SHAPES; ++i) {
-            capacity[i].store(0, std::memory_order_relaxed);
-            free_slots[i].store(0, std::memory_order_relaxed);
-            idle_slots[i].store(0, std::memory_order_relaxed);
+            summary[i].reset();
             started[i].store(0, std::memory_order_relaxed);
             samples[i].reset();
         }
     }
 };
-// A publication cell has independent ownership traffic from other resource shapes.
+// Side queue hints occupy independent cache lines and have one designated writer.
 struct alignas(64) PartitionReadyCounter {
     std::atomic<uint64_t> value{0};
     uint64_t load(std::memory_order order = std::memory_order_seq_cst) const { return value.load(order); }
     void store(uint64_t n, std::memory_order order = std::memory_order_seq_cst) { value.store(n, order); }
-    uint64_t fetch_add(uint64_t n, std::memory_order order = std::memory_order_seq_cst) {
-        return value.fetch_add(n, order);
-    }
 };
 static_assert(sizeof(PartitionReadyCounter) == 64);
 struct PartitionShared {
     std::atomic<bool> enabled{false};
     std::atomic<bool> calibration_done{false};
     int32_t schedulers[2]{}, orchestrator_cluster{-1};
-    PartitionReadyCounter ready_published[2][PARTITION_SHAPES]{};
-    std::atomic<uint32_t> idle_mask[2][PARTITION_SHAPES]{};
+    // Only the lowest-index S on each side writes its queue hint.
+    // Low 32 bits: entries; high bits: that leader has idle resource.
+    PartitionReadyCounter side_queue[2][PARTITION_SHAPES]{};
     PartitionThread threads[PARTITION_THREADS];
     void reset() {
         enabled.store(false, std::memory_order_relaxed);
         calibration_done.store(false, std::memory_order_relaxed);
         schedulers[0] = schedulers[1] = 0;
         orchestrator_cluster = -1;
-        for (auto &cluster : ready_published)
-            for (auto &count : cluster)
-                count.store(0, std::memory_order_relaxed);
-        for (auto &cluster : idle_mask)
-            for (auto &mask : cluster)
-                mask.store(0, std::memory_order_relaxed);
+        for (auto &cluster : side_queue)
+            for (auto &hint : cluster)
+                hint.store(0, std::memory_order_relaxed);
         for (auto &thread : threads)
             thread.reset();
     }
@@ -135,6 +180,20 @@ struct PartitionLoad {
     uint64_t blocked[2]{}, ready[2]{};
     uint32_t capacity[2]{}, free[2]{}, idle[2]{}, schedulers[2]{};
 };
+inline int partition_ready_side(int preferred, int source, const uint64_t depth[2], const int32_t schedulers[2]) {
+    int c = source >= 0 && source < 2 ? source : preferred;
+    if (c < 0 || c > 1) c = schedulers[0] ? 0 : 1;
+    if (!schedulers[c]) return schedulers[1 - c] ? 1 - c : c;
+    int other = 1 - c;
+    if (schedulers[other] && depth[c] >= 4 &&
+        depth[c] * schedulers[other] > depth[other] * schedulers[c] + 2u * schedulers[c] * schedulers[other])
+        return other;
+    return c;
+}
+// Queue depth is advisory. The actual pop and range claim remain atomic.
+inline bool partition_may_steal(uint64_t local, uint64_t remote, int local_s, int remote_s) {
+    return local == 0 && local_s > 0 && remote_s > 0 && remote >= static_cast<uint64_t>(2 * remote_s + 2);
+}
 struct PartitionDecision {
     int32_t cluster{-1};
     uint64_t score_ns[2]{};
@@ -146,7 +205,42 @@ struct PartitionWeights {
     uint64_t dependency[2][2]{{250, 750}, {750, 250}};
     uint64_t idle_pickup[2]{};
 };
+// Bounded O-local table: no shared member counter and no scope-wide grouping.
+struct PartitionGroup {
+    uint64_t id{0}, scope{0}, born{0};
+    uint32_t members{0};
+};
 struct ClusterPartitioner {
+    PartitionSummarySample summary_cache[PARTITION_THREADS][PARTITION_SHAPES]{};
+    PartitionGroup groups[PARTITION_GROUP_SLOTS]{};
+    uint64_t next_group{0}, inherited_decisions{0}, full_decisions{0};
+    bool can_inherit(const AdaptiveTaskState &producer, uint64_t scope) const {
+        if (!producer.group) return false;
+        const auto &g = groups[producer.group % PARTITION_GROUP_SLOTS];
+        return g.id == producer.group && g.scope == scope && g.members < PARTITION_GROUP_LIMIT &&
+               decision_count() - g.born < PARTITION_GROUP_LIFETIME;
+    }
+    void join_group(AdaptiveTaskState &task, uint64_t parent, uint64_t scope) {
+        if (!parent) {
+            parent = ++next_group;
+            groups[parent % PARTITION_GROUP_SLOTS] = {parent, scope, decision_count(), 0};
+            ++full_decisions;
+        } else {
+            ++inherited_decisions;
+        }
+        ++groups[parent % PARTITION_GROUP_SLOTS].members;
+        task.group = parent;
+    }
+    PartitionDecision inherit(int cluster) {
+        PartitionDecision out;
+        out.cluster = cluster;
+        out.learned = decision_count() >= PARTITION_CALIBRATION_NODES;
+        ++decisions[cluster];
+        if (out.learned) ++learned_decisions;
+        else ++cold_decisions;
+        return out;
+    }
+
     PartitionTrace trace;
     PartitionWeights weights[PARTITION_SHAPES];
     uint64_t assigned[2][PARTITION_SHAPES]{};
@@ -221,46 +315,55 @@ struct ClusterPartitioner {
     bool needs_snapshot(int shape) const {
         return load_batch[shape] != decision_count() / PARTITION_BATCH_NODES;
     }
-    // Each shape uses one advisory snapshot per eight-decision epoch. Subsequent
+    // Each shape uses one advisory snapshot per 64-decision epoch. Subsequent
     // submissions add local reservations; scheduler progress is incorporated at
     // the next epoch. The snapshot does not constitute a resource reservation.
-    PartitionLoad load(const PartitionShared &shared, int shape, const uint64_t queue_depth[2]) {
+    PartitionLoad load(const PartitionShared &shared, int shape) {
         if (needs_snapshot(shape)) {
             auto &cached = cached_load[shape];
             cached = PartitionLoad{};
-            uint64_t started[2]{};
-            for (const auto &thread : shared.threads) {
+            uint64_t released[2]{}, queued[2]{}, taken[2]{};
+            for (int t = 0; t < PARTITION_THREADS; ++t) {
+                const auto &thread = shared.threads[t];
+                const auto &row = thread.summary[shape];
+                auto &sample = summary_cache[t][shape];
+                // A racing row retains its last coherent totals; readers never spin.
+                row.read(sample);
+                for (int side = 0; side < 2; ++side) {
+                    released[side] += sample.released[side];
+                    queued[side] += sample.queued[side];
+                    taken[side] += sample.taken[side];
+                }
                 int c = thread.cluster.load(std::memory_order_relaxed);
                 if (c < 0 || c > 1) continue;
-                cached.capacity[c] += thread.capacity[shape].load(std::memory_order_relaxed);
-                cached.free[c] += thread.free_slots[shape].load(std::memory_order_relaxed);
-                cached.idle[c] += thread.idle_slots[shape].load(std::memory_order_relaxed);
-                started[c] += thread.started[shape].load(std::memory_order_relaxed);
+                uint64_t packed = row.resources.load(std::memory_order_relaxed);
+                cached.capacity[c] += packed & 255u;
+                cached.free[c] += (packed >> 8) & 255u;
+                cached.idle[c] += (packed >> 16) & 255u;
             }
             for (int c = 0; c < 2; ++c) {
                 cached.schedulers[c] = shared.schedulers[c];
-                uint64_t published = shared.ready_published[c][shape].load(std::memory_order_relaxed);
-                cached.blocked[c] = assigned[c][shape] > published ? assigned[c][shape] - published : 0;
-                uint64_t waiting = published > started[c] ? published - started[c] : 0;
-                cached.ready[c] = waiting > queue_depth[c] ? waiting : queue_depth[c];
+                cached.blocked[c] = assigned[c][shape] > released[c] ? assigned[c][shape] - released[c] : 0;
+                uint64_t waiting = queued[c] > taken[c] ? queued[c] - taken[c] : 0;
+                uint64_t depth = shared.side_queue[c][shape].load(std::memory_order_relaxed) & 0xffffffffu;
+                cached.ready[c] = waiting > depth ? waiting : depth;
             }
             load_batch[shape] = decision_count() / PARTITION_BATCH_NODES;
             ++snapshots;
         }
         return cached_load[shape];
     }
-    void commit(int cluster, int shape, uint32_t units, bool pending_wait) {
+    void commit(int cluster, int shape, uint32_t units) {
         assigned[cluster][shape] += units;
-        // Assignment precedes wiring/publication, so new work enters exactly one
-        // local pressure class even if schedulers concurrently publish or start it.
         auto &load = cached_load[shape];
-        if (pending_wait) load.blocked[cluster] += units;
-        else load.ready[cluster] += units;
+        // New O assignments remain local future reservations until refresh.
+        // Refresh rebuilds from totals; it never adds the old local delta again.
+        load.blocked[cluster] += units;
     }
     // Future reservations are block units, capped at one capacity wave per side.
     // They do not consume free/idle slots. Pending new tasks include their own
-    // blocks before assignment; ready publication removes existing reservations
-    // through assigned - published, independently of dispatch snapshots.
+    // blocks before assignment; ready publication removes existing preferences
+    // through assigned - released, independently of dispatch snapshots.
     static uint64_t future_reservation_cost(
         const PartitionLoad &load, int c, uint32_t pending_units, uint64_t queue_ns
     ) {

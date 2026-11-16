@@ -90,14 +90,13 @@ python test_benchmark_bgemm.py -p a2a3 -d 0 --case ClusterScaleAdaptive --manual
 Run each case once with its golden check before using `--skip-golden` for
 repeated timing. See [AICPU cluster placement](../../../../docs/user/how-to/use-aicpu-cluster-placement.md)
 for the runtime behavior and measurement boundaries.
-The current controller uses a fixed 256-node calibration prefix, immutable
-cluster targets, and eight-node snapshot epochs. It has no cross-cluster
-pickup or repeated model fitting. In the
-[2026-11-16 investigation](../../../../docs/investigations/2026-11-aicpu-cluster-bgemm.md),
-automatic median device-wall time decreased by 15.66%/12.37% against a fresh
-previous-controller baseline, but remained 14.32%/18.23% above the paired
-Shared controls (Case0/Scale). These are combined-change, unlocked-device
-results, not individual-change attribution or evidence for default enablement.
+The current controller retains a fixed 256-node calibration prefix and uses
+bounded dependency groups, ready-time final binding, 64-node summary epochs
+and restricted single-block cross-cluster pickup. See the
+[2026-11-16 investigation](../../../../docs/investigations/2026-11-aicpu-cluster-bgemm.md)
+for staged v6/v7 controls. The final Case0/Scale automatic medians are
+3.60%/18.79% below same-binary Shared controls in this unlocked-device suite;
+the results do not establish an independent benefit from cross-cluster pickup.
 
 Tolerances are `RTOL = ATOL = 1e-3`, with inputs scaled by `0.01` to keep the
 `grid_k`-deep float32 accumulation inside them.
@@ -106,3 +105,12 @@ For turning a run into numbers rather than pass/fail, see
 [`docs/dfx/README.md`](../../../../docs/dfx/README.md) — in particular the
 scheduler-overhead model, which is the thing the task-count axis here is built
 to probe.
+
+### v7 控制成本分阶段实验
+
+当前自动策略使用有界小组偏好、ready 时绑定、低频单写者摘要以及受限跨侧领取。
+完整机制与压力记账见 [放置说明](../../../../docs/user/how-to/use-aicpu-cluster-placement.md)，
+结果见 [实验记录](../../../../docs/investigations/2026-11-aicpu-cluster-bgemm.md)。
+`reproduce_cluster_study.py` 执行四个独立黄金校验和两批反序的各 15 轮计时；
+`run_control_stage.py <new-output-dir> --jobs <N>` 从当前 worktree 构建并追加独立诊断；
+`analyze_control_study.py <study-root>` 汇总本次保存的各阶段。

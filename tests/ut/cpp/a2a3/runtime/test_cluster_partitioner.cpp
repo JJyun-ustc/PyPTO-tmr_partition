@@ -119,15 +119,15 @@ TEST(ClusterPartitioner, ReadyPublicationTransfersFutureReservationToReadyPressu
     shared.reset();
     shared.schedulers[0] = shared.schedulers[1] = 2;
     shared.threads[0].cluster.store(0);
-    shared.threads[0].capacity[0].store(20);
+    shared.threads[0].summary[0].resources.store(20);
     ClusterPartitioner model;
     model.assigned[0][0] = 20;
-    uint64_t depths[2]{};
-    auto blocked = model.load(shared, 0, depths);
+    auto blocked = model.load(shared, 0);
     EXPECT_EQ(ClusterPartitioner::future_reservation_cost(blocked, 0, 0, 2000), 500u);
-    shared.ready_published[0][0].store(20);
+    shared.threads[0].summary[0].queued[0].store(20);
+    shared.threads[0].summary[0].released[0].store(20);
     model.decisions[0] = PARTITION_BATCH_NODES;
-    auto ready = model.load(shared, 0, depths);
+    auto ready = model.load(shared, 0);
     EXPECT_EQ(ready.blocked[0], 0u);
     EXPECT_EQ(ready.ready[0], 20u);
     EXPECT_EQ(ClusterPartitioner::future_reservation_cost(ready, 0, 0, 2000), 0u);
@@ -207,23 +207,23 @@ TEST(ClusterPartitioner, FixedBatchReusesSnapshotAndReservesPendingWorkLocally) 
     shared.reset();
     shared.schedulers[0] = shared.schedulers[1] = 2;
     shared.threads[0].cluster.store(0);
-    shared.threads[0].capacity[0].store(20);
+    shared.threads[0].summary[0].resources.store(20);
     ClusterPartitioner model;
-    uint64_t depth[2]{};
-    auto initial = model.load(shared, 0, depth);
+    auto initial = model.load(shared, 0);
     EXPECT_EQ(initial.ready[0] + initial.blocked[0], 0u);
     // O commits a blocked multi-block task; concurrent S publication and
-    // dispatch remain invisible until the next eight-decision epoch.
-    model.commit(0, 0, 4, true);
-    shared.ready_published[0][0].store(4);
-    shared.threads[0].started[0].store(4);
+    // dispatch remain invisible until the next refresh epoch.
+    model.commit(0, 0, 4);
+    shared.threads[0].summary[0].queued[0].store(4);
+    shared.threads[0].summary[0].released[0].store(4);
+    shared.threads[0].summary[0].taken[0].store(4);
     model.decisions[0] = 1;
-    auto cached = model.load(shared, 0, depth);
+    auto cached = model.load(shared, 0);
     EXPECT_EQ(cached.blocked[0], 4u);
     EXPECT_EQ(cached.ready[0], 0u);
     EXPECT_EQ(model.snapshots, 1u);
-    model.decisions[0] = 8;
-    auto refreshed = model.load(shared, 0, depth);
+    model.decisions[0] = PARTITION_BATCH_NODES;
+    auto refreshed = model.load(shared, 0);
     EXPECT_EQ(refreshed.blocked[0] + refreshed.ready[0], 0u);
     EXPECT_EQ(model.snapshots, 2u);
 }
@@ -233,31 +233,30 @@ TEST(ClusterPartitioner, BatchReadyReservationsAreCountedOnceAndRefreshInBlockUn
     shared.schedulers[0] = shared.schedulers[1] = 2;
     shared.threads[0].cluster.store(0);
     ClusterPartitioner model;
-    uint64_t depth[2]{};
-    (void)model.load(shared, 0, depth);
-    model.commit(0, 0, 16, false);
-    auto cached = model.load(shared, 0, depth);
-    EXPECT_EQ(cached.ready[0], 16u);
-    EXPECT_EQ(cached.blocked[0], 0u);
-    shared.ready_published[0][0].store(16);
-    shared.threads[0].started[0].store(6);
-    depth[0] = 1;  // One multi-block queue entry, ten undispatched blocks.
-    model.decisions[0] = 8;
-    EXPECT_EQ(model.load(shared, 0, depth).ready[0], 10u);
+    (void)model.load(shared, 0);
+    model.commit(0, 0, 16);
+    auto cached = model.load(shared, 0);
+    EXPECT_EQ(cached.ready[0], 0u);
+    EXPECT_EQ(cached.blocked[0], 16u);
+    shared.threads[0].summary[0].queued[0].store(16);
+    shared.threads[0].summary[0].released[0].store(16);
+    shared.threads[0].summary[0].taken[0].store(6);
+    shared.side_queue[0][0].store(1);  // One entry, ten undispatched blocks.
+    model.decisions[0] = PARTITION_BATCH_NODES;
+    EXPECT_EQ(model.load(shared, 0).ready[0], 10u);
 }
 TEST(ClusterPartitioner, ShapesHaveIndependentSnapshotsWithinGlobalBatch) {
     PartitionShared shared;
     shared.reset();
     ClusterPartitioner model;
-    uint64_t depth[2]{};
-    (void)model.load(shared, 0, depth);
-    (void)model.load(shared, 0, depth);
-    (void)model.load(shared, 1, depth);
-    (void)model.load(shared, 1, depth);
+    (void)model.load(shared, 0);
+    (void)model.load(shared, 0);
+    (void)model.load(shared, 1);
+    (void)model.load(shared, 1);
     EXPECT_EQ(model.snapshots, 2u);
     model.decisions[0] = 7;
     EXPECT_FALSE(model.needs_snapshot(0));
-    model.decisions[0] = 8;
+    model.decisions[0] = PARTITION_BATCH_NODES;
     EXPECT_TRUE(model.needs_snapshot(0));
     EXPECT_TRUE(model.needs_snapshot(1));
 }
@@ -268,10 +267,10 @@ TEST(ClusterPartitioner, ReadyLedgerHasNoTransfersAndSeparatesBlockedWork) {
     shared.threads[0].cluster.store(0);
     ClusterPartitioner model;
     model.assigned[0][0] = 100;
-    shared.ready_published[0][0].store(40);
-    shared.threads[0].started[0].store(10);
-    uint64_t depth[2]{};
-    auto load = model.load(shared, 0, depth);
+    shared.threads[0].summary[0].queued[0].store(40);
+    shared.threads[0].summary[0].released[0].store(40);
+    shared.threads[0].summary[0].taken[0].store(10);
+    auto load = model.load(shared, 0);
     EXPECT_EQ(load.blocked[0], 60u);
     EXPECT_EQ(load.ready[0], 30u);
     EXPECT_EQ(load.ready[1], 0u);
@@ -305,4 +304,92 @@ TEST(ClusterPartitioner, ConcurrentSnapshotsRemainCoherent) {
     PartitionSample sample;
     ASSERT_TRUE(bucket.read(sample));
     EXPECT_EQ(sample.count[3], 20000u);
+}
+
+TEST(ClusterPartitioner, ReadyBindingFollowsActualReleaseWithCongestionHysteresis) {
+    int32_t schedulers[2]{2, 3};
+    uint64_t empty[2]{};
+    EXPECT_EQ(partition_ready_side(0, 1, empty, schedulers), 1);
+    uint64_t balanced[2]{4, 6};
+    EXPECT_EQ(partition_ready_side(0, 1, balanced, schedulers), 1);
+    uint64_t congested[2]{0, 15};
+    EXPECT_EQ(partition_ready_side(0, 1, congested, schedulers), 0);
+    EXPECT_EQ(partition_ready_side(1, -1, empty, schedulers), 1);
+    schedulers[0] = 0;
+    EXPECT_EQ(partition_ready_side(0, 0, empty, schedulers), 1);
+}
+
+TEST(ClusterPartitioner, GroupsBoundFanoutLifetimeScopeAndSlotReuse) {
+    ClusterPartitioner model;
+    AdaptiveTaskState parent;
+    model.join_group(parent, 0, 7);
+    EXPECT_TRUE(model.can_inherit(parent, 7));
+    EXPECT_FALSE(model.can_inherit(parent, 8));
+    for (uint32_t i = 1; i < PARTITION_GROUP_LIMIT; ++i) {
+        AdaptiveTaskState child;
+        model.join_group(child, parent.group, 7);
+    }
+    EXPECT_FALSE(model.can_inherit(parent, 7));
+    model.join_group(parent, 0, 7);
+    model.decisions[0] += PARTITION_GROUP_LIFETIME;
+    EXPECT_FALSE(model.can_inherit(parent, 7));
+    model.join_group(parent, 0, 7);
+    for (uint32_t i = 0; i < PARTITION_GROUP_SLOTS; ++i) {
+        AdaptiveTaskState other;
+        model.join_group(other, 0, 7);
+    }
+    EXPECT_FALSE(model.can_inherit(parent, 7));
+}
+
+TEST(ClusterPartitioner, RacedSummaryRetainsLastCoherentLedgerWithoutDoubleReservation) {
+    PartitionShared shared;
+    shared.schedulers[0] = shared.schedulers[1] = 2;
+    ClusterPartitioner model;
+    model.assigned[0][0] = 16;
+    auto &row = shared.threads[0].summary[0];
+    row.begin_write();
+    row.released[0].store(4);
+    row.queued[1].store(4);
+    row.end_write();
+    auto first = model.load(shared, 0);
+    EXPECT_EQ(first.blocked[0], 12u);
+    EXPECT_EQ(first.ready[1], 4u);
+    row.begin_write();
+    row.released[0].store(16);
+    row.queued[1].store(16);
+    model.decisions[0] += PARTITION_BATCH_NODES;
+    auto racing = model.load(shared, 0);
+    EXPECT_EQ(racing.blocked[0], 12u);
+    EXPECT_EQ(racing.ready[1], 4u);
+    row.end_write();
+    model.decisions[0] += PARTITION_BATCH_NODES;
+    auto final = model.load(shared, 0);
+    EXPECT_EQ(final.blocked[0], 0u);
+    EXPECT_EQ(final.ready[1], 16u);
+}
+
+TEST(ClusterPartitioner, BorrowingDebitsQueueSideIndependentlyOfExecutionSide) {
+    PartitionShared shared;
+    shared.schedulers[0] = 2;
+    shared.schedulers[1] = 3;
+    ClusterPartitioner model;
+    model.assigned[0][0] = 16;
+    // O prefers 0, a releasing S queues on 1, and a cluster-0 S borrows six.
+    auto &publisher = shared.threads[2].summary[0];
+    publisher.released[0].store(16);
+    publisher.queued[1].store(16);
+    shared.threads[0].summary[0].taken[1].store(6);
+    shared.threads[0].started[0].store(6);
+    auto load = model.load(shared, 0);
+    EXPECT_EQ(load.blocked[0] + load.blocked[1], 0u);
+    EXPECT_EQ(load.ready[0], 0u);
+    EXPECT_EQ(load.ready[1], 10u);
+}
+
+TEST(ClusterPartitioner, BorrowingRequiresIdleLocalQueueAndSubstantialRemoteBacklog) {
+    EXPECT_FALSE(partition_may_steal(0, 7, 2, 3));
+    EXPECT_TRUE(partition_may_steal(0, 8, 2, 3));
+    EXPECT_FALSE(partition_may_steal(1, 100, 2, 3));
+    EXPECT_FALSE(partition_may_steal(0, 100, 2, 0));
+    EXPECT_FALSE(partition_may_steal(0, 100, 0, 3));
 }

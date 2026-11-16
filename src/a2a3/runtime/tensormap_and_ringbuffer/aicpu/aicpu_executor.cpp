@@ -1075,17 +1075,56 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                     }
                 }
                 LOG_INFO(
-                    "AICPU_ADAPTIVE_FINAL version=3 decisions=%llu,%llu started=%llu,%llu "
+                    "AICPU_ADAPTIVE_FINAL version=4 decisions=%llu,%llu started=%llu,%llu "
                     "cold=%llu learned=%llu calibrations=%llu updates=%llu,%llu batch_size=%llu snapshots=%llu",
                     static_cast<unsigned long long>(model.decisions[0]),
                     static_cast<unsigned long long>(model.decisions[1]), static_cast<unsigned long long>(started[0]),
                     static_cast<unsigned long long>(started[1]), static_cast<unsigned long long>(model.cold_decisions),
                     static_cast<unsigned long long>(model.learned_decisions),
-                    static_cast<unsigned long long>(model.calibrations), static_cast<unsigned long long>(model.updates[0]),
+                    static_cast<unsigned long long>(model.calibrations),
+                    static_cast<unsigned long long>(model.updates[0]),
                     static_cast<unsigned long long>(model.updates[1]),
                     static_cast<unsigned long long>(simpler::tmr::PARTITION_BATCH_NODES),
                     static_cast<unsigned long long>(model.snapshots)
                 );
+                LOG_INFO(
+                    "AICPU_PLACEMENT_GROUP full=%llu inherited=%llu",
+                    static_cast<unsigned long long>(model.full_decisions),
+                    static_cast<unsigned long long>(model.inherited_decisions)
+                );
+                for (int shape = 0; shape < simpler::tmr::PARTITION_SHAPES; ++shape) {
+                    uint64_t released[2]{}, queued[2]{}, taken[2]{}, actual[2]{};
+                    for (const auto &thread : rt->scheduler.placement_feedback.threads) {
+                        int cluster = thread.cluster.load(std::memory_order_relaxed);
+                        if (cluster >= 0 && cluster < 2)
+                            actual[cluster] += thread.started[shape].load(std::memory_order_relaxed);
+                        const auto &row = thread.summary[shape];
+                        for (int c = 0; c < 2; ++c) {
+                            released[c] += row.released[c].load(std::memory_order_relaxed);
+                            queued[c] += row.queued[c].load(std::memory_order_relaxed);
+                            taken[c] += row.taken[c].load(std::memory_order_relaxed);
+                        }
+                    }
+                    LOG_INFO(
+                        "AICPU_PLACEMENT_LEDGER shape=%d preferred=%llu,%llu released=%llu,%llu queued=%llu,%llu "
+                        "taken=%llu,%llu actual=%llu,%llu",
+                        shape, static_cast<unsigned long long>(model.assigned[0][shape]),
+                        static_cast<unsigned long long>(model.assigned[1][shape]),
+                        static_cast<unsigned long long>(released[0]), static_cast<unsigned long long>(released[1]),
+                        static_cast<unsigned long long>(queued[0]), static_cast<unsigned long long>(queued[1]),
+                        static_cast<unsigned long long>(taken[0]), static_cast<unsigned long long>(taken[1]),
+                        static_cast<unsigned long long>(actual[0]), static_cast<unsigned long long>(actual[1])
+                    );
+                }
+                for (int t = 0; t < sched_thread_num_; ++t) {
+                    const auto &row = rt->scheduler.placement_feedback.threads[t];
+                    LOG_INFO(
+                        "AICPU_PLACEMENT_PICKUP scheduler=%d checks=%llu attempts=%llu remote_blocks=%llu", t,
+                        static_cast<unsigned long long>(row.steal_checks),
+                        static_cast<unsigned long long>(row.steal_attempts),
+                        static_cast<unsigned long long>(row.remote_blocks)
+                    );
+                }
                 for (int shape = 0; shape < simpler::tmr::PARTITION_SHAPES; ++shape) {
                     const auto &w = model.weights[shape];
                     LOG_INFO(
@@ -1127,8 +1166,8 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
 #if SIMPLER_DFX
             if (get_chip_swimlane_level() >= ChipSwimlaneLevel::SCHED_PHASES) {
                 const char *o_names[] = {"poll", "queue_depth", "fanin", "load", "choose_commit", "wire_ready"};
-                const char *s_names[] = {"resource_feedback", "observe",         "auto_dispatch",
-                                         "strict_dispatch",   "shared_dispatch", "sync_dispatch"};
+                const char *s_names[] = {"resource_feedback", "observe",       "auto_dispatch", "strict_dispatch",
+                                         "shared_dispatch",   "sync_dispatch", "ready_binding", "cross_pickup"};
                 for (int i = 0; i < 6; ++i)
                     LOG_INFO(
                         "AICPU_PARTITION_TRACE owner=O stage=%s calls=%llu ns=%llu", o_names[i],
@@ -1139,7 +1178,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                     );
                 for (int t = 0; t < sched_thread_num_; ++t) {
                     const auto &trace = rt->scheduler.placement_feedback.threads[t].trace;
-                    for (int i = 0; i < 6; ++i)
+                    for (int i = 0; i < 8; ++i)
                         LOG_INFO(
                             "AICPU_PARTITION_TRACE owner=S%d stage=%s calls=%llu ns=%llu", t, s_names[i],
                             static_cast<unsigned long long>(trace.calls[i]),

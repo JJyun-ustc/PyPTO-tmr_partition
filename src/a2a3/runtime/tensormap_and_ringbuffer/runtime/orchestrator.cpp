@@ -1202,13 +1202,14 @@ static TaskOutputTensors submit_task_common(
     payload.init(args, result, prepared.alloc_result, layout);
 
     if (args.aicpu_cluster() == -2 && !cur_slot_state.task_attrs.requires_sync_start()) {
-        uint64_t decision_begin = get_sys_cnt_aicpu();
+        uint64_t decision_begin = 0;
         auto &feedback = sched->placement_feedback;
         auto &partitioner = orch->cluster_partitioner;
         bool tracing = false;
 #if SIMPLER_DFX
         tracing = orch->chip_swimlane_level >= ChipSwimlaneLevel::SCHED_PHASES;
 #endif
+        if (tracing) decision_begin = get_sys_cnt_aicpu();
         uint64_t trace_start = decision_begin;
         auto trace_stage = [&](int stage) {
             if (!tracing) return;
@@ -1218,53 +1219,64 @@ static TaskOutputTensors submit_task_common(
             trace_start = now;
         };
 
-        if (!feedback.enabled.load(std::memory_order_relaxed)) {
+        if (partitioner.decision_count() == 0) {
             feedback.schedulers[0] = orch->aicpu_cluster_sched_count[0];
             feedback.schedulers[1] = orch->aicpu_cluster_sched_count[1];
             feedback.enabled.store(true, std::memory_order_release);
+            sched->has_cluster_targets.store(true, std::memory_order_release);
         }
         partitioner.calibrate_once(feedback);
         trace_stage(0);
         ResourceShape shape = active_mask.to_shape();
         int shape_index = static_cast<int>(shape);
-        uint64_t ready[2]{};
-        if (partitioner.needs_snapshot(shape_index)) {
-            uint64_t shared_ready = shape == ResourceShape::DUMMY ?
-                                        sched->dummy_ready_queue.size() : sched->ready_queues[shape_index].size();
-            int sched_total = feedback.schedulers[0] + feedback.schedulers[1];
-            for (int c = 0; c < 2; ++c) {
-                ready[c] = shape == ResourceShape::DUMMY ? sched->cluster_dummy_queues[c].size() :
-                                                           sched->cluster_ready_queues[c][shape_index].size();
-                if (sched_total) ready[c] += shared_ready * feedback.schedulers[c] / sched_total;
-            }
-        }
-        trace_stage(1);
+        int depth = orch->scope_stack_top < 0 ? 0 : orch->scope_stack_top;
+        if (!partitioner.scope_ids[depth]) partitioner.open_scope(depth);
+        uint64_t scope = partitioner.scope_ids[depth];
+        uint32_t units = shape == ResourceShape::DUMMY ? 1 : cur_slot_state.logical_block_num;
         uint32_t pending = 0, sources[2]{};
+        uint64_t parent_group = 0;
+        int inherited = -1;
+        // The existing reduced fanin list supplies online group membership.
+        // Once a usable parent is found, avoid further shared-state reads.
         fanin_builder.for_each([&](ChipTaskSlotState *producer, DepFlags flags) {
-            if (!dep_has_wait(flags) || producer->task_state.load(std::memory_order_acquire) != CHIP_TASK_PENDING)
-                return;
-            pending++;
-            int c = producer->payload->placement.dispatch_cluster.load(std::memory_order_acquire);
-            if (c < 0) c = producer->task->target_aicpu_cluster;
-            if (c >= 0 && c < 2) sources[c]++;
+            if (!dep_has_wait(flags) || inherited >= 0) return;
+            const auto &parent = producer->payload->placement;
+            if (partitioner.can_inherit(parent, scope)) {
+                int actual = parent.dispatch_cluster.load(std::memory_order_acquire);
+                inherited = actual >= 0 ? actual : parent.preferred_cluster;
+                if (inherited >= 0 && feedback.schedulers[inherited]) parent_group = parent.group;
+                else inherited = -1;
+            }
+            if (inherited >= 0 || producer->task_state.load(std::memory_order_acquire) != CHIP_TASK_PENDING) return;
+            ++pending;
+            int c = parent.dispatch_cluster.load(std::memory_order_acquire);
+            if (c < 0) c = parent.scope ? parent.preferred_cluster : producer->task->target_aicpu_cluster;
+            if (c >= 0 && c < 2) ++sources[c];
         });
         trace_stage(2);
-        auto load = partitioner.load(feedback, shape_index, ready);
-        trace_stage(3);
-        uint32_t units = shape == ResourceShape::DUMMY ? 1 : cur_slot_state.logical_block_num;
-        auto decision = partitioner.choose(load, pending, sources, shape_index, feedback.orchestrator_cluster, units);
+        simpler::tmr::PartitionDecision decision;
+        if (inherited >= 0) {
+            decision = partitioner.inherit(inherited);
+        } else {
+            trace_stage(1);
+            auto load = partitioner.load(feedback, shape_index);
+            trace_stage(3);
+            decision = partitioner.choose(load, pending, sources, shape_index, feedback.orchestrator_cluster, units);
+        }
         if (decision.cluster >= 0) {
-            task.target_aicpu_cluster = decision.cluster;
-            sched->has_cluster_targets.store(true, std::memory_order_release);
-            int depth = orch->scope_stack_top < 0 ? 0 : orch->scope_stack_top;
-            if (!partitioner.scope_ids[depth]) partitioner.open_scope(depth);
-            payload.placement.scope = partitioner.scope_ids[depth];
-            payload.placement.submit_tick = get_sys_cnt_aicpu();
-            uint64_t ticks = payload.placement.submit_tick - decision_begin;
-            partitioner.decision_ticks += ticks;
-            if (ticks > partitioner.max_decision_ticks) partitioner.max_decision_ticks = ticks;
+            // Unbound automatic tasks carry only a preference until ready.
+            task.target_aicpu_cluster = -1;
+            payload.placement.scope = scope;
+            payload.placement.preferred_cluster = decision.cluster;
+            partitioner.join_group(payload.placement, parent_group, scope);
+            if (tracing) {
+                payload.placement.submit_tick = get_sys_cnt_aicpu();
+                uint64_t ticks = payload.placement.submit_tick - decision_begin;
+                partitioner.decision_ticks += ticks;
+                if (ticks > partitioner.max_decision_ticks) partitioner.max_decision_ticks = ticks;
+            }
             partitioner.scope_assignments[depth]++;
-            partitioner.commit(decision.cluster, shape_index, units, pending != 0);
+            partitioner.commit(decision.cluster, shape_index, units);
             cur_slot_state.task_attrs.set_early_resolve(false);
         }
         trace_stage(4);
