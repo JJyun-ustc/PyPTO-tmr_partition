@@ -1,0 +1,469 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
+
+#include "pypto/ir/type.h"
+
+#include <cstddef>
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <optional>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "pypto/core/dtype.h"
+#include "pypto/core/error.h"
+#include "pypto/core/hash.h"
+#include "pypto/core/logging.h"
+#include "pypto/ir/core.h"
+#include "pypto/ir/expr.h"
+#include "pypto/ir/kind_traits.h"
+#include "pypto/ir/memory_space.h"
+#include "pypto/ir/memref.h"
+#include "pypto/ir/scalar_expr.h"
+#include "pypto/ir/span.h"
+#include "pypto/ir/tile_view_semantics.h"
+
+namespace pypto {
+namespace ir {
+
+RegType::RegType(int64_t shape, DataType dtype, RegKind kind) : shape_(shape), dtype_(dtype), kind_(kind) {
+  CHECK(shape > 0) << "RegType shape must be a positive integer";
+  CHECK(DataTypeToString(dtype) != "UnknownType") << "RegType requires a known dtype";
+  CHECK(kind == RegKind::VecReg || kind == RegKind::MaskReg) << "Unknown RegKind";
+  CHECK(kind != RegKind::MaskReg || dtype == DataType::BOOL) << "MaskReg requires BOOL dtype";
+  CHECK(kind != RegKind::VecReg || dtype != DataType::BOOL) << "VecReg forbids BOOL dtype";
+}
+
+void detail::CheckValueType(const TypePtr& type, const Span& span, const char* context) {
+  CHECK_SPAN(!type || type->GetKind() != ObjectKind::VoidType, span)
+      << context << " cannot use VoidType: it represents no value; execute a void call with EvalStmt";
+}
+
+namespace {
+
+std::optional<MemorySpace> ValidateTileMemorySpaceConsistency(const std::optional<MemRefPtr>& memref,
+                                                              std::optional<MemorySpace> memory_space) {
+  if (!memref.has_value()) {
+    return memory_space;
+  }
+
+  const auto& memref_ptr = memref.value();
+  CHECK(memref_ptr != nullptr) << "TileType memref must not be null";
+  CHECK(memory_space.has_value()) << "TileType with MemRef must have explicit memory_space";
+
+  return memory_space;
+}
+
+std::vector<ExprPtr> MakeShapeExprs(const std::vector<int64_t>& shape) {
+  std::vector<ExprPtr> result;
+  result.reserve(shape.size());
+  for (int64_t dim : shape) {
+    result.push_back(std::make_shared<ConstInt>(dim, DataType::INDEX, Span::unknown()));
+  }
+  return result;
+}
+
+void ClearRedundantFullValidShape(std::vector<ExprPtr>& valid_shape, const std::vector<ExprPtr>& shape) {
+  if (!valid_shape.empty() && AreExprVectorsEqual(valid_shape, shape)) {
+    valid_shape.clear();
+  }
+}
+
+void ValidateTensorViewValues(const TensorView& view) {
+  detail::CheckValueOperands(view.stride, Span::unknown(), "TensorView stride");
+  detail::CheckValueOperands(view.valid_shape, Span::unknown(), "TensorView valid_shape");
+}
+
+void ValidateTileViewValues(const TileView& view) {
+  detail::CheckValueOperands(view.valid_shape, Span::unknown(), "TileView valid_shape");
+  detail::CheckValueOperands(view.stride, Span::unknown(), "TileView stride");
+  detail::CheckValueOperand(view.start_offset, Span::unknown(), "TileView start_offset");
+}
+
+void CanonicalizeTensorViewInPlace(std::optional<TensorView>& tensor_view,
+                                   const std::vector<ExprPtr>& shape) {
+  if (!tensor_view.has_value()) {
+    return;
+  }
+
+  ValidateTensorViewValues(*tensor_view);
+  ClearRedundantFullValidShape(tensor_view->valid_shape, shape);
+  if (tensor_view->stride.empty() && tensor_view->layout == TensorLayout::ND &&
+      tensor_view->valid_shape.empty() && tensor_view->pad == PadValue::null) {
+    tensor_view.reset();
+  }
+}
+
+void CanonicalizeTileViewInPlace(std::optional<TileView>& tile_view, const std::vector<ExprPtr>& shape,
+                                 const std::optional<MemorySpace>& memory_space) {
+  if (!tile_view.has_value()) {
+    return;
+  }
+
+  ValidateTileViewValues(*tile_view);
+  ClearRedundantFullValidShape(tile_view->valid_shape, shape);
+  if (tile_view_semantics::IsImplicitPrintedTileView(*tile_view, shape, memory_space)) {
+    tile_view.reset();
+  }
+}
+
+}  // namespace
+
+bool operator==(const TileView& lhs, const TileView& rhs) {
+  return AreExprVectorsEqual(lhs.valid_shape, rhs.valid_shape) &&
+         AreExprVectorsEqual(lhs.stride, rhs.stride) && AreExprsEqual(lhs.start_offset, rhs.start_offset) &&
+         lhs.blayout == rhs.blayout && lhs.slayout == rhs.slayout && lhs.fractal == rhs.fractal &&
+         lhs.pad == rhs.pad && lhs.compact == rhs.compact;
+}
+
+bool operator!=(const TileView& lhs, const TileView& rhs) { return !(lhs == rhs); }
+
+namespace {
+
+// Tags distinguish the AreExprsEqual cases so a value-equal ConstInt, a
+// pointer-equal Var, and a structurally-equal binary op can never collide on
+// the same hash bucket by coincidence.
+constexpr uint64_t kConstIntHashTag = 1;
+constexpr uint64_t kExprPtrHashTag = 2;
+constexpr uint64_t kBinaryExprHashTag = 3;
+constexpr uint64_t kCallExprHashTag = 4;
+constexpr uint64_t kUnaryExprHashTag = 5;
+
+// Mirror AreExprsEqual: ConstInt nodes compare by value, binary ops, unary ops
+// and Call nodes compare structurally (kind + operands / kind + dtype + operand /
+// op + args), all others by pointer identity.  The hash must match this
+// granularity — any extension to AreExprsEqual MUST get a corresponding branch
+// here.
+inline uint64_t HashExprForAreExprsEqual(const ExprPtr& e) {
+  if (!e) return 0;
+  if (auto c = As<ConstInt>(e)) {
+    return hash_combine(kConstIntHashTag, std::hash<int64_t>{}(c->value_));
+  }
+  if (auto b = As<BinaryExpr>(e)) {
+    uint64_t h = hash_combine(kBinaryExprHashTag, static_cast<uint64_t>(e->GetKind()));
+    h = hash_combine(h, HashExprForAreExprsEqual(b->left_));
+    return hash_combine(h, HashExprForAreExprsEqual(b->right_));
+  }
+  if (auto u = As<UnaryExpr>(e)) {
+    // AreExprsEqual compares a unary node's kind, result dtype and operand, so
+    // all three have to reach the hash or two equal TileViews could land in
+    // different buckets.
+    uint64_t h = hash_combine(kUnaryExprHashTag, static_cast<uint64_t>(e->GetKind()));
+    auto scalar = std::dynamic_pointer_cast<const ScalarType>(e->GetType());
+    h = hash_combine(h, scalar ? static_cast<uint64_t>(scalar->dtype_.Code()) : 0);
+    return hash_combine(h, HashExprForAreExprsEqual(u->operand_));
+  }
+  if (auto call = As<Call>(e)) {
+    uint64_t h = hash_combine(kCallExprHashTag, std::hash<std::string>{}(call->op_ ? call->op_->name_ : ""));
+    for (const auto& arg : call->args_) {
+      h = hash_combine(h, HashExprForAreExprsEqual(arg));
+    }
+    return h;
+  }
+  return hash_combine(kExprPtrHashTag, std::hash<const void*>{}(e.get()));
+}
+
+}  // namespace
+
+size_t Hash(const TileView& tv) {
+  uint64_t h = 0;
+  h = hash_combine(h, tv.valid_shape.size());
+  for (const auto& e : tv.valid_shape) h = hash_combine(h, HashExprForAreExprsEqual(e));
+  h = hash_combine(h, tv.stride.size());
+  for (const auto& e : tv.stride) h = hash_combine(h, HashExprForAreExprsEqual(e));
+  h = hash_combine(h, HashExprForAreExprsEqual(tv.start_offset));
+  h = hash_combine(h, std::hash<int>{}(static_cast<int>(tv.blayout)));
+  h = hash_combine(h, std::hash<int>{}(static_cast<int>(tv.slayout)));
+  h = hash_combine(h, std::hash<uint64_t>{}(tv.fractal));
+  h = hash_combine(h, std::hash<int>{}(static_cast<int>(tv.pad)));
+  h = hash_combine(h, std::hash<int>{}(static_cast<int>(tv.compact)));
+  return static_cast<size_t>(h);
+}
+
+ShapedType::ShapedType(DataType dtype, std::vector<ExprPtr> shape)
+    : ShapedType(dtype, std::move(shape), std::optional<MemRefPtr>{}) {}
+
+std::string TensorLayoutToString(TensorLayout layout) {
+  switch (layout) {
+    case TensorLayout::ND:
+      return "ND";
+    case TensorLayout::DN:
+      return "DN";
+    case TensorLayout::NZ:
+      return "NZ";
+    case TensorLayout::MX_A_ZZ:
+      return "MX_A_ZZ";
+    case TensorLayout::MX_B_NN:
+      return "MX_B_NN";
+    default:
+      throw TypeError("Unknown TensorLayout value: " + std::to_string(static_cast<int>(layout)));
+  }
+}
+
+TensorLayout StringToTensorLayout(const std::string& str) {
+  if (str == "ND") {
+    return TensorLayout::ND;
+  } else if (str == "DN") {
+    return TensorLayout::DN;
+  } else if (str == "NZ") {
+    return TensorLayout::NZ;
+  } else if (str == "MX_A_ZZ") {
+    return TensorLayout::MX_A_ZZ;
+  } else if (str == "MX_B_NN") {
+    return TensorLayout::MX_B_NN;
+  }
+  throw TypeError("Unknown TensorLayout string: " + str);
+}
+
+std::string TileLayoutToString(TileLayout layout) {
+  switch (layout) {
+    case TileLayout::none_box:
+      return "none_box";
+    case TileLayout::row_major:
+      return "row_major";
+    case TileLayout::col_major:
+      return "col_major";
+    default:
+      throw TypeError("Unknown TileLayout value: " + std::to_string(static_cast<int>(layout)));
+  }
+}
+
+TileLayout StringToTileLayout(const std::string& str) {
+  if (str == "none_box") {
+    return TileLayout::none_box;
+  } else if (str == "row_major") {
+    return TileLayout::row_major;
+  } else if (str == "col_major") {
+    return TileLayout::col_major;
+  }
+  throw TypeError("Unknown TileLayout string: " + str);
+}
+
+std::string CompactModeToString(CompactMode mode) {
+  switch (mode) {
+    case CompactMode::null:
+      return "null";
+    case CompactMode::normal:
+      return "normal";
+    default:
+      throw TypeError("Unknown CompactMode value: " + std::to_string(static_cast<int>(mode)));
+  }
+}
+
+CompactMode StringToCompactMode(const std::string& str) {
+  if (str == "null") {
+    return CompactMode::null;
+  } else if (str == "normal") {
+    return CompactMode::normal;
+  }
+  throw TypeError("Unknown CompactMode string: " + str);
+}
+
+std::optional<PadValue> TryStringToPadValue(const std::string& str) {
+  if (str == "null") return PadValue::null;
+  if (str == "zero") return PadValue::zero;
+  if (str == "max") return PadValue::max;
+  if (str == "min") return PadValue::min;
+  return std::nullopt;
+}
+
+BufferType::BufferType(std::vector<int64_t> shape, DataType dtype, MemorySpace memory_space,
+                       std::vector<int64_t> valid_shape, TileLayout blayout, TileLayout slayout,
+                       uint64_t fractal, PadValue pad, CompactMode compact)
+    : shape_(std::move(shape)),
+      dtype_(dtype),
+      memory_space_(memory_space),
+      valid_shape_(valid_shape.empty() ? shape_ : std::move(valid_shape)),
+      blayout_(blayout),
+      slayout_(slayout),
+      fractal_(fractal),
+      pad_(pad),
+      compact_(compact) {
+  CHECK(!shape_.empty()) << "BufferType physical shape must have at least one dimension";
+  CHECK(dtype_.GetBit() > 0 && dtype_ != DataType::TASK_ID)
+      << "BufferType requires an element data type, got " << dtype_.ToString();
+  CHECK(valid_shape_.size() == shape_.size()) << "BufferType valid_shape rank " << valid_shape_.size()
+                                              << " must match physical shape rank " << shape_.size();
+  for (size_t i = 0; i < shape_.size(); ++i) {
+    CHECK(shape_[i] > 0) << "BufferType physical extent at dimension " << i
+                         << " must be positive and static, got " << shape_[i];
+    CHECK(valid_shape_[i] == -1 || (valid_shape_[i] >= 0 && valid_shape_[i] <= shape_[i]))
+        << "BufferType valid extent at dimension " << i << " must be -1 (dynamic) or between 0 and "
+        << shape_[i] << ", got " << valid_shape_[i];
+  }
+  switch (memory_space_) {
+    case MemorySpace::Vec:
+    case MemorySpace::Mat:
+    case MemorySpace::Left:
+    case MemorySpace::Right:
+    case MemorySpace::Acc:
+    case MemorySpace::Bias:
+    case MemorySpace::LeftScale:
+    case MemorySpace::RightScale:
+      break;
+    default:
+      CHECK(false) << "BufferType requires an on-chip tile memory space, got "
+                   << static_cast<int>(memory_space_);
+  }
+  CHECK(blayout_ == TileLayout::row_major || blayout_ == TileLayout::col_major)
+      << "BufferType block layout must be row_major or col_major";
+  CHECK(slayout_ == TileLayout::none_box || slayout_ == TileLayout::row_major ||
+        slayout_ == TileLayout::col_major)
+      << "BufferType scatter layout must be none_box, row_major, or col_major";
+  CHECK(fractal_ > 0) << "BufferType fractal size in bytes must be positive";
+  CHECK(pad_ == PadValue::null || pad_ == PadValue::zero || pad_ == PadValue::max || pad_ == PadValue::min)
+      << "BufferType pad must be null, zero, max, or min";
+  CHECK(compact_ == CompactMode::null || compact_ == CompactMode::normal)
+      << "BufferType compact mode must be null or normal";
+}
+
+MultiBufferType::MultiBufferType(BufferTypePtr element_type, int64_t slot_count)
+    : element_type_(std::move(element_type)), slot_count_(slot_count) {
+  CHECK(element_type_) << "MultiBufferType element_type must not be null";
+  CHECK(slot_count_ > 0) << "MultiBufferType slot_count must be positive, got " << slot_count_;
+}
+
+TupleType::TupleType(std::vector<TypePtr> types) : types_(std::move(types)) {
+  for (const auto& type : types_) {
+    detail::CheckValueType(type, Span::unknown(), "TupleType element");
+  }
+}
+
+ShapedType::ShapedType(DataType dtype, const std::vector<int64_t>& shape, std::optional<MemRefPtr> memref)
+    : ShapedType(dtype, MakeShapeExprs(shape), std::move(memref)) {}
+
+TensorView::TensorView(std::vector<ExprPtr> stride_, TensorLayout layout_, std::vector<ExprPtr> valid_shape_,
+                       PadValue pad_)
+    : stride(std::move(stride_)), layout(layout_), valid_shape(std::move(valid_shape_)), pad(pad_) {
+  ValidateTensorViewValues(*this);
+}
+
+TensorView::TensorView(const std::vector<int64_t>& stride_ints, TensorLayout layout_,
+                       const std::vector<int64_t>& valid_shape_ints, PadValue pad_)
+    : layout(layout_), pad(pad_) {
+  for (int64_t s : stride_ints) {
+    stride.push_back(std::make_shared<ConstInt>(s, DataType::INDEX, Span::unknown()));
+  }
+  for (int64_t v : valid_shape_ints) {
+    valid_shape.push_back(std::make_shared<ConstInt>(v, DataType::INDEX, Span::unknown()));
+  }
+}
+
+TileView::TileView(std::vector<ExprPtr> valid_shape_, std::vector<ExprPtr> stride_, ExprPtr start_offset_,
+                   TileLayout blayout_, TileLayout slayout_, uint64_t fractal_, PadValue pad_,
+                   CompactMode compact_)
+    : valid_shape(std::move(valid_shape_)),
+      stride(std::move(stride_)),
+      start_offset(std::move(start_offset_)),
+      blayout(blayout_),
+      slayout(slayout_),
+      fractal(fractal_),
+      pad(pad_),
+      compact(compact_) {
+  ValidateTileViewValues(*this);
+}
+
+TileView::TileView(const std::vector<int64_t>& valid_shape_ints, const std::vector<int64_t>& stride_ints,
+                   ExprPtr start_offset_, TileLayout blayout_, TileLayout slayout_, uint64_t fractal_,
+                   PadValue pad_, CompactMode compact_)
+    : start_offset(std::move(start_offset_)),
+      blayout(blayout_),
+      slayout(slayout_),
+      fractal(fractal_),
+      pad(pad_),
+      compact(compact_) {
+  detail::CheckValueOperand(start_offset, Span::unknown(), "TileView start_offset");
+  for (int64_t v : valid_shape_ints) {
+    valid_shape.push_back(std::make_shared<ConstInt>(v, DataType::INDEX, Span::unknown()));
+  }
+  for (int64_t s : stride_ints) {
+    stride.push_back(std::make_shared<ConstInt>(s, DataType::INDEX, Span::unknown()));
+  }
+}
+
+ShapedType::ShapedType(DataType dtype, std::vector<ExprPtr> shape, MemRefPtr memref)
+    : ShapedType(dtype, std::move(shape), std::optional<MemRefPtr>{std::move(memref)}) {}
+
+ShapedType::ShapedType(DataType dtype, std::vector<ExprPtr> shape, std::optional<MemRefPtr> memref)
+    : dtype_(dtype), shape_(std::move(shape)), memref_(std::move(memref)) {
+  detail::CheckValueOperands(shape_, Span::unknown(), "ShapedType dimension");
+}
+
+TensorType::TensorType(std::vector<ExprPtr> shape, DataType dtype, std::optional<MemRefPtr> memref,
+                       std::optional<TensorView> tensor_view)
+    : ShapedType(dtype, std::move(shape), std::move(memref)), tensor_view_(std::move(tensor_view)) {
+  CanonicalizeTensorViewInPlace(tensor_view_, shape_);
+}
+
+TensorType::TensorType(const std::vector<int64_t>& shape, DataType dtype, std::optional<MemRefPtr> memref,
+                       std::optional<TensorView> tensor_view)
+    : ShapedType(dtype, shape, std::move(memref)), tensor_view_(std::move(tensor_view)) {
+  CanonicalizeTensorViewInPlace(tensor_view_, shape_);
+}
+
+TileType::TileType(const std::vector<int64_t>& shape, DataType dtype, std::optional<MemRefPtr> memref,
+                   std::optional<TileView> tile_view, std::optional<MemorySpace> memory_space)
+    : ShapedType(dtype, shape, std::move(memref)),
+      tile_view_(std::move(tile_view)),
+      memory_space_(ValidateTileMemorySpaceConsistency(memref_, memory_space)) {
+  CanonicalizeTileViewInPlace(tile_view_, shape_, memory_space_);
+}
+
+TileType::TileType(std::vector<ExprPtr> shape, DataType dtype, std::optional<MemRefPtr> memref,
+                   std::optional<TileView> tile_view, std::optional<MemorySpace> memory_space)
+    : ShapedType(dtype, std::move(shape), std::move(memref)),
+      tile_view_(std::move(tile_view)),
+      memory_space_(ValidateTileMemorySpaceConsistency(memref_, memory_space)) {
+  CanonicalizeTileViewInPlace(tile_view_, shape_, memory_space_);
+}
+
+std::optional<MemorySpace> TileType::GetMemorySpace() const { return memory_space_; }
+
+std::optional<MemorySpace> TileType::ValidateMemorySpace(const std::optional<MemRefPtr>& memref,
+                                                         std::optional<MemorySpace> memory_space) {
+  return ValidateTileMemorySpaceConsistency(memref, memory_space);
+}
+
+namespace {
+
+void ValidateArrayDType(DataType dtype) {
+  // TASK_ID is admitted as an opaque 64-bit scalar — used as a fence companion
+  // in manual_scope lowering. Same on-core C-stack lowering as integer dtypes
+  // (TaskId is a 64-bit POD).
+  CHECK(dtype.IsInt() || dtype == DataType::BOOL || dtype == DataType::TASK_ID)
+      << "ArrayType element dtype must be integer, BOOL, or TASK_ID, got " << dtype.ToString();
+}
+
+void ValidateArrayExtent(const ExprPtr& extent) {
+  CHECK(extent != nullptr) << "ArrayType extent must not be null";
+  auto c = As<ConstInt>(extent);
+  CHECK(c != nullptr) << "ArrayType extent must be a compile-time ConstInt";
+  CHECK(c->value_ > 0) << "ArrayType extent must be positive, got " << c->value_;
+}
+
+}  // namespace
+
+ArrayType::ArrayType(DataType dtype, ExprPtr extent)
+    : ShapedType(dtype, std::vector<ExprPtr>{std::move(extent)}) {
+  ValidateArrayDType(dtype_);
+  ValidateArrayExtent(shape_.at(0));
+}
+
+ArrayType::ArrayType(DataType dtype, int64_t extent)
+    : ShapedType(dtype, std::vector<int64_t>{extent}, std::nullopt) {
+  ValidateArrayDType(dtype_);
+  ValidateArrayExtent(shape_.at(0));
+}
+
+}  // namespace ir
+}  // namespace pypto

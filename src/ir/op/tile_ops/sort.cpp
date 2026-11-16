@@ -1,0 +1,284 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
+
+/**
+ * @file sort.cpp
+ * @brief Sorting tile operations (Sort32, MrgSort)
+ *
+ * This file implements sort operations for tile-level programming.
+ * Sort32 sorts fixed-size 32-element blocks and maps to pto.tsort32.
+ * MrgSort merges 4 pre-sorted lists and maps to pto.tmrgsort (format2).
+ */
+
+#include <any>
+#include <cstddef>
+#include <memory>
+#include <optional>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "pypto/core/dtype.h"
+#include "pypto/core/error.h"
+#include "pypto/core/logging.h"
+#include "pypto/ir/kind_traits.h"
+#include "pypto/ir/memory_space.h"
+#include "pypto/ir/op_registry.h"
+#include "pypto/ir/scalar_expr.h"
+#include "pypto/ir/type.h"
+#include "pypto/ir/type_inference.h"
+#include "src/ir/op/sort_utils.h"
+
+namespace pypto {
+namespace ir {
+
+// Helper to get kwargs value with optional default
+template <typename T>
+static T GetKwarg(const std::vector<std::pair<std::string, std::any>>& kwargs, const std::string& key,
+                  const std::optional<T>& default_value = std::nullopt) {
+  for (const auto& [k, v] : kwargs) {
+    if (k == key) {
+      return AnyCast<T>(v, "kwarg key: " + key);
+    }
+  }
+  if (default_value) {
+    return *default_value;
+  }
+  throw ValueError("Missing kwarg: " + key);
+}
+
+TypePtr DeduceTileSort32Type(const std::vector<ExprPtr>& args,
+                             const std::vector<std::pair<std::string, std::any>>& kwargs,
+                             const std::string& op_name) {
+  CHECK(args.size() == 2 || args.size() == 3)
+      << "The operator " << op_name << " requires 2 or 3 arguments (src, idx[, tmp]), but got "
+      << args.size();
+
+  // First arg: src tile (f16 or f32)
+  auto src_type = As<TileType>(args[0]->GetType());
+  CHECK(src_type) << "The operator " << op_name << " requires first argument to be a TileType, but got "
+                  << args[0]->GetType()->TypeName();
+  CHECK(src_type->dtype_ == DataType::FP16 || src_type->dtype_ == DataType::FP32)
+      << "The operator " << op_name << " requires src dtype to be FP16 or FP32, but got "
+      << src_type->dtype_.ToString();
+
+  // Second arg: idx tile — one index per src element, so it is shaped like src.
+  // TSORT32 pairs src[i] with idx[i] positionally; an idx that does not cover src
+  // reads past its own buffer, and a wider one silently ignores the tail. State the
+  // relation in the type so it is enforced once here instead of per consumer
+  // (gh#2612 -- LowerAutoVectorSplit is otherwise blind to this operand and cannot
+  // tell a legal full-width one from per-lane data left un-sharded).
+  //
+  // Only a PROVABLE mismatch is an error; an undecidable symbolic relation is left
+  // to the backend, so dynamic extents keep working exactly as before.
+  auto idx_type = As<TileType>(args[1]->GetType());
+  CHECK(idx_type) << "The operator " << op_name << " requires second argument to be a TileType, but got "
+                  << args[1]->GetType()->TypeName();
+  CHECK(idx_type->shape_.size() == src_type->shape_.size())
+      << "The operator " << op_name << " requires idx to have the same rank as src (one index per element), "
+      << "but got idx rank " << idx_type->shape_.size() << " against src rank " << src_type->shape_.size();
+  for (size_t d = 0; d < src_type->shape_.size(); ++d) {
+    CHECK(ProveValidExtentEqual(idx_type->shape_[d], src_type->shape_[d]) != ProofResult::kFalse)
+        << "The operator " << op_name << " requires idx to have the same shape as src (one index per "
+        << "element), but got idx shape " << FormatShape(idx_type->shape_) << " against src shape "
+        << FormatShape(src_type->shape_);
+  }
+
+  if (args.size() == 3) {
+    auto tmp_type = As<TileType>(args[2]->GetType());
+    CHECK(tmp_type) << "The operator " << op_name
+                    << " requires optional third argument 'tmp' to be a TileType, but got "
+                    << args[2]->GetType()->TypeName();
+    CHECK(tmp_type->dtype_ == src_type->dtype_)
+        << "The operator " << op_name << " requires tmp dtype to match src dtype ("
+        << src_type->dtype_.ToString() << "), but got " << tmp_type->dtype_.ToString();
+  }
+
+  // TSORT32 stores 8-byte value-index pairs: 2 FP32 or 4 FP16 elements.
+  const auto& input_shape = src_type->shape_;
+  CHECK(!input_shape.empty()) << "The operator " << op_name << " requires non-empty input shape";
+  const auto output_shape = GetSort32OutputShape(input_shape, src_type->dtype_, args[0]->span_);
+  const auto output_valid_shape =
+      GetSort32OutputShape(GetValidShape(src_type), src_type->dtype_, args[0]->span_);
+
+  TileView tile_view;
+  tile_view.valid_shape = output_valid_shape;
+  InheritTileViewLayout(tile_view, src_type);
+  return std::make_shared<TileType>(output_shape, src_type->dtype_, std::nullopt, tile_view);
+}
+
+// ============================================================================
+// Registration for Sort Operations
+// ============================================================================
+
+REGISTER_OP("tile.sort32")
+    .set_op_category("TileOp")
+    .functional_execution_memory_access()
+    .set_description("Sort fixed 32-element blocks (maps to pto.tsort32)")
+    .add_argument("src", "Input value tile (TileType, f16 or f32)")
+    .add_argument("idx", "Input index tile (TileType)")
+    .add_argument("tmp", "Optional A2/A3 scratch tile (same dtype and capacity as src)")
+    .set_input_memory(0, MemorySpace::Vec)
+    .set_input_memory(1, MemorySpace::Vec)
+    .set_input_memory(2, MemorySpace::Vec)
+    .set_output_memory(MemorySpace::Vec)
+    .not_inplace_safe()
+    // tmp IS exempt for the same target reason as tile.gather's: the "same dtype
+    // and capacity as src" rule is an A2/A3 one that the PTOAS verifier already
+    // enforces where the target is known. Rejecting here would break the form
+    // A5 accepts to duplicate a check this pass cannot make accurately.
+    .set_lane_invariant_arg(2)
+    .f_deduce_type([](const std::vector<ExprPtr>& args,
+                      const std::vector<std::pair<std::string, std::any>>& kwargs) {
+      return DeduceTileSort32Type(args, kwargs, "tile.sort32");
+    });
+
+// ============================================================================
+// MrgSort: 2-4 way merge sort (format2) — maps to pto.tmrgsort
+// ============================================================================
+
+TypePtr DeduceTileMrgSortType(const std::vector<ExprPtr>& args,
+                              const std::vector<std::pair<std::string, std::any>>& kwargs,
+                              const std::string& op_name) {
+  // Arg layout: (src0, ..., srcN-1, tmp)
+  //   2-way: 3 args  (src0, src1, tmp)
+  //   3-way: 4 args  (src0, src1, src2, tmp)
+  //   4-way: 5 args  (src0, src1, src2, src3, tmp)
+  //
+  // The PTO ISA exposes the per-way "executed" status as a vector<4xi16>
+  // output of pto.tmrgsort, not as a tile operand. Codegen synthesizes that
+  // vector directly; no IR-level executed tile is needed.
+  CHECK(args.size() >= 3 && args.size() <= 5)
+      << "The operator " << op_name << " requires 3-5 arguments (2-4 srcs + tmp), but got " << args.size();
+
+  size_t n_srcs = args.size() - 1;
+
+  // src0: sorted input tile (f16 or f32)
+  auto src0_type = As<TileType>(args[0]->GetType());
+  CHECK(src0_type) << "The operator " << op_name << " requires argument 0 to be a TileType, but got "
+                   << args[0]->GetType()->TypeName();
+  CHECK(src0_type->dtype_ == DataType::FP16 || src0_type->dtype_ == DataType::FP32)
+      << "The operator " << op_name << " requires src dtype to be FP16 or FP32, but got "
+      << src0_type->dtype_.ToString();
+
+  // src1..srcN-1: remaining source tiles — must match src0 dtype
+  for (size_t i = 1; i < n_srcs; ++i) {
+    auto src_type = As<TileType>(args[i]->GetType());
+    CHECK(src_type) << "The operator " << op_name << " requires argument " << i
+                    << " to be a TileType, but got " << args[i]->GetType()->TypeName();
+    CHECK(src_type->dtype_ == src0_type->dtype_)
+        << "The operator " << op_name << " requires all src tiles to have matching dtype, but argument " << i
+        << " has " << src_type->dtype_.ToString() << " (expected " << src0_type->dtype_.ToString() << ")";
+  }
+
+  // tmp workspace tile (last arg)
+  auto tmp_type = As<TileType>(args[n_srcs]->GetType());
+  CHECK(tmp_type) << "The operator " << op_name << " requires argument " << n_srcs
+                  << " (tmp) to be a TileType, but got " << args[n_srcs]->GetType()->TypeName();
+
+  // kwarg: exhausted (bool, default false)
+  [[maybe_unused]] bool exhausted = GetKwarg<bool>(kwargs, "exhausted", false);
+
+  // Output shape matches tmp tile (the merge destination buffer)
+  TileView tile_view;
+  tile_view.valid_shape = tmp_type->shape_;
+  InheritTileViewLayout(tile_view, src0_type);
+  return std::make_shared<TileType>(tmp_type->shape_, src0_type->dtype_, std::nullopt, tile_view);
+}
+
+REGISTER_OP("tile.mrgsort_format2")
+    .set_op_category("TileOp")
+    .set_description(
+        "Merge sort 2-4 sorted lists, format2 (maps to pto.tmrgsort). "
+        "Args: (src0, src1[, src2[, src3]], tmp). "
+        "2-way: 3 args, 3-way: 4 args, 4-way: 5 args.")
+    .add_argument("src0", "First sorted input tile (FP16 or FP32)")
+    .add_argument("src1", "Second sorted input tile")
+    .add_argument("tmp_or_src2", "Third sorted input tile (3/4-way) or tmp workspace (2-way)")
+    .add_argument("tmp_or_src3", "Fourth sorted input tile (4-way) or tmp workspace (3-way)")
+    .add_argument("tmp", "(4-way only) Temporary workspace tile")
+    .set_attr<bool>("exhausted")
+    .set_input_memory(0, MemorySpace::Vec)
+    .set_input_memory(1, MemorySpace::Vec)
+    .set_input_memory(2, MemorySpace::Vec)
+    .set_input_memory(3, MemorySpace::Vec)
+    .set_input_memory(4, MemorySpace::Vec)
+    .set_output_memory(MemorySpace::Vec)
+    .not_inplace_safe()
+    // NOT declared lane-invariant: in the 5-argument (4-way) form where arg 4 is
+    // the workspace, DeduceTileMrgSortType reads its extent, so a full-width one
+    // beside halved inputs is already rejected by the auto-split pass's
+    // type-consistency check. `tmp_or_src2` / `tmp_or_src3` are unclassifiable
+    // for a different reason: which of them is workspace is decided by the
+    // positional argument COUNT, not by a kwarg, so a per-position declaration
+    // cannot express it. They stay undeclared, and the pass treats them as data.
+    .f_deduce_type([](const std::vector<ExprPtr>& args,
+                      const std::vector<std::pair<std::string, std::any>>& kwargs) {
+      return DeduceTileMrgSortType(args, kwargs, "tile.mrgsort_format2");
+    });
+
+// ============================================================================
+// MrgSort1: single-list merge sort (format1) — maps to pto.tmrgsort
+// ============================================================================
+
+TypePtr DeduceTileMrgSort1Type(const std::vector<ExprPtr>& args,
+                               const std::vector<std::pair<std::string, std::any>>& kwargs,
+                               const std::string& op_name) {
+  CHECK(args.size() == 2) << "The operator " << op_name << " requires 2 arguments (src, block_len), but got "
+                          << args.size();
+
+  // arg0: src tile (f16 or f32)
+  auto src_type = As<TileType>(args[0]->GetType());
+  CHECK(src_type) << "The operator " << op_name << " requires argument 0 to be a TileType, but got "
+                  << args[0]->GetType()->TypeName();
+  CHECK(src_type->dtype_ == DataType::FP16 || src_type->dtype_ == DataType::FP32)
+      << "The operator " << op_name << " requires src dtype to be FP16 or FP32, but got "
+      << src_type->dtype_.ToString();
+
+  // arg1: block_len (integer scalar)
+  auto block_len_type = As<ScalarType>(args[1]->GetType());
+  CHECK(block_len_type) << "The operator " << op_name
+                        << " requires argument 1 (block_len) to be a ScalarType, but got "
+                        << args[1]->GetType()->TypeName();
+  CHECK(block_len_type->dtype_.IsInt())
+      << "The operator " << op_name << " requires block_len to be an integer type, but got "
+      << block_len_type->dtype_.ToString();
+
+  // Validate constant block_len: must be a positive multiple of 64
+  if (auto const_val = As<ConstInt>(args[1])) {
+    CHECK(const_val->value_ > 0 && const_val->value_ % 64 == 0)
+        << "The operator " << op_name << " requires block_len to be a positive multiple of 64, but got "
+        << const_val->value_;
+  }
+
+  // Output shape matches src (merge destination has same dimensions as input)
+  TileView tile_view;
+  tile_view.valid_shape = src_type->shape_;
+  InheritTileViewLayout(tile_view, src_type);
+  return std::make_shared<TileType>(src_type->shape_, src_type->dtype_, std::nullopt, tile_view);
+}
+
+REGISTER_OP("tile.mrgsort_format1")
+    .set_op_category("TileOp")
+    .functional_execution_memory_access()
+    .set_description("Single-list merge sort, format1 (maps to pto.tmrgsort format1)")
+    .add_argument("src", "Input tile containing pre-sorted runs (FP16 or FP32)")
+    .add_argument("block_len", "Run length for merge sort (integer scalar, multiple of 64)")
+    .set_input_memory(0, MemorySpace::Vec)
+    .set_output_memory(MemorySpace::Vec)
+    .not_inplace_safe()
+    .f_deduce_type([](const std::vector<ExprPtr>& args,
+                      const std::vector<std::pair<std::string, std::any>>& kwargs) {
+      return DeduceTileMrgSort1Type(args, kwargs, "tile.mrgsort_format1");
+    });
+
+}  // namespace ir
+}  // namespace pypto

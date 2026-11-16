@@ -1,0 +1,404 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
+
+/**
+ * @file unary.cpp
+ * @brief Unary tensor operations (neg, recip, exp, log, sqrt, rsqrt, cast, abs, sin, cos)
+ *
+ * This file implements unary operations for tensors that operate element-wise.
+ */
+
+#include <algorithm>
+#include <any>
+#include <memory>
+#include <optional>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "pypto/core/any_cast.h"
+#include "pypto/core/dtype.h"
+#include "pypto/core/error.h"
+#include "pypto/core/logging.h"
+#include "pypto/ir/cast_saturation.h"
+#include "pypto/ir/kind_traits.h"
+#include "pypto/ir/op_registry.h"
+#include "pypto/ir/span.h"
+#include "pypto/ir/type.h"
+#include "pypto/ir/type_inference.h"
+namespace pypto {
+namespace ir {
+
+namespace {
+
+// Unary ops rewrite each cell in place: they never move data between cells, so the set of
+// cells holding real data is exactly the input's. The result is a fresh allocation, so it
+// takes the input's effective valid region but none of its view/alias metadata — see
+// MakeFreshTensorType. A fully valid input yields a fully valid (view-less) result.
+TypePtr DeduceTensorUnaryResultType(const std::shared_ptr<const TensorType>& tensor_type,
+                                    DataType out_dtype) {
+  return MakeFreshTensorType(tensor_type->shape_, out_dtype, GetValidShape(tensor_type));
+}
+
+}  // namespace
+
+TypePtr DeduceTensorNegType(const std::vector<ExprPtr>& args,
+                            const std::vector<std::pair<std::string, std::any>>& kwargs) {
+  CHECK(args.size() == 1) << "tensor.neg requires exactly 1 argument, but got " << args.size();
+
+  auto tensor_type = AsTensorTypeLike(args[0]->GetType());
+  CHECK(tensor_type)
+      << "tensor.neg requires first argument to be a TensorType or DistributedTensorType, but got "
+      << args[0]->GetType()->TypeName();
+
+  // Negation preserves dtype (valid for both int and float)
+  return DeduceTensorUnaryResultType(tensor_type, tensor_type->dtype_);
+}
+
+TypePtr DeduceTensorAbsType(const std::vector<ExprPtr>& args,
+                            const std::vector<std::pair<std::string, std::any>>& kwargs) {
+  CHECK(args.size() == 1) << "tensor.abs requires exactly 1 argument, but got " << args.size();
+
+  auto tensor_type = AsTensorTypeLike(args[0]->GetType());
+  CHECK(tensor_type)
+      << "tensor.abs requires first argument to be a TensorType or DistributedTensorType, but got "
+      << args[0]->GetType()->TypeName();
+
+  // Absolute value preserves dtype (valid for both int and float)
+  return DeduceTensorUnaryResultType(tensor_type, tensor_type->dtype_);
+}
+
+TypePtr DeduceTensorRecipType(const std::vector<ExprPtr>& args,
+                              const std::vector<std::pair<std::string, std::any>>& kwargs) {
+  CHECK(args.size() == 1) << "tensor.recip requires exactly 1 argument, but got " << args.size();
+
+  auto tensor_type = AsTensorTypeLike(args[0]->GetType());
+  CHECK(tensor_type)
+      << "tensor.recip requires first argument to be a TensorType or DistributedTensorType, but got "
+      << args[0]->GetType()->TypeName();
+
+  CHECK(!GetKwargOr<bool>(kwargs, "high_precision", false) || tensor_type->dtype_ == DataType::FP16 ||
+        tensor_type->dtype_ == DataType::FP32)
+      << "The operator tensor.recip supports high_precision only for FP16 or FP32 because the PTOAS "
+         "high-precision template does not implement other dtypes";
+
+  // Reciprocal (1/x) always produces floating-point output
+  DataType out_dtype = tensor_type->dtype_;
+  if (!out_dtype.IsFloat()) {
+    out_dtype = DataType::FP32;
+  }
+
+  return DeduceTensorUnaryResultType(tensor_type, out_dtype);
+}
+
+TypePtr DeduceTensorExpType(const std::vector<ExprPtr>& args,
+                            const std::vector<std::pair<std::string, std::any>>& kwargs) {
+  CHECK(args.size() == 1) << "tensor.exp requires exactly 1 argument, but got " << args.size();
+
+  auto tensor_type = AsTensorTypeLike(args[0]->GetType());
+  CHECK(tensor_type)
+      << "tensor.exp requires first argument to be a TensorType or DistributedTensorType, but got "
+      << args[0]->GetType()->TypeName();
+
+  // exp should promote to float type if input is integer
+  // Exponential always produces floating-point output (e.g., exp(1) = 2.718...)
+  DataType out_dtype = tensor_type->dtype_;
+  if (!out_dtype.IsFloat()) {
+    // Promote to default float type (FP32)
+    out_dtype = DataType::FP32;
+  }
+
+  return DeduceTensorUnaryResultType(tensor_type, out_dtype);
+}
+
+TypePtr DeduceTensorLogType(const std::vector<ExprPtr>& args,
+                            const std::vector<std::pair<std::string, std::any>>& kwargs) {
+  CHECK(args.size() == 1) << "tensor.log requires exactly 1 argument, but got " << args.size();
+
+  auto tensor_type = AsTensorTypeLike(args[0]->GetType());
+  CHECK(tensor_type)
+      << "tensor.log requires first argument to be a TensorType or DistributedTensorType, but got "
+      << args[0]->GetType()->TypeName();
+
+  CHECK(tensor_type->dtype_ == DataType::FP16 || tensor_type->dtype_ == DataType::FP32)
+      << "tensor.log requires an FP16 or FP32 tensor operand, but got " << tensor_type->dtype_.ToString();
+
+  return DeduceTensorUnaryResultType(tensor_type, tensor_type->dtype_);
+}
+
+TypePtr DeduceTensorSqrtType(const std::vector<ExprPtr>& args,
+                             const std::vector<std::pair<std::string, std::any>>& kwargs) {
+  CHECK(args.size() == 1) << "tensor.sqrt requires exactly 1 argument, but got " << args.size();
+
+  auto tensor_type = AsTensorTypeLike(args[0]->GetType());
+  CHECK(tensor_type)
+      << "tensor.sqrt requires first argument to be a TensorType or DistributedTensorType, but got "
+      << args[0]->GetType()->TypeName();
+
+  // sqrt should promote to float type if input is integer
+  // Square root always produces floating-point output
+  DataType out_dtype = tensor_type->dtype_;
+  if (!out_dtype.IsFloat()) {
+    out_dtype = DataType::FP32;
+  }
+
+  return DeduceTensorUnaryResultType(tensor_type, out_dtype);
+}
+
+TypePtr DeduceTensorRsqrtType(const std::vector<ExprPtr>& args,
+                              const std::vector<std::pair<std::string, std::any>>& kwargs) {
+  CHECK(args.size() == 1) << "tensor.rsqrt requires exactly 1 argument, but got " << args.size();
+
+  auto tensor_type = AsTensorTypeLike(args[0]->GetType());
+  CHECK(tensor_type)
+      << "tensor.rsqrt requires first argument to be a TensorType or DistributedTensorType, but got "
+      << args[0]->GetType()->TypeName();
+
+  // rsqrt always produces floating-point output
+  DataType out_dtype = tensor_type->dtype_;
+  if (!out_dtype.IsFloat()) {
+    out_dtype = DataType::FP32;
+  }
+
+  return DeduceTensorUnaryResultType(tensor_type, out_dtype);
+}
+
+// Shared FP32-only deducer for transcendental ops (tensor.sin, tensor.cos).
+// These ops are intentionally FP32-only to avoid silent precision loss; callers
+// must explicitly cast non-FP32 inputs via tensor.cast.
+TypePtr DeduceTensorFP32OnlyType(const std::string& op_name, const std::vector<ExprPtr>& args,
+                                 const std::vector<std::pair<std::string, std::any>>& kwargs) {
+  CHECK(args.size() == 1) << op_name << " requires exactly 1 argument, but got " << args.size();
+
+  auto tensor_type = AsTensorTypeLike(args[0]->GetType());
+  CHECK(tensor_type) << op_name
+                     << " requires first argument to be a TensorType or DistributedTensorType, but got "
+                     << args[0]->GetType()->TypeName();
+
+  // FP32-only: do NOT auto-promote. Reject non-FP32 inputs with an actionable error.
+  CHECK(tensor_type->dtype_ == DataType::FP32)
+      << op_name << " is FP32-only, but got input with dtype " << tensor_type->dtype_.ToString()
+      << ". Cast the input to FP32 explicitly via pl.cast(x, pl.FP32) before applying " << op_name << ".";
+
+  return DeduceTensorUnaryResultType(tensor_type, tensor_type->dtype_);
+}
+
+TypePtr DeduceTensorCastType(const std::vector<ExprPtr>& args,
+                             const std::vector<std::pair<std::string, std::any>>& kwargs) {
+  CHECK(args.size() == 1) << "tensor.cast requires exactly 1 argument (input), but got " << args.size();
+
+  // ``AsTensorTypeLike`` accepts a ``DistributedTensorType`` (window) slice the
+  // same as a plain tensor (issue #1694): an elementwise op reads its window
+  // input as this rank's local GM and writes fresh local data — so the result
+  // is a plain ``TensorType`` (a cast is not a view into the window).
+  auto tensor_type = AsTensorTypeLike(args[0]->GetType());
+  CHECK(tensor_type) << "tensor.cast requires first argument to be a TensorType or DistributedTensorType, "
+                        "but got "
+                     << args[0]->GetType()->TypeName();
+
+  ValidateCastSaturationModeKwarg(kwargs, "tensor.cast");
+
+  // Read target_type from kwargs
+  bool found_target_type = false;
+  DataType target_dtype;
+  for (const auto& [key, value] : kwargs) {
+    if (key == "target_type") {
+      // Handle both DataType and int for backward compatibility
+      if (value.type() == typeid(DataType)) {
+        target_dtype = AnyCast<DataType>(value, "kwarg key: target_type");
+      } else if (value.type() == typeid(int)) {
+        target_dtype = static_cast<DataType>(AnyCast<int>(value, "kwarg key: target_type"));
+      } else {
+        throw TypeError("target_type must be a DataType or int, but got " + std::string(value.type().name()));
+      }
+      found_target_type = true;
+      break;
+    }
+  }
+  CHECK(found_target_type) << "tensor.cast requires 'target_type' kwarg";
+
+  // Reject same-dtype cast: the hardware pto.tcvt instruction is for
+  // cross-dtype conversion, and a same-dtype invocation can corrupt values
+  // rather than acting as an identity copy. Detecting this at construction
+  // time keeps malformed casts out of every downstream pass and codegen.
+  CHECK(tensor_type->dtype_ != target_dtype)
+      << "tensor.cast: target_type " << target_dtype.ToString()
+      << " equals input dtype; same-dtype cast is not a valid operation. "
+      << "Remove the cast or use a different target_type.";
+
+  // `mode` does not affect type deduction, but ConvertTensorToTileOps forwards this
+  // op's kwargs verbatim to tile.cast, whose codegen reads `mode` unconditionally.
+  // Require it here so a missing kwarg is reported against the op the caller wrote
+  // rather than surfacing later as a tile.cast failure inside the conversion pass.
+  const bool found_mode =
+      std::any_of(kwargs.begin(), kwargs.end(), [](const auto& kv) { return kv.first == "mode"; });
+  CHECK(found_mode) << "tensor.cast requires a 'mode' kwarg (round mode: none(0), rint(1), "
+                       "round(2), floor(3), ceil(4), trunc(5), odd(6)). Pass mode=\"round\" (2) "
+                       "to match the pl.cast / tensor_ops.cast default.";
+
+  const Span& span = args[0]->span_;
+  auto shape = AdjustFp4E2M1x2CastLastDim(tensor_type->shape_, tensor_type->dtype_, target_dtype, span);
+  auto valid_shape =
+      AdjustFp4E2M1x2CastLastDim(GetValidShape(tensor_type), tensor_type->dtype_, target_dtype, span);
+  if (!IsFp4PackedCastGeometryChange(tensor_type->dtype_, target_dtype)) {
+    return MakeFreshTensorType(std::move(shape), target_dtype, std::move(valid_shape));
+  }
+  // Packed FP4E2M1X2 ↔ a wider type: last dim expands/contracts 2:1 and the
+  // result is a fresh dense tensor whose strides are rebuilt from the destination
+  // shape (not scaled from a possibly non-contiguous source pitch).
+  TensorView view;
+  view.valid_shape = std::move(valid_shape);
+  std::vector<ExprPtr> src_stride;
+  if (tensor_type->tensor_view_.has_value()) {
+    src_stride = tensor_type->tensor_view_->stride;
+    view.layout = tensor_type->tensor_view_->layout;
+  }
+  view.stride =
+      AdjustFp4E2M1x2CastStrides(std::move(src_stride), shape, tensor_type->dtype_, target_dtype, span);
+  return std::make_shared<TensorType>(std::move(shape), target_dtype, std::nullopt,
+                                      std::make_optional(std::move(view)));
+}
+
+TypePtr DeduceTensorNotType(const std::vector<ExprPtr>& args,
+                            const std::vector<std::pair<std::string, std::any>>& kwargs) {
+  CHECK(args.size() == 1) << "tensor.not requires exactly 1 argument, but got " << args.size();
+
+  auto tensor_type = AsTensorTypeLike(args[0]->GetType());
+  CHECK(tensor_type)
+      << "tensor.not requires first argument to be a TensorType or DistributedTensorType, but got "
+      << args[0]->GetType()->TypeName();
+
+  // Matches tile.not, which this lowers 1:1 onto: pto.tnot / TNOT is defined for
+  // 16-bit integer element types only. Accepting a wider integer here would only
+  // defer the failure into ConvertTensorToTileOps.
+  CHECK(tensor_type->dtype_ == DataType::INT16 || tensor_type->dtype_ == DataType::UINT16)
+      << "tensor.not requires an int16 or uint16 tensor dtype, but got " << tensor_type->dtype_.ToString()
+      << ". Reinterpret or cast the tensor to a 16-bit integer dtype first.";
+
+  // Bitwise complement rewrites each element in place; dtype is unchanged.
+  return DeduceTensorUnaryResultType(tensor_type, tensor_type->dtype_);
+}
+
+// ============================================================================
+// Registration Function for Tensor Unary Operations
+// ============================================================================
+
+REGISTER_OP("tensor.neg")
+    .set_op_category("TensorOp")
+    .set_description("Element-wise negation operation")
+    .add_argument("input", "Input tensor (TensorType)")
+    .f_deduce_type([](const std::vector<ExprPtr>& args,
+                      const std::vector<std::pair<std::string, std::any>>& kwargs) {
+      return DeduceTensorNegType(args, kwargs);
+    });
+
+REGISTER_OP("tensor.abs")
+    .set_op_category("TensorOp")
+    .set_description("Element-wise absolute value operation")
+    .add_argument("input", "Input tensor (TensorType)")
+    .f_deduce_type([](const std::vector<ExprPtr>& args,
+                      const std::vector<std::pair<std::string, std::any>>& kwargs) {
+      return DeduceTensorAbsType(args, kwargs);
+    });
+
+REGISTER_OP("tensor.not")
+    .set_op_category("TensorOp")
+    .set_description("Element-wise bitwise NOT of an int16/uint16 tensor")
+    .add_argument("input", "Input tensor (TensorType) with int16 or uint16 dtype")
+    .f_deduce_type([](const std::vector<ExprPtr>& args,
+                      const std::vector<std::pair<std::string, std::any>>& kwargs) {
+      return DeduceTensorNotType(args, kwargs);
+    });
+
+REGISTER_OP("tensor.recip")
+    .set_op_category("TensorOp")
+    .set_description("Element-wise reciprocal (1/x) operation")
+    .add_argument("input", "Input tensor (TensorType)")
+    .set_attr<bool>("high_precision")
+    .f_deduce_type([](const std::vector<ExprPtr>& args,
+                      const std::vector<std::pair<std::string, std::any>>& kwargs) {
+      return DeduceTensorRecipType(args, kwargs);
+    });
+
+REGISTER_OP("tensor.exp")
+    .set_op_category("TensorOp")
+    .set_description("Element-wise exponential operation")
+    .add_argument("input", "Input tensor (TensorType)")
+    .f_deduce_type([](const std::vector<ExprPtr>& args,
+                      const std::vector<std::pair<std::string, std::any>>& kwargs) {
+      return DeduceTensorExpType(args, kwargs);
+    });
+
+REGISTER_OP("tensor.log")
+    .set_op_category("TensorOp")
+    .set_description("Element-wise natural logarithm operation")
+    .add_argument("input", "Input tensor (TensorType)")
+    .set_attr<bool>("high_precision")
+    .f_deduce_type([](const std::vector<ExprPtr>& args,
+                      const std::vector<std::pair<std::string, std::any>>& kwargs) {
+      return DeduceTensorLogType(args, kwargs);
+    });
+
+REGISTER_OP("tensor.sin")
+    .set_op_category("TensorOp")
+    .set_description("Element-wise sine operation (radians). FP32-only.")
+    .add_argument("input", "Input tensor (TensorType, FP32)")
+    .f_deduce_type([](const std::vector<ExprPtr>& args,
+                      const std::vector<std::pair<std::string, std::any>>& kwargs) {
+      return DeduceTensorFP32OnlyType("tensor.sin", args, kwargs);
+    });
+
+REGISTER_OP("tensor.cos")
+    .set_op_category("TensorOp")
+    .set_description("Element-wise cosine operation (radians). FP32-only.")
+    .add_argument("input", "Input tensor (TensorType, FP32)")
+    .f_deduce_type([](const std::vector<ExprPtr>& args,
+                      const std::vector<std::pair<std::string, std::any>>& kwargs) {
+      return DeduceTensorFP32OnlyType("tensor.cos", args, kwargs);
+    });
+
+REGISTER_OP("tensor.sqrt")
+    .set_op_category("TensorOp")
+    .set_description("Element-wise square root operation")
+    .add_argument("input", "Input tensor (TensorType)")
+    .f_deduce_type([](const std::vector<ExprPtr>& args,
+                      const std::vector<std::pair<std::string, std::any>>& kwargs) {
+      return DeduceTensorSqrtType(args, kwargs);
+    });
+
+REGISTER_OP("tensor.rsqrt")
+    .set_op_category("TensorOp")
+    .set_description(
+        "Element-wise reciprocal square root operation. "
+        "Passing high_precision=True opts into the higher-precision PTO path that uses a scratch buffer.")
+    .add_argument("input", "Input tensor (TensorType)")
+    .set_attr<bool>("high_precision")
+    .f_deduce_type([](const std::vector<ExprPtr>& args,
+                      const std::vector<std::pair<std::string, std::any>>& kwargs) {
+      return DeduceTensorRsqrtType(args, kwargs);
+    });
+
+REGISTER_OP("tensor.cast")
+    .set_op_category("TensorOp")
+    .set_description("Type casting operation")
+    .add_argument("input", "Input tensor (TensorType)")
+    .set_attr<DataType>("target_type")
+    .set_attr<int>("mode")
+    // Optional destination saturation: OFF(0) / ON(1). Absent means "keep the
+    // backend default" — see include/pypto/ir/cast_saturation.h.
+    .set_attr<int>("saturation_mode")
+    .f_deduce_type([](const std::vector<ExprPtr>& args,
+                      const std::vector<std::pair<std::string, std::any>>& kwargs) {
+      return DeduceTensorCastType(args, kwargs);
+    });
+
+}  // namespace ir
+}  // namespace pypto

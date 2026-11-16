@@ -1,0 +1,501 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+
+"""``matmul_acc`` / ``gemv_acc`` ``init_cond`` — conditional accumulator init.
+
+``init_cond`` makes the accumulator's initial value conditional: where the
+predicate holds, the accumulator is overwritten with ``lhs @ rhs`` rather than
+accumulated into. This is the split-K ``k == 0`` idiom, and it keeps the
+accumulator single-def where a hand-written if/else would put a phi on an
+in-place Acc buffer.
+
+The ISA carries this as one bit of the MAD's Xt register, but ``pto.tmatmul`` and
+``pto.tmatmul.acc`` are distinct ops, so a *runtime* predicate lowers to a branch
+over the two while a literal one selects a single op at compile time.
+
+GEMV is covered in the same file because it is the same mechanism on the same
+unit: ``tile.gemv_acc`` is a matmul whose M is 1, run on the same cube MAD, so it
+carries the same predicate bit and lowers through the same emitter. Its only
+difference is the padded Acc contract — a ``[1, N]`` GEMV result occupies 16
+physical rows — so its accumulator is minted as a ``[16, N]`` tile narrowed to a
+valid ``[1, N]`` rather than created at its logical shape.
+"""
+
+import pypto.language as pl
+import pytest
+from pypto import backend, codegen
+from pypto.backend import BackendType
+from pypto.ir import OptimizationStrategy, PassManager
+from pypto.language.parser.diagnostics import InvalidOperationError
+from pypto.runtime import RunConfig
+
+PTOCodegen = codegen.PTOCodegen
+
+
+@pytest.fixture(autouse=True)
+def _setup_backend():
+    backend.reset_for_testing()
+    backend.set_backend_type(BackendType.Ascend910)
+    yield
+    backend.reset_for_testing()
+
+
+def _generate_default_mlir(program_cls) -> str:
+    pm = PassManager.get_strategy(OptimizationStrategy.Default)
+    program = pm.run_passes(program_cls)
+    result = PTOCodegen().generate(program)
+    return result if isinstance(result, str) else "".join(result.values())
+
+
+@pl.program
+class MatmulAccPlain:
+    """No predicate — the accumulating form, unchanged."""
+
+    @pl.function(type=pl.FunctionType.InCore)
+    def kernel(
+        self,
+        lhs: pl.Tensor[[16, 16], pl.FP32],
+        rhs: pl.Tensor[[16, 16], pl.FP32],
+        output: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+    ) -> pl.Tensor[[16, 16], pl.FP32]:
+        lhs_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(
+            lhs, [0, 0], [16, 16], target_memory=pl.MemorySpace.Mat
+        )
+        rhs_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(
+            rhs, [0, 0], [16, 16], target_memory=pl.MemorySpace.Mat
+        )
+        acc_tile: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Acc] = pl.tile.create(
+            [16, 16], pl.FP32, target_memory=pl.MemorySpace.Acc
+        )
+        out_tile: pl.Tile[[16, 16], pl.FP32] = pl.tile.matmul_acc(acc_tile, lhs_tile, rhs_tile)
+        return pl.store(out_tile, [0, 0], output)
+
+
+@pl.program
+class MatmulAccInitTrue:
+    """Literal ``True`` — folds to the non-accumulating form."""
+
+    @pl.function(type=pl.FunctionType.InCore)
+    def kernel(
+        self,
+        lhs: pl.Tensor[[16, 16], pl.FP32],
+        rhs: pl.Tensor[[16, 16], pl.FP32],
+        output: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+    ) -> pl.Tensor[[16, 16], pl.FP32]:
+        lhs_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(
+            lhs, [0, 0], [16, 16], target_memory=pl.MemorySpace.Mat
+        )
+        rhs_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(
+            rhs, [0, 0], [16, 16], target_memory=pl.MemorySpace.Mat
+        )
+        acc_tile: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Acc] = pl.tile.create(
+            [16, 16], pl.FP32, target_memory=pl.MemorySpace.Acc
+        )
+        out_tile: pl.Tile[[16, 16], pl.FP32] = pl.tile.matmul_acc(
+            acc_tile, lhs_tile, rhs_tile, init_cond=True
+        )
+        return pl.store(out_tile, [0, 0], output)
+
+
+@pl.program
+class MatmulAccInitFalse:
+    """Literal ``False`` — folds to the accumulating form."""
+
+    @pl.function(type=pl.FunctionType.InCore)
+    def kernel(
+        self,
+        lhs: pl.Tensor[[16, 16], pl.FP32],
+        rhs: pl.Tensor[[16, 16], pl.FP32],
+        output: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+    ) -> pl.Tensor[[16, 16], pl.FP32]:
+        lhs_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(
+            lhs, [0, 0], [16, 16], target_memory=pl.MemorySpace.Mat
+        )
+        rhs_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(
+            rhs, [0, 0], [16, 16], target_memory=pl.MemorySpace.Mat
+        )
+        acc_tile: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Acc] = pl.tile.create(
+            [16, 16], pl.FP32, target_memory=pl.MemorySpace.Acc
+        )
+        out_tile: pl.Tile[[16, 16], pl.FP32] = pl.tile.matmul_acc(
+            acc_tile, lhs_tile, rhs_tile, init_cond=False
+        )
+        return pl.store(out_tile, [0, 0], output)
+
+
+@pl.program
+class MatmulAccSplitK:
+    """Runtime predicate — the split-K ``k == 0`` idiom.
+
+    Spelled through the type-dispatched ``pl.matmul_acc`` rather than
+    ``pl.tile.matmul_acc`` so the unified wrapper's Tile path is covered too.
+    """
+
+    @pl.function(type=pl.FunctionType.InCore)
+    def kernel(
+        self,
+        lhs: pl.Tensor[[16, 64], pl.FP32],
+        rhs: pl.Tensor[[64, 16], pl.FP32],
+        output: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+    ) -> pl.Tensor[[16, 16], pl.FP32]:
+        acc_tile: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Acc] = pl.tile.create(
+            [16, 16], pl.FP32, target_memory=pl.MemorySpace.Acc
+        )
+        for k0 in pl.range(0, 64, 16):
+            a: pl.Tile[[16, 16], pl.FP32] = pl.load(lhs, [0, k0], [16, 16], target_memory=pl.MemorySpace.Mat)
+            b: pl.Tile[[16, 16], pl.FP32] = pl.load(rhs, [k0, 0], [16, 16], target_memory=pl.MemorySpace.Mat)
+            acc_tile = pl.matmul_acc(acc_tile, a, b, init_cond=(k0 == 0))
+        return pl.store(acc_tile, [0, 0], output)
+
+
+def test_no_init_cond_emits_only_the_accumulating_form():
+    mlir = _generate_default_mlir(MatmulAccPlain)
+    assert "pto.tmatmul.acc" in mlir, mlir
+    # The accumulating op is the only matmul, and nothing is branched over.
+    assert mlir.count("pto.tmatmul") == 1, mlir
+    assert "scf.if" not in mlir, mlir
+
+
+def test_literal_true_folds_to_the_non_accumulating_form():
+    mlir = _generate_default_mlir(MatmulAccInitTrue)
+    assert "pto.tmatmul.acc" not in mlir, (
+        "init_cond=True must overwrite the accumulator, not accumulate into it:\n" + mlir
+    )
+    assert "pto.tmatmul " in mlir, mlir
+    # A compile-time predicate must not leave a branch behind.
+    assert "scf.if" not in mlir, mlir
+
+
+def test_literal_false_folds_to_the_accumulating_form():
+    mlir = _generate_default_mlir(MatmulAccInitFalse)
+    assert "pto.tmatmul.acc" in mlir, mlir
+    assert mlir.count("pto.tmatmul") == 1, mlir
+    assert "scf.if" not in mlir, mlir
+
+
+def test_runtime_predicate_branches_over_both_forms():
+    mlir = _generate_default_mlir(MatmulAccSplitK)
+    assert "scf.if" in mlir, "a runtime init_cond must lower to a branch:\n" + mlir
+    # Both arms are present: initialize on the guarded path, accumulate otherwise.
+    assert "pto.tmatmul.acc" in mlir, mlir
+    assert mlir.count("pto.tmatmul") == 2, (
+        "expected exactly the initializing and accumulating forms:\n" + mlir
+    )
+    # Both arms write the same in-place accumulator, so no phi is materialized
+    # for the tile — scf.if carries no results.
+    assert "scf.if" in mlir and "= scf.if" not in mlir, (
+        "the accumulator is written in place, so scf.if must not yield a value:\n" + mlir
+    )
+
+
+def test_non_boolean_init_cond_is_rejected():
+    with pytest.raises(InvalidOperationError, match="init_cond to have dtype BOOL"):
+
+        @pl.program
+        class BadInitCond:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                lhs: pl.Tensor[[16, 16], pl.FP32],
+                rhs: pl.Tensor[[16, 16], pl.FP32],
+                acc: pl.Tensor[[16, 16], pl.FP32],
+                output: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                lhs_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(
+                    lhs, [0, 0], [16, 16], target_memory=pl.MemorySpace.Mat
+                )
+                rhs_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(
+                    rhs, [0, 0], [16, 16], target_memory=pl.MemorySpace.Mat
+                )
+                acc_tile: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Acc] = pl.tile.create(
+                    [16, 16], pl.FP32, target_memory=pl.MemorySpace.Acc
+                )
+                # An index, not a predicate — must be rejected rather than
+                # silently reinterpreted as a truth value.
+                out_tile: pl.Tile[[16, 16], pl.FP32] = pl.tile.matmul_acc(
+                    acc_tile, lhs_tile, rhs_tile, init_cond=pl.read(acc, [0, 0])
+                )
+                return pl.store(out_tile, [0, 0], output)
+
+        _ = BadInitCond
+
+
+class TestAutoTiledPredicateFolds:
+    """The K-loop `AutoTileMatmulL0` generates must not pay for its predicate.
+
+    The pass emits `tile.matmul_acc(..., init_cond=(ko == 0))`. Once
+    `LowerPipelineLoops` replicates the loop and the enclosing loop is
+    eliminated, each replica's predicate is a compile-time literal — and the
+    emitter must fold it to a single MAD. It reaches codegen as a `ConstBool`
+    (the arithmetic simplifier's product), *not* the BOOL-typed `ConstInt` a
+    DSL-level `init_cond=True` produces, so an emitter that folded only
+    `ConstInt` would silently emit an `scf.if` on a constant and double the MADs
+    of every folded K block.
+    """
+
+    def test_folded_predicate_emits_one_mad_per_block_and_no_branch(self):
+        @pl.program
+        class AutoTiledMatmul:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                lhs: pl.Tensor[[16, 512], pl.BF16],
+                rhs: pl.Tensor[[512, 64], pl.BF16],
+                output: pl.Out[pl.Tensor[[16, 64], pl.FP32]],
+            ) -> pl.Tensor[[16, 64], pl.FP32]:
+                lhs_mat = pl.tile.load(lhs, [0, 0], [16, 512], target_memory=pl.MemorySpace.Mat)
+                rhs_mat = pl.tile.load(rhs, [0, 0], [512, 64], target_memory=pl.MemorySpace.Mat)
+                out_tile = pl.tile.matmul(lhs_mat, rhs_mat)
+                return pl.store(out_tile, [0, 0], output)
+
+        mlir = _generate_default_mlir(AutoTiledMatmul)
+        assert "scf.if" not in mlir, (
+            "a compile-time-constant init_cond must select one arm outright, not emit a branch\n" + mlir
+        )
+        # One overwrite (the seeding block) and one accumulate — never two of
+        # each, which is what an unfolded predicate would produce.
+        assert mlir.count("pto.tmatmul.acc") == 1, mlir
+        assert mlir.count("pto.tmatmul ") == 1, mlir
+
+
+class TestGroupedOperandsCarryPredicate:
+    """A grouped GEMM keeps its group axis and still gets the predicate.
+
+    A MoE expert slices its weights as ``w[e:e+1, :, :]`` — rank 3, batch 1 —
+    which converts to ``tile.batch_matmul_acc``. That op forwards ``init_cond``
+    to the single 2D ``tile.matmul_acc`` the batch=1 fast path emits, so the
+    predicate's domain is exactly ``matmul_acc``'s own rather than a rank-2
+    subset of it. Without the forwarding, the grouped site is the one shape in a
+    split-K tree that cannot use the idiom the rest of the tree uses.
+    """
+
+    def test_rank3_batch_one_folds_to_one_overwrite_and_one_accumulate(self):
+        @pl.program
+        class GroupedSplitK:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.Tensor[[16, 512], pl.BF16],
+                w: pl.Tensor[[2, 64, 512], pl.BF16],
+                output: pl.Out[pl.Tensor[[1, 16, 64], pl.FP32]],
+            ) -> pl.Tensor[[1, 16, 64], pl.FP32]:
+                acc = pl.tensor.create([1, 16, 64], pl.FP32)
+                for kb in pl.pipeline(0, 2, stage=2):
+                    k0 = kb * 256
+                    x_k = pl.tensor.slice(x, [16, 256], [0, k0])
+                    # Keeps the expert axis: rank 3, batch_count == 1.
+                    w_k = pl.tensor.slice(w, [1, 64, 256], [0, 0, k0])
+                    acc = pl.matmul_acc(acc, x_k, w_k, b_trans=True, init_cond=(kb == 0))
+                return pl.tensor.assemble(output, acc, [0, 0, 0])
+
+        mlir = _generate_default_mlir(GroupedSplitK)
+        # The predicate is a seed test on the unrolled K induction variable, so
+        # it folds: the kb == 0 step overwrites, the rest accumulate. A dropped
+        # predicate would accumulate into an uninitialized accumulator (no
+        # pto.tmatmul at all); an unfolded one would emit a branch.
+        assert "scf.if" not in mlir, "a compile-time-constant init_cond must select one arm outright\n" + mlir
+        assert mlir.count("pto.tmatmul ") == 1, (
+            "the kb == 0 step must overwrite the accumulator exactly once\n" + mlir
+        )
+        assert mlir.count("pto.tmatmul.acc") >= 1, "the remaining K steps must accumulate\n" + mlir
+
+
+# ---------------------------------------------------------------------------
+# GEMV — the same predicate on the same cube MAD, at M = 1.
+# ---------------------------------------------------------------------------
+
+
+@pl.program
+class GemvAccPlain:
+    """No predicate — the accumulating form, unchanged."""
+
+    @pl.function(type=pl.FunctionType.InCore)
+    def kernel(
+        self,
+        lhs: pl.Tensor[[1, 128], pl.FP32],
+        rhs: pl.Tensor[[128, 64], pl.FP32],
+        output: pl.Out[pl.Tensor[[1, 64], pl.FP32]],
+    ) -> pl.Tensor[[1, 64], pl.FP32]:
+        lhs_tile = pl.load(lhs, [0, 0], [1, 128], target_memory=pl.MemorySpace.Mat)
+        rhs_tile = pl.load(rhs, [0, 0], [128, 64], target_memory=pl.MemorySpace.Mat)
+        acc_raw = pl.tile.create([16, 64], pl.FP32, target_memory=pl.MemorySpace.Acc)
+        acc_tile = pl.tile.set_validshape(acc_raw, 1, 64)
+        out_tile = pl.tile.gemv_acc(acc_tile, lhs_tile, rhs_tile)
+        return pl.store(out_tile, [0, 0], output)
+
+
+@pl.program
+class GemvAccInitTrue:
+    """Literal ``True`` — folds to the non-accumulating form."""
+
+    @pl.function(type=pl.FunctionType.InCore)
+    def kernel(
+        self,
+        lhs: pl.Tensor[[1, 128], pl.FP32],
+        rhs: pl.Tensor[[128, 64], pl.FP32],
+        output: pl.Out[pl.Tensor[[1, 64], pl.FP32]],
+    ) -> pl.Tensor[[1, 64], pl.FP32]:
+        lhs_tile = pl.load(lhs, [0, 0], [1, 128], target_memory=pl.MemorySpace.Mat)
+        rhs_tile = pl.load(rhs, [0, 0], [128, 64], target_memory=pl.MemorySpace.Mat)
+        acc_raw = pl.tile.create([16, 64], pl.FP32, target_memory=pl.MemorySpace.Acc)
+        acc_tile = pl.tile.set_validshape(acc_raw, 1, 64)
+        out_tile = pl.tile.gemv_acc(acc_tile, lhs_tile, rhs_tile, init_cond=True)
+        return pl.store(out_tile, [0, 0], output)
+
+
+@pl.program
+class GemvAccInitFalse:
+    """Literal ``False`` — folds to the accumulating form."""
+
+    @pl.function(type=pl.FunctionType.InCore)
+    def kernel(
+        self,
+        lhs: pl.Tensor[[1, 128], pl.FP32],
+        rhs: pl.Tensor[[128, 64], pl.FP32],
+        output: pl.Out[pl.Tensor[[1, 64], pl.FP32]],
+    ) -> pl.Tensor[[1, 64], pl.FP32]:
+        lhs_tile = pl.load(lhs, [0, 0], [1, 128], target_memory=pl.MemorySpace.Mat)
+        rhs_tile = pl.load(rhs, [0, 0], [128, 64], target_memory=pl.MemorySpace.Mat)
+        acc_raw = pl.tile.create([16, 64], pl.FP32, target_memory=pl.MemorySpace.Acc)
+        acc_tile = pl.tile.set_validshape(acc_raw, 1, 64)
+        out_tile = pl.tile.gemv_acc(acc_tile, lhs_tile, rhs_tile, init_cond=False)
+        return pl.store(out_tile, [0, 0], output)
+
+
+@pl.program
+class GemvAccSplitK:
+    """Runtime predicate — the split-K ``k == 0`` idiom, without the peel.
+
+    Before ``init_cond``, this loop had to peel its first step into a separate
+    ``pl.tile.gemv`` behind an ``if``, which is what minted the accumulator and
+    forced it through a phi.
+
+    Spelled through the top-level ``pl.gemv_acc`` rather than ``pl.tile.gemv_acc``
+    so the re-exported name is covered too. ``acc_phase`` is passed alongside to
+    pin that it still composes with the predicate.
+    """
+
+    @pl.function(type=pl.FunctionType.InCore)
+    def kernel(
+        self,
+        lhs: pl.Tensor[[1, 256], pl.FP32],
+        rhs: pl.Tensor[[256, 64], pl.FP32],
+        output: pl.Out[pl.Tensor[[1, 64], pl.FP32]],
+    ) -> pl.Tensor[[1, 64], pl.FP32]:
+        acc_raw = pl.tile.create([16, 64], pl.FP32, target_memory=pl.MemorySpace.Acc)
+        acc_tile = pl.tile.set_validshape(acc_raw, 1, 64)
+        for k0 in pl.range(0, 256, 128):
+            a = pl.load(lhs, [0, k0], [1, 128], target_memory=pl.MemorySpace.Mat)
+            b = pl.load(rhs, [k0, 0], [128, 64], target_memory=pl.MemorySpace.Mat)
+            acc_tile = pl.gemv_acc(acc_tile, a, b, acc_phase=pl.AccPhase.Partial, init_cond=(k0 == 0))
+        return pl.store(acc_tile, [0, 0], output)
+
+
+def test_gemv_no_init_cond_emits_only_the_accumulating_form():
+    mlir = _generate_default_mlir(GemvAccPlain)
+    assert "pto.tgemv.acc" in mlir, mlir
+    assert mlir.count("pto.tgemv") == 1, mlir
+    assert "scf.if" not in mlir, mlir
+
+
+def test_gemv_literal_true_folds_to_the_non_accumulating_form():
+    mlir = _generate_default_mlir(GemvAccInitTrue)
+    assert "pto.tgemv.acc" not in mlir, (
+        "init_cond=True must overwrite the accumulator, not accumulate into it:\n" + mlir
+    )
+    assert "pto.tgemv " in mlir, mlir
+    assert "scf.if" not in mlir, mlir
+
+
+def test_gemv_literal_false_folds_to_the_accumulating_form():
+    mlir = _generate_default_mlir(GemvAccInitFalse)
+    assert "pto.tgemv.acc" in mlir, mlir
+    assert mlir.count("pto.tgemv") == 1, mlir
+    assert "scf.if" not in mlir, mlir
+
+
+def test_gemv_runtime_predicate_branches_over_both_forms():
+    mlir = _generate_default_mlir(GemvAccSplitK)
+    assert "scf.if" in mlir, "a runtime init_cond must lower to a branch:\n" + mlir
+    assert "pto.tgemv.acc" in mlir, mlir
+    assert mlir.count("pto.tgemv") == 2, "expected exactly the initializing and accumulating forms:\n" + mlir
+    # Both arms write the same in-place accumulator, so scf.if carries no result
+    # — the peel this replaces is exactly what needed a phi.
+    assert "= scf.if" not in mlir, (
+        "the accumulator is written in place, so scf.if must not yield a value:\n" + mlir
+    )
+    # acc_phase rides on both arms rather than being dropped by the branch.
+    gemv_lines = [line for line in mlir.splitlines() if "pto.tgemv" in line]
+    assert len(gemv_lines) == 2, mlir
+    assert all("#pto<acc_phase partial>" in line for line in gemv_lines), mlir
+
+
+def test_gemv_non_boolean_init_cond_is_rejected():
+    with pytest.raises(InvalidOperationError, match="init_cond to have dtype BOOL"):
+
+        @pl.program
+        class BadGemvInitCond:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                lhs: pl.Tensor[[1, 128], pl.FP32],
+                rhs: pl.Tensor[[128, 64], pl.FP32],
+                idx: pl.Tensor[[1, 64], pl.FP32],
+                output: pl.Out[pl.Tensor[[1, 64], pl.FP32]],
+            ) -> pl.Tensor[[1, 64], pl.FP32]:
+                lhs_tile = pl.load(lhs, [0, 0], [1, 128], target_memory=pl.MemorySpace.Mat)
+                rhs_tile = pl.load(rhs, [0, 0], [128, 64], target_memory=pl.MemorySpace.Mat)
+                acc_raw = pl.tile.create([16, 64], pl.FP32, target_memory=pl.MemorySpace.Acc)
+                acc_tile = pl.tile.set_validshape(acc_raw, 1, 64)
+                # An index, not a predicate — must be rejected rather than
+                # silently reinterpreted as a truth value.
+                out_tile = pl.tile.gemv_acc(acc_tile, lhs_tile, rhs_tile, init_cond=pl.read(idx, [0, 0]))
+                return pl.store(out_tile, [0, 0], output)
+
+        _ = BadGemvInitCond
+
+
+@pytest.mark.parametrize("runtime_bound", [False, True])
+def test_shared_row_accumulator_compiles_without_acc_to_acc_copy(tmp_path, runtime_bound):
+    @pl.jit
+    def kernel(
+        x: pl.Tensor[[64, 1024], pl.INT8],
+        w: pl.Tensor[[128, 1024], pl.INT8],
+        out: pl.Out[pl.Tensor[[64, 128], pl.INT32]],
+        n_tiles: pl.Scalar[pl.INDEX],
+    ):
+        with pl.at(level=pl.Level.CORE_GROUP):
+            acc = pl.create_tensor([64, 128], dtype=pl.INT32)
+            for k0 in pl.pipeline(0, 1024, 512, stage=2):
+                w_k = w[:, k0 : k0 + 512]
+                for t in pl.range(n_tiles):
+                    t0 = t * 16
+                    x_k = x[t0 : t0 + 16, k0 : k0 + 512]
+                    acc[t0 : t0 + 16, :] = pl.matmul_acc(
+                        acc[t0 : t0 + 16, :], x_k, w_k, b_trans=True, init_cond=(k0 == 0)
+                    )
+            out[:, :] = acc
+        return out
+
+    kernel.compile(
+        n_tiles=pl.RUNTIME if runtime_bound else 4,
+        config=RunConfig(codegen_only=True, save_kernels=True, save_kernels_dir=str(tmp_path)),
+    )
+    files = list(tmp_path.rglob("*.pto"))
+    assert files
+    mlir = "\n".join(file.read_text() for file in files)
+    assert "rows=16, cols=512" in mlir
+    assert "pto.tmatmul.acc" in mlir
+    assert "pto.tmatmul ins" in mlir
+    assert not any("pto.tmov" in line and line.count("loc=acc") == 2 for line in mlir.splitlines())
+    assert sum("pto.tstore " in line for line in mlir.splitlines()) == 4
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

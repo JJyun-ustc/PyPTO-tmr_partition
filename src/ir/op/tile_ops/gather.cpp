@@ -1,0 +1,502 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
+
+/**
+ * @file gather.cpp
+ * @brief Gather tile operations
+ *
+ * This file implements gather operators:
+ * - tile.gather: index-based element gathering (pto.tgather index form)
+ * - tile.gather_mask: mask-pattern element selection (pto.tgather mask form)
+ * - tile.gather_compare: compare-form element gathering, two outputs
+ *   (pto.tgather compare form, returns TupleType{dst, cdst})
+ */
+
+#include <any>
+#include <cstdint>
+#include <memory>
+#include <optional>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "pypto/core/any_cast.h"
+#include "pypto/core/dtype.h"
+#include "pypto/core/logging.h"
+#include "pypto/ir/kind_traits.h"
+#include "pypto/ir/memory_space.h"
+#include "pypto/ir/op_registry.h"
+#include "pypto/ir/scalar_expr.h"
+#include "pypto/ir/span.h"
+#include "pypto/ir/tile_view_semantics.h"
+#include "pypto/ir/type.h"
+#include "pypto/ir/type_inference.h"
+
+namespace pypto {
+namespace ir {
+
+static TypePtr DeduceTileGatherType(const std::vector<ExprPtr>& args,
+                                    const std::vector<std::pair<std::string, std::any>>& kwargs,
+                                    const std::string& op_name) {
+  CHECK(args.size() == 3) << "The operator " << op_name
+                          << " requires 3 arguments (src, indices, tmp), but got " << args.size();
+
+  // First arg: src tile (f16, f32, i16, or i32)
+  auto src_type = As<TileType>(args[0]->GetType());
+  CHECK(src_type) << "The operator " << op_name << " requires first argument to be a TileType, but got "
+                  << args[0]->GetType()->TypeName();
+  CHECK(src_type->dtype_ == DataType::FP16 || src_type->dtype_ == DataType::FP32 ||
+        src_type->dtype_ == DataType::INT16 || src_type->dtype_ == DataType::INT32)
+      << "The operator " << op_name << " requires src dtype to be FP16, FP32, INT16, or INT32, but got "
+      << src_type->dtype_.ToString();
+
+  // Second arg: indices tile. i32 is valid with any src; i16 is valid only with a
+  // 16-bit src (FP16/INT16). The A5 (Ascend950) tgather b16 form pairs a 2-byte
+  // src with 2-byte indices, whereas a 32-bit src uses the b32 form that reads
+  // each index as a u32 — so an INT16 index with a 32-bit src is unsafe on every
+  // target, not merely arch-gated. That universal constraint is checked here in
+  // the backend-agnostic deducer; A2/A3's i32-only rule is still enforced later
+  // by the PTOAS verifier (PTO IR manual, tgather index-form checks — A2/A3 vs
+  // A5).
+  auto idx_type = As<TileType>(args[1]->GetType());
+  CHECK(idx_type) << "The operator " << op_name << " requires second argument to be a TileType, but got "
+                  << args[1]->GetType()->TypeName();
+  const bool idx_is_i16 = idx_type->dtype_ == DataType::INT16;
+  const bool src_is_16bit = src_type->dtype_ == DataType::FP16 || src_type->dtype_ == DataType::INT16;
+  CHECK(idx_type->dtype_ == DataType::INT32 || (idx_is_i16 && src_is_16bit))
+      << "The operator " << op_name
+      << " requires indices dtype INT32 (any src), or INT16 with a 16-bit src "
+         "(FP16/INT16); INT16 indices with a 32-bit src are unsafe (tgather b32 "
+         "reads them as u32). Got indices "
+      << idx_type->dtype_.ToString() << " with src " << src_type->dtype_.ToString();
+
+  // Third arg: tmp workspace tile. A5 (Ascend950) does not read tmp in the
+  // index form and imposes no tmp dtype/shape relation; A2/A3 requires tmp to
+  // match the indices element type and valid shape. Deduction is backend-
+  // agnostic, so only the shared contract (tmp must be a Vec tile operand) is
+  // checked here — the arch-specific same-type/same-valid-shape rule runs in
+  // the PTOAS verifier (PTO IR manual, tgather index-form checks — A2/A3).
+  auto tmp_type = As<TileType>(args[2]->GetType());
+  CHECK(tmp_type) << "The operator " << op_name << " requires third argument to be a TileType, but got "
+                  << args[2]->GetType()->TypeName();
+
+  // Output: shape from indices tile, dtype from src tile, propagate tile_view
+  TileView tile_view;
+  tile_view.valid_shape = idx_type->shape_;
+  InheritTileViewLayout(tile_view, src_type);
+  return std::make_shared<TileType>(idx_type->shape_, src_type->dtype_, std::nullopt, tile_view);
+}
+
+// ============================================================================
+// Registration for Gather Operations
+// ============================================================================
+
+REGISTER_OP("tile.gather")
+    .set_op_category("TileOp")
+    .set_description("Gather elements by index (maps to pto.tgather)")
+    .add_argument("src", "Source tile (FP16, FP32, INT16, or INT32)")
+    .add_argument("indices", "Index tile (INT32 any src, or INT16 with a 16-bit src)")
+    .add_argument("tmp", "Temporary workspace tile (any Vec dtype; A2/A3 constrains at PTOAS)")
+    // A2/A3's 16-bit path writes tmp; other paths may leave it unused.
+    .set_arg_effect(2, ArgEffect::Write)
+    .set_workspace_arg(2)
+    .set_input_memory(0, MemorySpace::Vec)
+    .set_input_memory(1, MemorySpace::Vec)
+    .set_input_memory(2, MemorySpace::Vec)
+    .set_output_memory(MemorySpace::Vec)
+    .not_inplace_safe()
+    // src is a lookup table addressed by absolute index, not positionally: the
+    // halved `indices` already give each lane its own slice of the OUTPUT while
+    // both read the whole table. Declaring the KIND matters -- a partitioned
+    // producer must be rejected, because the indices stay absolute. tmp is plain
+    // workspace, where halving is harmless.
+    .set_lane_invariant_arg(0, LaneInvariantArg::IndexAddressedSource)
+    // tmp IS exempt, because whether an oversized one is out of contract is a
+    // TARGET question this pass cannot answer: A5 does not read tmp in the index
+    // form at all, so a full-width external tmp beside halved indices is legal
+    // there, while A2/A3 requires tmp to match the indices' element type and
+    // valid shape. That A2/A3 rule is already enforced where the target is
+    // known -- the PTOAS verifier -- so rejecting here would only break the
+    // legal A5 form to duplicate a check this pass cannot make accurately.
+    .set_lane_invariant_arg(2)
+    .f_deduce_type([](const std::vector<ExprPtr>& args,
+                      const std::vector<std::pair<std::string, std::any>>& kwargs) {
+      return DeduceTileGatherType(args, kwargs, "tile.gather");
+    });
+
+// ============================================================================
+// GatherB: byte-offset form of gather (pto.tgatherb)
+// ============================================================================
+
+static TypePtr DeduceTileGatherbType(const std::vector<ExprPtr>& args,
+                                     const std::vector<std::pair<std::string, std::any>>& kwargs,
+                                     const std::string& op_name) {
+  CHECK(args.size() == 2) << "The operator " << op_name << " requires 2 arguments (src, offset), but got "
+                          << args.size();
+
+  auto src_type = As<TileType>(args[0]->GetType());
+  CHECK(src_type) << "The operator " << op_name << " requires src to be a TileType, but got "
+                  << args[0]->GetType()->TypeName();
+  auto is_gatherb_dtype = [](const DataType& dtype) {
+    return dtype == DataType::INT8 || dtype == DataType::UINT8 || dtype == DataType::INT16 ||
+           dtype == DataType::UINT16 || dtype == DataType::INT32 || dtype == DataType::UINT32 ||
+           dtype == DataType::FP16 || dtype == DataType::BF16 || dtype == DataType::FP32;
+  };
+  CHECK(is_gatherb_dtype(src_type->dtype_))
+      << "The operator " << op_name
+      << " requires src dtype to be an 8/16/32-bit int/uint or FP16/BF16/FP32, but got "
+      << src_type->dtype_.ToString();
+  DataType output_dtype = src_type->dtype_;
+  for (const auto& [key, value] : kwargs) {
+    if (key != "output_dtype") continue;
+    if (value.type() == typeid(DataType)) {
+      output_dtype = AnyCast<DataType>(value, "kwarg key: output_dtype");
+    } else if (value.type() == typeid(int)) {
+      output_dtype = static_cast<DataType>(AnyCast<int>(value, "kwarg key: output_dtype"));
+    }
+    break;
+  }
+  CHECK(is_gatherb_dtype(output_dtype))
+      << "The operator " << op_name
+      << " requires output_dtype to be an 8/16/32-bit int/uint or FP16/BF16/FP32, but got "
+      << output_dtype.ToString();
+
+  auto offset_type = As<TileType>(args[1]->GetType());
+  CHECK(offset_type) << "The operator " << op_name << " requires offset to be a TileType, but got "
+                     << args[1]->GetType()->TypeName();
+  CHECK(offset_type->dtype_ == DataType::UINT32)
+      << "The operator " << op_name << " requires offset dtype to be UINT32, but got "
+      << offset_type->dtype_.ToString();
+  CHECK(src_type->shape_.size() == 2)
+      << "The operator " << op_name << " requires a 2D src tile, but got rank " << src_type->shape_.size();
+  CHECK(offset_type->shape_.size() == 2)
+      << "The operator " << op_name << " requires a 2D offset tile, but got rank "
+      << offset_type->shape_.size();
+
+  // TGATHERB is a 32-byte block gather. Each UINT32 offset selects the first
+  // byte of one source block, and one offset row expands to a destination row
+  // whose element count is offset_cols * (32 / sizeof(src_dtype)). The offset
+  // row itself must occupy a whole number of 32-byte blocks: eight UINT32
+  // entries. This also supplies all eight offsets consumed by one vgatherb
+  // repeat on A2/A3, including a partial valid-column tail.
+  auto offset_cols = As<ConstInt>(offset_type->shape_[1]);
+  CHECK(offset_cols) << "The operator " << op_name << " requires static offset columns";
+  CHECK(offset_cols->value_ > 0 && offset_cols->value_ % 8 == 0)
+      << "The operator " << op_name
+      << " requires offset columns to be a positive multiple of 8 (32-byte UINT32 row), but got "
+      << offset_cols->value_;
+
+  const auto element_bytes = output_dtype.GetByte();
+  CHECK(element_bytes != 0 && 32 % element_bytes == 0)
+      << "The operator " << op_name
+      << " requires a byte-addressable output dtype that divides 32 bytes, but got "
+      << output_dtype.ToString();
+  const int64_t elements_per_block = static_cast<int64_t>(32 / element_bytes);
+  auto make_scaled_dim = [elements_per_block](const ExprPtr& dim) -> ExprPtr {
+    if (auto constant = As<ConstInt>(dim)) {
+      return std::make_shared<ConstInt>(constant->value_ * elements_per_block, DataType::INDEX,
+                                        constant->span_);
+    }
+    return MakeMul(dim, std::make_shared<ConstInt>(elements_per_block, DataType::INDEX, Span::unknown()));
+  };
+
+  const auto& offset_view = tile_view_semantics::GetEffectiveTileView(*offset_type);
+  std::vector<ExprPtr> output_shape = {
+      offset_type->shape_[0],
+      make_scaled_dim(offset_type->shape_[1]),
+  };
+  std::vector<ExprPtr> output_valid_shape = {
+      offset_view.valid_shape[0],
+      make_scaled_dim(offset_view.valid_shape[1]),
+  };
+
+  TileView tile_view;
+  tile_view.valid_shape = std::move(output_valid_shape);
+  tile_view.blayout = TileLayout::row_major;
+  return std::make_shared<TileType>(std::move(output_shape), output_dtype, std::nullopt, tile_view);
+}
+
+REGISTER_OP("tile.gatherb")
+    .set_op_category("TileOp")
+    .set_description("Gather 32-byte source blocks by UINT32 byte offset (maps to pto.tgatherb)")
+    .add_argument("src", "Source tile (8/16/32-bit int/uint or FP16/BF16/FP32)")
+    .add_argument("offset", "One UINT32 byte offset per 32-byte destination block")
+    .set_attr<DataType>("output_dtype")
+    .set_input_memory(0, MemorySpace::Vec)
+    .set_input_memory(1, MemorySpace::Vec)
+    .set_output_memory(MemorySpace::Vec)
+    .not_inplace_safe()
+    // Byte-offset form of tile.gather: src is the shared table, `offset` carries
+    // the per-lane addressing and the result shape.
+    .set_lane_invariant_arg(0, LaneInvariantArg::IndexAddressedSource)
+    .f_deduce_type([](const std::vector<ExprPtr>& args,
+                      const std::vector<std::pair<std::string, std::any>>& kwargs) {
+      return DeduceTileGatherbType(args, kwargs, "tile.gatherb");
+    });
+
+// ============================================================================
+// Gather Mask: mask-pattern form of pto.tgather
+// ============================================================================
+
+static TypePtr DeduceTileGatherMaskType(const std::vector<ExprPtr>& args,
+                                        const std::vector<std::pair<std::string, std::any>>& kwargs,
+                                        const std::string& op_name) {
+  CHECK(args.size() == 1) << "The operator " << op_name << " requires 1 argument (src), but got "
+                          << args.size();
+
+  auto src_type = As<TileType>(args[0]->GetType());
+  CHECK(src_type) << "The operator " << op_name << " requires first argument to be a TileType, but got "
+                  << args[0]->GetType()->TypeName();
+  CHECK(src_type->dtype_ == DataType::FP16 || src_type->dtype_ == DataType::FP32 ||
+        src_type->dtype_ == DataType::INT16 || src_type->dtype_ == DataType::INT32)
+      << "The operator " << op_name << " requires src dtype to be FP16, FP32, INT16, or INT32, but got "
+      << src_type->dtype_.ToString();
+
+  // Validate mask_pattern kwarg (values 1-7 per PTOAS MaskPattern enum)
+  int pattern = -1;
+  for (const auto& [key, value] : kwargs) {
+    if (key == "mask_pattern") {
+      pattern = std::any_cast<int>(value);
+      break;
+    }
+  }
+  CHECK(pattern >= 1 && pattern <= 7)
+      << "The operator " << op_name << " requires mask_pattern in range [1, 7], but got " << pattern;
+
+  // Output shape: mask selects a subset of columns per row, producing a compacted tile.
+  //   P0101 (1), P1010 (2) — stride 2: each row contributes cols/2 elements
+  //   P0001 (3)..P1000 (6) — stride 4: each row contributes cols/4 elements
+  //   P1111 (7)            — no stride: all cols kept
+  const auto& src_shape = src_type->shape_;
+  INTERNAL_CHECK_SPAN(src_shape.size() == 2, args[0]->span_)
+      << "Internal error: tile.gather_mask requires 2D src shape, got rank " << src_shape.size();
+
+  const ExprPtr& col_expr = src_shape[1];
+  ExprPtr out_col_expr;
+  if (pattern == 7) {
+    out_col_expr = col_expr;  // P1111: all cols
+  } else {
+    int64_t divisor = (pattern <= 2) ? 2 : 4;
+    if (auto const_col = As<ConstInt>(col_expr)) {
+      int64_t out_cols = const_col->value_ / divisor;
+      CHECK(const_col->value_ % divisor == 0)
+          << "The operator " << op_name << " with mask_pattern=" << pattern
+          << " requires src columns divisible by " << divisor << ", got " << const_col->value_;
+      out_col_expr = std::make_shared<ConstInt>(out_cols, DataType::INDEX, Span::unknown());
+    } else {
+      auto div_expr = std::make_shared<ConstInt>(divisor, DataType::INDEX, Span::unknown());
+      out_col_expr = std::make_shared<FloorDiv>(col_expr, div_expr, DataType::INDEX, Span::unknown());
+    }
+  }
+
+  std::vector<ExprPtr> out_shape = {src_shape[0], out_col_expr};
+  TileView tile_view;
+  tile_view.valid_shape = out_shape;
+  InheritTileViewLayout(tile_view, src_type);
+
+  // Read optional output_dtype kwarg for cross-type bit extraction (e.g. FP32→UINT32).
+  // Hardware TGATHER mask form only requires sizeof(dst) == sizeof(src), not same type.
+  bool has_output_dtype = false;
+  DataType out_dtype;
+  for (const auto& [key, value] : kwargs) {
+    if (key == "output_dtype") {
+      if (value.type() == typeid(DataType)) {
+        out_dtype = AnyCast<DataType>(value, "kwarg key: output_dtype");
+      } else if (value.type() == typeid(int)) {
+        out_dtype = static_cast<DataType>(AnyCast<int>(value, "kwarg key: output_dtype"));
+      }
+      has_output_dtype = true;
+      break;
+    }
+  }
+  if (!has_output_dtype) {
+    out_dtype = src_type->dtype_;
+  } else {
+    CHECK(out_dtype.GetBit() == src_type->dtype_.GetBit())
+        << "The operator " << op_name << " output_dtype must have the same bit width as src dtype ("
+        << src_type->dtype_.ToString() << " = " << src_type->dtype_.GetBit() << " bits), but got "
+        << out_dtype.ToString() << " = " << out_dtype.GetBit() << " bits";
+  }
+
+  return std::make_shared<TileType>(out_shape, out_dtype, std::nullopt, tile_view);
+}
+
+REGISTER_OP("tile.gather_mask")
+    .set_op_category("TileOp")
+    .set_description("Gather elements by mask pattern (maps to pto.tgather with maskPattern)")
+    .add_argument("src", "Source tile (FP16, FP32, INT16, or INT32)")
+    .set_attr<int>("mask_pattern")
+    .set_attr<DataType>("output_dtype")  // optional: cross-type output (sizeof equality required)
+    .set_input_memory(0, MemorySpace::Vec)
+    .set_output_memory(MemorySpace::Vec)
+    .not_inplace_safe()
+    .f_deduce_type([](const std::vector<ExprPtr>& args,
+                      const std::vector<std::pair<std::string, std::any>>& kwargs) {
+      return DeduceTileGatherMaskType(args, kwargs, "tile.gather_mask");
+    });
+
+// ============================================================================
+// Gather Compare: compare-form of pto.tgather with two destination outputs.
+// ============================================================================
+//
+// Args (3 inputs):
+//   src    : source tile (FP16/FP32/INT16/INT32)
+//   kvalue : scalar threshold (ScalarType, dtype must match src — applied
+//            to every row of src)
+//   tmp    : workspace tile (UINT8, sized by codegen kernel)
+//
+// Attrs:
+//   cmp_mode    : int in [0, 5] matching {eq, ne, lt, le, gt, ge}
+//   offset      : int starting index offset
+//   out_cols    : int — output column count per row for dst
+//   count_dtype : DataType — INT32 or UINT32 (defaults to INT32 in caller)
+//
+// Output: TupleType{ TileType_dst, TileType_cdst } (2 outputs)
+//   dst  shape  = [rows, out_cols], dtype = INT32 (gathered indices)
+//   cdst shape  = [1, rows], dtype = count_dtype (per-row match count)
+//
+// `cdst` is kept 2D (`[1, rows]`) so that the rows-many counts are
+// physically contiguous (row_major + cols * sizeof(count_dtype) % 32 == 0),
+// which is required by the PTOAS pto.tgather verifier and the PTO TileConfig
+// 32-byte alignment static_assert. The compare-form ISA writes
+// `cdstPtr + i` for i in [0, srcValidRow), and the [1, rows] row_major
+// layout provides exactly that contiguity.
+//
+// The DPS buffers backing dst/cdst are allocated by the downstream
+// init_memref / memory_reuse passes from the deduced TupleType, so this
+// op stays purely 3-input-2-output at the IR/DSL surface.
+//
+// The DSL form `d, c = pl.tile.gather_compare(src, kvalue, tmp, ...)` is
+// unpacked by the parser into `tmp_tuple = call; d = tmp_tuple[0];
+// c = tmp_tuple[1]`, so callers receive a (Tile, Tile) pair.
+
+static TypePtr DeduceTileGatherCompareType(const std::vector<ExprPtr>& args,
+                                           const std::vector<std::pair<std::string, std::any>>& kwargs,
+                                           const std::string& op_name) {
+  CHECK(args.size() == 3) << "The operator " << op_name
+                          << " requires 3 arguments (src, kvalue, tmp), but got " << args.size();
+
+  auto src_type = As<TileType>(args[0]->GetType());
+  CHECK(src_type) << "The operator " << op_name << " requires src to be a TileType, but got "
+                  << args[0]->GetType()->TypeName();
+  CHECK(src_type->dtype_ == DataType::FP16 || src_type->dtype_ == DataType::FP32 ||
+        src_type->dtype_ == DataType::INT16 || src_type->dtype_ == DataType::INT32)
+      << "The operator " << op_name << " requires src dtype in {FP16, FP32, INT16, INT32}, but got "
+      << src_type->dtype_.ToString();
+  CHECK(src_type->shape_.size() == 2)
+      << "The operator " << op_name << " requires 2D src, but got rank " << src_type->shape_.size();
+
+  auto kv_type = As<ScalarType>(args[1]->GetType());
+  CHECK(kv_type) << "The operator " << op_name << " requires kvalue to be a ScalarType, but got "
+                 << args[1]->GetType()->TypeName();
+  CHECK(kv_type->dtype_ == src_type->dtype_)
+      << "The operator " << op_name << " requires kvalue dtype equal to src dtype "
+      << src_type->dtype_.ToString() << " , but got " << kv_type->dtype_.ToString();
+
+  auto tmp_type = As<TileType>(args[2]->GetType());
+  CHECK(tmp_type) << "The operator " << op_name << " requires tmp to be a TileType, but got "
+                  << args[2]->GetType()->TypeName();
+
+  int cmp_mode = -1;
+  bool cmp_mode_seen = false;
+  int out_cols = -1;
+  bool out_cols_seen = false;
+  DataType count_dtype = DataType::INT32;
+  for (const auto& [key, value] : kwargs) {
+    if (key == "cmp_mode") {
+      cmp_mode = AnyCast<int>(value, "kwarg key: cmp_mode");
+      cmp_mode_seen = true;
+    } else if (key == "out_cols") {
+      out_cols = AnyCast<int>(value, "kwarg key: out_cols");
+      out_cols_seen = true;
+    } else if (key == "count_dtype") {
+      if (value.type() == typeid(DataType)) {
+        count_dtype = AnyCast<DataType>(value, "kwarg key: count_dtype");
+      } else {
+        count_dtype = static_cast<DataType>(AnyCast<int>(value, "kwarg key: count_dtype"));
+      }
+    }
+  }
+  CHECK(cmp_mode_seen) << "The operator " << op_name << " requires a 'cmp_mode' keyword argument";
+  CHECK(cmp_mode >= 0 && cmp_mode <= 5)
+      << "The operator " << op_name << " requires cmp_mode in [0, 5] (eq/ne/lt/le/gt/ge), but got "
+      << cmp_mode;
+  CHECK(out_cols_seen) << "The operator " << op_name << " requires an 'out_cols' keyword argument";
+  CHECK(out_cols > 0) << "The operator " << op_name << " requires out_cols > 0, but got " << out_cols;
+  CHECK(count_dtype == DataType::INT32 || count_dtype == DataType::UINT32)
+      << "The operator " << op_name << " requires count_dtype to be INT32 or UINT32, but got "
+      << count_dtype.ToString();
+
+  // Deduce dst/cdst tile types from src.shape[0] (rows) + attrs.
+  const ExprPtr& rows_expr = src_type->shape_[0];
+  auto out_cols_expr = std::make_shared<ConstInt>(out_cols, DataType::INDEX, Span::unknown());
+
+  TileView dst_view;
+  dst_view.valid_shape = {rows_expr, out_cols_expr};
+  InheritTileViewLayout(dst_view, src_type);
+  std::vector<ExprPtr> dst_shape = {rows_expr, out_cols_expr};
+  auto dst_type = std::make_shared<TileType>(dst_shape, DataType::INT32, std::nullopt, dst_view);
+
+  // cdst is shaped as [1, rows] (one count per src-row, laid out as a single
+  // row of `rows` int32s) — required by the PTOAS pto.tgather verifier
+  // (cdst must use row_major blayout) AND the PTO TileConfig 32-byte
+  // alignment static_assert (row_major + cols*sizeof(int) % 32 == 0).
+  // The compare-form ISA writes `cdstPtr + i` for i in [0, srcValidRow),
+  // so the rows-many counts must be physically contiguous, which the
+  // [1, rows] row_major layout provides.
+  auto one_expr = std::make_shared<ConstInt>(1, DataType::INDEX, Span::unknown());
+  TileView cdst_view;
+  cdst_view.valid_shape = {one_expr, rows_expr};
+  cdst_view.blayout = TileLayout::row_major;
+  std::vector<ExprPtr> cdst_shape = {one_expr, rows_expr};
+  auto cdst_type = std::make_shared<TileType>(cdst_shape, count_dtype, std::nullopt, cdst_view);
+
+  std::vector<TypePtr> elements{dst_type, cdst_type};
+  return std::make_shared<TupleType>(std::move(elements));
+}
+
+REGISTER_OP("tile.gather_compare")
+    .set_op_category("TileOp")
+    .set_description(
+        "Compare-form gather: scan src per-row against kvalue, produce gathered indices "
+        "tile (dst) and per-row match count tile (cdst). Maps to pto.tgather compare-form. "
+        "Returns TupleType{dst, cdst}.")
+    .add_argument("src", "Source tile (FP16/FP32/INT16/INT32, 2D)")
+    .add_argument("kvalue", "Scalar threshold (ScalarType; dtype must match src; applied per row)")
+    .add_argument("tmp", "Workspace tile (UINT8)")
+    .set_attr<int>("cmp_mode")
+    .set_attr<int>("offset")
+    .set_attr<int>("out_cols")
+    .set_attr<DataType>("count_dtype")
+    .set_input_memory(0, MemorySpace::Vec)
+    .set_input_memory(2, MemorySpace::Vec)
+    // Two outputs (dst, cdst), carried by the deduced TupleType rather than by
+    // destination arguments — the caller cannot pre-allocate buffers InitMemRef
+    // owns. `tmp` is hardware scratch that ConvertTensorToTileOps synthesizes:
+    // written, but carrying no result anyone reads, so it is declared a
+    // workspace instead of masquerading as a third output.
+    .set_output_arity(2)
+    .set_arg_effect(0, ArgEffect::Read)
+    .set_arg_effect(1, ArgEffect::Read)
+    .set_arg_effect(2, ArgEffect::Write)
+    .set_workspace_arg(2)
+    // Output is a TupleType{TileType_dst, TileType_cdst}. set_output_memory applies
+    // Vec to every TileType element inside the TupleType.
+    .set_output_memory(MemorySpace::Vec)
+    .not_inplace_safe()
+    .set_lane_invariant_arg(2)
+    .f_deduce_type([](const std::vector<ExprPtr>& args,
+                      const std::vector<std::pair<std::string, std::any>>& kwargs) {
+      return DeduceTileGatherCompareType(args, kwargs, "tile.gather_compare");
+    });
+
+}  // namespace ir
+}  // namespace pypto

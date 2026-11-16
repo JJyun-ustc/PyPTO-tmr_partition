@@ -1,0 +1,576 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+
+"""Regression tests for generated-binary runtime compatibility stamps."""
+
+import fcntl
+import json
+import multiprocessing
+import subprocess
+import sys
+from dataclasses import replace
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock
+
+import pypto.runtime._binary_cache as binary_cache
+import pytest
+from pypto.jit._artifact_manifest import BuildKind
+from pypto.runtime._binary_cache import (
+    BinaryCacheContext,
+    binary_context_path,
+    prepare_binary_context,
+    record_binary_context,
+)
+from pypto.runtime._prebuilt import BINARY_MANIFEST, prepare_prebuilt, read_prebuilt
+
+_RUNTIME_OLD = "a" * 40
+_RUNTIME_NEW = "b" * 40
+_PTO_ISA = "c" * 40
+
+
+def _context(**changes) -> BinaryCacheContext:
+    context = BinaryCacheContext(
+        platform="a2a3sim",
+        runtime_name="tensormap_and_ringbuffer",
+        runtime_revision=_RUNTIME_OLD,
+        pto_isa_revision=_PTO_ISA,
+    )
+    return replace(context, **changes)
+
+
+def _touch(path: Path, content: bytes = b"binary") -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(content)
+    return path
+
+
+def _init_git_repo(path: Path) -> str:
+    path.mkdir(parents=True)
+    subprocess.run(["git", "init", "--quiet"], cwd=path, check=True)
+    (path / "tracked.hpp").write_text("// committed\n", encoding="utf-8")
+    subprocess.run(["git", "add", "tracked.hpp"], cwd=path, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=PyPTO Tests",
+            "-c",
+            "user.email=pypto-tests@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "initial",
+        ],
+        cwd=path,
+        check=True,
+    )
+    return subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=path,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+def test_runtime_revision_change_invalidates_both_orchestration_caches(tmp_path: Path) -> None:
+    """A runtime-header revision change invalidates prebuild and sibling binaries."""
+    old_context = _context()
+    record_binary_context(tmp_path, old_context)
+    orch_prebuild = _touch(tmp_path / "cache" / "orch_main.bin")
+    orch_sidecar = _touch(tmp_path / "orchestration" / "main.so")
+    kernel_sidecar = _touch(tmp_path / "kernels" / "aiv" / "kernel.so")
+    kernel_object = _touch(tmp_path / "kernels" / "aic" / "kernel.o")
+    orch_source = _touch(tmp_path / "orchestration" / "main.cpp", b"// source\n")
+    kernel_source = _touch(tmp_path / "kernels" / "aiv" / "kernel.cpp", b"// source\n")
+
+    removed = prepare_binary_context(
+        tmp_path,
+        replace(old_context, runtime_revision=_RUNTIME_NEW),
+    )
+
+    assert removed == 4
+    assert not orch_prebuild.exists()
+    assert not orch_sidecar.exists()
+    assert not kernel_sidecar.exists()
+    assert not kernel_object.exists()
+    assert orch_source.exists()
+    assert kernel_source.exists()
+    assert not binary_context_path(tmp_path).exists()
+
+
+def test_matching_context_preserves_binaries_but_discards_stamp(tmp_path: Path) -> None:
+    """Keep verified binaries while withholding the stamp until assembly succeeds."""
+    context = _context()
+    orch_prebuild = _touch(tmp_path / "cache" / "orch_main.bin")
+    orch_sidecar = _touch(tmp_path / "orchestration" / "main.so")
+
+    record_binary_context(tmp_path, context)
+
+    assert prepare_binary_context(tmp_path, context) == 0
+    assert orch_prebuild.exists()
+    assert orch_sidecar.exists()
+    assert not binary_context_path(tmp_path).exists()
+
+
+def test_legacy_unstamped_cache_is_invalidated_once(tmp_path: Path) -> None:
+    orch_prebuild = _touch(tmp_path / "cache" / "orch_main.bin")
+    orch_sidecar = _touch(tmp_path / "orchestration" / "main.so")
+
+    assert prepare_binary_context(tmp_path, _context()) == 2
+    assert not orch_prebuild.exists()
+    assert not orch_sidecar.exists()
+
+
+@pytest.mark.parametrize(
+    "changed_context",
+    [
+        _context(platform="a2a3"),
+        _context(runtime_name="host_build_graph"),
+        _context(pto_isa_revision="d" * 40),
+    ],
+)
+def test_any_abi_context_change_invalidates_cache(
+    tmp_path: Path,
+    changed_context: BinaryCacheContext,
+) -> None:
+    record_binary_context(tmp_path, _context())
+    binary = _touch(tmp_path / "cache" / "orch_main.bin")
+
+    assert prepare_binary_context(tmp_path, changed_context) == 1
+    assert not binary.exists()
+
+
+def test_malformed_stamp_never_authorizes_binary_reuse(tmp_path: Path) -> None:
+    stamp = binary_context_path(tmp_path)
+    stamp.parent.mkdir(parents=True)
+    stamp.write_text("{not json", encoding="utf-8")
+    binary = _touch(tmp_path / "cache" / "orch_main.bin")
+
+    assert prepare_binary_context(tmp_path, _context()) == 1
+    assert not binary.exists()
+    assert not stamp.exists()
+
+
+def test_unknown_current_identity_never_authorizes_binary_reuse(tmp_path: Path) -> None:
+    record_binary_context(tmp_path, _context())
+    binary = _touch(tmp_path / "cache" / "orch_main.bin")
+
+    assert prepare_binary_context(tmp_path, None) == 1
+    assert not binary.exists()
+    assert not binary_context_path(tmp_path).exists()
+    record_binary_context(tmp_path, None)
+    assert not binary_context_path(tmp_path).exists()
+
+
+def test_invalidation_discards_stamp_before_removing_artifacts(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    context = _context()
+    stamp = binary_context_path(tmp_path)
+    record_binary_context(tmp_path, context)
+
+    def fail_artifact_removal(_work_dir: Path | str) -> int:
+        assert not stamp.exists()
+        raise RuntimeError("artifact removal failed")
+
+    monkeypatch.setattr(binary_cache, "_invalidate_binary_artifacts", fail_artifact_removal)
+
+    with pytest.raises(RuntimeError, match="artifact removal failed"):
+        binary_cache.invalidate_binary_context(tmp_path)
+
+    assert not stamp.exists()
+
+
+def test_record_binary_context_writes_schema_and_cleans_temp_file(tmp_path: Path) -> None:
+    """Publish the context and artifact hashes without leaving temporary stamp files."""
+    context = _context()
+
+    record_binary_context(tmp_path, context)
+
+    stamp = binary_context_path(tmp_path)
+    assert json.loads(stamp.read_text(encoding="utf-8")) == {"context": context.to_dict(), "files": {}}
+    assert not list(stamp.parent.glob(f"{stamp.name}.*.tmp"))
+
+
+def test_dirty_runtime_checkout_disables_binary_reuse(device_runner, monkeypatch, tmp_path: Path) -> None:
+    runtime_root = tmp_path / "runtime"
+    pto_isa_root = tmp_path / "pto-isa"
+    _init_git_repo(runtime_root)
+    _init_git_repo(pto_isa_root)
+    (runtime_root / "tracked.hpp").write_text("// locally modified\n", encoding="utf-8")
+    monkeypatch.setitem(
+        sys.modules,
+        "_task_interface",
+        SimpleNamespace(__build_commit__=_RUNTIME_OLD),
+    )
+
+    context = device_runner._current_binary_context(
+        SimpleNamespace(project_root=runtime_root),
+        platform="a2a3sim",
+        runtime_name="tensormap_and_ringbuffer",
+        pto_isa_root=str(pto_isa_root),
+    )
+
+    assert context is None
+
+
+def test_dirty_pto_isa_checkout_disables_binary_reuse(device_runner, monkeypatch, tmp_path: Path) -> None:
+    pto_isa_root = tmp_path / "pto-isa"
+    _init_git_repo(pto_isa_root)
+    (pto_isa_root / "tracked.hpp").write_text("// locally modified\n", encoding="utf-8")
+    monkeypatch.setattr(device_runner, "_runtime_revision", Mock(return_value=_RUNTIME_OLD))
+
+    context = device_runner._current_binary_context(
+        object(),
+        platform="a2a3sim",
+        runtime_name="tensormap_and_ringbuffer",
+        pto_isa_root=str(pto_isa_root),
+    )
+
+    assert context is None
+
+
+def test_non_git_pto_isa_root_does_not_use_pin_as_actual_identity(
+    device_runner,
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """A non-git root has no verifiable revision, so binary reuse must be off.
+
+    The identity has to come from the checkout's own HEAD. Substituting the pin
+    (what the tree is *supposed* to be) would let stale binaries survive.
+    """
+    pto_isa_root = tmp_path / "pto-isa"
+    pto_isa_root.mkdir()
+    monkeypatch.setattr(device_runner, "_runtime_revision", Mock(return_value=_RUNTIME_OLD))
+
+    context = device_runner._current_binary_context(
+        object(),
+        platform="a2a3sim",
+        runtime_name="tensormap_and_ringbuffer",
+        pto_isa_root=str(pto_isa_root),
+    )
+
+    assert context is None
+
+
+def test_installed_runtime_uses_embedded_revision_with_clean_pto_isa(
+    device_runner,
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    runtime_assets = tmp_path / "wheel-assets"
+    runtime_assets.mkdir()
+    pto_isa_root = tmp_path / "pto-isa"
+    pto_isa_revision = _init_git_repo(pto_isa_root)
+    monkeypatch.setitem(
+        sys.modules,
+        "_task_interface",
+        SimpleNamespace(__build_commit__=_RUNTIME_OLD),
+    )
+
+    context = device_runner._current_binary_context(
+        SimpleNamespace(project_root=runtime_assets),
+        platform="a2a3sim",
+        runtime_name="tensormap_and_ringbuffer",
+        pto_isa_root=str(pto_isa_root),
+    )
+
+    assert context == _context(pto_isa_revision=pto_isa_revision)
+
+
+def _write_minimal_artifact(work_dir: Path) -> None:
+    source = work_dir / "orchestration" / "main.cpp"
+    source.parent.mkdir(parents=True)
+    source.write_text("// orchestration\n", encoding="utf-8")
+    (work_dir / "kernel_config.py").write_text(
+        "KERNELS = []\n"
+        f"ORCHESTRATION = {{'source': {str(source)!r}, 'function_name': 'entry'}}\n"
+        "RUNTIME_CONFIG = {'runtime': 'tensormap_and_ringbuffer'}\n",
+        encoding="utf-8",
+    )
+
+
+def _stub_assembly(device_runner, monkeypatch, tmp_path: Path, chip_build: Mock) -> BinaryCacheContext:
+    _write_minimal_artifact(tmp_path)
+    context = _context()
+    monkeypatch.setattr(device_runner, "ensure_pto_isa_root", Mock(return_value="/pto-isa"))
+    monkeypatch.setattr(device_runner, "KernelCompiler", Mock(return_value=object()))
+    monkeypatch.setattr(device_runner, "_current_binary_context", Mock(return_value=context))
+    monkeypatch.setattr(
+        device_runner,
+        "_compile_single_orchestration",
+        Mock(return_value=b"orchestration binary"),
+    )
+    monkeypatch.setattr(device_runner, "ChipCallable", SimpleNamespace(build=chip_build))
+    monkeypatch.setattr(device_runner, "register_callable_identity", Mock())
+    return context
+
+
+def test_compile_and_assemble_records_context_after_success(
+    device_runner,
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    chip = object()
+    context = _stub_assembly(device_runner, monkeypatch, tmp_path, Mock(return_value=chip))
+    record = Mock()
+    monkeypatch.setattr(device_runner, "record_binary_context", record)
+
+    assembled, _, _ = device_runner._compile_and_assemble(tmp_path, "a2a3sim")
+
+    assert assembled is chip
+    record.assert_called_once_with(tmp_path, context)
+
+
+def test_compile_and_assemble_does_not_stamp_failed_assembly(
+    device_runner,
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    _stub_assembly(device_runner, monkeypatch, tmp_path, Mock(side_effect=RuntimeError("assemble failed")))
+    record = Mock()
+    monkeypatch.setattr(device_runner, "record_binary_context", record)
+
+    with pytest.raises(RuntimeError, match="assemble failed"):
+        device_runner._compile_and_assemble(tmp_path, "a2a3sim")
+
+    record.assert_not_called()
+
+
+def test_failed_matching_cache_is_invalidated_before_retry(
+    device_runner,
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """Discard binaries after an interrupted transaction before attempting assembly again."""
+    context = _context()
+    cached_binary = _touch(tmp_path / "cache" / "orch_main.bin", b"cached orchestration")
+    record_binary_context(tmp_path, context)
+    chip = object()
+    build = Mock(side_effect=[RuntimeError("assemble failed"), chip])
+    _stub_assembly(device_runner, monkeypatch, tmp_path, build)
+    compile_orchestration = device_runner._compile_single_orchestration
+
+    with pytest.raises(RuntimeError, match="assemble failed"):
+        device_runner._compile_and_assemble(tmp_path, "a2a3sim")
+
+    assert cached_binary.exists()
+    assert not binary_context_path(tmp_path).exists()
+    compile_orchestration.assert_not_called()
+
+    assembled, _, _ = device_runner._compile_and_assemble(tmp_path, "a2a3sim")
+
+    assert assembled is chip
+    assert not cached_binary.exists()
+    compile_orchestration.assert_called_once()
+    assert (
+        json.loads(binary_context_path(tmp_path).read_text(encoding="utf-8"))["context"] == context.to_dict()
+    )
+
+
+def test_compile_and_assemble_serializes_same_work_dir(
+    device_runner,
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    _write_minimal_artifact(tmp_path)
+    process_context = multiprocessing.get_context("fork")
+    entered = process_context.Event()
+    release = process_context.Event()
+
+    def assemble_locked(_work_dir, _platform):
+        entered.set()
+        if not release.wait(timeout=5):
+            raise TimeoutError("assembly was not released")
+        return object(), "runtime", {}
+
+    monkeypatch.setattr(device_runner, "_compile_and_assemble_locked", assemble_locked)
+    process = process_context.Process(
+        target=device_runner._compile_and_assemble,
+        args=(tmp_path, "a2a3sim"),
+    )
+    process.start()
+    try:
+        assert entered.wait(timeout=5)
+        lock_path = tmp_path / "cache" / ".binary_context.lock"
+        with lock_path.open("a+b") as lock_file:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+        release.set()
+        process.join(timeout=5)
+        assert process.exitcode == 0
+
+        with lock_path.open("a+b") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+    finally:
+        release.set()
+        if process.is_alive():
+            process.terminate()
+        process.join(timeout=5)
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_prebuilt_records_final_bytes_only_after_complete_assembly(
+    device_runner, monkeypatch, tmp_path, fail
+):
+    chip_build = Mock(side_effect=RuntimeError("assembly failed")) if fail else Mock(return_value=object())
+    _stub_assembly(device_runner, monkeypatch, tmp_path, chip_build)
+    with (tmp_path / "kernel_config.py").open("a") as stream:
+        stream.write("KERNELS = [dict(func_id=3, name='final', source='kernel.cpp')]\n")
+    monkeypatch.setattr(device_runner, "_kernel_cache_file", Mock(return_value=tmp_path / "cache.bin"))
+    monkeypatch.setattr(device_runner, "_compile_single_kernel", Mock(return_value=(3, b"stripped kernel")))
+    monkeypatch.setattr(device_runner, "CoreCallable", SimpleNamespace(build=Mock(return_value=object())))
+    if fail:
+        with pytest.raises(RuntimeError, match="assembly failed"):
+            device_runner._compile_and_assemble(tmp_path, "a2a3sim", save_prebuilt=True)
+        assert not (tmp_path / BINARY_MANIFEST).exists()
+    else:
+        device_runner._compile_and_assemble(tmp_path, "a2a3sim", save_prebuilt=True)
+        record = read_prebuilt(tmp_path, "a2a3sim", BuildKind.SINGLE_CHIP)["."]
+        assert record["kernels"][0]["binary"] == b"stripped kernel"
+        assert record["orchestration"]["binary"] == b"orchestration binary"
+
+
+@pytest.mark.parametrize("cache_form", ["final", "sidecar"])
+def test_ready_promotion_ignores_inherited_mutable_binaries(device_runner, monkeypatch, tmp_path, cache_form):
+    _real_orchestration_compiler = device_runner._compile_single_orchestration
+    context = _stub_assembly(device_runner, monkeypatch, tmp_path, Mock(return_value=object()))
+    # Use sources outside the conventional kernels/ directory as well: the
+    # manifest, not an output-directory naming convention, defines each source.
+    source = _touch(tmp_path / "generated/updated.cpp", b"// new kernel")
+    with (tmp_path / "kernel_config.py").open("a") as stream:
+        stream.write(
+            f"KERNELS = [dict(func_id=3, name='updated', core_type='aiv', source={str(source)!r})]\n"
+        )
+    kernel_cache = tmp_path / "cache/kernel.bin"
+    if cache_form == "final":
+        _touch(kernel_cache, b"old kernel")
+        _touch(tmp_path / "cache/orch_main.bin", b"old orchestration")
+    else:
+        _touch(source.with_suffix(".so"), b"old kernel")
+        _touch(tmp_path / "orchestration/main.so", b"old orchestration")
+    record_binary_context(tmp_path, context)
+    compiler = SimpleNamespace(
+        compile_incore=Mock(return_value=b"new kernel"),
+        compile_orchestration=Mock(return_value=b"new orchestration"),
+    )
+    monkeypatch.setattr(device_runner, "KernelCompiler", Mock(return_value=compiler))
+    monkeypatch.setattr(device_runner, "_kernel_cache_file", Mock(return_value=kernel_cache))
+    monkeypatch.setattr(device_runner, "CoreCallable", SimpleNamespace(build=Mock(return_value=object())))
+    # _stub_assembly stubs this helper; restore it to exercise source-sidecar reuse.
+    monkeypatch.setattr(device_runner, "_compile_single_orchestration", _real_orchestration_compiler)
+    device_runner._compile_and_assemble(tmp_path, "a2a3sim", save_prebuilt=True)
+    record = read_prebuilt(tmp_path, "a2a3sim", BuildKind.SINGLE_CHIP)["."]
+    assert record["kernels"][0]["binary"] == b"new kernel"
+    assert record["orchestration"]["binary"] == b"new orchestration"
+    compiler.compile_incore.assert_called_once()
+    compiler.compile_orchestration.assert_called_once()
+
+
+@pytest.mark.parametrize("platform", ["a2a3sim", "a2a3"])
+def test_ready_compiler_retains_only_one_copy_of_final_binaries(
+    device_runner, monkeypatch, tmp_path, platform
+):
+    compile_orchestration = device_runner._compile_single_orchestration
+    _stub_assembly(device_runner, monkeypatch, tmp_path, Mock(return_value=object()))
+    source = _touch(tmp_path / "kernels/kernel.cpp", b"// kernel")
+    with (tmp_path / "kernel_config.py").open("a") as stream:
+        stream.write(f"KERNELS = [dict(func_id=3, name='k', core_type='aiv', source={str(source)!r})]\n")
+    kernel = b"k" * 100_000
+    orchestration = b"o" * 300_000
+    compiler = SimpleNamespace(
+        compile_incore=Mock(return_value=kernel if platform.endswith("sim") else kernel * 3),
+        compile_orchestration=Mock(return_value=orchestration),
+    )
+    monkeypatch.setattr(device_runner, "KernelCompiler", Mock(return_value=compiler))
+    monkeypatch.setattr(device_runner, "extract_text_section", Mock(return_value=kernel))
+    monkeypatch.setattr(device_runner, "_kernel_cache_file", Mock(return_value=tmp_path / "cache/kernel.bin"))
+    monkeypatch.setattr(device_runner, "CoreCallable", SimpleNamespace(build=Mock(return_value=object())))
+    monkeypatch.setattr(device_runner, "_compile_single_orchestration", compile_orchestration)
+    prepare_prebuilt(tmp_path, platform, BuildKind.SINGLE_CHIP)
+    records = read_prebuilt(tmp_path, platform, BuildKind.SINGLE_CHIP)["."]
+    assert records["kernels"][0]["binary"] == kernel
+    assert records["orchestration"]["binary"] == orchestration
+    files = {str(p.relative_to(tmp_path)): p.stat().st_size for p in tmp_path.rglob("*") if p.is_file()}
+    assert set(files) == {
+        "kernel_config.py",
+        "kernels/kernel.cpp",
+        "orchestration/main.cpp",
+        BINARY_MANIFEST,
+        "prebuilt/kernel_0.bin",
+        "prebuilt/orchestration.bin",
+    }
+    assert sum(files.values()) < 402_000
+    assert not (tmp_path / "cache").exists()
+
+
+@pytest.mark.parametrize("damage", ["missing", "corrupt", "unrecorded"])
+def test_partial_binary_cache_preserves_verified_files(tmp_path: Path, damage: str) -> None:
+    """Invalidate only unusable artifacts while retaining independently verified binaries."""
+    context = _context()
+    good = _touch(tmp_path / "cache" / "kernel.bin", b"verified kernel")
+    damaged = _touch(tmp_path / "orchestration" / "main.so", b"original orchestration")
+    record_binary_context(tmp_path, context)
+    if damage == "missing":
+        damaged.unlink()
+    elif damage == "corrupt":
+        damaged.write_bytes(b"corrupt orchestration")
+    else:
+        damaged = _touch(tmp_path / "cache" / "unrecorded.bin")
+
+    assert prepare_binary_context(tmp_path, context) == (0 if damage == "missing" else 1)
+    assert good.read_bytes() == b"verified kernel"
+    assert not damaged.exists()
+    assert not binary_context_path(tmp_path).exists()
+
+
+@pytest.mark.parametrize("damage", ["none", "missing", "corrupt"])
+def test_assembly_rebuilds_only_unusable_binaries(device_runner, monkeypatch, tmp_path, damage):
+    """Reuse valid kernel bytes and rebuild orchestration only when its cache is unusable."""
+    context = _stub_assembly(device_runner, monkeypatch, tmp_path, Mock(return_value=object()))
+    source = _touch(tmp_path / "kernels/kernel.cpp", b"// kernel")
+    with (tmp_path / "kernel_config.py").open("a") as stream:
+        stream.write(f"KERNELS = [dict(func_id=3, core_type='aiv', source={str(source)!r})]\n")
+    kernel_cache = _touch(tmp_path / "cache/kernel.bin", b"verified kernel")
+    orchestration = _touch(tmp_path / "cache/orch_main.bin", b"verified orchestration")
+    record_binary_context(tmp_path, context)
+    if damage == "missing":
+        orchestration.unlink()
+    elif damage == "corrupt":
+        orchestration.write_bytes(b"corrupt")
+    compile_kernel = Mock(side_effect=AssertionError("verified kernel must not be recompiled"))
+    monkeypatch.setattr(device_runner, "_kernel_cache_file", Mock(return_value=kernel_cache))
+    monkeypatch.setattr(device_runner, "_compile_single_kernel", compile_kernel)
+    monkeypatch.setattr(device_runner, "CoreCallable", SimpleNamespace(build=Mock(return_value=object())))
+
+    device_runner._compile_and_assemble(tmp_path, "a2a3sim")
+
+    compile_kernel.assert_not_called()
+    assert device_runner._compile_single_orchestration.call_count == (0 if damage == "none" else 1)
+    assert kernel_cache.read_bytes() == b"verified kernel"
+    assert binary_context_path(tmp_path).exists()
+
+
+def test_old_stamp_requires_rebuild(tmp_path: Path) -> None:
+    """Reject schema-one stamps that do not authenticate individual binary files."""
+    binary = _touch(tmp_path / "cache" / "kernel.bin")
+    stamp = binary_context_path(tmp_path)
+    stamp.write_text(json.dumps(_context(schema=1).to_dict()))
+    assert prepare_binary_context(tmp_path, _context()) == 1
+    assert not binary.exists()
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

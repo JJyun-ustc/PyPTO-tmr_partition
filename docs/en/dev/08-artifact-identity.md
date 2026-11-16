@@ -1,0 +1,188 @@
+# Artifact Identity Foundations
+
+The internal `pypto._identity` module provides content hashing and deterministic
+record encoding for the persistent JIT cache proposed in [RFC #2653](https://github.com/hw-native-sys/pypto/issues/2653).
+The opt-in [JIT integration](10-jit-cache.md) supplies automatic inventories for
+supported Linux toolchains. Unsupported dependency discovery remains unavailable.
+The default build policy combines source hashes with published build/version
+identifiers as described in [JIT caching](10-jit-cache.md#toolchain-support-and-cost).
+Those identifiers are version claims, not proofs of installed contents. The
+inventory completeness rules below describe `PYPTO_CACHE_IDENTITY=content`;
+build-policy evidence uses distinct `reported_version` tags.
+
+## Typed records
+
+`encode_record()` uses a versioned, type-tagged encoding. `digest_record()`
+returns its full SHA-256 digest. Supported values are `None`, booleans, integers,
+floats, strings, bytes, lists, tuples, and dictionaries with string keys.
+Dictionary insertion order does not affect the result; sequence order does.
+
+```python
+from pypto._identity import digest_record
+
+assert digest_record(True) != digest_record(1)
+assert digest_record(1) != digest_record(1.0)
+assert digest_record(0.0) != digest_record(-0.0)
+assert digest_record({"rows": 32, "cols": 64}) == digest_record({"cols": 64, "rows": 32})
+```
+
+Floats retain their IEEE-754 bits, including signed zero and NaN payloads.
+String values and dictionary keys preserve Python code points, distinguishing
+non-BMP characters from explicit surrogate pairs before JSON serialization.
+Unsupported objects, non-string dictionary keys, and cycles raise errors;
+there is no `str()`/`repr()` fallback. Adapters must explicitly normalize enum,
+path, and configuration values, preserving their semantic types. Bump the
+identity schema when changing this encoding.
+
+## File and directory inputs
+
+`ContentRoot` captures an absolute path when constructed, preserving `..` so
+the filesystem resolves preceding symlinks correctly. `fingerprint_content()`
+hashes the bytes of each supplied file and recursively enumerates directory
+inputs in sorted order. Root order and boundaries are retained. Paths remain
+part of identity until the compiler supplies stable source-location and include
+path mapping; identical content at different paths may therefore miss.
+
+Directory inventories exclude `.git`, `__pycache__`, `.pyc`, and `.pyo` metadata.
+All other resources contribute. `fingerprint_extra_sources()` filters directory
+inputs to Python sources; directly supplied files contribute regardless of
+extension. Empty additional-source lists are valid, but an empty required
+installation inventory is unavailable.
+
+Symlinks contribute resolved paths and target content. Broken links, directory
+cycles, non-regular files, unreadable inputs, and detected read-time changes
+produce an unavailable digest with a reason. Errors are not silently treated as
+empty files or omitted dependencies. File metadata helps detect races but never
+substitutes for content in an identity. This is not an atomic filesystem
+snapshot: the JIT adapter revalidates mutable source inputs before
+publication, and installation inputs must remain immutable within a process.
+
+Additional application sources are reread for each request. An application's
+extra fingerprint supplements those inputs; it cannot replace missing files
+or toolchain evidence.
+
+## Installation inventories and missing evidence
+
+`ToolchainInputs` has five required components: PyPTO, runtime, PTO-ISA, ptoas,
+and the device/orchestration toolchain. A `ComponentInputs` inventory starts
+unavailable, even when some file paths are known. A dependency-aware adapter
+must establish completeness before clearing `unavailable_reason`.
+
+The adapter must account for actual imported code, native libraries, compiler
+resources, dynamic dependencies, headers, SDK/sysroot inputs, and link inputs.
+It must share resolution with the compilation path, including ptoas launchers
+and effective compiler selection. A file hash establishes that file's identity;
+it does not prove that the file is the complete dependency set.
+
+`InstallationIdentityCache.capture()` reports every unavailable component. Its
+result has `usable=False` and `digest=None` if any component is incomplete or
+unreadable. There is no shared `UNKNOWN` key. An extra application fingerprint
+cannot turn this result into a usable toolchain identity.
+
+### Externally verified revisions
+
+`ComponentInputs.verified_revision` is the one exception to reading contents. An
+adapter may set it only when some other mechanism has already proven, in the
+same resolution, that the component's bytes *are* that revision. A version an
+installation reports about itself is not such a proof, and neither is a path
+that contains a version number.
+
+PTO-ISA is the only component that currently qualifies. `ensure_pto_isa_root()`
+returns a checkout only after proving it is clean and at the pinned commit, and
+re-clones it from the pin otherwise; git objects are content-addressed, so a
+clean tree at `HEAD == pin` is byte-for-byte the pinned tree. Hashing that tree
+again re-proves what the resolution established.
+
+That resolution decides cleanliness with `git status --porcelain`, which omits
+paths the checkout ignores, so a build writing generated files into the ISA tree
+would not disturb it. The adapter therefore re-asks with `--ignored`, which
+covers the tracked state again at the same time: anything at all that git does
+not account for — ignored, untracked or modified — sends the component back to
+its contents. That check costs about 18ms against the 0.71s the content read
+costs.
+
+An adapter that cannot read the revision, or cannot get a usable answer about
+the tree, falls back the same way, and `unavailable_reason` still outranks a
+revision, so an incomplete component stays unavailable.
+
+A verified revision is recorded together with its component name, so one
+component's revision can never produce the same digest as another's, nor as any
+content digest.
+
+### Self-reported versions
+
+`ComponentInputs.reported_version` is deliberately weaker and is named for what
+it is: a version the installation states about *itself*, with nothing verifying
+it. It separates installations that say they differ; it cannot see bytes that
+changed while the version stayed put, so a rebuild or a patch applied in place
+is invisible to it.
+
+ptoas uses it. Nothing proves that installation's bytes: it is an external tree
+selected by `PTOAS_ROOT`, its releases carry no manifest the installer checks,
+and the sha256 in `toolchain/versions.env` names the downloaded wheel rather
+than anything reachable from the unpacked tree. The identity therefore rests on
+a deployment property — that ptoas arrives as an unmodified published build —
+not on evidence PyPTO can check.
+
+The complete `--version` text is the identity, not the number parsed from it.
+The accepted-version check keeps only the numeric part, so a dev build's suffix
+— the one marker separating it from the release it was built from — would
+otherwise be discarded, and the two would share an identity.
+
+`reported_version` and `verified_revision` are recorded under different tags, so
+the same string under each yields different digests: a self-reported claim can
+never impersonate a proof. A failed probe falls back to the content inventory,
+and `unavailable_reason` still outranks both.
+
+A component may carry a version *and* contents. The device toolchain does: its
+compiler runs on the host, so its inputs come from the CANN installation, which
+states its own build, and from files the host OS provides, which state nothing.
+Each part is covered by the evidence it actually has. Declared roots are always
+read, so a version never stands in for files the component lists — if that
+inventory cannot be read, the component is unavailable however good the version
+is.
+
+CANN is identified by `innerversion` from `ascend_toolkit_install.info`, in
+preference to `version`: two builds of one release share the release number and
+differ only in the build. An installation reaches its own info file by more than
+one path — `arm64-linux` is a symlink to `aarch64-linux` — so candidates are
+counted by the file they name, not by path. Anything unexpected (no info file,
+two distinct ones, an empty value, an unrecognised install layout) reads every
+input as before.
+
+Successful component reads are memoized by their complete resolved inventory,
+with synchronization for concurrent threads. Changed selection must produce a
+new inventory. Failed reads are retried rather than cached indefinitely.
+Replacing code, libraries, or tools at the same installation paths requires a
+process restart. Application source refresh never uses this memoization.
+
+## Environment classification
+
+`python/pypto/_environment.json` records environment inputs and their rationale:
+
+| Category | Required treatment at integration |
+| -------- | --------------------------------- |
+| `semantic` | Resolve effective precedence and include the value in compilation inputs. |
+| `tool_resolution` | Identify the selected tools and dependency contents, not just the search-path strings. |
+| `fresh_request` | Honor requested compilation/check/output behavior before cache lookup. |
+| `nonsemantic` | Exclude only with the recorded justification, such as terminal formatting or logging. |
+
+The registry is an audit inventory, not a blanket hash of the environment or
+an implementation of those policies. Existing diagnostic bypass behavior is
+described in [JIT functions](language/03-functions.md#compile-options-and-diagnostic-requests).
+
+`tests/lint/check_environment_inputs.py` runs in pre-commit without loading the
+native extension. It checks Python reads and C++ `getenv`/`secure_getenv` calls
+under `python/pypto`, `python/bindings`, `src`, and `include`. Recognized Python
+forms include imports, aliases, module string constants, mapping reads, and
+bulk reads. Aliases are scoped to their lexical context; ambiguous module
+constant assignments, including control-flow writes, remain dynamic.
+The hook uses Python 3.10. Dynamic reads need an exact file/function exception and a reason;
+that exception cannot hide a new literal variable. Unused exceptions fail.
+
+This static check does not certify dependencies inside downstream tools or
+arbitrary reflective Python code. The registry also records non-`PYPTO_*`
+inputs such as `PATH`, compiler include/library search variables, loader
+injection, and locale; the toolchain adapters must account for these before
+claiming complete identity. Unsupported dependency discovery must remain
+unavailable during persistent lookup.

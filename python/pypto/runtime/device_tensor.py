@@ -1,0 +1,351 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+
+"""User-facing handle to worker-resident device memory.
+
+A :class:`DeviceTensor` exposes an opaque ``(data_ptr, shape, dtype)`` triple
+bound to a specific :class:`~pypto.runtime.Worker`'s address space. Tensors
+allocated by a Worker also retain simpler's owning ``Buffer`` handle; the
+address-free distributed wire ABI derives its ``Tensor`` descriptor from that
+handle instead of transporting the process-local pointer. Pass it to
+:class:`~pypto.ir.compiled_program.CompiledProgram` in place of a
+``torch.Tensor`` to skip the host→device copy on entry and the device→host
+copy on exit. Public L2 and distributed dispatch both derive an address-free
+wire ``Tensor`` from the retained owner ``Buffer``. The direct ``ChipTensor``
+adapter remains available only as a low-level compatibility helper.
+
+Lifetime is **caller-managed**: every :meth:`~pypto.runtime.Worker.malloc`
+(or :meth:`~pypto.runtime.Worker.alloc_tensor`) must be paired with a
+matching :meth:`~pypto.runtime.Worker.free` (or
+:meth:`~pypto.runtime.Worker.free_tensor`) before the Worker is closed.
+
+Because no D2H copy happens for a ``DeviceTensor``, callers that want to
+read the data back must do so explicitly via
+:meth:`~pypto.runtime.Worker.copy_from`.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, field
+from types import EllipsisType
+from typing import Any
+
+import torch
+
+
+@dataclass(frozen=True)
+class DeviceTensor:
+    """Handle to a buffer already resident on a Worker.
+
+    Attributes:
+        data_ptr: Device pointer of the first element this handle addresses.
+            For a borrowed view this is ``buffer.base + byte_offset``, not the
+            allocation base.
+        shape: Logical tensor shape (all dimensions positive).
+        dtype: Element ``torch.dtype``.
+        byte_offset: Distance in bytes from the owning allocation's base to
+            ``data_ptr``. Zero for a whole allocation, nonzero for a view
+            created by :meth:`Worker.view_tensor`; must be aligned to ``dtype``.
+        buffer: Optional simpler ``Buffer`` retained for address-free wire
+            dispatch. It is populated by :meth:`Worker.alloc_tensor` and
+            inherited by :meth:`Worker.view_tensor`; a manually constructed
+            raw-pointer tensor can be used only with low-level direct-chip
+            compatibility helpers. All public ``Worker.run`` paths require
+            :meth:`Worker.alloc_tensor` and its retained owner ``Buffer``.
+    """
+
+    data_ptr: int
+    shape: tuple[int, ...]
+    dtype: torch.dtype
+    buffer: Any | None = field(default=None, repr=False, compare=False, hash=False)
+    byte_offset: int = 0
+
+    def __init__(
+        self,
+        data_ptr: int,
+        shape: Sequence[int],
+        dtype: torch.dtype,
+        *,
+        buffer: Any | None = None,
+        byte_offset: int = 0,
+    ) -> None:
+        # bool is an int subclass — an exact-type check excludes it so True/False
+        # can't pose as a pointer or dim.
+        if type(data_ptr) is not int or data_ptr <= 0:
+            raise ValueError(f"DeviceTensor.data_ptr must be a positive int, got {data_ptr!r}")
+        raw_shape = tuple(shape)
+        for d in raw_shape:
+            if type(d) is not int:
+                raise TypeError(f"DeviceTensor.shape must contain ints, got {raw_shape!r}")
+        if not raw_shape:
+            raise ValueError("DeviceTensor.shape must be non-empty")
+        if any(d <= 0 for d in raw_shape):
+            raise ValueError(f"DeviceTensor.shape must be all positive, got {raw_shape}")
+        shape_t = raw_shape
+        if type(dtype) is not torch.dtype:
+            raise TypeError(f"DeviceTensor.dtype must be torch.dtype, got {type(dtype).__name__}")
+        if type(byte_offset) is not int or byte_offset < 0:
+            raise ValueError(f"DeviceTensor.byte_offset must be a nonnegative int, got {byte_offset!r}")
+        element_size = torch.empty((), dtype=dtype).element_size()
+        if byte_offset % element_size:
+            raise ValueError("DeviceTensor.byte_offset must be aligned to its dtype")
+        if buffer is not None:
+            try:
+                buffer_base = int(buffer.base)
+            except (AttributeError, TypeError, ValueError) as e:
+                raise TypeError("DeviceTensor.buffer must be a simpler Buffer with an integer base") from e
+            if buffer_base + byte_offset != data_ptr:
+                raise ValueError(
+                    f"DeviceTensor.buffer.base (0x{buffer_base:x}) plus byte_offset "
+                    f"does not match data_ptr (0x{data_ptr:x})"
+                )
+            if not callable(getattr(buffer, "tensor", None)):
+                raise TypeError("DeviceTensor.buffer must provide buffer.tensor(shapes, dtype)")
+            if hasattr(buffer, "nbytes"):
+                count = 1
+                for dim in shape_t:
+                    count *= dim
+                if byte_offset + count * element_size > buffer.nbytes:
+                    raise ValueError("DeviceTensor view exceeds its owning buffer")
+        object.__setattr__(self, "data_ptr", data_ptr)
+        object.__setattr__(self, "shape", shape_t)
+        object.__setattr__(self, "dtype", dtype)
+        object.__setattr__(self, "buffer", buffer)
+        object.__setattr__(self, "byte_offset", byte_offset)
+
+    @property
+    def nbytes(self) -> int:
+        """Total bytes referenced by this handle."""
+        elem = torch.tensor([], dtype=self.dtype).element_size()
+        n = 1
+        for d in self.shape:
+            n *= d
+        return n * elem
+
+    def __repr__(self) -> str:
+        return f"DeviceTensor(data_ptr=0x{self.data_ptr:x}, shape={self.shape}, dtype={self.dtype})"
+
+
+@dataclass(frozen=True)
+class StackedDeviceTensor:
+    """A leading-dim-stacked ``[B, *tail]`` tensor whose ``B`` shards are each
+    resident on a (possibly different) worker.
+
+    Pass it to a distributed program in place of a host ``torch.Tensor`` for a
+    parameter that the orchestrator slices along its leading dimension and
+    dispatches per rank (``for r in range(world_size): child(x[r], device=...)``).
+    Indexing ``obj[i, ...]`` returns shard ``i``'s :class:`DeviceTensor`, so the
+    generated ``host_orch`` derives a wire Tensor from its retained Buffer and
+    skips the per-dispatch H2D upload — the shards are uploaded once (e.g. via
+    :meth:`~pypto.runtime.distributed_runner.DistributedWorker.alloc_stacked_tensor`)
+    and reused across dispatches.
+
+    Correctness contract: ``worker_ids[i]`` is the worker that holds shard ``i``
+    and MUST equal the worker the compiled program submits ``x[i]``'s task to
+    (its ``device=`` expression). The canonical ``device=r`` program uses the
+    identity ``worker_ids == range(B)``; a permuted or subset placement (e.g.
+    ``device=perm[r]`` / ``device=2*r``) requires the matching ``worker_ids``.
+
+    Attributes:
+        shards: One :class:`DeviceTensor` per leading-dim index; ``shards[i]`` is
+            resident on worker ``worker_ids[i]`` with shape ``full_shape[1:]``.
+        full_shape: The logical stacked shape ``(B, *tail)``.
+        shape: Alias for ``full_shape``, matching the :class:`DeviceTensor`
+            interface.
+        worker_ids: ``worker_ids[i]`` is the worker holding ``shards[i]``.
+    """
+
+    shards: tuple[DeviceTensor, ...]
+    full_shape: tuple[int, ...]
+    worker_ids: tuple[int, ...]
+
+    def __init__(
+        self,
+        shards: Sequence[DeviceTensor],
+        full_shape: Sequence[int],
+        worker_ids: Sequence[int],
+    ) -> None:
+        shards_t = tuple(shards)
+        full_t = tuple(full_shape)
+        workers_t = tuple(worker_ids)
+        if len(full_t) < 2:
+            raise ValueError(f"StackedDeviceTensor.full_shape must have rank >= 2, got {full_t}")
+        b = full_t[0]
+        if b < 1:
+            raise ValueError(
+                f"StackedDeviceTensor needs at least one shard in the leading dim, got full_shape {full_t}"
+            )
+        tail = full_t[1:]
+        if len(shards_t) != b:
+            raise ValueError(
+                f"StackedDeviceTensor expects {b} shards (leading dim of {full_t}); got {len(shards_t)}"
+            )
+        if len(workers_t) != b:
+            raise ValueError(
+                f"StackedDeviceTensor expects {b} worker_ids (one per shard); got {len(workers_t)}"
+            )
+        if len(set(workers_t)) != len(workers_t):
+            raise ValueError(f"StackedDeviceTensor.worker_ids must be distinct, got {workers_t}")
+        for i, shard in enumerate(shards_t):
+            if type(shard) is not DeviceTensor:
+                raise TypeError(f"shard {i} must be a DeviceTensor, got {type(shard).__name__}")
+            if shard.shape != tail:
+                raise ValueError(
+                    f"shard {i} has shape {shard.shape}; expected per-shard shape {tail} "
+                    f"(leading dim dropped from {full_t})"
+                )
+            if shard.dtype != shards_t[0].dtype:
+                raise ValueError(
+                    f"shard {i} dtype {shard.dtype} differs from shard 0 dtype {shards_t[0].dtype}"
+                )
+        object.__setattr__(self, "shards", shards_t)
+        object.__setattr__(self, "full_shape", full_t)
+        object.__setattr__(self, "worker_ids", workers_t)
+
+    @property
+    def dtype(self) -> torch.dtype:
+        """Element ``torch.dtype`` shared by all shards."""
+        return self.shards[0].dtype
+
+    @property
+    def shape(self) -> tuple[int, ...]:
+        """Logical stacked shape, matching the ``DeviceTensor`` interface."""
+        return self.full_shape
+
+    def __getitem__(self, idx: int | slice | tuple[int | slice | EllipsisType, ...]) -> DeviceTensor:
+        """Return shard ``i`` for a leading-index ``i`` or ``(i, <full slices>)``.
+
+        The generated ``host_orch`` emits either ``x[r]`` or ``x[r, 0:N, 0:M]``,
+        and callers may use the ``x[r, ...]`` (Ellipsis) whole-shard form; all
+        resolve to shard ``r``. Any non-whole-shard trailing slice is rejected
+        loudly — a stacked tensor only supports whole-shard slicing on the
+        leading dimension.
+        """
+        if isinstance(idx, tuple):
+            if not idx:
+                raise IndexError("StackedDeviceTensor requires a leading-dim index")
+            rank, rest = idx[0], idx[1:]
+        else:
+            rank, rest = idx, ()
+        if type(rank) is not int:
+            raise TypeError(f"StackedDeviceTensor leading index must be int, got {type(rank).__name__}")
+        if not 0 <= rank < len(self.shards):
+            raise IndexError(f"shard index {rank} out of range [0, {len(self.shards)})")
+        tail = self.full_shape[1:]
+        # Expand a single Ellipsis into full slices so each trailing index maps
+        # to a concrete shard axis; ``x[i, ...]`` is the documented whole-shard
+        # form and must behave like ``x[i]``.
+        if any(s is Ellipsis for s in rest):
+            if sum(s is Ellipsis for s in rest) > 1:
+                raise IndexError("StackedDeviceTensor index accepts at most one Ellipsis")
+            e = rest.index(Ellipsis)
+            n_fill = len(tail) - (len(rest) - 1)
+            if n_fill < 0:
+                raise IndexError(f"too many indices for StackedDeviceTensor of shape {self.full_shape}")
+            rest = rest[:e] + tuple(slice(None) for _ in range(n_fill)) + rest[e + 1 :]
+        if len(rest) > len(tail):
+            raise IndexError(f"too many indices for StackedDeviceTensor of shape {self.full_shape}")
+        for axis, s in enumerate(rest):
+            full = slice(0, tail[axis])
+            if s != full and s != slice(None):
+                raise ValueError(
+                    f"StackedDeviceTensor only supports whole-shard slicing on the leading "
+                    f"dim; got partial slice {s} on axis {axis + 1} (shard shape {tail})"
+                )
+        return self.shards[rank]
+
+    def __repr__(self) -> str:
+        return (
+            f"StackedDeviceTensor(full_shape={self.full_shape}, "
+            f"worker_ids={self.worker_ids}, dtype={self.dtype})"
+        )
+
+
+def default_init_prep(init: torch.Tensor) -> torch.Tensor:
+    """Default host-buffer prep for an upload: a defensive contiguous CPU copy."""
+    return init.contiguous().cpu()
+
+
+def alloc_device_tensor(
+    *,
+    malloc: Callable[[int], int],
+    copy_to: Callable[[int, int, int], None],
+    free: Callable[[int], None],
+    buffer_for_ptr: Callable[[int], Any | None] | None = None,
+    shape: Sequence[int],
+    dtype: torch.dtype,
+    init: torch.Tensor | None = None,
+    init_prep: Callable[[torch.Tensor], torch.Tensor] | None = None,
+) -> DeviceTensor:
+    """Allocate a device buffer and (optionally) upload host data.
+
+    Shared by :meth:`pypto.runtime.ChipWorker.alloc_tensor` (L2) and
+    :meth:`pypto.runtime.distributed_runner.DistributedWorker.alloc_tensor`
+    (L3). The ``malloc`` / ``copy_to`` / ``free`` callables are injected with
+    any ``worker_id`` already bound, so this helper stays free of worker scope.
+
+    When *init* is provided its dtype and shape must match exactly. The host
+    buffer actually uploaded is ``init_prep(init)``: the default makes a
+    defensive contiguous CPU copy. L3 accepts an ordinary CPU-contiguous tensor
+    and stages it through a runtime-owned shared Buffer. If any step after
+    ``malloc`` raises, the allocation is rolled back via ``free`` before the
+    exception propagates so callers never observe a leaked pointer.
+
+    Args:
+        malloc: ``malloc(nbytes) -> device_ptr``.
+        copy_to: ``copy_to(dst_dev_ptr, src_host_ptr, nbytes) -> None`` (H2D).
+        free: ``free(device_ptr) -> None`` (rollback on failure).
+        buffer_for_ptr: Resolve the pointer to its owning simpler ``Buffer``.
+            Real runtime Workers provide this so the resulting tensor can be
+            packed into address-free wire ``TaskArgs``. A custom Worker that
+            omits it can still expose raw-pointer memory operations, but its
+            resulting ``DeviceTensor`` cannot be dispatched.
+        shape: Logical tensor shape (all dimensions positive).
+        dtype: Element ``torch.dtype``.
+        init: Optional host tensor to upload into the buffer.
+        init_prep: Maps ``init`` to the host tensor actually uploaded. Defaults
+            to a defensive ``init.contiguous().cpu()`` copy.
+
+    Returns:
+        A :class:`DeviceTensor` referencing the allocated buffer.
+    """
+    # Validate the shape up front (before malloc) and without coercion, mirroring
+    # DeviceTensor's constructor contract: bool is an int subclass, so reject it
+    # explicitly; only positive int dimensions are allowed. This avoids allocating
+    # for a wrong logical shape (e.g. an empty shape would make n_elems == 1) and
+    # gives the same error the resulting DeviceTensor would raise — just earlier.
+    shape_t = tuple(shape)
+    if not shape_t:
+        raise ValueError("shape must be non-empty")
+    for d in shape_t:
+        if type(d) is not int:
+            raise TypeError(f"shape must contain ints, got {shape_t!r}")
+    if any(d <= 0 for d in shape_t):
+        raise ValueError(f"shape must contain only positive dimensions, got {shape_t}")
+    n_elems = 1
+    for d in shape_t:
+        n_elems *= d
+    elem = torch.tensor([], dtype=dtype).element_size()
+    nbytes = n_elems * elem
+    ptr = malloc(nbytes)
+    try:
+        if init is not None:
+            if init.dtype != dtype or tuple(init.shape) != shape_t:
+                raise ValueError(
+                    f"init must have shape={shape_t} dtype={dtype}, "
+                    f"got shape={tuple(init.shape)} dtype={init.dtype}"
+                )
+            host = (init_prep or default_init_prep)(init)
+            copy_to(ptr, host.data_ptr(), nbytes)
+        buffer = buffer_for_ptr(ptr) if buffer_for_ptr is not None else None
+        return DeviceTensor(ptr, shape_t, dtype, buffer=buffer)
+    except Exception:
+        free(ptr)
+        raise

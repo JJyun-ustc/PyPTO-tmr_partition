@@ -1,0 +1,2883 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+
+"""a2a3-specific regression tests for ExpandMixedKernel cross-core handling.
+
+GM-pipe-buffer injection is exercised separately in
+``test_inject_gm_pipe_buffer.py``; this file pins down ExpandMixedKernel's
+own a2a3 boundary behaviour without running InjectGMPipeBuffer.
+"""
+
+import pypto
+import pypto.language as pl
+import pypto.language.distributed as pld
+import pytest
+from pypto import backend, ir, passes
+from pypto.backend import BackendType
+
+
+@pytest.fixture(autouse=True)
+def _setup_backend():
+    """Configure Ascend910 backend before each test and reset afterward."""
+    backend.reset_for_testing()
+    backend.set_backend_type(BackendType.Ascend910)
+    yield
+    backend.reset_for_testing()
+
+
+def _run_pipeline(program: ir.Program) -> ir.Program:
+    """Run SSA -> infer-memory -> expand-mixed-kernel.
+
+    InjectGMPipeBuffer is intentionally excluded so this file's Expecteds
+    pin only what ExpandMixedKernel produces.
+    """
+    return passes.expand_mixed_kernel()(passes.infer_tile_memory_space()(passes.convert_to_ssa()(program)))
+
+
+def _run_pipeline_from_tensor(program: ir.Program) -> ir.Program:
+    """Run SSA -> tensor-to-tile -> infer-memory -> expand-mixed-kernel.
+
+    Mirrors _run_pipeline but inserts convert_tensor_to_tile_ops between SSA
+    and InferTileMemorySpace, for cases that start from tensor-level IR.
+    """
+    return passes.expand_mixed_kernel()(
+        passes.infer_tile_memory_space()(
+            passes.convert_tensor_to_tile_ops()(passes.convert_to_ssa()(program))
+        )
+    )
+
+
+def _op_name(stmt: ir.Stmt) -> str:
+    """Return the op name of an AssignStmt/EvalStmt Call, or '' for anything else."""
+    call = None
+    if isinstance(stmt, ir.AssignStmt) and isinstance(stmt.value, ir.Call):
+        call = stmt.value
+    elif isinstance(stmt, ir.EvalStmt) and isinstance(stmt.expr, ir.Call):
+        call = stmt.expr
+    if call is not None and isinstance(call.op, ir.Op):
+        return call.op.name
+    return ""
+
+
+def _swap_aic_aiv_members(program: ir.Program) -> ir.Program:
+    """Reverse a literal-typed fixture's core members while retaining its bodies and ABI."""
+    functions = []
+    for func in program.functions.values():
+        if func.func_type not in (ir.FunctionType.AIC, ir.FunctionType.AIV):
+            functions.append(func)
+            continue
+        swapped_type = ir.FunctionType.AIV if func.func_type == ir.FunctionType.AIC else ir.FunctionType.AIC
+        functions.append(
+            ir.Function(
+                func.name,
+                list(zip(func.params, func.param_directions, strict=True)),
+                func.return_types,
+                func.body,
+                func.span,
+                type=swapped_type,
+                attrs=func.attrs,
+                requires_runtime_binding=func.requires_runtime_binding,
+                ir_stage=func.ir_stage,
+            )
+        )
+    return ir.Program(functions, program.name, program.span)
+
+
+def test_automatic_mx_scale_v2c_requires_a5_backend():
+    """A2A3 rejects the A5-only MX byte-preserving V2C transport."""
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def main_incore_0(self, src: pl.Tensor[[16, 64], pl.FP32]):
+            _quant, scale = pl.quant_mx(pl.load(src, [0, 0], [16, 64]), group_axis=1)
+            _scale_mat = pl.move(
+                scale,
+                target_memory=pl.Mem.Mat,
+                blayout=pl.TileLayout.row_major,
+                slayout=pl.TileLayout.row_major,
+            )
+
+    with pytest.raises(ValueError, match="requires an A5 backend"):
+        _run_pipeline(Before)
+
+
+def test_direct_incore_defer_wait_requires_task_level_waiter_contract():
+    """A direct InCore helper must not bypass task-level waiter validation."""
+
+    @pl.program
+    class Program:
+        @pl.function(type=pl.FunctionType.InCore)
+        def direct_wait(self, signal: pld.DistributedTensor[[1, 1], pl.INT32]):
+            pld.system.defer_wait(
+                signal,
+                offsets=[0, 0],
+                expected=1,
+                cmp=pld.WaitCmp.Ge,
+            )
+
+    with pytest.raises(ValueError, match="bypasses the deferred-waiter task contract"):
+        _run_pipeline(Program)
+
+
+def test_aiv_defer_wait_requires_task_level_waiter_contract():
+    """A specialized AIV kernel cannot bypass the InCore scope validator."""
+
+    @pl.program
+    class Program:
+        @pl.function(type=pl.FunctionType.AIV)
+        def direct_wait(self, signal: pld.DistributedTensor[[1, 1], pl.INT32]):
+            pld.system.defer_wait(
+                signal,
+                offsets=[0, 0],
+                expected=1,
+                cmp=pld.WaitCmp.Ge,
+            )
+
+    with pytest.raises(ValueError, match="bypasses the deferred-waiter task contract"):
+        _run_pipeline(Program)
+
+
+def test_forged_waiter_marker_without_task_level_call_site_is_rejected():
+    """The printable internal attr is not accepted as provenance on its own."""
+
+    @pl.program
+    class Program:
+        @pl.function(type=pl.FunctionType.InCore)
+        def direct_wait(self, signal: pld.DistributedTensor[[1, 1], pl.INT32]):
+            pl.func_attr({"deferred_completion_waiter": True})
+            pld.system.defer_wait(
+                signal,
+                offsets=[0, 0],
+                expected=1,
+                cmp=pld.WaitCmp.Ge,
+            )
+
+    with pytest.raises(ValueError, match="no task-level Orchestration call site"):
+        _run_pipeline(Program)
+
+
+def test_deferred_waiter_dispatched_from_a_graph_body_is_accepted():
+    """The caller check asks "is this a task-level orchestration body".
+
+    A Graph body is one — its call sites are task launches like any other
+    orchestration body's. Requiring strictly `Orchestration` rejects a legal
+    Graph that dispatches a deferred waiter, with a message telling the author
+    to do what they already did.
+    """
+
+    @pl.program
+    class Program:
+        @pl.function(type=pl.FunctionType.InCore)
+        def waiter(self, signal: pld.DistributedTensor[[1, 1], pl.INT32]):
+            pl.func_attr({"deferred_completion_waiter": True})
+            pld.system.defer_wait(signal, offsets=[0, 0], expected=1, cmp=pld.WaitCmp.Ge)
+
+        @pl.function(type=pl.FunctionType.Graph)
+        def layer(self, signal: pld.DistributedTensor[[1, 1], pl.INT32]):
+            self.waiter(signal)
+
+    _run_pipeline(Program)
+
+
+def test_forged_waiter_plain_call_early_resolve_fails_closed():
+    """A plain GlobalVar call cannot smuggle an unsafe early-resolve attr."""
+
+    @pl.program
+    class Program:
+        @pl.function(type=pl.FunctionType.InCore)
+        def waiter(self, signal: pld.DistributedTensor[[1, 1], pl.INT32]):
+            pl.func_attr({"deferred_completion_waiter": True})
+            pld.system.defer_wait(signal, offsets=[0, 0], expected=1, cmp=pld.WaitCmp.Ge)
+
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def main(self, signal: pld.DistributedTensor[[1, 1], pl.INT32]):
+            self.waiter(signal, attrs={"allow_early_resolve": True})
+
+    with pytest.raises(ValueError, match="cannot use allow_early_resolve=True"):
+        _run_pipeline(Program)
+
+
+def test_forged_waiter_plain_call_core_num_fails_closed():
+    """A plain GlobalVar call cannot turn the waiter into an SPMD launch."""
+
+    @pl.program
+    class Program:
+        @pl.function(type=pl.FunctionType.InCore)
+        def waiter(self, signal: pld.DistributedTensor[[1, 1], pl.INT32]):
+            pl.func_attr({"deferred_completion_waiter": True})
+            pld.system.defer_wait(signal, offsets=[0, 0], expected=1, cmp=pld.WaitCmp.Ge)
+
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def main(self, signal: pld.DistributedTensor[[1, 1], pl.INT32]):
+            self.waiter(signal, attrs={"core_num": 2})
+
+    with pytest.raises(ValueError, match="single-block task"):
+        _run_pipeline(Program)
+
+
+def test_forged_waiter_plain_call_predicate_fails_closed():
+    """A printable waiter marker cannot bypass the no-predicate contract."""
+
+    @pl.program
+    class Program:
+        @pl.function(type=pl.FunctionType.InCore)
+        def waiter(self, signal: pld.DistributedTensor[[1, 1], pl.INT32]):
+            pl.func_attr({"deferred_completion_waiter": True})
+            pld.system.defer_wait(signal, offsets=[0, 0], expected=1, cmp=pld.WaitCmp.Ge)
+
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def main(
+            self,
+            signal: pld.DistributedTensor[[1, 1], pl.INT32],
+            gate: pl.Tensor[[1], pl.INT32],
+        ):
+            self.waiter(signal, attrs={"predicate": gate[0] > 0})
+
+    with pytest.raises(ValueError, match="cannot use a dispatch predicate"):
+        _run_pipeline(Program)
+
+
+def test_forged_waiter_plain_call_sync_start_fails_closed():
+    """A printable waiter marker cannot bypass the single-block contract."""
+
+    @pl.program
+    class Program:
+        @pl.function(type=pl.FunctionType.InCore)
+        def waiter(self, signal: pld.DistributedTensor[[1, 1], pl.INT32]):
+            pl.func_attr({"deferred_completion_waiter": True})
+            pld.system.defer_wait(signal, offsets=[0, 0], expected=1, cmp=pld.WaitCmp.Ge)
+
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def main(self, signal: pld.DistributedTensor[[1, 1], pl.INT32]):
+            self.waiter(signal, attrs={"sync_start": True})
+
+    with pytest.raises(ValueError, match="single-block task"):
+        _run_pipeline(Program)
+
+
+def test_valid_waiter_aiv_form_remains_valid_on_expand_rerun():
+    """The audit revalidates the marked AIV form produced by the first run."""
+
+    @pl.program
+    class Program:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def main(self, signal: pld.DistributedTensor[[1, 1], pl.INT32]):
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="waiter"):
+                pld.system.defer_wait(
+                    signal,
+                    offsets=[0, 0],
+                    expected=1,
+                    cmp=pld.WaitCmp.Ge,
+                )
+
+    outlined = passes.outline_incore_scopes()(passes.convert_to_ssa()(Program))
+    expanded = passes.expand_mixed_kernel()(passes.infer_tile_memory_space()(outlined))
+    waiter = expanded.get_function("waiter")
+    assert waiter is not None
+    assert waiter.func_type == ir.FunctionType.AIV
+    assert waiter.attrs["deferred_completion_waiter"] is True
+
+    rerun = passes.expand_mixed_kernel()(expanded)
+    rerun_waiter = rerun.get_function("waiter")
+    assert rerun_waiter is not None
+    assert rerun_waiter.func_type == ir.FunctionType.AIV
+
+
+def test_validated_waiter_accepts_trailing_empty_return():
+    """Function normalization may append a no-value return terminator."""
+
+    @pl.program
+    class Program:
+        @pl.function(type=pl.FunctionType.InCore)
+        def waiter(self, signal: pld.DistributedTensor[[1, 1], pl.INT32]):
+            pl.func_attr({"deferred_completion_waiter": True})
+            pld.system.defer_wait(
+                signal,
+                offsets=[0, 0],
+                expected=1,
+                cmp=pld.WaitCmp.Ge,
+            )
+            return  # noqa: PLR1711 - explicit empty terminator is the test subject
+
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def main(self, signal: pld.DistributedTensor[[1, 1], pl.INT32]):
+            self.waiter(signal)
+
+    after = _run_pipeline(Program)
+    waiter = after.get_function("waiter")
+    assert waiter is not None
+    assert waiter.func_type == ir.FunctionType.AIV
+
+
+def test_hand_written_group_members_share_canonical_abi():
+    """Different AIC/AIV signatures are normalized to the Group ABI (#2097).
+
+    ``MixedKernels`` gives every active lane the same runtime argument array.
+    A hand-written Group is allowed to capture the union of its member inputs,
+    so ExpandMixedKernel must make both member wrappers consume that union in
+    the same order instead of letting orchestration codegen use the first call's
+    shorter signature for both lanes.
+    """
+
+    @pl.program
+    class Program:
+        @pl.function(type=pl.FunctionType.AIC)
+        def cube_side(
+            self,
+            q: pl.Tensor[[16, 16], pl.FP32],
+            sink: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+            task: pl.Scalar[pl.INDEX],
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
+            return sink
+
+        @pl.function(type=pl.FunctionType.AIV)
+        def vec_side(
+            self,
+            out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            task: pl.Scalar[pl.INDEX],
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
+            return out
+
+        @pl.function(type=pl.FunctionType.Group)
+        def mixed(
+            self,
+            q: pl.Tensor[[16, 16], pl.FP32],
+            sink: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+            out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            task: pl.Scalar[pl.INDEX],
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
+            self.cube_side(q, sink, task)
+            result = self.vec_side(out, task)
+            return result
+
+    after = _run_pipeline(Program)
+    cube = after.get_function("cube_side")
+    vec = after.get_function("vec_side")
+    group = after.get_function("mixed")
+    assert cube is not None
+    assert vec is not None
+    assert group is not None
+    expected_names = [param.name_hint for param in group.params]
+
+    assert [param.name_hint for param in cube.params] == expected_names
+    assert [param.name_hint for param in vec.params] == expected_names
+    assert cube.param_directions == group.param_directions
+    assert vec.param_directions == group.param_directions
+
+    member_calls = []
+    for stmt in ir.flatten_to_stmts(group.body):
+        if isinstance(stmt, ir.AssignStmt) and isinstance(stmt.value, ir.Call):
+            member_calls.append(stmt.value)
+        elif isinstance(stmt, ir.EvalStmt) and isinstance(stmt.expr, ir.Call):
+            member_calls.append(stmt.expr)
+    assert len(member_calls) == 2
+    for call in member_calls:
+        assert [arg.name_hint for arg in call.args] == expected_names
+
+
+def test_hand_written_no_split_pipe_group_infers_dual_aiv_dispatch():
+    """910B explicit pipe members get the same lane-1 handshake replay as auto-expanded mixed kernels."""
+
+    @pl.program
+    class Program:
+        @pl.function(type=pl.FunctionType.AIC)
+        def cube_side(
+            self,
+            q: pl.Tensor[[16, 16], pl.FP32],
+            sink: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
+            v2c = pl.reserve_buffer(name="probe_v2c", size=4096, base=pl.AUTO)
+            c2v_peer = pl.import_peer_buffer(name="probe_c2v", peer_func="vec_side")
+            pl.aic_initialize_pipe(c2v_peer, v2c, dir_mask=3, slot_size=512)
+            return sink
+
+        @pl.function(type=pl.FunctionType.AIV)
+        def vec_side(
+            self,
+            out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
+            c2v = pl.reserve_buffer(name="probe_c2v", size=4096, base=pl.AUTO)
+            v2c_peer = pl.import_peer_buffer(name="probe_v2c", peer_func="cube_side")
+            pl.aiv_initialize_pipe(c2v, v2c_peer, dir_mask=3, slot_size=512)
+            tile = pl.tpop_from_aic(shape=[16, 16], dtype=pl.FP32, split=0)
+            pl.tfree_to_aic(tile, split=0)
+            return out
+
+        @pl.function(type=pl.FunctionType.Group)
+        def mixed(
+            self,
+            q: pl.Tensor[[16, 16], pl.FP32],
+            sink: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+            out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
+            self.cube_side(q, sink)
+            return self.vec_side(out)
+
+    after = _run_pipeline(Program)
+    vec = after.get_function("vec_side")
+    assert vec is not None
+    assert vec.attrs.get("dual_aiv_dispatch") is True
+
+
+def test_reused_hand_written_group_members_get_private_adapters():
+    """A member used outside its Group keeps its original ABI."""
+
+    @pl.program
+    class Program:
+        @pl.function(type=pl.FunctionType.AIC)
+        def cube_side(
+            self,
+            q: pl.Tensor[[16, 16], pl.FP32],
+            sink: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+            task: pl.Scalar[pl.INDEX],
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
+            return sink
+
+        @pl.function(type=pl.FunctionType.AIV)
+        def vec_side(
+            self,
+            out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            task: pl.Scalar[pl.INDEX],
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
+            return out
+
+        @pl.function(type=pl.FunctionType.Group)
+        def mixed(
+            self,
+            q: pl.Tensor[[16, 16], pl.FP32],
+            sink: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+            out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            task: pl.Scalar[pl.INDEX],
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
+            self.cube_side(q, sink, task)
+            result = self.vec_side(out, task)
+            return result
+
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def main(
+            self,
+            q: pl.Tensor[[16, 16], pl.FP32],
+            sink: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+            out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            task: pl.Scalar[pl.INDEX],
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
+            sink = self.cube_side(q, sink, task)
+            return self.mixed(q, sink, out, task)
+
+    after = _run_pipeline(Program)
+    group = after.get_function("mixed")
+    aic_adapter = after.get_function("mixed_aic_adapter")
+    aiv_adapter = after.get_function("mixed_aiv_adapter")
+    cube = after.get_function("cube_side")
+    vec = after.get_function("vec_side")
+    assert group is not None
+    assert aic_adapter is not None
+    assert aiv_adapter is not None
+    assert cube is not None
+    assert vec is not None
+    canonical_names = [param.name_hint for param in group.params]
+
+    assert len(cube.params) == 3
+    assert len(vec.params) == 2
+    assert [param.name_hint for param in aic_adapter.params] == canonical_names
+    assert [param.name_hint for param in aiv_adapter.params] == canonical_names
+    group_text = group.as_python()
+    assert "mixed_aic_adapter(" in group_text
+    assert "mixed_aiv_adapter(" in group_text
+
+
+def test_hand_written_group_submit_remaps_no_dep_override():
+    """A widened Submit keeps no_dep attached to the original member argument."""
+
+    @pl.program
+    class Program:
+        @pl.function(type=pl.FunctionType.AIC)
+        def cube_side(
+            self,
+            q: pl.Tensor[[16, 16], pl.FP32],
+            task: pl.Scalar[pl.INDEX],
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
+            return q
+
+        @pl.function(type=pl.FunctionType.AIV)
+        def vec_side(
+            self,
+            out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            task: pl.Scalar[pl.INDEX],
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
+            return out
+
+        @pl.function(type=pl.FunctionType.Group)
+        def mixed(
+            self,
+            q: pl.Tensor[[16, 16], pl.FP32],
+            out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            task: pl.Scalar[pl.INDEX],
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
+            _cube_out, _cube_tid = pl.submit(self.cube_side, q, task)
+            vec_out, _vec_tid = pl.submit(
+                self.vec_side,
+                pl.no_dep(out),
+                task,
+                attrs={"arg_directions": [pl.adir.output_existing, pl.adir.scalar]},
+            )
+            return vec_out
+
+    after = _run_pipeline(Program)
+    group = after.get_function("mixed")
+    assert group is not None
+    submits = [
+        stmt.value
+        for stmt in ir.flatten_to_stmts(group.body)
+        if isinstance(stmt, ir.AssignStmt) and isinstance(stmt.value, ir.Submit)
+    ]
+    vec_submit = next(submit for submit in submits if submit.op.name == "vec_side")
+
+    assert list(vec_submit.args) == list(group.params)
+    assert vec_submit.attrs["arg_direction_overrides"] == [1]
+    assert list(vec_submit.arg_directions) == []
+
+
+@pytest.mark.parametrize("reuse_members", [False, True])
+def test_hand_written_group_rebinds_shared_inout_results(reuse_members):
+    """Member writebacks bind to the canonical ABI, including private adapters (#3014)."""
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.AIC)
+        def cube_side(
+            self,
+            sink: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
+            return sink
+
+        @pl.function(type=pl.FunctionType.AIV)
+        def vec_side(
+            self,
+            sink: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+            out: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+        ) -> tuple[pl.Tensor[[16, 16], pl.FP32], pl.Tensor[[16, 16], pl.FP32]]:
+            return sink, out
+
+        @pl.function(type=pl.FunctionType.Group)
+        def mixed(
+            self,
+            out: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+            sink: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+        ) -> tuple[pl.Tensor[[16, 16], pl.FP32], pl.Tensor[[16, 16], pl.FP32]]:
+            sink = self.cube_side(sink)
+            sink, out = self.vec_side(sink, out)
+            return sink, out
+
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def main(
+            self,
+            out: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+            sink: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+        ) -> tuple[pl.Tensor[[16, 16], pl.FP32], pl.Tensor[[16, 16], pl.FP32]]:
+            sink = self.cube_side(sink)
+            return self.mixed(out, sink)
+
+    @pl.program
+    class Expected:
+        @pl.function(type=pl.FunctionType.AIC)
+        def cube_side(
+            self,
+            out: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+            sink: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
+            return sink
+
+        @pl.function(type=pl.FunctionType.AIV)
+        def vec_side(
+            self,
+            out: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+            sink: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+        ) -> tuple[pl.Tensor[[16, 16], pl.FP32], pl.Tensor[[16, 16], pl.FP32]]:
+            return sink, out
+
+    before = Before
+    if not reuse_members:
+        before = ir.Program(
+            [func for func in Before.functions.values() if func.name != "main"], Before.name, Before.span
+        )
+    after = _run_pipeline(before)
+    group = after.get_function("mixed")
+    assert group is not None
+    member_names = ("mixed_aic_adapter", "mixed_aiv_adapter") if reuse_members else ("cube_side", "vec_side")
+    for actual_name, expected_name in zip(member_names, ("cube_side", "vec_side"), strict=True):
+        member = after.get_function(actual_name)
+        expected = Expected.get_function(expected_name)
+        assert member is not None and expected is not None
+        ir.assert_structural_equal(member, expected)
+        assert "FREE_VAR" not in member.as_python()
+
+    calls = [
+        stmt.value
+        for stmt in ir.flatten_to_stmts(group.body)
+        if isinstance(stmt, ir.AssignStmt) and isinstance(stmt.value, ir.Call)
+    ]
+    assert [call.op.name for call in calls] == list(member_names)
+    assert all(list(call.args) == list(group.params) for call in calls)
+    if reuse_members:
+        for name in ("cube_side", "vec_side"):
+            original = Before.get_function(name)
+            retained = after.get_function(name)
+            assert original is not None and retained is not None
+            ir.assert_structural_equal(retained, original)
+
+
+@pytest.mark.parametrize("use_submit", [False, True])
+def test_hand_written_group_rebinds_tuple_writeback_no_dep(use_submit):
+    """Swapped tuple writebacks retain buffer identity and no_dep's canonical position (#3014)."""
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.AIC)
+        def cube_side(
+            self,
+            first: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+            second: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+        ) -> tuple[pl.Tensor[[16, 16], pl.FP32], pl.Tensor[[16, 16], pl.FP32]]:
+            return second, first
+
+        @pl.function(type=pl.FunctionType.AIV)
+        def vec_side(
+            self,
+            sink: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
+            return sink
+
+        @pl.function(type=pl.FunctionType.Group)
+        def mixed_call(
+            self,
+            first: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+            second: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
+            second, first = self.cube_side(first, second)
+            second = self.vec_side(pl.no_dep(second))
+            return second
+
+        @pl.function(type=pl.FunctionType.Group)
+        def mixed_submit(
+            self,
+            first: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+            second: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
+            (second, first), _cube_tid = pl.submit(self.cube_side, first, second)
+            second, _vec_tid = pl.submit(self.vec_side, pl.no_dep(second))
+            return second
+
+    @pl.program
+    class Expected:
+        @pl.function(type=pl.FunctionType.AIC)
+        def cube_side(
+            self,
+            first: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+            second: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+        ) -> tuple[pl.Tensor[[16, 16], pl.FP32], pl.Tensor[[16, 16], pl.FP32]]:
+            return second, first
+
+        @pl.function(type=pl.FunctionType.AIV)
+        def vec_side(
+            self,
+            first: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+            second: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
+            return second
+
+    group_name = "mixed_submit" if use_submit else "mixed_call"
+    before = ir.Program(
+        [func for func in Before.functions.values() if func.name in ("cube_side", "vec_side", group_name)],
+        Before.name,
+        Before.span,
+    )
+    after = _run_pipeline(before)
+    group = after.get_function(group_name)
+    assert group is not None
+    for name in ("cube_side", "vec_side"):
+        member = after.get_function(name)
+        expected = Expected.get_function(name)
+        assert member is not None and expected is not None
+        ir.assert_structural_equal(member, expected)
+        assert "FREE_VAR" not in member.as_python()
+
+    launch_type = ir.Submit if use_submit else ir.Call
+    launches = [
+        stmt.value
+        for stmt in ir.flatten_to_stmts(group.body)
+        if isinstance(stmt, ir.AssignStmt) and isinstance(stmt.value, launch_type)
+    ]
+    assert [launch.op.name for launch in launches] == ["cube_side", "vec_side"]
+    assert all(list(launch.args) == list(group.params) for launch in launches)
+    assert launches[1].attrs["arg_direction_overrides"] == [1]
+
+
+def test_hand_written_groups_share_callee_lineage_without_leaking_program_state():
+    """Shared return maps stay callee-relative and expire before the next Program.
+
+    All Groups share a producer that delegates to ``choose``. Alternating
+    call-site permutations must still yield different canonical bindings. Reuse
+    the exact producer node with a different ``choose`` body on the next pass
+    invocation so a cache escaping the normalization scope would be observable.
+    """
+    span = ir.Span.unknown()
+    tensor_type = ir.TensorType([16, 16], ir.DataType.FP32)
+    first = ir.Var("first", tensor_type, span)
+    second = ir.Var("second", tensor_type, span)
+    selected = ir.Var("selected", tensor_type, span)
+    producer = ir.Function(
+        "producer",
+        [(first, ir.ParamDirection.InOut), (second, ir.ParamDirection.InOut)],
+        [tensor_type],
+        ir.SeqStmts(
+            [
+                ir.AssignStmt(
+                    selected, ir.Call(ir.GlobalVar("choose"), [first, second], tensor_type, span), span
+                ),
+                ir.ReturnStmt([selected], span),
+            ],
+            span,
+        ),
+        span,
+        ir.FunctionType.AIC,
+    )
+    sink = ir.Var("sink", tensor_type, span)
+    consumer = ir.Function(
+        "consumer",
+        [(sink, ir.ParamDirection.InOut)],
+        [tensor_type],
+        ir.ReturnStmt([sink], span),
+        span,
+        ir.FunctionType.AIV,
+    )
+    groups: list[ir.Function] = []
+    for i in range(16):
+        params = [ir.Var("first", tensor_type, span), ir.Var("second", tensor_type, span)]
+        value = ir.Var("value", tensor_type, span)
+        result = ir.Var("result", tensor_type, span)
+        args = params if i % 2 == 0 else params[::-1]
+        groups.append(
+            ir.Function(
+                f"mixed_{i}",
+                [(param, ir.ParamDirection.InOut) for param in params],
+                [tensor_type],
+                ir.SeqStmts(
+                    [
+                        ir.AssignStmt(
+                            value, ir.Call(ir.GlobalVar("producer"), args, tensor_type, span), span
+                        ),
+                        ir.AssignStmt(
+                            result,
+                            ir.Call(
+                                ir.GlobalVar("consumer"),
+                                [value],
+                                {},
+                                {"arg_direction_overrides": [0]},
+                                tensor_type,
+                                span,
+                            ),
+                            span,
+                        ),
+                        ir.ReturnStmt([result], span),
+                    ],
+                    span,
+                ),
+                span,
+                ir.FunctionType.Group,
+            )
+        )
+
+    for selected_index in (0, 1):
+        choose_params = [ir.Var("first", tensor_type, span), ir.Var("second", tensor_type, span)]
+        choose = ir.Function(
+            "choose",
+            [(param, ir.ParamDirection.InOut) for param in choose_params],
+            [tensor_type],
+            ir.ReturnStmt([choose_params[selected_index]], span),
+            span,
+            ir.FunctionType.AIC,
+        )
+        before = ir.Program([choose, producer, consumer, *groups], "shared_members", span)
+        after = passes.expand_mixed_kernel()(before)
+        for i in range(len(groups)):
+            group = after.get_function(f"mixed_{i}")
+            adapter = after.get_function(f"mixed_{i}_aiv_adapter")
+            assert group is not None and adapter is not None
+            expected_index = selected_index if i % 2 == 0 else 1 - selected_index
+            ir.assert_structural_equal(adapter.body, ir.ReturnStmt([adapter.params[expected_index]], span))
+            assert "FREE_VAR" not in adapter.as_python()
+            launches = [
+                stmt.value
+                for stmt in ir.flatten_to_stmts(group.body)
+                if isinstance(stmt, ir.AssignStmt) and isinstance(stmt.value, ir.Call)
+            ]
+            assert all(list(call.args) == list(group.params) for call in launches)
+            assert launches[1].attrs["arg_direction_overrides"] == [expected_index]
+
+
+@pytest.mark.parametrize("producer_type", [pl.FunctionType.AIC, pl.FunctionType.AIV])
+@pytest.mark.parametrize("projection_index", [0, 1])
+@pytest.mark.parametrize("use_submit", [False, True])
+@pytest.mark.parametrize("no_dep", [False, True])
+def test_hand_written_group_rebinds_direct_tuple_projection(
+    producer_type, projection_index, use_submit, no_dep
+):
+    """Direct tuple arguments retain their selected buffer in either core's adapter (#3014)."""
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.AIC)
+        def producer(
+            self,
+            first: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+            second: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+        ) -> tuple[pl.Tensor[[16, 16], pl.FP32], pl.Tensor[[16, 16], pl.FP32]]:
+            return second, first
+
+        @pl.function(type=pl.FunctionType.AIV)
+        def consumer(
+            self,
+            sink: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
+            return sink
+
+        @pl.function(type=pl.FunctionType.Group)
+        def mixed_call_0(
+            self,
+            first: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+            second: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
+            pair = self.producer(first, second)
+            result = self.consumer(pair[0])
+            return result
+
+        @pl.function(type=pl.FunctionType.Group)
+        def mixed_call_1(
+            self,
+            first: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+            second: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
+            pair = self.producer(first, second)
+            result = self.consumer(pair[1])
+            return result
+
+        @pl.function(type=pl.FunctionType.Group)
+        def mixed_submit_0(
+            self,
+            first: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+            second: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
+            pair = pl.submit(self.producer, first, second)
+            result, _consumer_tid = pl.submit(self.consumer, pair[0])
+            return result
+
+        @pl.function(type=pl.FunctionType.Group)
+        def mixed_submit_1(
+            self,
+            first: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+            second: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
+            pair = pl.submit(self.producer, first, second)
+            result, _consumer_tid = pl.submit(self.consumer, pair[1])
+            return result
+
+        @pl.function(type=pl.FunctionType.Group)
+        def mixed_call_no_dep_0(
+            self,
+            first: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+            second: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
+            pair = self.producer(first, second)
+            result = self.consumer(pl.no_dep(pair[0]))
+            return result
+
+        @pl.function(type=pl.FunctionType.Group)
+        def mixed_call_no_dep_1(
+            self,
+            first: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+            second: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
+            pair = self.producer(first, second)
+            result = self.consumer(pl.no_dep(pair[1]))
+            return result
+
+        @pl.function(type=pl.FunctionType.Group)
+        def mixed_submit_no_dep_0(
+            self,
+            first: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+            second: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
+            pair = pl.submit(self.producer, first, second)
+            result, _consumer_tid = pl.submit(self.consumer, pl.no_dep(pair[0]))
+            return result
+
+        @pl.function(type=pl.FunctionType.Group)
+        def mixed_submit_no_dep_1(
+            self,
+            first: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+            second: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
+            pair = pl.submit(self.producer, first, second)
+            result, _consumer_tid = pl.submit(self.consumer, pl.no_dep(pair[1]))
+            return result
+
+    @pl.program
+    class Expected:
+        @pl.function(type=pl.FunctionType.AIV)
+        def consumer_first(
+            self,
+            first: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+            second: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
+            return first
+
+        @pl.function(type=pl.FunctionType.AIV)
+        def consumer_second(
+            self,
+            first: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+            second: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
+            return second
+
+    launch_kind = "submit" if use_submit else "call"
+    override = "_no_dep" if no_dep else ""
+    group_name = f"mixed_{launch_kind}{override}_{projection_index}"
+    before = ir.Program(
+        [func for func in Before.functions.values() if func.name in ("producer", "consumer", group_name)],
+        Before.name,
+        Before.span,
+    )
+    expected = Expected
+    if producer_type == pl.FunctionType.AIV:
+        before = _swap_aic_aiv_members(before)
+        expected = _swap_aic_aiv_members(expected)
+    after = _run_pipeline(before)
+    producer = after.get_function("producer")
+    original_producer = before.get_function("producer")
+    consumer = after.get_function("consumer")
+    expected_name = "consumer_second" if projection_index == 0 else "consumer_first"
+    expected_consumer = expected.get_function(expected_name)
+    group = after.get_function(group_name)
+    assert producer is not None and original_producer is not None
+    assert consumer is not None and expected_consumer is not None and group is not None
+    ir.assert_structural_equal(producer, original_producer)
+    ir.assert_structural_equal(consumer, expected_consumer)
+    assert "FREE_VAR" not in consumer.as_python()
+
+    launches = [
+        stmt.value
+        for stmt in ir.flatten_to_stmts(group.body)
+        if isinstance(stmt, ir.AssignStmt) and isinstance(stmt.value, (ir.Call, ir.Submit))
+    ]
+    assert [launch.op.name for launch in launches] == ["producer", "consumer"]
+    assert all(isinstance(launch, ir.Submit if use_submit else ir.Call) for launch in launches)
+    assert all(list(launch.args) == list(group.params) for launch in launches)
+    if no_dep:
+        assert launches[1].attrs["arg_direction_overrides"] == [1 - projection_index]
+
+
+@pytest.mark.parametrize("producer_type", [pl.FunctionType.AIC, pl.FunctionType.AIV])
+@pytest.mark.parametrize("tuple_form", ["alias", "nested"])
+def test_hand_written_group_rebinds_aliased_tuple_projection(producer_type, tuple_form):
+    """Tuple aliases and nested tuple construction preserve the selected writeback."""
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.AIC)
+        def producer(
+            self,
+            first: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+            second: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+        ) -> tuple[pl.Tensor[[16, 16], pl.FP32], pl.Tensor[[16, 16], pl.FP32]]:
+            return second, first
+
+        @pl.function(type=pl.FunctionType.AIV)
+        def consumer(
+            self,
+            sink: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
+            return sink
+
+        @pl.function(type=pl.FunctionType.Group)
+        def mixed_alias(
+            self,
+            first: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+            second: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
+            pair = self.producer(first, second)
+            alias = pair
+            result = self.consumer(alias[0])
+            return result
+
+        @pl.function(type=pl.FunctionType.Group)
+        def mixed_nested(
+            self,
+            first: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+            second: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
+            pair = self.producer(first, second)
+            nested = ((pair[1], pair[0]), pair)
+            result = self.consumer(pl.no_dep(nested[0][1]))
+            return result
+
+    @pl.program
+    class Expected:
+        @pl.function(type=pl.FunctionType.AIV)
+        def consumer(
+            self,
+            first: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+            second: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
+            return second
+
+    group_name = f"mixed_{tuple_form}"
+    before = ir.Program(
+        [func for func in Before.functions.values() if func.name in ("producer", "consumer", group_name)],
+        Before.name,
+        Before.span,
+    )
+    expected = Expected
+    if producer_type == pl.FunctionType.AIV:
+        before = _swap_aic_aiv_members(before)
+        expected = _swap_aic_aiv_members(expected)
+    after = _run_pipeline(before)
+    consumer = after.get_function("consumer")
+    expected_consumer = expected.get_function("consumer")
+    group = after.get_function(group_name)
+    assert consumer is not None and expected_consumer is not None and group is not None
+    ir.assert_structural_equal(consumer, expected_consumer)
+    assert "FREE_VAR" not in consumer.as_python()
+    calls = [
+        stmt.value
+        for stmt in ir.flatten_to_stmts(group.body)
+        if isinstance(stmt, ir.AssignStmt) and isinstance(stmt.value, ir.Call)
+    ]
+    assert [call.op.name for call in calls] == ["producer", "consumer"]
+    assert all(list(call.args) == list(group.params) for call in calls)
+    if tuple_form == "nested":
+        assert calls[1].attrs["arg_direction_overrides"] == [1]
+
+
+@pytest.mark.parametrize("boundary_kind", ["view", "fresh"])
+def test_hand_written_group_no_dep_rejects_projected_non_writeback_results(boundary_kind):
+    """Projecting a non-writeback tuple element must not turn it into a Group parameter."""
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.AIC)
+        def producer_view(
+            self,
+            source: pl.InOut[pl.Tensor[[8, 32], pl.FP32]],
+        ) -> tuple[pl.Tensor[[16, 16], pl.FP32], pl.Tensor[[8, 32], pl.FP32]]:
+            viewed = pl.tensor.view(source, [16, 16])
+            return viewed, source
+
+        @pl.function(type=pl.FunctionType.AIC)
+        def producer_fresh(
+            self,
+            source: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+        ) -> tuple[pl.Tensor[[16, 16], pl.FP32], pl.Tensor[[16, 16], pl.FP32]]:
+            fresh = pl.tensor.create([16, 16], dtype=pl.FP32)
+            return fresh, source
+
+        @pl.function(type=pl.FunctionType.AIV)
+        def consumer(
+            self,
+            sink: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
+            return sink
+
+        @pl.function(type=pl.FunctionType.Group)
+        def mixed_view(
+            self,
+            source: pl.InOut[pl.Tensor[[8, 32], pl.FP32]],
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
+            pair = self.producer_view(source)
+            return self.consumer(pl.no_dep(pair[0]))
+
+        @pl.function(type=pl.FunctionType.Group)
+        def mixed_fresh(
+            self,
+            source: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
+            pair = self.producer_fresh(source)
+            return self.consumer(pl.no_dep(pair[0]))
+
+    before = ir.Program(
+        [
+            func
+            for func in Before.functions.values()
+            if func.name in (f"producer_{boundary_kind}", "consumer", f"mixed_{boundary_kind}")
+        ],
+        Before.name,
+        Before.span,
+    )
+    # Deliberately skip tensor-to-tile conversion to exercise ExpandMixedKernel's
+    # rejection of non-writeback results, before its tile-only precondition holds.
+    with passes.PassContext([], passes.VerificationLevel.NONE):
+        with pytest.raises(
+            ValueError, match="Cannot map pl.no_dep argument 0 .* to a canonical Group parameter"
+        ):
+            _run_pipeline(before)
+
+
+@pytest.mark.parametrize("boundary_kind", ["slice", "view", "fresh"])
+def test_hand_written_group_no_dep_rejects_non_writeback_results(boundary_kind):
+    """A member's slice, view or fresh result cannot stand in for a complete Group parameter."""
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.AIC)
+        def cube_slice(
+            self,
+            source: pl.InOut[pl.Tensor[[32, 16], pl.FP32]],
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
+            result = pl.tensor.slice(source, [16, 16], [16, 0])
+            return result
+
+        @pl.function(type=pl.FunctionType.AIC)
+        def cube_view(
+            self,
+            source: pl.InOut[pl.Tensor[[8, 32], pl.FP32]],
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
+            result = pl.tensor.view(source, [16, 16])
+            return result
+
+        @pl.function(type=pl.FunctionType.AIC)
+        def cube_fresh(
+            self,
+            source: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
+            result = pl.tensor.create([16, 16], dtype=pl.FP32)
+            return result
+
+        @pl.function(type=pl.FunctionType.AIV)
+        def vec_side(
+            self,
+            sink: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
+            return sink
+
+        @pl.function(type=pl.FunctionType.Group)
+        def mixed_slice(
+            self,
+            source: pl.InOut[pl.Tensor[[32, 16], pl.FP32]],
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
+            local = self.cube_slice(source)
+            return self.vec_side(pl.no_dep(local))
+
+        @pl.function(type=pl.FunctionType.Group)
+        def mixed_view(
+            self,
+            source: pl.InOut[pl.Tensor[[8, 32], pl.FP32]],
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
+            local = self.cube_view(source)
+            return self.vec_side(pl.no_dep(local))
+
+        @pl.function(type=pl.FunctionType.Group)
+        def mixed_fresh(
+            self,
+            source: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
+            local = self.cube_fresh(source)
+            return self.vec_side(pl.no_dep(local))
+
+    before = ir.Program(
+        [
+            func
+            for func in Before.functions.values()
+            if func.name in (f"cube_{boundary_kind}", "vec_side", f"mixed_{boundary_kind}")
+        ],
+        Before.name,
+        Before.span,
+    )
+    # Deliberately skip tensor-to-tile conversion to exercise ExpandMixedKernel's
+    # rejection of non-writeback results, before its tile-only precondition holds.
+    with passes.PassContext([], passes.VerificationLevel.NONE):
+        with pytest.raises(
+            ValueError, match="Cannot map pl.no_dep argument 0 .* to a canonical Group parameter"
+        ):
+            _run_pipeline(before)
+
+
+def test_explicit_sync_core_type_routes_each_event_to_one_lane():
+    """Mixed JIT kernels must not duplicate set/wait onto both core types."""
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def explicit_sync(
+            self,
+            workspace: pl.Tensor[[256], pl.INT64],
+            x: pl.Tensor[[16], pl.FP32],
+        ) -> pl.Tensor[[16], pl.FP32]:
+            pl.system.set_ffts(workspace)
+            pl.system.sync_set(4, pipe=pl.PipeType.MTE3, ffts_mode=2, core_type=pl.KernelType.AIV)
+            pl.system.sync_wait(4, pipe=pl.PipeType.MTE2, core_type=pl.KernelType.AIC)
+            return x
+
+    after = _run_pipeline(Before)
+    aic = next(f for f in after.functions.values() if f.func_type == ir.FunctionType.AIC)
+    aiv = next(f for f in after.functions.values() if f.func_type == ir.FunctionType.AIV)
+    aic_ops = [_op_name(stmt) for stmt in ir.flatten_to_stmts(aic.body)]
+    aiv_ops = [_op_name(stmt) for stmt in ir.flatten_to_stmts(aiv.body)]
+
+    assert aic_ops.count("system.set_ffts") == 1
+    assert aic_ops.count("system.sync_wait") == 1
+    assert "system.sync_set" not in aic_ops
+    assert aiv_ops.count("system.set_ffts") == 1
+    assert aiv_ops.count("system.sync_set") == 1
+    assert "system.sync_wait" not in aiv_ops
+
+
+def test_pipeline_flags_core_type_routes_pairs_to_matching_lane():
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def explicit_flags(self, x: pl.Tensor[[16], pl.FP32]) -> pl.Tensor[[16], pl.FP32]:
+            pl.system.set_flag(pl.PipeType.MTE2, pl.PipeType.V, 0, core_type=pl.KernelType.AIV)
+            pl.system.wait_flag(pl.PipeType.MTE2, pl.PipeType.V, 0, core_type=pl.KernelType.AIV)
+            pl.system.set_flag(pl.PipeType.MTE1, pl.PipeType.M, 1, core_type=pl.KernelType.AIC)
+            pl.system.wait_flag(pl.PipeType.MTE1, pl.PipeType.M, 1, core_type=pl.KernelType.AIC)
+            return x
+
+    after = _run_pipeline(Before)
+    aic = next(f for f in after.functions.values() if f.func_type == ir.FunctionType.AIC)
+    aiv = next(f for f in after.functions.values() if f.func_type == ir.FunctionType.AIV)
+    assert [_op_name(s) for s in ir.flatten_to_stmts(aic.body)].count("system.set_flag") == 1
+    assert [_op_name(s) for s in ir.flatten_to_stmts(aic.body)].count("system.wait_flag") == 1
+    assert [_op_name(s) for s in ir.flatten_to_stmts(aiv.body)].count("system.set_flag") == 1
+    assert [_op_name(s) for s in ir.flatten_to_stmts(aiv.body)].count("system.wait_flag") == 1
+    aic_flags = [
+        s.expr
+        for s in ir.flatten_to_stmts(aic.body)
+        if isinstance(s, ir.EvalStmt) and isinstance(s.expr, ir.Call) and "flag" in _op_name(s)
+    ]
+    aiv_flags = [
+        s.expr
+        for s in ir.flatten_to_stmts(aiv.body)
+        if isinstance(s, ir.EvalStmt) and isinstance(s.expr, ir.Call) and "flag" in _op_name(s)
+    ]
+    assert {call.kwargs["src_pipe"] for call in aic_flags} == {int(pl.PipeType.MTE1)}
+    assert {call.kwargs["src_pipe"] for call in aiv_flags} == {int(pl.PipeType.MTE2)}
+
+
+def test_v2c_boundary_uses_nz_layout_on_a2a3():
+    """On Ascend910, cross-core push needs no layout adaptation on the AIV side.
+
+    Ascend910 routes push/pop through ub -> gm -> mat. The ub -> gm transfer
+    uses ND layout directly, so no tile.move is needed before tpush_to_aic.
+    The AIC tpop lands in Mat with NZ layout (col_major blayout), and a
+    subsequent Mat -> Left tile.move resolves the final layout.
+    """
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore, attrs={"split": pl.SplitMode.UP_DOWN})
+        def main_incore_0(
+            self,
+            x: pl.Tensor[[16, 128], pl.BF16],
+            y: pl.Tensor[[128, 64], pl.BF16],
+            out_0: pl.Out[pl.Tensor[[16, 64], pl.FP32]],
+        ) -> pl.Tensor[[16, 64], pl.FP32]:
+            x_tile = pl.load(x, [0, 0], [16, 128])
+            # Direct Vec -> Left boundary (exercises BuildCrossCoreTransferView with Left)
+            x_left = pl.move(x_tile, target_memory=pl.MemorySpace.Left)
+            y_mat = pl.load(y, [0, 0], [128, 64], target_memory=pl.MemorySpace.Mat)
+            y_right = pl.move(y_mat, target_memory=pl.MemorySpace.Right)
+            z_tile = pl.matmul(x_left, y_right)
+            z_vec = pl.move(
+                z_tile,
+                target_memory=pl.MemorySpace.Vec,
+                blayout=pl.TileLayout.row_major,
+                slayout=pl.TileLayout.none_box,
+            )
+            out_0: pl.Tensor[[16, 64], pl.FP32] = pl.store(z_vec, [0, 0], out_0)
+            return out_0
+
+    @pl.program
+    class Expected:
+        @pl.function(type=pl.FunctionType.AIC, attrs={"split": pl.SplitMode.UP_DOWN})
+        def main_incore_0_aic(
+            self,
+            x: pl.Tensor[[16, 128], pl.BF16],
+            y: pl.Tensor[[128, 64], pl.BF16],
+            out_0: pl.Out[pl.Tensor[[16, 64], pl.FP32]],
+        ):
+            main_incore_0_v2c_slot_buffer = pl.reserve_buffer(
+                name="main_incore_0_v2c_slot_buffer", size=8192, base=-1
+            )
+            main_incore_0_c2v_slot_buffer_import = pl.import_peer_buffer(
+                name="main_incore_0_c2v_slot_buffer", peer_func="main_incore_0_aiv"
+            )
+            pl.aic_initialize_pipe(
+                main_incore_0_c2v_slot_buffer_import,
+                main_incore_0_v2c_slot_buffer,
+                dir_mask=3,
+                slot_size=4096,
+                slot_num=2,
+            )
+            x_left_mat: pl.Tile[[16, 128], pl.BF16, pl.MemorySpace.Mat] = pl.tpop_from_aiv(split=0)
+            x_left: pl.Tile[[16, 128], pl.BF16, pl.MemorySpace.Left] = pl.move(
+                x_left_mat,
+                target_memory=pl.MemorySpace.Left,
+                blayout=pl.TileLayout.col_major,
+                slayout=pl.TileLayout.row_major,
+            )
+            pl.tfree_to_aiv(x_left_mat)
+            y_mat: pl.Tile[[128, 64], pl.BF16, pl.MemorySpace.Mat] = pl.load(
+                y, [0, 0], [128, 64], target_memory=pl.MemorySpace.Mat
+            )
+            y_right = pl.move(y_mat, target_memory=pl.MemorySpace.Right)
+            z_tile = pl.matmul(x_left, y_right)
+            pl.tpush_to_aiv(z_tile, split=0)
+
+        @pl.function(type=pl.FunctionType.AIV, attrs={"split": pl.SplitMode.UP_DOWN})
+        def main_incore_0_aiv(
+            self,
+            x: pl.Tensor[[16, 128], pl.BF16],
+            y: pl.Tensor[[128, 64], pl.BF16],
+            out_0: pl.Out[pl.Tensor[[16, 64], pl.FP32]],
+        ) -> pl.Tensor[[16, 64], pl.FP32]:
+            main_incore_0_v2c_slot_buffer_import = pl.import_peer_buffer(
+                name="main_incore_0_v2c_slot_buffer", peer_func="main_incore_0_aic"
+            )
+            main_incore_0_c2v_slot_buffer = pl.reserve_buffer(
+                name="main_incore_0_c2v_slot_buffer", size=8192, base=-1
+            )
+            pl.aiv_initialize_pipe(
+                main_incore_0_c2v_slot_buffer,
+                main_incore_0_v2c_slot_buffer_import,
+                dir_mask=3,
+                slot_size=4096,
+                slot_num=2,
+            )
+            x_tile: pl.Tile[[16, 128], pl.BF16] = pl.load(x, [0, 0], [16, 128], target_memory=pl.Mem.Vec)
+            pl.tpush_to_aic(x_tile, split=0)
+            z_vec: pl.Tile[[16, 64], pl.FP32, pl.MemorySpace.Vec] = pl.tpop_from_aic(split=0)
+            out_0_store: pl.Tensor[[16, 64], pl.FP32] = pl.store(z_vec, [0, 0], out_0)
+            pl.tfree_to_aic(z_vec)
+            return out_0_store
+
+        @pl.function(type=pl.FunctionType.Group, attrs={"split": pl.SplitMode.UP_DOWN})
+        def main_incore_0(
+            self,
+            x: pl.Tensor[[16, 128], pl.BF16],
+            y: pl.Tensor[[128, 64], pl.BF16],
+            out_0: pl.Out[pl.Tensor[[16, 64], pl.FP32]],
+        ) -> pl.Tensor[[16, 64], pl.FP32]:
+            self.main_incore_0_aic(x, y, out_0)
+            self.main_incore_0_aiv(x, y, out_0)
+            return out_0
+
+    After = _run_pipeline(Before)
+    ir.assert_structural_equal(After, Expected)
+
+
+def test_c2v_boundary_preserves_vec_pop_layout_on_a2a3():
+    """On Ascend910, C2V Vec pops must stay in the final Vec layout.
+
+    The A2A3 GM-backed pipe consumer materializes the popped tile through an ND
+    GlobalTensor. PTO-ISA does not support loading that ND buffer into an NZ
+    Vec tile, so ExpandMixedKernel must not introduce an NZ Vec bridge tile
+    here.
+    """
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore, attrs={"split": pl.SplitMode.UP_DOWN})
+        def main_incore_0(
+            self,
+            x: pl.Tensor[[16, 128], pl.BF16],
+            y: pl.Tensor[[128, 64], pl.BF16],
+            out_0: pl.Out[pl.Tensor[[16, 64], pl.FP32]],
+        ) -> pl.Tensor[[16, 64], pl.FP32]:
+            x_mat = pl.load(x, [0, 0], [16, 128], target_memory=pl.MemorySpace.Mat)
+            x_left = pl.move(x_mat, target_memory=pl.MemorySpace.Left)
+            y_mat = pl.load(y, [0, 0], [128, 64], target_memory=pl.MemorySpace.Mat)
+            y_right = pl.move(y_mat, target_memory=pl.MemorySpace.Right)
+            z_tile = pl.matmul(x_left, y_right)
+            z_vec = pl.move(
+                z_tile,
+                target_memory=pl.MemorySpace.Vec,
+                blayout=pl.TileLayout.row_major,
+                slayout=pl.TileLayout.none_box,
+            )
+            out_0 = pl.store(z_vec, [0, 0], out_0)
+            return out_0
+
+    @pl.program
+    class Expected:
+        @pl.function(type=pl.FunctionType.AIC, attrs={"split": pl.SplitMode.UP_DOWN})
+        def main_incore_0_aic(
+            self,
+            x: pl.Tensor[[16, 128], pl.BF16],
+            y: pl.Tensor[[128, 64], pl.BF16],
+            out_0: pl.Out[pl.Tensor[[16, 64], pl.FP32]],
+        ):
+            main_incore_0_c2v_slot_buffer_import = pl.import_peer_buffer(
+                name="main_incore_0_c2v_slot_buffer", peer_func="main_incore_0_aiv"
+            )
+            pl.aic_initialize_pipe(
+                main_incore_0_c2v_slot_buffer_import,
+                pl.const(0, pl.INT32),
+                dir_mask=1,
+                slot_size=4096,
+                slot_num=2,
+            )
+            x_mat: pl.Tile[[16, 128], pl.BF16, pl.MemorySpace.Mat] = pl.load(
+                x, [0, 0], [16, 128], target_memory=pl.MemorySpace.Mat
+            )
+            x_left = pl.move(x_mat, target_memory=pl.MemorySpace.Left)
+            y_mat: pl.Tile[[128, 64], pl.BF16, pl.MemorySpace.Mat] = pl.load(
+                y, [0, 0], [128, 64], target_memory=pl.MemorySpace.Mat
+            )
+            y_right = pl.move(y_mat, target_memory=pl.MemorySpace.Right)
+            z_tile = pl.matmul(x_left, y_right)
+            pl.tpush_to_aiv(z_tile, split=0)
+
+        @pl.function(type=pl.FunctionType.AIV, attrs={"split": pl.SplitMode.UP_DOWN})
+        def main_incore_0_aiv(
+            self,
+            x: pl.Tensor[[16, 128], pl.BF16],
+            y: pl.Tensor[[128, 64], pl.BF16],
+            out_0: pl.Out[pl.Tensor[[16, 64], pl.FP32]],
+        ) -> pl.Tensor[[16, 64], pl.FP32]:
+            main_incore_0_c2v_slot_buffer = pl.reserve_buffer(
+                name="main_incore_0_c2v_slot_buffer", size=8192, base=-1
+            )
+            pl.aiv_initialize_pipe(
+                main_incore_0_c2v_slot_buffer,
+                pl.const(0, pl.INT32),
+                dir_mask=1,
+                slot_size=4096,
+                slot_num=2,
+            )
+            z_vec: pl.Tile[[16, 64], pl.FP32, pl.MemorySpace.Vec] = pl.tpop_from_aic(split=0)
+            out_0_store: pl.Tensor[[16, 64], pl.FP32] = pl.store(z_vec, [0, 0], out_0)
+            pl.tfree_to_aic(z_vec)
+            return out_0_store
+
+        @pl.function(type=pl.FunctionType.Group, attrs={"split": pl.SplitMode.UP_DOWN})
+        def main_incore_0(
+            self,
+            x: pl.Tensor[[16, 128], pl.BF16],
+            y: pl.Tensor[[128, 64], pl.BF16],
+            out_0: pl.Out[pl.Tensor[[16, 64], pl.FP32]],
+        ) -> pl.Tensor[[16, 64], pl.FP32]:
+            self.main_incore_0_aic(x, y, out_0)
+            self.main_incore_0_aiv(x, y, out_0)
+            return out_0
+
+    After = _run_pipeline(Before)
+    ir.assert_structural_equal(After, Expected)
+
+
+def test_gm_mediated_cross_lane_store_load_gets_handshake_on_a2a3():
+    """Regression for issue #1433.
+
+    A mixed root that exchanges data AIC -> AIV through a GM scratch tensor
+    (``tile.store`` on the cube lane, ``tile.load`` from the same tensor on the
+    vector lane) used to split into AIC/AIV kernels with no cross-core fence,
+    leaving them racing on the shared GM region. ExpandMixedKernel must now
+    detect the GM-mediated dependency and emit a tpush/tpop handshake (plus the
+    automatic pipe setup) so the AIV load happens-after the AIC store.
+    """
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore, attrs={"split": pl.SplitMode.UP_DOWN})
+        def gm_relay(
+            self,
+            x: pl.Tensor[[16, 128], pl.BF16],
+            y: pl.Tensor[[128, 64], pl.BF16],
+            scratch: pl.Out[pl.Tensor[[16, 64], pl.FP32]],
+            out: pl.Out[pl.Tensor[[16, 64], pl.FP32]],
+        ) -> pl.Tensor[[16, 64], pl.FP32]:
+            # AIC lane: matmul, then store the cube result into GM scratch.
+            x_mat = pl.load(x, [0, 0], [16, 128], target_memory=pl.MemorySpace.Mat)
+            x_left = pl.move(x_mat, target_memory=pl.MemorySpace.Left)
+            y_mat = pl.load(y, [0, 0], [128, 64], target_memory=pl.MemorySpace.Mat)
+            y_right = pl.move(y_mat, target_memory=pl.MemorySpace.Right)
+            z_acc = pl.matmul(x_left, y_right)
+            scratch = pl.store(z_acc, [0, 0], scratch)
+            # AIV lane: read the same GM scratch back, elementwise, store out.
+            chunk = pl.load(scratch, [0, 0], [16, 64], target_memory=pl.MemorySpace.Vec)
+            chunk = pl.exp(chunk)
+            out = pl.store(chunk, [0, 0], out)
+            return out
+
+    @pl.program
+    class Expected:
+        @pl.function(type=pl.FunctionType.AIC, attrs={"split": pl.SplitMode.UP_DOWN})
+        def gm_relay_aic(
+            self,
+            x: pl.Tensor[[16, 128], pl.BF16],
+            y: pl.Tensor[[128, 64], pl.BF16],
+            scratch: pl.Out[pl.Tensor[[16, 64], pl.FP32]],
+            out: pl.Out[pl.Tensor[[16, 64], pl.FP32]],
+        ):
+            gm_relay_c2v_slot_buffer_import = pl.import_peer_buffer(
+                name="gm_relay_c2v_slot_buffer", peer_func="gm_relay_aiv"
+            )
+            pl.aic_initialize_pipe(
+                gm_relay_c2v_slot_buffer_import,
+                pl.const(0, pl.INT32),
+                dir_mask=1,
+                slot_size=4096,
+                slot_num=2,
+            )
+            x_mat: pl.Tile[[16, 128], pl.BF16, pl.MemorySpace.Mat] = pl.load(
+                x, [0, 0], [16, 128], target_memory=pl.MemorySpace.Mat
+            )
+            x_left = pl.move(x_mat, target_memory=pl.MemorySpace.Left)
+            y_mat: pl.Tile[[128, 64], pl.BF16, pl.MemorySpace.Mat] = pl.load(
+                y, [0, 0], [128, 64], target_memory=pl.MemorySpace.Mat
+            )
+            y_right = pl.move(y_mat, target_memory=pl.MemorySpace.Right)
+            z_acc = pl.matmul(x_left, y_right)
+            # Fresh local (underscore-prefixed: unused by design, the store result
+            # is consumed by no later op on the AIC lane) so the binding matches the
+            # pass-emitted SSA store-result var structurally.
+            _scratch_stored: pl.Tensor[[16, 64], pl.FP32] = pl.store(z_acc, [0, 0], scratch)
+            pl.tpush_to_aiv(z_acc, split=0)
+
+        @pl.function(type=pl.FunctionType.AIV, attrs={"split": pl.SplitMode.UP_DOWN})
+        def gm_relay_aiv(
+            self,
+            x: pl.Tensor[[16, 128], pl.BF16],
+            y: pl.Tensor[[128, 64], pl.BF16],
+            scratch: pl.Out[pl.Tensor[[16, 64], pl.FP32]],
+            out: pl.Out[pl.Tensor[[16, 64], pl.FP32]],
+        ) -> pl.Tensor[[16, 64], pl.FP32]:
+            gm_relay_c2v_slot_buffer = pl.reserve_buffer(name="gm_relay_c2v_slot_buffer", size=8192, base=-1)
+            pl.aiv_initialize_pipe(
+                gm_relay_c2v_slot_buffer,
+                pl.const(0, pl.INT32),
+                dir_mask=1,
+                slot_size=4096,
+                slot_num=2,
+            )
+            sync_tile: pl.Tile[[16, 64], pl.FP32, pl.MemorySpace.Vec] = pl.tpop_from_aic(split=0)
+            pl.tfree_to_aic(sync_tile)
+            chunk: pl.Tile[[16, 64], pl.FP32, pl.MemorySpace.Vec] = pl.load(
+                scratch, [0, 0], [16, 64], target_memory=pl.MemorySpace.Vec
+            )
+            chunk_exp = pl.exp(chunk)
+            out_store: pl.Tensor[[16, 64], pl.FP32] = pl.store(chunk_exp, [0, 0], out)
+            return out_store
+
+        @pl.function(type=pl.FunctionType.Group, attrs={"split": pl.SplitMode.UP_DOWN})
+        def gm_relay(
+            self,
+            x: pl.Tensor[[16, 128], pl.BF16],
+            y: pl.Tensor[[128, 64], pl.BF16],
+            scratch: pl.Out[pl.Tensor[[16, 64], pl.FP32]],
+            out: pl.Out[pl.Tensor[[16, 64], pl.FP32]],
+        ) -> pl.Tensor[[16, 64], pl.FP32]:
+            self.gm_relay_aic(x, y, scratch, out)
+            self.gm_relay_aiv(x, y, scratch, out)
+            return out
+
+    After = _run_pipeline(Before)
+    ir.assert_structural_equal(After, Expected)
+
+
+def test_accumulator_with_tile_create_classifies_as_pure_aic():
+    """Regression for issue #1083.
+
+    A CORE_GROUP scope whose only "vector" signal is a declaration-only
+    ``tile.create`` feeding a matmul/matmul_acc loop used to be misclassified
+    as mixed — routed through the split path and emitting broken AIC/AIV IR.
+    After the fix, ``tile.create`` is SHARED in the core-affinity classifier,
+    and ``InferTileMemorySpace`` back-propagates the body's Acc memory to the
+    iter_arg and init, so the kernel classifies as pure AIC.
+    """
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def matmul_accumulator(
+            self,
+            a: pl.Tensor[[16, 256], pl.BF16],
+            b: pl.Tensor[[256, 128], pl.BF16],
+            out: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+        ) -> pl.Tensor[[16, 128], pl.FP32]:
+            acc = pl.create_tensor([16, 128], dtype=pl.FP32)
+            for k in pl.range(0, 256, 64):
+                a_slice = pl.slice(a, [16, 64], [0, k])
+                b_slice = pl.slice(b, [64, 128], [k, 0])
+                acc = pl.matmul_acc(acc, a_slice, b_slice)
+            out = pl.assemble(out, acc, [0, 0])
+            return out
+
+    After = _run_pipeline_from_tensor(Before)
+
+    # Exactly one non-orchestration function, typed as AIC (no AIC/AIV split,
+    # no Group wrapper), since the scope is semantically pure cube.
+    compute_funcs = [fn for _, fn in After.functions.items() if fn.func_type != ir.FunctionType.Orchestration]
+    assert len(compute_funcs) == 1, (
+        f"expected a single pure-AIC function, got {[(fn.name, fn.func_type) for fn in compute_funcs]}"
+    )
+    assert compute_funcs[0].func_type == ir.FunctionType.AIC, (
+        f"expected FunctionType.AIC, got {compute_funcs[0].func_type}"
+    )
+
+
+def test_tpop_yielded_as_branch_result_frees_before_yield_on_a2a3():
+    """Regression for issue #1413.
+
+    When a cross-core tile's last use is the ``YieldStmt`` that carries it out
+    of an ``if`` branch, ExpandMixedKernel's tpop/tfree finalizer must emit the
+    ``tfree_to_aic`` *before* the yield. A ``YieldStmt`` is the mandatory
+    terminator of a control-flow body with return values, so appending the
+    tfree after it produced a malformed branch (``tpop; yield; tfree``) that
+    later crashed Simplify's ``StripTrailingYield`` with
+    "control-flow body tail must be YieldStmt when return_vars is non-empty".
+
+    Both branches of the ``if`` do cube work whose Vec-moved result is the
+    branch's carried value, so after the AIC/AIV split each AIV branch reduces
+    to ``tpop_from_aic`` -> ``tfree_to_aic`` -> ``yield``.
+    """
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def main_incore_0(
+            self,
+            x: pl.Tensor[[16, 128], pl.BF16],
+            w: pl.Tensor[[128, 128], pl.BF16],
+            flag: pl.Scalar[pl.INT32],
+            out_0: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+        ) -> pl.Tensor[[16, 128], pl.FP32]:
+            if flag == 0:
+                a_mat = pl.load(x, [0, 0], [16, 128], target_memory=pl.MemorySpace.Mat)
+                a_left = pl.move(a_mat, target_memory=pl.MemorySpace.Left)
+                b_mat = pl.load(w, [0, 0], [128, 128], target_memory=pl.MemorySpace.Mat)
+                b_right = pl.move(b_mat, target_memory=pl.MemorySpace.Right)
+                z = pl.matmul(a_left, b_right)
+                acc = pl.move(z, target_memory=pl.MemorySpace.Vec)
+            else:
+                a_mat2 = pl.load(x, [0, 0], [16, 128], target_memory=pl.MemorySpace.Mat)
+                a_left2 = pl.move(a_mat2, target_memory=pl.MemorySpace.Left)
+                b_mat2 = pl.load(w, [0, 0], [128, 128], target_memory=pl.MemorySpace.Mat)
+                b_right2 = pl.move(b_mat2, target_memory=pl.MemorySpace.Right)
+                z2 = pl.matmul(a_left2, b_right2)
+                acc = pl.move(z2, target_memory=pl.MemorySpace.Vec)
+            out_0: pl.Tensor[[16, 128], pl.FP32] = pl.store(acc, [0, 0], out_0)
+            return out_0
+
+    aiv = _run_pipeline(Before).get_function("main_incore_0_aiv")
+    assert aiv is not None, "expand should produce an AIV function"
+
+    if_stmts = [s for s in ir.flatten_to_stmts(aiv.body) if isinstance(s, ir.IfStmt)]
+    assert len(if_stmts) == 1, f"expected one AIV if-statement, got {len(if_stmts)}"
+    if_stmt = if_stmts[0]
+
+    for label, branch in (("then", if_stmt.then_body), ("else", if_stmt.else_body)):
+        assert branch is not None, f"{label} branch must exist"
+        stmts = ir.flatten_to_stmts(branch)
+        # The branch carries a result, so it must still end with the YieldStmt.
+        assert isinstance(stmts[-1], ir.YieldStmt), (
+            f"{label} branch must end with YieldStmt, got {type(stmts[-1]).__name__} "
+            f"(tfree appended after the yield => malformed body)"
+        )
+        # The popped tile is freed immediately *before* that yield.
+        assert _op_name(stmts[-2]) == "system.tfree_to_aic", (
+            f"{label} branch must emit tfree_to_aic right before the yield, got {_op_name(stmts[-2])!r}"
+        )
+        # Sanity: the branch opens with the matching tpop.
+        assert _op_name(stmts[0]) == "tile.tpop_from_aic", (
+            f"{label} branch should open with tile.tpop_from_aic, got {_op_name(stmts[0])!r}"
+        )
+
+
+def test_gm_sync_hoisted_before_consumer_loop_on_a2a3():
+    """Issue #1564: cube->vector GM dependency whose consumer load is nested in a
+    loop.
+
+    The cube stores the matmul result to a GM scratch at the function top level;
+    the vector reads that scratch back per-row inside a ``for`` loop. The fence
+    must be a single tpush (after the store) paired with a single tpop *hoisted
+    before the loop* — not one tpop per iteration (which would be N tpops for one
+    tpush and deadlock). Before the fix the producer/consumer lived in different
+    structural bodies, so no fence was emitted at all and the lanes raced (the
+    first iterations read the scratch before the store landed).
+    """
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore, attrs={"split": pl.SplitMode.UP_DOWN})
+        def gm_relay_loop(
+            self,
+            x: pl.Tensor[[16, 128], pl.BF16],
+            y: pl.Tensor[[128, 64], pl.BF16],
+            scratch: pl.Out[pl.Tensor[[16, 64], pl.FP32]],
+            out: pl.Out[pl.Tensor[[16, 64], pl.FP32]],
+        ) -> pl.Tensor[[16, 64], pl.FP32]:
+            # AIC lane: matmul, then store the cube result into GM scratch (top level).
+            x_mat = pl.load(x, [0, 0], [16, 128], target_memory=pl.MemorySpace.Mat)
+            x_left = pl.move(x_mat, target_memory=pl.MemorySpace.Left)
+            y_mat = pl.load(y, [0, 0], [128, 64], target_memory=pl.MemorySpace.Mat)
+            y_right = pl.move(y_mat, target_memory=pl.MemorySpace.Right)
+            z_acc = pl.matmul(x_left, y_right)
+            scratch = pl.store(z_acc, [0, 0], scratch)
+            # AIV lane: read the same GM scratch back per-row, inside a loop.
+            for r in pl.range(16):
+                row = pl.load(scratch, [r, 0], [1, 64], target_memory=pl.MemorySpace.Vec)
+                row = pl.exp(row)
+                out = pl.store(row, [r, 0], out)
+            return out
+
+    After = _run_pipeline(Before)
+    aic = next(f for f in After.functions.values() if f.func_type == ir.FunctionType.AIC)
+    aiv = next(f for f in After.functions.values() if f.func_type == ir.FunctionType.AIV)
+
+    # Producer lane: exactly one tpush fencing the cube store.
+    aic_stmts = ir.flatten_to_stmts(aic.body)
+    assert sum(_op_name(s) == "tile.tpush_to_aiv" for s in aic_stmts) == 1, (
+        "AIC must emit exactly one tpush_to_aiv after the cube store"
+    )
+
+    # Consumer lane: the fence tpop/tfree must sit before the scatter loop, never
+    # inside it (one tpop per tpush, not one per iteration).
+    aiv_top = ir.flatten_to_stmts(aiv.body)
+    for_idx = next((i for i, s in enumerate(aiv_top) if isinstance(s, ir.ForStmt)), None)
+    assert for_idx is not None, "AIV must still contain the per-row scatter loop"
+    for_stmt = aiv_top[for_idx]
+    assert isinstance(for_stmt, ir.ForStmt)
+    before_loop = aiv_top[:for_idx]
+    assert any(_op_name(s) == "tile.tpop_from_aic" for s in before_loop), (
+        "fence tpop_from_aic must be hoisted before the consumer loop"
+    )
+    assert any(_op_name(s) == "system.tfree_to_aic" for s in before_loop), (
+        "fence tfree_to_aic must be hoisted before the consumer loop"
+    )
+    loop_body = ir.flatten_to_stmts(for_stmt.body)
+    assert not any(_op_name(s) == "tile.tpop_from_aic" for s in loop_body), (
+        "no per-iteration tpop: N tpops for a single tpush would deadlock"
+    )
+
+
+def test_two_gm_syncs_hoisted_to_same_loop_on_a2a3():
+    """Issue #1564 follow-up: two cube->vector GM dependencies whose consumer
+    loads sit in the *same* loop must each get their own hoisted fence.
+
+    Both fences key on the same enclosing loop stmt, so a plain
+    ``map<Stmt*, GmSyncPop>`` would keep only the last one and leave the other
+    scratch unsynchronized. The collection uses a multimap and emits every fence
+    via ``equal_range``, so the AIV must open the loop with two tpop_from_aic.
+    """
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore, attrs={"split": pl.SplitMode.UP_DOWN})
+        def gm_relay_two(
+            self,
+            x: pl.Tensor[[16, 128], pl.BF16],
+            y: pl.Tensor[[128, 64], pl.BF16],
+            scratch_a: pl.Out[pl.Tensor[[16, 64], pl.FP32]],
+            scratch_b: pl.Out[pl.Tensor[[16, 64], pl.FP32]],
+            out: pl.Out[pl.Tensor[[16, 64], pl.FP32]],
+        ) -> pl.Tensor[[16, 64], pl.FP32]:
+            # AIC lane: two matmuls -> two GM scratch tensors (top level).
+            x_mat = pl.load(x, [0, 0], [16, 128], target_memory=pl.MemorySpace.Mat)
+            x_left = pl.move(x_mat, target_memory=pl.MemorySpace.Left)
+            y_mat = pl.load(y, [0, 0], [128, 64], target_memory=pl.MemorySpace.Mat)
+            y_right = pl.move(y_mat, target_memory=pl.MemorySpace.Right)
+            z_a = pl.matmul(x_left, y_right)
+            scratch_a = pl.store(z_a, [0, 0], scratch_a)
+            z_b = pl.matmul(x_left, y_right)
+            scratch_b = pl.store(z_b, [0, 0], scratch_b)
+            # AIV lane: read BOTH scratch tensors per-row inside ONE loop.
+            for r in pl.range(16):
+                a = pl.load(scratch_a, [r, 0], [1, 64], target_memory=pl.MemorySpace.Vec)
+                b = pl.load(scratch_b, [r, 0], [1, 64], target_memory=pl.MemorySpace.Vec)
+                s = pl.add(a, b)
+                out = pl.store(s, [r, 0], out)
+            return out
+
+    After = _run_pipeline(Before)
+    aic = next(f for f in After.functions.values() if f.func_type == ir.FunctionType.AIC)
+    aiv = next(f for f in After.functions.values() if f.func_type == ir.FunctionType.AIV)
+
+    aic_stmts = ir.flatten_to_stmts(aic.body)
+    assert sum(_op_name(s) == "tile.tpush_to_aiv" for s in aic_stmts) == 2, (
+        "two cube stores must produce two tpush_to_aiv fences"
+    )
+
+    aiv_top = ir.flatten_to_stmts(aiv.body)
+    for_idx = next((i for i, s in enumerate(aiv_top) if isinstance(s, ir.ForStmt)), None)
+    assert for_idx is not None, "AIV must still contain the consumer loop"
+    for_stmt = aiv_top[for_idx]
+    assert isinstance(for_stmt, ir.ForStmt)
+    before_loop = aiv_top[:for_idx]
+    n_pop = sum(_op_name(s) == "tile.tpop_from_aic" for s in before_loop)
+    assert n_pop == 2, f"both fences must be hoisted before the loop, got {n_pop}"
+    loop_body = ir.flatten_to_stmts(for_stmt.body)
+    assert not any(_op_name(s) == "tile.tpop_from_aic" for s in loop_body), (
+        "fences must not be emitted per iteration"
+    )
+
+
+def test_split_slot_num_override_sizes_c2v_ring_on_a2a3():
+    """``pl.split(mode, slot_num=N)`` (propagated as the ``slot_num`` function
+    attr) overrides the hardcoded ring depth on the automatic cube->vector pipe.
+
+    Mirrors ``test_c2v_boundary_preserves_vec_pop_layout_on_a2a3`` but with
+    ``slot_num=16`` instead of the default 2: the reserved buffer grows to
+    ``slot_size * 16`` (65536) and both ``initialize_pipe`` calls carry an
+    explicit ``slot_num=16`` attribute.
+    """
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore, attrs={"split": pl.SplitMode.UP_DOWN, "slot_num": 16})
+        def main_incore_0(
+            self,
+            x: pl.Tensor[[16, 128], pl.BF16],
+            y: pl.Tensor[[128, 64], pl.BF16],
+            out_0: pl.Out[pl.Tensor[[16, 64], pl.FP32]],
+        ) -> pl.Tensor[[16, 64], pl.FP32]:
+            x_mat = pl.load(x, [0, 0], [16, 128], target_memory=pl.MemorySpace.Mat)
+            x_left = pl.move(x_mat, target_memory=pl.MemorySpace.Left)
+            y_mat = pl.load(y, [0, 0], [128, 64], target_memory=pl.MemorySpace.Mat)
+            y_right = pl.move(y_mat, target_memory=pl.MemorySpace.Right)
+            z_tile = pl.matmul(x_left, y_right)
+            z_vec = pl.move(
+                z_tile,
+                target_memory=pl.MemorySpace.Vec,
+                blayout=pl.TileLayout.row_major,
+                slayout=pl.TileLayout.none_box,
+            )
+            out_0 = pl.store(z_vec, [0, 0], out_0)
+            return out_0
+
+    @pl.program
+    class Expected:
+        @pl.function(type=pl.FunctionType.AIC, attrs={"split": pl.SplitMode.UP_DOWN, "slot_num": 16})
+        def main_incore_0_aic(
+            self,
+            x: pl.Tensor[[16, 128], pl.BF16],
+            y: pl.Tensor[[128, 64], pl.BF16],
+            out_0: pl.Out[pl.Tensor[[16, 64], pl.FP32]],
+        ):
+            main_incore_0_c2v_slot_buffer_import = pl.import_peer_buffer(
+                name="main_incore_0_c2v_slot_buffer", peer_func="main_incore_0_aiv"
+            )
+            pl.aic_initialize_pipe(
+                main_incore_0_c2v_slot_buffer_import,
+                pl.const(0, pl.INT32),
+                dir_mask=1,
+                slot_size=4096,
+                slot_num=16,
+            )
+            x_mat: pl.Tile[[16, 128], pl.BF16, pl.MemorySpace.Mat] = pl.load(
+                x, [0, 0], [16, 128], target_memory=pl.MemorySpace.Mat
+            )
+            x_left = pl.move(x_mat, target_memory=pl.MemorySpace.Left)
+            y_mat: pl.Tile[[128, 64], pl.BF16, pl.MemorySpace.Mat] = pl.load(
+                y, [0, 0], [128, 64], target_memory=pl.MemorySpace.Mat
+            )
+            y_right = pl.move(y_mat, target_memory=pl.MemorySpace.Right)
+            z_tile = pl.matmul(x_left, y_right)
+            pl.tpush_to_aiv(z_tile, split=0)
+
+        @pl.function(type=pl.FunctionType.AIV, attrs={"split": pl.SplitMode.UP_DOWN, "slot_num": 16})
+        def main_incore_0_aiv(
+            self,
+            x: pl.Tensor[[16, 128], pl.BF16],
+            y: pl.Tensor[[128, 64], pl.BF16],
+            out_0: pl.Out[pl.Tensor[[16, 64], pl.FP32]],
+        ) -> pl.Tensor[[16, 64], pl.FP32]:
+            main_incore_0_c2v_slot_buffer = pl.reserve_buffer(
+                name="main_incore_0_c2v_slot_buffer", size=65536, base=-1
+            )
+            pl.aiv_initialize_pipe(
+                main_incore_0_c2v_slot_buffer,
+                pl.const(0, pl.INT32),
+                dir_mask=1,
+                slot_size=4096,
+                slot_num=16,
+            )
+            z_vec: pl.Tile[[16, 64], pl.FP32, pl.MemorySpace.Vec] = pl.tpop_from_aic(split=0)
+            out_0_store: pl.Tensor[[16, 64], pl.FP32] = pl.store(z_vec, [0, 0], out_0)
+            pl.tfree_to_aic(z_vec)
+            return out_0_store
+
+        @pl.function(type=pl.FunctionType.Group, attrs={"split": pl.SplitMode.UP_DOWN, "slot_num": 16})
+        def main_incore_0(
+            self,
+            x: pl.Tensor[[16, 128], pl.BF16],
+            y: pl.Tensor[[128, 64], pl.BF16],
+            out_0: pl.Out[pl.Tensor[[16, 64], pl.FP32]],
+        ) -> pl.Tensor[[16, 64], pl.FP32]:
+            self.main_incore_0_aic(x, y, out_0)
+            self.main_incore_0_aiv(x, y, out_0)
+            return out_0
+
+    After = _run_pipeline(Before)
+    ir.assert_structural_equal(After, Expected)
+
+
+def test_local_slot_num_sizes_reserve_and_both_peer_initializers():
+    """Local depth 4 reserves four tiles while transport retains sixteen slots."""
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def main_incore_0(
+            self,
+            x: pl.Tensor[[16, 128], pl.BF16],
+            y: pl.Tensor[[128, 64], pl.BF16],
+            out_0: pl.Out[pl.Tensor[[16, 64], pl.FP32]],
+        ) -> pl.Tensor[[16, 64], pl.FP32]:
+            pl.func_attr({"split": pl.SplitMode.UP_DOWN, "slot_num": 16, "local_slot_num": 4})
+            x_mat = pl.load(x, [0, 0], [16, 128], target_memory=pl.MemorySpace.Mat)
+            x_left = pl.move(x_mat, target_memory=pl.MemorySpace.Left)
+            y_mat = pl.load(y, [0, 0], [128, 64], target_memory=pl.MemorySpace.Mat)
+            y_right = pl.move(y_mat, target_memory=pl.MemorySpace.Right)
+            z_tile = pl.matmul(x_left, y_right)
+            z_vec = pl.move(
+                z_tile,
+                target_memory=pl.MemorySpace.Vec,
+                blayout=pl.TileLayout.row_major,
+                slayout=pl.TileLayout.none_box,
+            )
+            out_0 = pl.store(z_vec, [0, 0], out_0)
+            return out_0
+
+    @pl.program
+    class Expected:
+        @pl.function(type=pl.FunctionType.AIC)
+        def main_incore_0_aic(
+            self,
+            x: pl.Tensor[[16, 128], pl.BF16],
+            y: pl.Tensor[[128, 64], pl.BF16],
+            out_0: pl.Out[pl.Tensor[[16, 64], pl.FP32]],
+        ):
+            pl.func_attr({"split": pl.SplitMode.UP_DOWN, "slot_num": 16, "local_slot_num": 4})
+            main_incore_0_c2v_slot_buffer_import = pl.import_peer_buffer(
+                name="main_incore_0_c2v_slot_buffer", peer_func="main_incore_0_aiv"
+            )
+            pl.aic_initialize_pipe(
+                main_incore_0_c2v_slot_buffer_import,
+                pl.const(0, pl.INT32),
+                dir_mask=1,
+                slot_size=4096,
+                slot_num=16,
+                local_slot_num=4,
+            )
+            x_mat: pl.Tile[[16, 128], pl.BF16, pl.MemorySpace.Mat] = pl.load(
+                x, [0, 0], [16, 128], target_memory=pl.MemorySpace.Mat
+            )
+            x_left = pl.move(x_mat, target_memory=pl.MemorySpace.Left)
+            y_mat: pl.Tile[[128, 64], pl.BF16, pl.MemorySpace.Mat] = pl.load(
+                y, [0, 0], [128, 64], target_memory=pl.MemorySpace.Mat
+            )
+            y_right = pl.move(y_mat, target_memory=pl.MemorySpace.Right)
+            z_tile = pl.matmul(x_left, y_right)
+            pl.tpush_to_aiv(z_tile, split=0)
+
+        @pl.function(type=pl.FunctionType.AIV)
+        def main_incore_0_aiv(
+            self,
+            x: pl.Tensor[[16, 128], pl.BF16],
+            y: pl.Tensor[[128, 64], pl.BF16],
+            out_0: pl.Out[pl.Tensor[[16, 64], pl.FP32]],
+        ) -> pl.Tensor[[16, 64], pl.FP32]:
+            pl.func_attr({"split": pl.SplitMode.UP_DOWN, "slot_num": 16, "local_slot_num": 4})
+            main_incore_0_c2v_slot_buffer = pl.reserve_buffer(
+                name="main_incore_0_c2v_slot_buffer", size=16384, base=-1
+            )
+            pl.aiv_initialize_pipe(
+                main_incore_0_c2v_slot_buffer,
+                pl.const(0, pl.INT32),
+                dir_mask=1,
+                slot_size=4096,
+                slot_num=16,
+                local_slot_num=4,
+            )
+            z_vec: pl.Tile[[16, 64], pl.FP32, pl.MemorySpace.Vec] = pl.tpop_from_aic(split=0)
+            out_0_store: pl.Tensor[[16, 64], pl.FP32] = pl.store(z_vec, [0, 0], out_0)
+            pl.tfree_to_aic(z_vec)
+            return out_0_store
+
+        @pl.function(type=pl.FunctionType.Group)
+        def main_incore_0(
+            self,
+            x: pl.Tensor[[16, 128], pl.BF16],
+            y: pl.Tensor[[128, 64], pl.BF16],
+            out_0: pl.Out[pl.Tensor[[16, 64], pl.FP32]],
+        ) -> pl.Tensor[[16, 64], pl.FP32]:
+            pl.func_attr({"split": pl.SplitMode.UP_DOWN, "slot_num": 16, "local_slot_num": 4})
+            self.main_incore_0_aic(x, y, out_0)
+            self.main_incore_0_aiv(x, y, out_0)
+            return out_0
+
+    After = _run_pipeline(Before)
+    ir.assert_structural_equal(After, Expected)
+
+
+# ---------------------------------------------------------------------------
+# Backstop: direct invocation that skips LowerAutoVectorSplit.
+#
+# This pass is documented as invocable on its own after InferTileMemorySpace
+# ("building a custom pass pipeline"), and a bare pass call does NOT enforce
+# `required` properties — only PassPipeline does. So AivSplitLoweredValid can be
+# unmet here even though it is declared. The authoring diagnostic for an
+# unsplittable transpose lives in LowerAutoVectorSplit (see
+# test_lower_auto_vector_split.py), but without a guard here that flow expands
+# the kernel silently and SplitVectorKernel mis-shapes it.
+# ---------------------------------------------------------------------------
+
+
+def test_transpose_hazard_backstopped_when_lowering_is_skipped():
+    """Skipping pass 23 must not silently expand an unsplittable transpose."""
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore, attrs={"split": pl.SplitMode.UP_DOWN})
+        def t_hazard(
+            self,
+            x: pl.Tensor[[16, 128], pl.BF16],
+            y: pl.Tensor[[128, 8], pl.BF16],
+            out_0: pl.Out[pl.Tensor[[8, 16], pl.FP32]],
+        ) -> pl.Tensor[[8, 16], pl.FP32]:
+            x_mat = pl.load(x, [0, 0], [16, 128], target_memory=pl.MemorySpace.Mat)
+            x_left = pl.move(x_mat, target_memory=pl.MemorySpace.Left)
+            y_mat = pl.load(y, [0, 0], [128, 8], target_memory=pl.MemorySpace.Mat)
+            y_right = pl.move(y_mat, target_memory=pl.MemorySpace.Right)
+            z = pl.matmul(x_left, y_right)  # [16, 8] (cube result)
+            z_vec = pl.move(z, target_memory=pl.MemorySpace.Vec)
+            zt = pl.transpose(z_vec, axis1=0, axis2=1)  # swaps split dim 0 (extent 16)
+            out_0 = pl.store(zt, [0, 0], out_0)
+            return out_0
+
+    p = passes.convert_to_ssa()(Before)
+    p = passes.lower_composite_ops()(p)
+    p = passes.flatten_tile_nd_to_2d()(p)
+    p = passes.infer_tile_memory_space()(p)
+    # No lower_auto_vector_split() — the documented direct-invocation flow.
+    with pytest.raises(pypto.InternalError, match="swaps the split axis"):
+        passes.expand_mixed_kernel()(p)
+
+
+# ---------------------------------------------------------------------------
+# Regression: GM tensor written on the AIV lane, consumed by the AIC matmul.
+#
+# Mirror of the GM-mediated cross-lane store/load handshake test in the OPPOSITE
+# direction. The vector lane stores into a GM tensor (producing a fresh SSA
+# version); the cube lane loads that version back as the matmul left operand.
+# ExpandMixedKernel builds the AIC body's param/clone map from func->params_
+# only, so the AIV-defined GM version is a dangling free var on the AIC lane ->
+# the printer marks it __FREE_VAR and PTO codegen's GetOrCreateTensorView
+# crashes. The fix repoints the cross-half GM use onto the shared base parameter
+# (straight-line tile.store result, IfStmt phi, and ForStmt return_var forms).
+# ---------------------------------------------------------------------------
+
+
+def _expand_no_verify(program: ir.Program) -> ir.Program:
+    """SSA -> infer-memory -> expand-mixed-kernel, expanding with verification off.
+
+    Verification is disabled (empty PassContext) so a mis-routed free Var is
+    observable as a returned-IR property instead of a verifier crash -- matching
+    the __FREE_VAR check below.
+    """
+    p = passes.infer_tile_memory_space()(passes.convert_to_ssa()(program))
+    with passes.PassContext([]):
+        return passes.expand_mixed_kernel()(p)
+
+
+def _assert_no_free_var(program: ir.Program) -> None:
+    """A dangling/free Var prints with a ``__FREE_VAR`` suffix and later crashes
+    PTO codegen's GetOrCreateTensorView; assert none survive the split."""
+    assert "__FREE_VAR" not in ir.python_print(program)
+
+
+def _assert_aic_loads_reference_params(after: ir.Program) -> None:
+    """Every cube-lane ``tile.load`` source must resolve to an AIC parameter.
+
+    The AIV lane writes a GM tensor (a fresh SSA version) that the AIC lane loads
+    back for the matmul. ExpandMixedKernel must thread that cross-half reference
+    onto the AIC function's shared GM parameter; otherwise the AIC body loads
+    from a Var defined only on the AIV lane -- a dangling reference codegen
+    cannot resolve. ``unique_id`` (not ``id(...)``) is the reliable identity key
+    across binding-layer Var wrappers.
+    """
+    aic = next(f for f in after.functions.values() if f.func_type == ir.FunctionType.AIC)
+    param_ids = {p.unique_id for p in aic.params}
+    dangling = []
+    for s in ir.flatten_to_stmts(aic.body):
+        if isinstance(s, ir.AssignStmt) and isinstance(s.value, ir.Call) and _op_name(s) == "tile.load":
+            src = s.value.args[0]  # tile.load arg0 is the source tensor
+            if isinstance(src, ir.Var) and src.unique_id not in param_ids:
+                dangling.append(src.name_hint)
+    assert not dangling, (
+        f"AIC tile.load reads non-parameter Var(s) {dangling}: a cross-half GM "
+        f"SSA version was not threaded into the AIC parameter map"
+    )
+
+
+def test_aiv_gm_write_consumed_by_cube_straightline_resolves_to_param():
+    """Straight-line ``tile.store`` result (``scratch__ssa_v1``).
+
+    AIV: load -> add -> store into GM ``scratch``. AIC: load that scratch back ->
+    move Left -> matmul(scratch, b) -> move Vec. Before the fix the AIC load
+    reads the AIV-defined store-result version as a free var.
+    """
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def gm_aiv_to_aic(
+            self,
+            a: pl.Tensor[[16, 128], pl.BF16],
+            b: pl.Tensor[[128, 128], pl.BF16],
+            scratch: pl.Out[pl.Tensor[[16, 128], pl.BF16]],
+            out_0: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+        ) -> pl.Tensor[[16, 128], pl.FP32]:
+            # AIV lane: produce a GM scratch tensor (vector store).
+            a_tile = pl.load(a, [0, 0], [16, 128])
+            s = pl.add(a_tile, a_tile)
+            scratch = pl.store(s, [0, 0], scratch)
+            # AIC lane: cube matmul consumes the AIV-written scratch.
+            s_mat = pl.load(scratch, [0, 0], [16, 128], target_memory=pl.MemorySpace.Mat)
+            s_left = pl.move(s_mat, target_memory=pl.MemorySpace.Left)
+            b_mat = pl.load(b, [0, 0], [128, 128], target_memory=pl.MemorySpace.Mat)
+            b_right = pl.move(b_mat, target_memory=pl.MemorySpace.Right)
+            z = pl.matmul(s_left, b_right)
+            z_vec = pl.move(z, target_memory=pl.MemorySpace.Vec)
+            out_0 = pl.store(z_vec, [0, 0], out_0)
+            return out_0
+
+    After = _expand_no_verify(Before)
+    _assert_no_free_var(After)
+    _assert_aic_loads_reference_params(After)
+
+
+def test_aiv_gm_write_in_if_consumed_by_cube_resolves_to_param():
+    """Conditional write -> IfStmt phi return_var (``scratch__phi_v*``).
+
+    Both branches store into GM ``scratch`` (so its post-if value is a phi whose
+    yields resolve to the same ``scratch`` origin); the AIC matmul loads that
+    phi. Exercises the IfStmt return_var origin propagation.
+    """
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def gm_phi(
+            self,
+            a: pl.Tensor[[16, 128], pl.BF16],
+            b: pl.Tensor[[128, 128], pl.BF16],
+            flag: pl.Scalar[pl.INT32],
+            scratch: pl.Out[pl.Tensor[[16, 128], pl.BF16]],
+            out_0: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+        ) -> pl.Tensor[[16, 128], pl.FP32]:
+            # AIV lane: both branches write GM scratch -> post-if phi version.
+            if flag == 0:
+                a0 = pl.load(a, [0, 0], [16, 128])
+                s0 = pl.add(a0, a0)
+                scratch = pl.store(s0, [0, 0], scratch)
+            else:
+                a1 = pl.load(a, [0, 0], [16, 128])
+                s1 = pl.mul(a1, a1)
+                scratch = pl.store(s1, [0, 0], scratch)
+            # AIC lane: cube matmul consumes the phi-versioned scratch.
+            s_mat = pl.load(scratch, [0, 0], [16, 128], target_memory=pl.MemorySpace.Mat)
+            s_left = pl.move(s_mat, target_memory=pl.MemorySpace.Left)
+            b_mat = pl.load(b, [0, 0], [128, 128], target_memory=pl.MemorySpace.Mat)
+            b_right = pl.move(b_mat, target_memory=pl.MemorySpace.Right)
+            z = pl.matmul(s_left, b_right)
+            z_vec = pl.move(z, target_memory=pl.MemorySpace.Vec)
+            out_0 = pl.store(z_vec, [0, 0], out_0)
+            return out_0
+
+    After = _expand_no_verify(Before)
+    _assert_no_free_var(After)
+    _assert_aic_loads_reference_params(After)
+
+
+def test_aiv_gm_write_in_loop_consumed_by_cube_resolves_to_param():
+    """Loop write -> ForStmt return_var (``scratch__rv_v*``).
+
+    The loop carries GM ``scratch`` as an iter_arg (init = the ``scratch`` param)
+    and stores into it each iteration; its post-loop value is the return_var that
+    the AIC matmul loads. Covered by origin_map (return_var -> iter_arg -> init).
+    """
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def gm_loop(
+            self,
+            a: pl.Tensor[[16, 128], pl.BF16],
+            b: pl.Tensor[[128, 128], pl.BF16],
+            scratch: pl.Out[pl.Tensor[[16, 128], pl.BF16]],
+            out_0: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+        ) -> pl.Tensor[[16, 128], pl.FP32]:
+            # AIV lane: store GM scratch each iteration -> post-loop return_var.
+            for i in pl.range(2):  # noqa: B007 - loop index unused by design
+                a_tile = pl.load(a, [0, 0], [16, 128])
+                s = pl.add(a_tile, a_tile)
+                scratch = pl.store(s, [0, 0], scratch)
+            # AIC lane: cube matmul consumes the loop-carried scratch version.
+            s_mat = pl.load(scratch, [0, 0], [16, 128], target_memory=pl.MemorySpace.Mat)
+            s_left = pl.move(s_mat, target_memory=pl.MemorySpace.Left)
+            b_mat = pl.load(b, [0, 0], [128, 128], target_memory=pl.MemorySpace.Mat)
+            b_right = pl.move(b_mat, target_memory=pl.MemorySpace.Right)
+            z = pl.matmul(s_left, b_right)
+            z_vec = pl.move(z, target_memory=pl.MemorySpace.Vec)
+            out_0 = pl.store(z_vec, [0, 0], out_0)
+            return out_0
+
+    After = _expand_no_verify(Before)
+    _assert_no_free_var(After)
+    _assert_aic_loads_reference_params(After)
+
+
+# ---------------------------------------------------------------------------
+# Regression (issue #3009): while conditions are uses of loop-carried state,
+# even when the backedge reads an independent value and no result escapes.
+# ---------------------------------------------------------------------------
+
+
+def _assert_split_function_equal(after: ir.Program, expected: ir.Program, name: str) -> None:
+    actual_func = after.get_function(name)
+    expected_func = expected.get_function(name)
+    assert actual_func is not None
+    assert expected_func is not None
+    ir.assert_structural_equal(actual_func, expected_func)
+
+
+def test_while_condition_only_scalar_carry_survives_nested_split():
+    """Issue #3009: a polling carry stays live through the while condition."""
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def poll(
+            self,
+            a: pl.Tensor[[16, 16], pl.FP16],
+            b: pl.Tensor[[16, 16], pl.FP16],
+            flags: pl.Tensor[[16], pl.INT32],
+            cube_out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            vector_out: pl.Out[pl.Tensor[[16, 16], pl.FP16]],
+            lane: pl.Scalar[pl.INDEX],
+            worker: pl.Scalar[pl.INDEX],
+        ):
+            a_mat = pl.load(a, [0, 0], [16, 16], target_memory=pl.Mem.Mat)
+            b_mat = pl.load(b, [0, 0], [16, 16], target_memory=pl.Mem.Mat)
+            left = pl.move(a_mat, target_memory=pl.Mem.Left)
+            right = pl.move(b_mat, target_memory=pl.Mem.Right)
+            acc = pl.matmul(left, right)
+            _cube_store = pl.store(acc, [0, 0], cube_out)
+            if lane == 0:
+                if worker == 1:
+                    initial_ready = pl.tensor.read(flags, [0])
+                    for (ready,) in pl.while_(init_values=(initial_ready,)):
+                        pl.cond(pl.cast(ready, pl.INDEX) != 1)
+                        pl.system.cacheinvalid()
+                        next_ready = pl.tensor.read(flags, [0])
+                        _final_ready = pl.yield_(next_ready)
+                    value = pl.load(a, [0, 0], [16, 16], target_memory=pl.Mem.Vec)
+                    incremented = pl.add(value, 1.0)
+                    _vector_store = pl.store(incremented, [0, 0], vector_out)
+
+    @pl.program
+    class Expected:
+        @pl.function(type=pl.FunctionType.AIV)
+        def poll_aiv(
+            self,
+            a: pl.Tensor[[16, 16], pl.FP16],
+            b: pl.Tensor[[16, 16], pl.FP16],
+            flags: pl.Tensor[[16], pl.INT32],
+            cube_out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            vector_out: pl.Out[pl.Tensor[[16, 16], pl.FP16]],
+            lane: pl.Scalar[pl.INDEX],
+            worker: pl.Scalar[pl.INDEX],
+        ):
+            pl.func_attr({"dual_aiv_dispatch": True})
+            if lane == 0:
+                if worker == 1:
+                    initial_ready = pl.tensor.read(flags, [0])
+                    for (ready,) in pl.while_(init_values=(initial_ready,)):
+                        pl.cond(pl.cast(ready, pl.INDEX) != 1)
+                        pl.system.cacheinvalid()
+                        next_ready = pl.tensor.read(flags, [0])
+                        _final_ready = pl.yield_(next_ready)
+                    value = pl.load(a, [0, 0], [16, 16], target_memory=pl.Mem.Vec)
+                    incremented = pl.add(value, 1.0)
+                    _vector_store = pl.store(incremented, [0, 0], vector_out)
+
+    After = _expand_no_verify(Before)
+    _assert_no_free_var(After)
+    _assert_split_function_equal(After, Expected, "poll_aiv")
+
+
+def test_while_condition_only_tile_read_carry_survives_nested_split():
+    """A Vec load/read backedge stays live even when its result is not exported."""
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def poll(
+            self,
+            a: pl.Tensor[[16, 16], pl.FP16],
+            b: pl.Tensor[[16, 16], pl.FP16],
+            flags: pl.Tensor[[16], pl.INT32],
+            cube_out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            vector_out: pl.Out[pl.Tensor[[16, 16], pl.FP16]],
+            lane: pl.Scalar[pl.INDEX],
+            worker: pl.Scalar[pl.INDEX],
+        ):
+            a_mat = pl.load(a, [0, 0], [16, 16], target_memory=pl.Mem.Mat)
+            b_mat = pl.load(b, [0, 0], [16, 16], target_memory=pl.Mem.Mat)
+            left = pl.move(a_mat, target_memory=pl.Mem.Left)
+            right = pl.move(b_mat, target_memory=pl.Mem.Right)
+            acc = pl.matmul(left, right)
+            _cube_store = pl.store(acc, [0, 0], cube_out)
+            if lane == 0:
+                if worker == 1:
+                    initial_tile = pl.load(flags, [0], [16], target_memory=pl.Mem.Vec)
+                    initial_ready = pl.tile.read(initial_tile, [0])
+                    for (ready,) in pl.while_(init_values=(initial_ready,)):
+                        pl.cond(pl.cast(ready, pl.INDEX) != 1)
+                        pl.system.cacheinvalid()
+                        flag_tile = pl.load(flags, [0], [16], target_memory=pl.Mem.Vec)
+                        next_ready = pl.tile.read(flag_tile, [0])
+                        _final_ready = pl.yield_(next_ready)
+                    value = pl.load(a, [0, 0], [16, 16], target_memory=pl.Mem.Vec)
+                    incremented = pl.add(value, 1.0)
+                    _vector_store = pl.store(incremented, [0, 0], vector_out)
+
+    @pl.program
+    class Expected:
+        @pl.function(type=pl.FunctionType.AIV)
+        def poll_aiv(
+            self,
+            a: pl.Tensor[[16, 16], pl.FP16],
+            b: pl.Tensor[[16, 16], pl.FP16],
+            flags: pl.Tensor[[16], pl.INT32],
+            cube_out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            vector_out: pl.Out[pl.Tensor[[16, 16], pl.FP16]],
+            lane: pl.Scalar[pl.INDEX],
+            worker: pl.Scalar[pl.INDEX],
+        ):
+            pl.func_attr({"dual_aiv_dispatch": True})
+            if lane == 0:
+                if worker == 1:
+                    initial_tile = pl.load(flags, [0], [16], target_memory=pl.Mem.Vec)
+                    initial_ready = pl.tile.read(initial_tile, [0])
+                    for (ready,) in pl.while_(init_values=(initial_ready,)):
+                        pl.cond(pl.cast(ready, pl.INDEX) != 1)
+                        pl.system.cacheinvalid()
+                        flag_tile = pl.load(flags, [0], [16], target_memory=pl.Mem.Vec)
+                        next_ready = pl.tile.read(flag_tile, [0])
+                        _final_ready = pl.yield_(next_ready)
+                    value = pl.load(a, [0, 0], [16, 16], target_memory=pl.Mem.Vec)
+                    incremented = pl.add(value, 1.0)
+                    _vector_store = pl.store(incremented, [0, 0], vector_out)
+
+    After = _expand_no_verify(Before)
+    _assert_no_free_var(After)
+    _assert_split_function_equal(After, Expected, "poll_aiv")
+
+
+def test_while_condition_seed_keeps_fifo_dependency_and_prunes_dead_slot():
+    """Condition liveness propagates over the yield without seeding a dead cycle."""
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def poll_fifo(
+            self,
+            a: pl.Tensor[[16, 16], pl.FP16],
+            b: pl.Tensor[[16, 16], pl.FP16],
+            flags: pl.Tensor[[16], pl.INT32],
+            cube_out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            vector_out: pl.Out[pl.Tensor[[16, 16], pl.FP16]],
+        ):
+            a_mat = pl.load(a, [0, 0], [16, 16], target_memory=pl.Mem.Mat)
+            b_mat = pl.load(b, [0, 0], [16, 16], target_memory=pl.Mem.Mat)
+            left = pl.move(a_mat, target_memory=pl.Mem.Left)
+            right = pl.move(b_mat, target_memory=pl.Mem.Right)
+            acc = pl.matmul(left, right)
+            _cube_store = pl.store(acc, [0, 0], cube_out)
+            first = pl.tensor.read(flags, [0])
+            second = pl.tensor.read(flags, [1])
+            dead = pl.tensor.read(flags, [2])
+            for ready, queued, unused in pl.while_(init_values=(first, second, dead)):
+                pl.cond(pl.cast(ready, pl.INDEX) != 1)
+                pl.system.cacheinvalid()
+                fresh = pl.tensor.read(flags, [0])
+                _final_ready, _final_queued, _final_unused = pl.yield_(queued, fresh, unused)
+            value = pl.load(a, [0, 0], [16, 16], target_memory=pl.Mem.Vec)
+            incremented = pl.add(value, 1.0)
+            _vector_store = pl.store(incremented, [0, 0], vector_out)
+
+    @pl.program
+    class Expected:
+        @pl.function(type=pl.FunctionType.AIV)
+        def poll_fifo_aiv(
+            self,
+            a: pl.Tensor[[16, 16], pl.FP16],
+            b: pl.Tensor[[16, 16], pl.FP16],
+            flags: pl.Tensor[[16], pl.INT32],
+            cube_out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            vector_out: pl.Out[pl.Tensor[[16, 16], pl.FP16]],
+        ):
+            pl.func_attr({"dual_aiv_dispatch": True})
+            first = pl.tensor.read(flags, [0])
+            second = pl.tensor.read(flags, [1])
+            for ready, queued in pl.while_(init_values=(first, second)):
+                pl.cond(pl.cast(ready, pl.INDEX) != 1)
+                pl.system.cacheinvalid()
+                fresh = pl.tensor.read(flags, [0])
+                _final_ready, _final_queued = pl.yield_(queued, fresh)
+            value = pl.load(a, [0, 0], [16, 16], target_memory=pl.Mem.Vec)
+            incremented = pl.add(value, 1.0)
+            _vector_store = pl.store(incremented, [0, 0], vector_out)
+
+    After = _expand_no_verify(Before)
+    _assert_no_free_var(After)
+    _assert_split_function_equal(After, Expected, "poll_fifo_aiv")
+
+
+# ---------------------------------------------------------------------------
+# Regression (issue #2716): a multi-entry FIFO's carries survive the split.
+#
+# A two-entry FIFO rotates: slot 0's next value IS slot 1's iter_arg, so slot 1
+# is read nowhere but the loop's own yield. StripDeadIterArgs seeds liveness from
+# the body *excluding* that yield, so it used to call slot 1 dead and drop it --
+# while the positional yield filter kept slot 0's value naming the iter_arg it
+# had just deleted. Two outcomes, same defect: where no repair reached the loop
+# the free Var survived to PTO codegen ("no MLIR mapping for MemRef base ..."),
+# and where one did the rotation was silently rewritten into a self-carry, which
+# freezes the FIFO and computes the wrong answer.
+# ---------------------------------------------------------------------------
+
+
+def _first_carry_loop(stmt: ir.Stmt) -> ir.ForStmt:
+    """The first ForStmt with iter_args in `stmt`, searched depth-first."""
+    for inner in ir.flatten_to_stmts(stmt):
+        if isinstance(inner, ir.ForStmt):
+            if inner.iter_args:
+                return inner
+            return _first_carry_loop(inner.body)
+    raise AssertionError("no loop with iter_args found")
+
+
+def _assert_fifo_rotation_intact(after: ir.Program) -> None:
+    """The AIV lane keeps all three carries and still rotates slot 1 into slot 0.
+
+    Checking the yield operand by identity is the point: a dropped slot 1 leaves
+    slot 0 yielding either a free Var (crash) or its own iter_arg (silent
+    self-carry), and only an identity comparison separates the latter from the
+    rotation the author wrote.
+    """
+    aiv = next(f for f in after.functions.values() if f.func_type == ir.FunctionType.AIV)
+    loop = _first_carry_loop(aiv.body)
+    assert len(loop.iter_args) == 3, (
+        f"expected the 3 authored carries to survive, got {[a.name_hint for a in loop.iter_args]}"
+    )
+    tail = ir.flatten_to_stmts(loop.body)[-1]
+    assert isinstance(tail, ir.YieldStmt), f"loop body must end with YieldStmt, got {type(tail).__name__}"
+    assert len(tail.value) == 3, f"expected 3 yielded values, got {len(tail.value)}"
+    rotated = tail.value[1]
+    assert isinstance(rotated, ir.Var), f"slot 1 must yield the slot-2 carry, got {type(rotated).__name__}"
+    assert rotated.unique_id == loop.iter_args[2].unique_id, (
+        f"slot 1 must yield carry '{loop.iter_args[2].name_hint}' (the FIFO rotation), "
+        f"got '{rotated.name_hint}'"
+    )
+
+
+def test_two_entry_fifo_rotation_survives_split_inside_carry_less_loop():
+    """FIFO loop nested in a carry-less loop -- the form that reached codegen.
+
+    No repair descends into a loop without iter_args, so a dropped carry leaves
+    the surviving slot's yield naming a Var the loop no longer binds, and that
+    free Var is only caught ~30 passes later by PTO codegen.
+    """
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def fifo_nested(
+            self,
+            a: pl.Tensor[[16, 128], pl.BF16],
+            b: pl.Tensor[[128, 128], pl.BF16],
+            out_0: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+        ) -> pl.Tensor[[16, 128], pl.FP32]:
+            for _t in pl.range(2):  # noqa: B007 - carry-less by design, see docstring
+                a_mat = pl.load(a, [0, 0], [16, 128], target_memory=pl.MemorySpace.Mat)
+                a_left = pl.move(a_mat, target_memory=pl.MemorySpace.Left)
+                b_mat = pl.load(b, [0, 0], [128, 128], target_memory=pl.MemorySpace.Mat)
+                b_right = pl.move(b_mat, target_memory=pl.MemorySpace.Right)
+                acc = pl.matmul(a_left, b_right)  # AIC
+                acc_vec = pl.move(acc, target_memory=pl.MemorySpace.Vec)  # C->V boundary
+                p0 = pl.add(acc_vec, acc_vec)  # AIV: FIFO entry 0
+                p1 = pl.add(p0, p0)  # AIV: FIFO entry 1
+                s = pl.add(p0, p1)
+                for _i, (s_it, p0_it, p1_it) in pl.range(4, init_values=(s, p0, p1)):  # noqa: B007
+                    s_next = pl.add(s_it, p0_it)  # only entry 0 is consumed
+                    p_new = pl.add(acc_vec, acc_vec)
+                    s, p0, p1 = pl.yield_(s_next, p1_it, p_new)  # rotate 1 -> 0
+                _sink = pl.store(s, [0, 0], out_0)  # noqa: F841 - keeps the outer loop carry-less
+            return out_0
+
+    After = _expand_no_verify(Before)
+    _assert_no_free_var(After)
+    _assert_fifo_rotation_intact(After)
+
+
+def test_two_entry_fifo_rotation_not_rewritten_to_self_carry():
+    """FIFO loop at function top level -- the form that compiled but was wrong.
+
+    Here FixupDanglingYieldValues does reach the loop, and its per-slot fallback
+    (yield the slot's own iter_arg) turns the rotation into a self-carry: entry 0
+    never advances and the freshly computed entry is dead-coded away. No error is
+    raised, so only an identity check on the yield operand catches it.
+    """
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def fifo_toplevel(
+            self,
+            a: pl.Tensor[[16, 128], pl.BF16],
+            b: pl.Tensor[[128, 128], pl.BF16],
+            out_0: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+        ) -> pl.Tensor[[16, 128], pl.FP32]:
+            a_mat = pl.load(a, [0, 0], [16, 128], target_memory=pl.MemorySpace.Mat)
+            a_left = pl.move(a_mat, target_memory=pl.MemorySpace.Left)
+            b_mat = pl.load(b, [0, 0], [128, 128], target_memory=pl.MemorySpace.Mat)
+            b_right = pl.move(b_mat, target_memory=pl.MemorySpace.Right)
+            acc = pl.matmul(a_left, b_right)  # AIC
+            acc_vec = pl.move(acc, target_memory=pl.MemorySpace.Vec)  # C->V boundary
+            p0 = pl.add(acc_vec, acc_vec)
+            p1 = pl.add(p0, p0)
+            s = pl.add(p0, p1)
+            for _i, (s_it, p0_it, p1_it) in pl.range(4, init_values=(s, p0, p1)):  # noqa: B007
+                s_next = pl.add(s_it, p0_it)
+                p_new = pl.add(acc_vec, acc_vec)
+                s, p0, p1 = pl.yield_(s_next, p1_it, p_new)  # rotate 1 -> 0
+            out_0 = pl.store(s, [0, 0], out_0)
+            return out_0
+
+    After = _expand_no_verify(Before)
+    _assert_no_free_var(After)
+    _assert_fifo_rotation_intact(After)
+
+
+def test_nested_yield_of_an_enclosing_scope_value_is_not_rewritten():
+    """A nested loop may legitimately yield a value bound outside its own body.
+
+    `FixupDanglingYieldValues` walks a block accumulating the definitions it has
+    passed, and every recursion used to restart that set empty. A loop reached
+    through one therefore could not see the enclosing loop's variable or
+    anything defined before it, so a perfectly valid yield looked dangling and
+    was replaced by the slot's own carry -- the same silent self-carry this file
+    guards against above, arriving by a different route.
+    """
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def outer_scope_yield(
+            self,
+            a: pl.Tensor[[16, 128], pl.BF16],
+            b: pl.Tensor[[128, 128], pl.BF16],
+            out_0: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+        ) -> pl.Tensor[[16, 128], pl.FP32]:
+            a_mat = pl.load(a, [0, 0], [16, 128], target_memory=pl.MemorySpace.Mat)
+            a_left = pl.move(a_mat, target_memory=pl.MemorySpace.Left)
+            b_mat = pl.load(b, [0, 0], [128, 128], target_memory=pl.MemorySpace.Mat)
+            b_right = pl.move(b_mat, target_memory=pl.MemorySpace.Right)
+            acc = pl.matmul(a_left, b_right)  # AIC
+            acc_vec = pl.move(acc, target_memory=pl.MemorySpace.Vec)  # C->V boundary
+            outer_val = pl.add(acc_vec, acc_vec)  # bound before the carry-less loop
+            for _t in pl.range(2):  # noqa: B007 - carry-less, so the repair recurses
+                seed = pl.add(outer_val, outer_val)
+                for _i, (s_it,) in pl.range(4, init_values=(seed,)):  # noqa: B007
+                    s = pl.yield_(outer_val)  # legitimate: bound two scopes up
+                _sink = pl.store(s, [0, 0], out_0)  # noqa: F841 - keeps the outer loop carry-less
+            return out_0
+
+    After = _expand_no_verify(Before)
+    _assert_no_free_var(After)
+
+    aiv = next(f for f in After.functions.values() if f.func_type == ir.FunctionType.AIV)
+    loop = _first_carry_loop(aiv.body)
+    tail = ir.flatten_to_stmts(loop.body)[-1]
+    assert isinstance(tail, ir.YieldStmt), f"loop body must end with YieldStmt, got {type(tail).__name__}"
+    assert len(tail.value) == 1, f"expected 1 yielded value, got {len(tail.value)}"
+    yielded = tail.value[0]
+    assert isinstance(yielded, ir.Var), f"expected a Var operand, got {type(yielded).__name__}"
+    carry_ids = {a.unique_id for a in loop.iter_args}
+    assert yielded.unique_id not in carry_ids, (
+        f"the enclosing-scope value was rewritten into a self-carry on '{yielded.name_hint}'"
+    )
+
+
+def test_scalar_parameter_branch_results_survive_on_both_lanes():
+    """Both lanes must retain live if results yielding a parameter or its expression.
+
+    Parameters have no defining statement in the body. Omitting them from the
+    branch cleanup scope used to erase both result slots but keep their uses.
+    """
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def parameter_branch(
+            self,
+            x: pl.Tensor[[16, 16], pl.BF16],
+            out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            vec_out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            n: pl.Scalar[pl.INDEX],
+        ) -> tuple[pl.Tensor[[16, 16], pl.FP32], pl.Tensor[[16, 16], pl.FP32]]:
+            if n > 1:
+                selected, limit = pl.yield_(n - 1, n)
+            else:
+                selected, limit = pl.yield_(0, 1)
+            if selected < limit:
+                a = pl.load(x, [0, 0], [16, 16], target_memory=pl.MemorySpace.Mat)
+                a_left = pl.move(a, target_memory=pl.MemorySpace.Left)
+                a_right = pl.move(a, target_memory=pl.MemorySpace.Right)
+                product = pl.matmul(a_left, a_right)
+                pl.store(product, [0, 0], out)
+                zero = pl.tile.full([16, 16], dtype=pl.FP32, value=0.0)
+                pl.store(zero, [0, 0], vec_out)
+            return out, vec_out
+
+    @pl.program
+    class Expected:
+        @pl.function(type=pl.FunctionType.AIC)
+        def parameter_branch_aic(
+            self,
+            x: pl.Tensor[[16, 16], pl.BF16],
+            out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            vec_out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            n: pl.Scalar[pl.INDEX],
+        ):
+            if n > 1:
+                selected, limit = pl.yield_(n - 1, n)
+            else:
+                selected, limit = pl.yield_(0, 1)
+            if selected < limit:
+                a = pl.load(x, [0, 0], [16, 16], target_memory=pl.MemorySpace.Mat)
+                a_left = pl.move(a, target_memory=pl.MemorySpace.Left)
+                a_right = pl.move(a, target_memory=pl.MemorySpace.Right)
+                product = pl.matmul(a_left, a_right)
+                pl.store(product, [0, 0], out)
+
+        @pl.function(type=pl.FunctionType.AIV)
+        def parameter_branch_aiv(
+            self,
+            x: pl.Tensor[[16, 16], pl.BF16],
+            out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            vec_out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            n: pl.Scalar[pl.INDEX],
+        ) -> tuple[pl.Tensor[[16, 16], pl.FP32], pl.Tensor[[16, 16], pl.FP32]]:
+            pl.func_attr({"dual_aiv_dispatch": True})
+            if n > 1:
+                selected, limit = pl.yield_(n - 1, n)
+            else:
+                selected, limit = pl.yield_(0, 1)
+            if selected < limit:
+                zero = pl.tile.full([16, 16], dtype=pl.FP32, value=0.0)
+                pl.store(zero, [0, 0], vec_out)
+            return out, vec_out
+
+    After = _expand_no_verify(Before)
+    ExpectedSSA = passes.infer_tile_memory_space()(passes.convert_to_ssa()(Expected))
+    _assert_no_free_var(After)
+    for lane in ("aic", "aiv"):
+        name = f"parameter_branch_{lane}"
+        actual = After.get_function(name)
+        expected = ExpectedSSA.get_function(name)
+        assert actual is not None and expected is not None
+        ir.assert_structural_equal(actual, expected)
+
+
+def test_nested_yield_of_a_function_parameter_is_not_rewritten():
+    """A parameter is bound by the signature, so no statement in the body defines it.
+
+    The scope threaded into the walk starts at the function body, so a yield
+    naming a parameter has nothing backing it unless the parameters are seeded
+    in -- and it would be replaced by the slot's own carry, dropping the update.
+    """
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def param_yield(
+            self,
+            a: pl.Tensor[[16, 128], pl.BF16],
+            b: pl.Tensor[[128, 128], pl.BF16],
+            scratch: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+            out_0: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+        ) -> pl.Tensor[[16, 128], pl.FP32]:
+            a_mat = pl.load(a, [0, 0], [16, 128], target_memory=pl.MemorySpace.Mat)
+            a_left = pl.move(a_mat, target_memory=pl.MemorySpace.Left)
+            b_mat = pl.load(b, [0, 0], [128, 128], target_memory=pl.MemorySpace.Mat)
+            b_right = pl.move(b_mat, target_memory=pl.MemorySpace.Right)
+            acc = pl.matmul(a_left, b_right)  # AIC
+            acc_vec = pl.move(acc, target_memory=pl.MemorySpace.Vec)  # C->V boundary
+            for _t in pl.range(2):  # noqa: B007 - carry-less, so the repair recurses
+                for _i, (s_it,) in pl.range(4, init_values=(scratch,)):  # noqa: B007
+                    s = pl.yield_(scratch)  # legitimate: bound by the signature
+                _sink = pl.store(acc_vec, [0, 0], s)  # noqa: F841 - keeps the outer loop carry-less
+            return out_0
+
+    After = _expand_no_verify(Before)
+    _assert_no_free_var(After)
+
+    aiv = next(f for f in After.functions.values() if f.func_type == ir.FunctionType.AIV)
+    loop = _first_carry_loop(aiv.body)
+    tail = ir.flatten_to_stmts(loop.body)[-1]
+    assert isinstance(tail, ir.YieldStmt), f"loop body must end with YieldStmt, got {type(tail).__name__}"
+    assert len(tail.value) == 1, f"expected 1 yielded value, got {len(tail.value)}"
+    yielded = tail.value[0]
+    assert isinstance(yielded, ir.Var), f"expected a Var operand, got {type(yielded).__name__}"
+    carry_ids = {c.unique_id for c in loop.iter_args}
+    assert yielded.unique_id not in carry_ids, (
+        f"the parameter yield was rewritten into a self-carry on '{yielded.name_hint}'"
+    )
+    param_ids = {p.unique_id for p in aiv.params}
+    assert yielded.unique_id in param_ids, (
+        f"expected the yield to keep naming the parameter, got '{yielded.name_hint}'"
+    )
+
+
+def test_nested_yield_of_a_cross_core_result_is_not_rewritten():
+    """A boundary move's destination has no defining statement left on either lane.
+
+    `BuildCoreBody` replaces the C->V ``tile.move`` with a ``tpop`` that defines a
+    fresh Var and records the original in ``tpop_var_remap``; references to it are
+    repointed later by ``apply_tpop_remap``. Between those two steps the original
+    looks undefined, so a yield naming it directly must not be "repaired" -- once
+    the reference is replaced by the slot's own carry there is nothing left for
+    the remap to fix, and the loop silently stops updating.
+    """
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def xcore_yield(
+            self,
+            a: pl.Tensor[[16, 128], pl.BF16],
+            b: pl.Tensor[[128, 128], pl.BF16],
+            out_0: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+        ) -> pl.Tensor[[16, 128], pl.FP32]:
+            a_mat = pl.load(a, [0, 0], [16, 128], target_memory=pl.MemorySpace.Mat)
+            a_left = pl.move(a_mat, target_memory=pl.MemorySpace.Left)
+            b_mat = pl.load(b, [0, 0], [128, 128], target_memory=pl.MemorySpace.Mat)
+            b_right = pl.move(b_mat, target_memory=pl.MemorySpace.Right)
+            # An independent Vec seed, so the carry's init is not itself a
+            # boundary result.
+            seed = pl.cast(pl.load(a, [0, 0], [16, 128]), target_type=pl.FP32)
+            for _t in pl.range(2):  # noqa: B007 - carry-less, so the repair recurses
+                for _i, (v_it,) in pl.range(4, init_values=(seed,)):  # noqa: B007
+                    acc = pl.matmul(a_left, b_right)  # AIC
+                    acc_vec = pl.move(acc, target_memory=pl.MemorySpace.Vec)  # C->V boundary
+                    v = pl.yield_(acc_vec)  # yields the transfer result directly
+                _sink = pl.store(v, [0, 0], out_0)  # noqa: F841 - keeps the outer loop carry-less
+            return out_0
+
+    After = _expand_no_verify(Before)
+    _assert_no_free_var(After)
+
+    aiv = next(f for f in After.functions.values() if f.func_type == ir.FunctionType.AIV)
+    loop = _first_carry_loop(aiv.body)
+    body_stmts = ir.flatten_to_stmts(loop.body)
+    tail = body_stmts[-1]
+    assert isinstance(tail, ir.YieldStmt), f"loop body must end with YieldStmt, got {type(tail).__name__}"
+    assert len(tail.value) == 1, f"expected 1 yielded value, got {len(tail.value)}"
+    yielded = tail.value[0]
+    assert isinstance(yielded, ir.Var), f"expected a Var operand, got {type(yielded).__name__}"
+    carry_ids = {c.unique_id for c in loop.iter_args}
+    assert yielded.unique_id not in carry_ids, (
+        f"the cross-core transfer result was rewritten into a self-carry on '{yielded.name_hint}'"
+    )
+    # After apply_tpop_remap the operand must be the tpop this lane defines.
+    defined_ids = {s.var.unique_id for s in body_stmts if isinstance(s, ir.AssignStmt)}
+    assert yielded.unique_id in defined_ids, (
+        f"yield operand '{yielded.name_hint}' is not defined in the loop body"
+    )
+
+
+@pytest.mark.parametrize("use_while", [False, True])
+def test_branch_loop_initializer_keeps_enclosing_producer(use_while):
+    """HCA's branch-local carry must reuse the dominating L1 allocation."""
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def branch_init(
+            self,
+            x: pl.Tensor[[16, 16], pl.BF16],
+            out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            n: pl.Scalar[pl.INDEX],
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
+            seed = pl.tile.create([16, 16], dtype=pl.BF16, target_memory=pl.Mem.Mat)
+            if n > 0:
+                value = pl.load(x, [0, 0], [16, 16], target_memory=pl.Mem.Mat)
+                filled = pl.assemble(seed, value, [0, 0])
+                tile = pl.yield_(filled)
+            else:
+                for i, (carry,) in pl.range(2, init_values=(seed,)):
+                    value = pl.load(x, [0, 0], [16, 16], target_memory=pl.Mem.Mat)
+                    updated = pl.assemble(carry, value, [0, 0])
+                    loop_result = pl.yield_(updated)
+                tile = pl.yield_(loop_result)
+            left = pl.move(tile, target_memory=pl.Mem.Left)
+            right = pl.move(tile, target_memory=pl.Mem.Right)
+            acc = pl.matmul(left, right)
+            vec = pl.move(acc, target_memory=pl.Mem.Vec)
+            out = pl.store(vec, [0, 0], out)
+            return out
+
+    class UseWhile(ir.IRMutator):
+        def visit_for_stmt(self, op):
+            # The loop variable is unused. Retain the carry/yield structure
+            # while exercising the shared WhileStmt initializer repair.
+            return ir.WhileStmt(
+                ir.ConstBool(True, op.span),
+                op.iter_args,
+                op.body,
+                op.return_vars,
+                op.span,
+            )
+
+    before = passes.infer_tile_memory_space()(passes.convert_to_ssa()(Before))
+    if use_while:
+        before = UseWhile().visit_program(before)
+    after = passes.expand_mixed_kernel()(before)
+    properties = passes.IRPropertySet()
+    properties.insert(passes.IRProperty.SSAForm)
+    properties.insert(passes.IRProperty.UseAfterDef)
+    passes.run_verifier(properties)(after)
+    aic = next(f for f in after.functions.values() if f.func_type == ir.FunctionType.AIC)
+    stmts = ir.flatten_to_stmts(aic.body)
+    seed = next(s for s in stmts if _op_name(s) == ir.get_op("tile.create").name)
+    assert isinstance(seed, ir.AssignStmt)
+    branch = next(s for s in stmts if isinstance(s, ir.IfStmt))
+    assert branch.else_body is not None
+    loop = next(s for s in ir.flatten_to_stmts(branch.else_body) if isinstance(s, (ir.ForStmt, ir.WhileStmt)))
+    assert loop.iter_args[0].initValue.same_as(seed.var)
+    assert all(not isinstance(s, ir.AssignStmt) for s in ir.flatten_to_stmts(branch.else_body))
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

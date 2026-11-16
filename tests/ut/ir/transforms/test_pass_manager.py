@@ -1,0 +1,436 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+
+"""Unit tests for PassManager and Pass classes."""
+
+import os
+
+import pytest
+from pypto import DataType, ir, passes
+
+TENSOR_ONLY_PASSES = [
+    "OutlineHierarchyScopes",
+    "OutlineGraphScopes",
+    "OutlineIncoreScopes",
+    "OutlineClusterScopes",
+    "DeduplicateOutlinedKernels",
+    "ConvertTensorToTileOps",
+    "OptimizeOrchTensors",
+]
+
+TENSOR_OPTIMIZATION_PASSES = [
+    "InlineFunctions",
+    "UnrollLoops",
+    "CtrlFlowTransform",
+    "ConvertToSSA",
+    "Simplify",
+    "NormalizeStmtStructure",
+    "FlattenCallExpr",
+    *TENSOR_ONLY_PASSES,
+    "LowerCompositeOps",
+    "FlattenTileNdTo2D",
+    "BlockNzTensorViews",
+    "BlockMxScaleTensorViews",
+    "LegalizeTileCast",
+    "AutoTileMatmulL0",
+    "CanonicalizeTileSlice",
+    "InferTileMemorySpace",
+    "InsertMxScaleAddr",
+    "ResolveBackendOpLayouts",
+    "LowerAutoVectorSplit",
+    "ExpandMixedKernel",
+    "InjectGMPipeBuffer",
+    "SplitVectorKernel",
+    "StampTfreeSplit",
+    "NormalizeReturnOrder",
+    "SkewCrossCorePipeline",
+    "LowerPipelineToSlots",
+    "LowerPipelineLoops",
+    "CanonicalizeIOOrder",
+    "MaterializeTensorStrides",
+    "InitMemRef",
+    "SelectBufferIRFunctions",
+    "MaterializeSemanticAliases",
+    "MemoryReuse",
+    "VerifyTileStorage",
+    "AllocateMemoryAddr",
+    "VerifyTileStorageAllocated",
+    "FoldNoOpReshape",
+    "FuseCreateAssembleToSlice",
+    "LowerL2TensorCollectives",
+    "LegalizeSpmdLaunches",
+    "DeriveCallDirections",
+    "AutoDeriveTaskDependencies",
+    "ExpandManualPhaseFence",
+    "SynthesizeAllReduceSignals",
+    "MaterializeCommDomainScopes",
+    "LowerHostTensorCollectives",
+    "MaterializeDistTensorCtx",
+    "Simplify",
+    "LegalizeGraphBoundary",
+    "MaterializeRuntimeScopes",
+    "ClassifyIterArgCarry",
+    "InsertCommFence",
+    "MaterializeValidShapeSymbols",
+    "LowerTileToBuffer",
+]
+
+
+class TestOptimizationStrategy:
+    """Test OptimizationStrategy enum."""
+
+    def test_optimization_strategy_values(self):
+        """Test that all optimization strategies exist."""
+        assert ir.OptimizationStrategy.Default is not None
+
+
+class TestPassManagerBasics:
+    """Test basic PassManager functionality."""
+
+    def test_pass_manager_get_strategy_default(self):
+        """Test getting Default strategy PassManager."""
+        pm = ir.PassManager.get_strategy(ir.OptimizationStrategy.Default)
+        assert pm is not None
+        assert pm.strategy == ir.OptimizationStrategy.Default
+        assert pm.pass_names == TENSOR_OPTIMIZATION_PASSES
+
+    def test_pass_manager_rejects_unknown_strategy(self):
+        """An unsupported strategy value raises instead of silently running Default."""
+        with pytest.raises(ValueError, match="Unsupported optimization strategy"):
+            # Deliberately ill-typed: the guard exists for values the type system
+            # rules out, so exercising it requires stepping outside the annotation.
+            ir.PassManager.get_strategy("NotAStrategy")  # type: ignore[arg-type]
+
+    def test_auto_scope_deps_switch_forwarded_to_pass_factory(self, monkeypatch):
+        """PassManager forwards the high-level AUTO-scope deps switch."""
+        import pypto.ir.pass_manager as pass_manager_mod  # noqa: PLC0415
+
+        captured: list[bool] = []
+
+        def fake_auto_deps(*, analyze_auto_scopes=False):
+            captured.append(analyze_auto_scopes)
+            return passes.simplify()
+
+        monkeypatch.setattr(pass_manager_mod.passes, "auto_derive_task_dependencies", fake_auto_deps)
+
+        ir.PassManager.get_strategy(ir.OptimizationStrategy.Default)
+        ir.PassManager.get_strategy(
+            ir.OptimizationStrategy.Default,
+            analyze_auto_scopes_for_deps=True,
+        )
+
+        assert captured == [False, True]
+
+    def test_pipeline_is_single_source_of_passes_and_names(self):
+        """PassManager views follow the C++ pipeline and cannot drift independently."""
+        pm = ir.PassManager.get_strategy(ir.OptimizationStrategy.Default)
+        original_names = pm.pass_names
+
+        names_snapshot = pm.pass_names
+        names_snapshot.pop()
+        assert pm.pass_names == original_names
+
+        shortened_pipeline = passes.PassPipeline()
+        for pass_obj in pm.passes[:2]:
+            shortened_pipeline.add_pass(pass_obj)
+        pm._pipeline = shortened_pipeline
+
+        assert pm.pass_names == original_names[:2]
+        assert [pass_obj.get_name() for pass_obj in pm.passes] == original_names[:2]
+        with pytest.raises(AttributeError):
+            setattr(pm, "pass_names", original_names)
+        with pytest.raises(AttributeError):
+            setattr(pm, "passes", ())
+
+
+class TestPassManagerExecution:
+    """Test PassManager execution functionality."""
+
+    def test_run_with_implicit_default_strategy(self):
+        """Test running PassManager with implicit Default strategy."""
+        span = ir.Span.unknown()
+        dtype = DataType.INT64
+        x = ir.Var("x", ir.ScalarType(dtype), span)
+        z = ir.Var("z", ir.ScalarType(dtype), span)
+        assign = ir.AssignStmt(z, x, span)
+        func = ir.Function("test_func", [x], [ir.ScalarType(dtype)], assign, span)
+        pm = ir.PassManager.get_strategy()
+        program = ir.Program([func], "test_run_with_implicit_default_strategy", ir.Span.unknown())
+        result = pm.run_passes(program)
+        func = list(result.functions.values())[0]
+        assert pm.strategy == ir.OptimizationStrategy.Default
+        assert result is not program
+        assert func.name == "test_func"
+
+
+class TestPassManagerMultipleInstances:
+    """Test that multiple PassManager instances work independently."""
+
+    def test_multiple_instances_same_strategy(self):
+        """Test creating multiple instances of the same strategy."""
+        pm1 = ir.PassManager.get_strategy(ir.OptimizationStrategy.Default)
+        pm2 = ir.PassManager.get_strategy(ir.OptimizationStrategy.Default)
+
+        # Should be different instances
+        assert pm1 is not pm2
+
+        # But should have the same strategy
+        assert pm1.strategy == pm2.strategy
+
+        # And same pass names
+        assert pm1.get_pass_names() == pm2.get_pass_names()
+
+
+class TestPassManagerWithProgram:
+    """Test PassManager execution with Program input."""
+
+    def test_run_passes_on_program_with_default_strategy(self):
+        """Test running PassManager with Default strategy on a Program."""
+        span = ir.Span.unknown()
+        dtype = DataType.INT64
+
+        # Create first function
+        x1 = ir.Var("x", ir.ScalarType(dtype), span)
+        z1 = ir.Var("z", ir.ScalarType(dtype), span)
+        assign1 = ir.AssignStmt(z1, x1, span)
+        func1 = ir.Function("func1", [x1], [ir.ScalarType(dtype)], assign1, span)
+
+        # Create second function
+        x2 = ir.Var("x", ir.ScalarType(dtype), span)
+        z2 = ir.Var("z", ir.ScalarType(dtype), span)
+        assign2 = ir.AssignStmt(z2, x2, span)
+        func2 = ir.Function("func2", [x2], [ir.ScalarType(dtype)], assign2, span)
+
+        # Create program with both functions
+        program = ir.Program([func1, func2], "test_program", span)
+
+        pm = ir.PassManager.get_strategy(ir.OptimizationStrategy.Default)
+        result = pm.run_passes(program)
+
+        # Default strategy runs all registered passes; function names unchanged
+        assert isinstance(result, ir.Program)
+        assert result.name == "test_program"
+        assert len(result.functions) == 2
+
+        func_names = [func.name for func in result.functions.values()]
+        assert "func1" in func_names
+        assert "func2" in func_names
+
+    def test_run_passes_on_single_function_program(self):
+        """Test running PassManager on a Program with a single function."""
+        span = ir.Span.unknown()
+        dtype = DataType.INT64
+
+        # Create a single function
+        x = ir.Var("x", ir.ScalarType(dtype), span)
+        z = ir.Var("z", ir.ScalarType(dtype), span)
+        assign = ir.AssignStmt(z, x, span)
+        func = ir.Function("single_func", [x], [ir.ScalarType(dtype)], assign, span)
+
+        # Create program with single function
+        program = ir.Program([func], "single_func_program", span)
+
+        pm = ir.PassManager.get_strategy(ir.OptimizationStrategy.Default)
+        result = pm.run_passes(program)
+
+        assert isinstance(result, ir.Program)
+        assert result.name == "single_func_program"
+        assert len(result.functions) == 1
+
+        func_names = [func.name for func in result.functions.values()]
+        assert "single_func" in func_names
+
+
+class TestPassManagerPlannerGate:
+    """Keep the construction-time pass list consistent with execution-time planning.
+
+    DSA_RP omits ``MemoryReuse``; PTOAS also omits ``AllocateMemoryAddr``. The
+    run-time context must match the planner that chose those passes, rather
+    than combine one planner's recipe with another planner's storage lowering.
+    The planner also controls whether AutoTile may enumerate automatic dbC.
+    """
+
+    @staticmethod
+    def _trivial_program():
+        span = ir.Span.unknown()
+        dt = DataType.INT64
+        x = ir.Var("x", ir.ScalarType(dt), span)
+        z = ir.Var("z", ir.ScalarType(dt), span)
+        func = ir.Function("f", [x], [ir.ScalarType(dt)], ir.AssignStmt(z, x, span), span)
+        return ir.Program([func], "p", span)
+
+    def test_construct_pypto_run_ptoas_raises(self):
+        """Built outside PTOAS (default PYPTO, so MemoryReuse is IN the pipeline), then
+        run inside a PTOAS context -> the mismatch must raise, not silently mis-schedule."""
+        pm = ir.PassManager.get_strategy(ir.OptimizationStrategy.Default)
+        with passes.PassContext([], memory_planner=passes.MemoryPlanner.PTOAS):
+            with pytest.raises(RuntimeError, match="memory_planner"):
+                pm.run_passes(self._trivial_program())
+
+    def test_construct_ptoas_run_pypto_raises(self):
+        """The converse: built under PTOAS (MemoryReuse dropped) then run under the
+        default PYPTO planner leaves no memory planning at all -> also a mismatch."""
+        with passes.PassContext([], memory_planner=passes.MemoryPlanner.PTOAS):
+            pm = ir.PassManager.get_strategy(ir.OptimizationStrategy.Default)
+        with pytest.raises(RuntimeError, match="memory_planner"):
+            pm.run_passes(self._trivial_program())
+
+    def test_construct_pypto_run_dsa_rp_raises(self):
+        """A pipeline built for legacy PyPTO cannot silently switch to DSA-RP."""
+        pm = ir.PassManager.get_strategy(ir.OptimizationStrategy.Default)
+        with passes.PassContext([], memory_planner=passes.MemoryPlanner.DSA_RP):
+            with pytest.raises(RuntimeError, match="memory_planner"):
+                pm.run_passes(self._trivial_program())
+
+    def test_construct_dsa_rp_run_pypto_raises(self):
+        """A pipeline built for DSA-RP cannot silently switch to legacy PyPTO."""
+        with passes.PassContext([], memory_planner=passes.MemoryPlanner.DSA_RP):
+            pm = ir.PassManager.get_strategy(ir.OptimizationStrategy.Default)
+        with pytest.raises(RuntimeError, match="memory_planner"):
+            pm.run_passes(self._trivial_program())
+
+    def test_construct_and_run_same_planner_ok(self):
+        """Matched planner at construction and run -> the guard does not fire (both the
+        default PYPTO and an explicit PTOAS context)."""
+        pm_pypto = ir.PassManager.get_strategy(ir.OptimizationStrategy.Default)
+        pm_pypto._check_planner_consistency()  # PYPTO == PYPTO, no raise
+        with passes.PassContext([], memory_planner=passes.MemoryPlanner.PTOAS):
+            pm_ptoas = ir.PassManager.get_strategy(ir.OptimizationStrategy.Default)
+            pm_ptoas._check_planner_consistency()  # PTOAS == PTOAS, no raise
+        with passes.PassContext([], memory_planner=passes.MemoryPlanner.DSA_RP):
+            pm_dsa_rp = ir.PassManager.get_strategy(ir.OptimizationStrategy.Default)
+            pm_dsa_rp._check_planner_consistency()  # DSA_RP == DSA_RP, no raise
+
+
+class TestPassManagerDumpIR:
+    """Test dump_ir mode in PassManager."""
+
+    def test_dump_ir_creates_files(self, tmp_path):
+        """dump_ir=True creates frontend + per-pass IR dump files."""
+        span = ir.Span.unknown()
+        dtype = DataType.INT64
+        x = ir.Var("x", ir.ScalarType(dtype), span)
+        z = ir.Var("z", ir.ScalarType(dtype), span)
+        assign = ir.AssignStmt(z, x, span)
+        func = ir.Function("test_func", [x], [ir.ScalarType(dtype)], assign, span)
+        program = ir.Program([func], "dump_test", span)
+
+        pm = ir.PassManager.get_strategy(ir.OptimizationStrategy.Default)
+        output_dir = str(tmp_path / "dump_output")
+        result = pm.run_passes(program, dump_ir=True, output_dir=output_dir)
+
+        assert result is not None
+        # Frontend + one file per pass (warning .log files may also be present)
+        expected_py_files = ["00_frontend.py"] + [
+            f"{i + 1:02d}_after_{name}.py" for i, name in enumerate(pm.pass_names)
+        ]
+        actual_files = sorted(os.listdir(output_dir))
+        actual_py_files = [f for f in actual_files if f.endswith(".py")]
+        assert actual_py_files == sorted(expected_py_files)
+        # Any extra files must be .log warning dumps
+        extra_files = [f for f in actual_files if not f.endswith(".py")]
+        assert all(f.endswith(".log") for f in extra_files)
+
+    def test_dump_ir_requires_output_dir(self):
+        """dump_ir=True without output_dir raises ValueError."""
+        span = ir.Span.unknown()
+        dtype = DataType.INT64
+        x = ir.Var("x", ir.ScalarType(dtype), span)
+        z = ir.Var("z", ir.ScalarType(dtype), span)
+        assign = ir.AssignStmt(z, x, span)
+        func = ir.Function("test_func", [x], [ir.ScalarType(dtype)], assign, span)
+        program = ir.Program([func], "dump_test", span)
+
+        pm = ir.PassManager.get_strategy(ir.OptimizationStrategy.Default)
+        with pytest.raises(ValueError, match="output_dir is required"):
+            pm.run_passes(program, dump_ir=True)
+
+    def test_dump_ir_preserves_outer_instruments(self, tmp_path):
+        """dump_ir=True preserves instruments from an outer PassContext."""
+        span = ir.Span.unknown()
+        dtype = DataType.INT64
+        x = ir.Var("x", ir.ScalarType(dtype), span)
+        z = ir.Var("z", ir.ScalarType(dtype), span)
+        assign = ir.AssignStmt(z, x, span)
+        func = ir.Function("test_func", [x], [ir.ScalarType(dtype)], assign, span)
+        program = ir.Program([func], "dump_test", span)
+
+        log: list[str] = []
+
+        def before_cb(p: passes.Pass, _program: ir.Program) -> None:
+            log.append(p.get_name())
+
+        outer_instrument = passes.CallbackInstrument(before_pass=before_cb, name="Outer")
+
+        pm = ir.PassManager.get_strategy(ir.OptimizationStrategy.Default)
+        output_dir = str(tmp_path / "dump_output")
+
+        with passes.PassContext([outer_instrument]):
+            pm.run_passes(program, dump_ir=True, output_dir=output_dir)
+
+        # Outer instrument's before callback should have fired for each pass
+        assert len(log) == len(pm.pass_names)
+
+    @staticmethod
+    def _acc_tile_program():
+        """A program whose signature carries an Acc tile (implicit boxed view).
+
+        ``Mem.Acc``'s implicit view is ``blayout=col_major, slayout=row_major,
+        fractal=1024`` yet the canonical ``tile_view_`` is ``nullopt``, so the
+        concise dump prints no ``TileView`` at all — the exact omission issue
+        #2088 addresses. The frontend dump (written before any pass) is a stable
+        place to observe whether the resolved layout is printed.
+        """
+        span = ir.Span.unknown()
+        dims = [ir.ConstInt(128, DataType.INT32, span), ir.ConstInt(128, DataType.INT32, span)]
+        acc = ir.TileType(dims, DataType.FP32, None, None, ir.MemorySpace.Acc)
+        t = ir.Var("t", acc, span)
+        z = ir.Var("z", acc, span)
+        body = ir.SeqStmts([ir.AssignStmt(z, t, span), ir.ReturnStmt([z], span)], span)
+        func = ir.Function("main", [t], [acc], body, span)
+        return ir.Program([func], "acc_dump_test", span)
+
+    @pytest.mark.parametrize("dump_arg", [True, ir.PassDumpLevel.CONCISE])
+    def test_dump_ir_concise_omits_implicit_tile_layout(self, tmp_path, dump_arg):
+        """CONCISE (and bool ``True``) keep the concise form (no TileView on Acc)."""
+        pm = ir.PassManager.get_strategy(ir.OptimizationStrategy.Default)
+        output_dir = str(tmp_path / "dump_output")
+
+        # VerificationLevel.NONE: the intentionally-minimal Acc-tile passthrough is
+        # not a valid post-pass pipeline state, so the autouse RoundtripInstrument
+        # would reject it — irrelevant to what the frontend dump (written before any
+        # pass) records here.
+        with passes.PassContext([], passes.VerificationLevel.NONE):
+            pm.run_passes(self._acc_tile_program(), dump_ir=dump_arg, output_dir=output_dir)
+
+        frontend = (tmp_path / "dump_output" / "00_frontend.py").read_text()
+        assert "pl.Mem.Acc" in frontend
+        assert "TileView" not in frontend
+
+    def test_dump_ir_explicit_level_resolves_tile_layout(self, tmp_path):
+        """PassDumpLevel.EXPLICIT makes dumps state the resolved tile layout."""
+        pm = ir.PassManager.get_strategy(ir.OptimizationStrategy.Default)
+        output_dir = str(tmp_path / "dump_output")
+
+        with passes.PassContext([], passes.VerificationLevel.NONE):
+            pm.run_passes(
+                self._acc_tile_program(),
+                dump_ir=ir.PassDumpLevel.EXPLICIT,
+                output_dir=output_dir,
+            )
+
+        frontend = (tmp_path / "dump_output" / "00_frontend.py").read_text()
+        assert (
+            "pl.Mem.Acc, pl.TileView(blayout=pl.TileLayout.col_major, "
+            "slayout=pl.TileLayout.row_major, fractal=1024)" in frontend
+        )
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

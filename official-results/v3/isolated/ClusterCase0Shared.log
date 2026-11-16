@@ -1,0 +1,28 @@
+[mono_ns=6140413888724760][T0x3fffbbab8420][INFO] configure_aicore_op_timeout: [device_runner_base.cpp:1666] aclrtSetOpExecuteTimeOutV2: requested=45000000 us, actual=47244640 us
+[mono_ns=6140413892698900][T0x3fffbbab8420][INFO] ensure_device_initialized: [device_runner_base.cpp:1724] DeviceRunner: device=0 set, streams created
+[mono_ns=6140413892755880][T0x3fffbbab8420][INFO] ensure_device_initialized: [device_runner_base.cpp:1731] DeviceRunner: device=0 max_block_dim=24 (cube=24, vector=48)
+[mono_ns=6140413936469380][T0x3fffbbab8420][INFO] BootstrapDispatcher: [load_aicpu_op.cpp:214] BootstrapDispatcher: bundled dispatcher (14472 B) + inner SO (4406552 B) uploaded; inner SO at simpler_inner_cd78e16e15a3a756_0.so
+[mono_ns=6140413936522310][T0x3fffbbab8420][INFO] ensure_binaries_loaded: [device_runner_base.cpp:1926] DeviceRunner: inner SO uploaded to preinstall via dispatcher bootstrap
+[mono_ns=6140413936833880][T0x3fffbbab8420][INFO] Init: [load_aicpu_op.cpp:382] LoadAicpuOp::Init: JSON=/tmp/simpler_inner_cd78e16e15a3a756_30943.json inner_basename=simpler_inner_cd78e16e15a3a756_0.so
+[mono_ns=6140413937043610][T0x3fffbbab8420][INFO] Init: [load_aicpu_op.cpp:390] LoadAicpuOp: Loaded inner SO via JSON, handle=0x2aab0fdd0440
+[mono_ns=6140413937185480][T0x3fffbbab8420][INFO] Init: [load_aicpu_op.cpp:407] LoadAicpuOp: resolved handle for simpler_aicpu_exec (opType=simpler_aicpu_exec_cd78e16e15a3a756): 0x2aab0fdd3710
+[mono_ns=6140413937201230][T0x3fffbbab8420][INFO] Init: [load_aicpu_op.cpp:407] LoadAicpuOp: resolved handle for simpler_aicpu_init (opType=simpler_aicpu_init_cd78e16e15a3a756): 0x2aab0fdd3c00
+[mono_ns=6140413937212250][T0x3fffbbab8420][INFO] Init: [load_aicpu_op.cpp:407] LoadAicpuOp: resolved handle for simpler_aicpu_register_callable (opType=simpler_aicpu_register_callable_cd78e16e15a3a756): 0x2aab0fdd40f0
+[mono_ns=6140413937217180][T0x3fffbbab8420][INFO] ensure_binaries_loaded: [device_runner_base.cpp:1942] DeviceRunner: inner SO registered (runtime entry handles ready)
+[mono_ns=6140413937223780][T0x3fffbbab8420][INFO] ensure_binaries_loaded: [device_runner_base.cpp:1955] DeviceRunner: binaries loaded
+[mono_ns=6140413937254270][T0x3fffbbab8420][INFO] fill_init_arch_fields: [device_runner.cpp:155] fill_init_arch_fields: device 0 nocache alias offset=0x80000000000
+[mono_ns=6140413937259530][T0x3fffbbab8420][INFO] ensure_aicpu_init_launched: [device_runner_base.cpp:1871] === launch_aicpu_payload simpler_aicpu_init ===
+
+=== Runtime: tensormap_and_ringbuffer  Level: 2  Pipeline depth: default ===
+  TestBenchmarkBgemm::ClusterCase0Shared ...
+[mono_ns=6140414494007480][T0x3fffbbab8420][INFO] register_callable_impl: [runtime_maker.cpp:313] Registering 2 kernel(s) in register_callable_impl
+[mono_ns=6140414518238540][T0x3fffbbab8420][TIMING] log_callable_image: Callable image: device=0 runner=0x2aab0d389500 chip_hash=0x954c5c9d98bb1e94 chip_dev=0x12c0c001a000 upload_bytes=633360 children=2
+[mono_ns=6140414518259480][T0x3fffbbab8420][TIMING] log_callable_image: Callable code: device=0 runner=0x2aab0d389500 chip_hash=0x954c5c9d98bb1e94 chip_dev=0x12c0c001a000 func_id=0 code_begin=0x12c0c00b41e0 code_end_exclusive=0x12c0c00b4624 code_bytes=1092 code_fnv1a64=0x212c407e5c39dda2
+[mono_ns=6140414518264190][T0x3fffbbab8420][TIMING] log_callable_image: Callable code: device=0 runner=0x2aab0d389500 chip_hash=0x954c5c9d98bb1e94 chip_dev=0x12c0c001a000 func_id=1 code_begin=0x12c0c00b4720 code_end_exclusive=0x12c0c00b49cc code_bytes=684 code_fnv1a64=0x4c0e49fc6b5f2f9f
+[mono_ns=6140414518273920][T0x3fffbbab8420][INFO] register_callable_impl: [runtime_maker.cpp:339] Orchestration SO: 613488 bytes uploaded (host-only)
+[mono_ns=6140414518283050][T0x3fffbbab8420][TIMING] record_device_orch_callable: [device_runner_base.cpp:2425] Callable registration: device=0 runner=0x2aab0d389500 cid=0 chip_hash=0x954c5c9d98bb1e94 aicore_image_hash=0xe01db861de7b5371 orch_hash=0xcc0cea48cf5b46c3 orch_bytes=613488
+[mono_ns=6140414518338850][T0x3fffbbab8420][INFO] register_callable_on_device: [device_runner_base.cpp:2340] === launch_aicpu_payload simpler_aicpu_register_callable ===
+[mono_ns=6140414519515300][T0x3fffbbab8420][INFO] commit_device_register: [device_runner_base.cpp:2291] AICPU callable load committed cid=0 (count=1)
+[TIMING] torch_backend_autoload setting=unset raw=null raw_truncated=false effective=enabled torch_imported=true torch_npu_loaded=false
+[WARNING] Warning: no usable deps.json at /data/aicpu-cluster-study/official-worktree/runtime/outputs/TestBenchmarkBgemm_ClusterCase0Shared_20261113_092827/deps.json; Perfetto trace will have no dependency arrows. Run a dep_gen capture (--enable-dep-gen) and pass --deps-json <path> to add them.
+  TestBenchmarkBgemm::ClusterCase0Shared PASSED

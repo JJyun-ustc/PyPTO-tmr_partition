@@ -1,0 +1,583 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+
+"""
+PyPTO Language module - Type-safe DSL API for writing IR functions.
+
+This module provides:
+- function decorator for parsing DSL functions to IR
+- Tensor type for tensor annotations and runtime wrapping
+- Tile type for tile annotations and runtime wrapping
+- Type-safe operation wrappers (tensor.*, tile.*, system.*, and unified ops)
+- DSL helpers (range, yield_)
+- DataType constants
+
+Typical usage:
+    import pypto.language as pl
+
+    @pl.function
+    def my_func(x: pl.Tensor[[64, 128], pl.FP16]) -> pl.Tensor[[64, 128], pl.FP32]:
+        result: pl.Tensor[[64, 128], pl.FP32] = pl.create_tensor([64, 128], dtype=pl.FP32)
+        return result
+
+    @pl.function
+    def block_func(x: pl.Tensor[[64, 64], pl.FP32]) -> pl.Tensor[[64, 64], pl.FP32]:
+        tile: pl.Tile[[64, 64], pl.FP32] = pl.load(x, [0, 0], [64, 64])
+        result: pl.Tile[[64, 64], pl.FP32] = pl.add(tile, tile)
+        return pl.store(result, [0, 0], x)
+
+    @pl.function
+    def scalar_func(x: pl.Scalar[pl.FP32]) -> pl.Scalar[pl.FP32]:
+        return x
+"""
+
+from pypto.ir import TensorView, TileView
+from pypto.jit import JITFunction, jit
+from pypto.pypto_core import DataType
+from pypto.pypto_core.ir import (
+    AccPhase,
+    AtomicType,
+    CachePolicy,
+    CompactMode,
+    ForKind,
+    FunctionType,
+    Level,
+    MemorySpace,
+    PadValue,
+    PipeType,
+    RegKind,
+    Role,
+    SplitMode,
+    STPhase,
+    TensorLayout,
+    TileLayout,
+)
+
+from . import _dump as _dump
+from . import arg_direction as adir
+from . import optimizations, parser
+from .dsl_api import (
+    at,
+    cluster,
+    cond,
+    const,
+    func_attr,
+    graph,
+    parallel,
+    pipeline,
+    range,
+    split_aiv,
+    spmd,
+    static_assert,
+    static_print,
+    unroll,
+    while_,
+    yield_,
+)
+from .op import array_ops as array
+from .op import prefetch_ops as prefetch
+from .op import system_ops as system
+from .op import tensor_ops as tensor
+from .op import tile_ops as tile
+from .op.system_ops import (
+    AUTO,
+    KernelType,
+    SyncAllMode,
+    aic_initialize_pipe,
+    aiv_initialize_pipe,
+    import_peer_buffer,
+    reserve_buffer,
+    tfree_to_aic,
+    tfree_to_aiv,
+    tpop_from_aic,
+    tpop_from_aiv,
+    tpush_to_aic,
+    tpush_to_aiv,
+)
+from .op.tensor_ops import ci as arange
+
+# Names that also exist at tile level are imported below from ``unified_ops``
+# instead so the Tensor/Tile dispatch wins. Keep this block to names the tile
+# layer does not define, or whose tile twin takes a signature no dispatcher can
+# reconcile (``gather`` / ``scatter``), or that carry no operand to dispatch on
+# at all (``full``, ``random``, and the block-identity queries).
+from .op.tensor_ops import (
+    create_l1,
+    create_tensor,
+    dim,
+    dump_tag,
+    expand_clone,
+    full,
+    gather,
+    get_block_idx,
+    get_block_num,
+    get_subblock_idx,
+    no_dep,
+    paged_gather,
+    random,
+    scatter,
+    set_cache_policy,
+)
+from .op.tile_ops import (
+    MemRefType,
+    addc,
+    addsc,
+    aic_gather,
+    aiv_shard,
+    cmps,
+    create_tile,
+    gatherb,
+    gemv,
+    gemv_acc,
+    gemv_bias,
+    load,
+    lrelu,
+    matmul_bias,
+    matmul_mx_acc,
+    matmul_mx_bias,
+    max,
+    maximums,
+    mgather,
+    min,
+    minimums,
+    move,
+    prelu,
+    relu,
+    rem,
+    rems,
+    sel,
+    sels,
+    store,
+    subc,
+    subsc,
+    tri,
+)
+from .op.tile_ops import (
+    mscatter as mscatter,
+)
+from .op.tile_ops import (
+    tmov_x2zz as tmov_x2zz,
+)
+from .op.unified_ops import (
+    abs,
+    add,
+    and_,
+    ands,
+    assemble,
+    batch_matmul,
+    cast,
+    cmp,
+    col_argmax,
+    col_argmin,
+    col_expand,
+    col_expand_add,
+    col_expand_div,
+    col_expand_expdif,
+    col_expand_max,
+    col_expand_min,
+    col_expand_mul,
+    col_expand_sub,
+    col_max,
+    col_min,
+    col_prod,
+    col_sum,
+    concat,
+    cos,
+    div,
+    exp,
+    expands,
+    fillpad,
+    fillpad_expand,
+    fmod,
+    fmods,
+    gather_row,
+    log,
+    matmul,
+    matmul_acc,
+    matmul_mx,
+    maximum,
+    minimum,
+    mrgsort,
+    mul,
+    neg,
+    not_,
+    or_,
+    ors,
+    part_add,
+    part_max,
+    part_min,
+    part_mul,
+    quant_mx,
+    read,
+    recip,
+    reinterpret_view,
+    reshape,
+    row_argmax,
+    row_argmin,
+    row_expand,
+    row_expand_add,
+    row_expand_div,
+    row_expand_expdif,
+    row_expand_max,
+    row_expand_min,
+    row_expand_mul,
+    row_expand_sub,
+    row_max,
+    row_min,
+    row_prod,
+    row_sum,
+    rsqrt,
+    scatter_update,
+    set_validshape,
+    shl,
+    shls,
+    shr,
+    shrs,
+    sin,
+    slice,
+    sort32,
+    sqrt,
+    sub,
+    transpose,
+    write,
+    xor,
+    xors,
+)
+from .optimizations import cross_core_slot, split
+from .parser.decorator import InlineFunction, function, inline, program
+from .parser.text_parser import loads, loads_program, parse, parse_program
+from .scope import ScopeMode, manual_scope, scope, spmd_submit, submit
+from .typing import (
+    RUNTIME,
+    Array,
+    AsyncEvent,
+    AsyncSession,
+    ConstexprMarker,
+    DynVar,
+    InOut,
+    IntLike,
+    MemRef,
+    Out,
+    PrefetchAsyncContext,
+    Ptr,
+    Reg,
+    Scalar,
+    Tensor,
+    Tile,
+    Tuple,
+    constexpr,
+    dynamic,
+)
+
+# Short alias for MemorySpace (pl.Mem.Vec instead of pl.MemorySpace.Vec)
+Mem = MemorySpace
+
+# Re-export TensorLayout constants for convenience
+ND = TensorLayout.ND
+DN = TensorLayout.DN
+NZ = TensorLayout.NZ
+MX_A_ZZ = TensorLayout.MX_A_ZZ
+MX_B_NN = TensorLayout.MX_B_NN
+
+# Re-export DataType constants for convenience
+FP4E2M1X2 = DataType.FP4E2M1X2  # packed carrier (PTOAS / Torch)
+FP4E1M2X2 = DataType.FP4E1M2X2  # packed carrier (PTOAS)
+# Match the PTOAS packed-format spelling while preserving the established aliases.
+fp4e2m1x2 = FP4E2M1X2
+fp4e1m2x2 = FP4E1M2X2
+FP8E4M3FN = DataType.FP8E4M3FN
+FP8E5M2 = DataType.FP8E5M2
+FP8E8M0 = DataType.FP8E8M0
+FP16 = DataType.FP16
+FP32 = DataType.FP32
+BF16 = DataType.BF16
+HF4 = DataType.HF4
+HF8 = DataType.HF8
+INT4 = DataType.INT4
+INT8 = DataType.INT8
+INT16 = DataType.INT16
+INT32 = DataType.INT32
+INT64 = DataType.INT64
+UINT4 = DataType.UINT4
+UINT8 = DataType.UINT8
+UINT16 = DataType.UINT16
+UINT32 = DataType.UINT32
+UINT64 = DataType.UINT64
+BOOL = DataType.BOOL
+INDEX = DataType.INDEX
+TASK_ID = DataType.TASK_ID
+
+# Convenience alias for the TaskId scalar annotation (manual_scope deps).
+# ``pl.TaskId`` is equivalent to ``pl.Scalar[pl.TASK_ID]``.
+TaskId = Scalar[TASK_ID]
+
+__all__ = [
+    "jit",
+    "JITFunction",
+    "function",
+    "inline",
+    "program",
+    "InlineFunction",
+    "parse",
+    "parser",
+    "loads",
+    "parse_program",
+    "loads_program",
+    "Tensor",
+    "Tile",
+    "Scalar",
+    "constexpr",
+    "ConstexprMarker",
+    "Array",
+    "Tuple",
+    "DynVar",
+    "InOut",
+    "IntLike",
+    "Out",
+    "RUNTIME",
+    "dynamic",
+    "const",
+    "range",
+    "parallel",
+    "unroll",
+    "pipeline",
+    "while_",
+    "yield_",
+    "cond",
+    "static_print",
+    "static_assert",
+    "func_attr",
+    "at",
+    "cluster",
+    "graph",
+    "spmd",
+    "split_aiv",
+    "optimizations",
+    "split",
+    "cross_core_slot",
+    "adir",
+    "array",
+    "prefetch",
+    "tile",
+    "system",
+    "tensor",
+    # Unified dispatch
+    "add",
+    "sub",
+    "mul",
+    "div",
+    "part_add",
+    "part_mul",
+    "part_max",
+    "part_min",
+    "maximum",
+    "exp",
+    "log",
+    "cast",
+    "concat",
+    "reshape",
+    "reinterpret_view",
+    "transpose",
+    "slice",
+    "matmul",
+    "batch_matmul",
+    "row_max",
+    "row_sum",
+    "row_min",
+    "row_prod",
+    "col_sum",
+    "col_max",
+    "col_min",
+    "col_prod",
+    "row_argmax",
+    "row_argmin",
+    "col_argmax",
+    "col_argmin",
+    "row_expand",
+    "row_expand_add",
+    "row_expand_sub",
+    "row_expand_mul",
+    "row_expand_div",
+    "row_expand_max",
+    "row_expand_min",
+    "row_expand_expdif",
+    "col_expand",
+    "col_expand_mul",
+    "col_expand_div",
+    "col_expand_sub",
+    "col_expand_add",
+    "col_expand_max",
+    "col_expand_min",
+    "col_expand_expdif",
+    "expand_clone",
+    "expands",
+    "neg",
+    "abs",
+    "recip",
+    "read",
+    "write",
+    # Promoted tile-only
+    "create_tile",
+    "fillpad",
+    "fillpad_expand",
+    "load",
+    "store",
+    "move",
+    "gatherb",
+    "mgather",
+    "mscatter",
+    "sqrt",
+    "rsqrt",
+    "relu",
+    "matmul_acc",
+    "matmul_bias",
+    "matmul_mx",
+    "matmul_mx_acc",
+    "matmul_mx_bias",
+    "gemv",
+    "gemv_acc",
+    "gemv_bias",
+    "minimum",
+    "min",
+    "max",
+    "cmp",
+    "cmps",
+    "set_validshape",
+    "rem",
+    "rems",
+    "fmod",
+    "fmods",
+    "and_",
+    "ands",
+    "or_",
+    "ors",
+    "xor",
+    "xors",
+    "shl",
+    "shls",
+    "shr",
+    "shrs",
+    "maximums",
+    "minimums",
+    "prelu",
+    "not_",
+    "addc",
+    "subc",
+    "addsc",
+    "subsc",
+    "lrelu",
+    "sel",
+    "sels",
+    "tri",
+    # MX quantization
+    "quant_mx",
+    "tmov_x2zz",
+    # Promoted system ops (cross-core)
+    "AUTO",
+    "tpush_to_aiv",
+    "tpush_to_aic",
+    "aiv_shard",
+    "aic_gather",
+    "tpop_from_aic",
+    "tpop_from_aiv",
+    "aic_initialize_pipe",
+    "aiv_initialize_pipe",
+    "reserve_buffer",
+    "import_peer_buffer",
+    "tfree_to_aic",
+    "tfree_to_aiv",
+    # Unified dispatch (also defined at tile level)
+    "assemble",
+    "cos",
+    "gather_row",
+    "mrgsort",
+    "scatter_update",
+    "sin",
+    "sort32",
+    # Promoted tensor-only
+    "create_tensor",
+    "dim",
+    "full",
+    "ScopeMode",
+    "scope",
+    "manual_scope",
+    "submit",
+    "spmd_submit",
+    "no_dep",
+    "dump_tag",
+    "set_cache_policy",
+    "scatter",
+    "arange",
+    "gather",
+    "paged_gather",
+    "random",
+    "create_l1",
+    "get_block_idx",
+    "get_block_num",
+    "get_subblock_idx",
+    "FunctionType",
+    "ForKind",
+    "AccPhase",
+    "AtomicType",
+    "CachePolicy",
+    "KernelType",
+    "SyncAllMode",
+    "Level",
+    "MemRef",
+    "Reg",
+    "RegKind",
+    "Role",
+    "SplitMode",
+    "STPhase",
+    "Mem",
+    "MemRefType",
+    "MemorySpace",
+    "PipeType",
+    "Ptr",
+    "PrefetchAsyncContext",
+    "AsyncEvent",
+    "AsyncSession",
+    "TensorLayout",
+    "TensorView",
+    "TileLayout",
+    "PadValue",
+    "CompactMode",
+    "TileView",
+    "ND",
+    "DN",
+    "NZ",
+    "MX_A_ZZ",
+    "MX_B_NN",
+    "FP4E2M1X2",
+    "FP4E1M2X2",
+    "fp4e2m1x2",
+    "fp4e1m2x2",
+    "FP8E4M3FN",
+    "FP8E5M2",
+    "FP8E8M0",
+    "FP16",
+    "FP32",
+    "BF16",
+    "HF4",
+    "HF8",
+    "INT4",
+    "INT8",
+    "INT16",
+    "INT32",
+    "INT64",
+    "UINT4",
+    "UINT8",
+    "UINT16",
+    "UINT32",
+    "UINT64",
+    "BOOL",
+    "INDEX",
+    "TASK_ID",
+    "TaskId",
+]

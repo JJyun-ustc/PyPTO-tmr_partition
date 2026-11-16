@@ -1,0 +1,351 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+
+"""
+PyPTO Language operations module.
+
+This module organizes language-level operations by category:
+- tensor: High-level tensor operations (TensorType)
+- tile: Tile-level operations (TileType)
+- system: Hardware synchronization primitives
+
+A unified namespace (``pl.add``, ``pl.exp``, ...) auto-dispatches
+between tensor and tile paths based on the input type (Tensor vs Tile).
+The explicit ``pl.tensor.*``, ``pl.tile.*``, and ``pl.system.*``
+namespaces remain available for cases where the caller wants to be explicit.
+
+"""
+
+from . import array_ops as array
+from . import prefetch_ops as prefetch
+from . import system_ops as system
+from . import tensor_ops as tensor
+from . import tile_ops as tile
+
+# Promoted system ops (accessible as pl.tfree_to_aic, etc.)
+from .system_ops import (
+    aic_initialize_pipe,
+    aiv_initialize_pipe,
+    import_peer_buffer,
+    reserve_buffer,
+    tfree_to_aic,
+    tfree_to_aiv,
+    tpop_from_aic,
+    tpop_from_aiv,
+    tpush_to_aic,
+    tpush_to_aiv,
+)
+from .tensor_ops import ci as arange
+from .tensor_ops import create as create_tensor
+
+# Promoted tensor-only ops (accessible as pl.create_tensor, etc.). Names that
+# also exist at tile level are re-exported below from ``unified_ops`` instead so
+# the Tensor/Tile dispatch wins — keep this block to names the tile layer does
+# not define, or whose tile twin takes a signature no dispatcher can reconcile
+# (``gather`` / ``scatter``), or that carry no operand to dispatch on at all
+# (``full``, ``random``, and the block-identity queries).
+from .tensor_ops import (
+    create_l1,
+    dim,
+    expand_clone,
+    full,
+    gather,
+    get_block_idx,
+    get_block_num,
+    get_subblock_idx,
+    paged_gather,
+    random,
+    scatter,
+)
+
+# Promoted tile-only ops (accessible as pl.load, etc.). ``abs`` and the
+# bitwise family are re-exported below from ``unified_ops`` instead so the
+# unified Tensor/Tile dispatch wins.
+from .tile_ops import (
+    addc,
+    addsc,
+    aic_gather,
+    aiv_shard,
+    cmps,
+    create_tile,
+    gatherb,
+    gemv,
+    gemv_acc,
+    gemv_bias,
+    load,
+    lrelu,
+    matmul_bias,
+    matmul_mx_acc,
+    matmul_mx_bias,
+    max,
+    maximums,
+    mgather,
+    min,
+    minimums,
+    move,
+    mscatter,
+    prelu,
+    relu,
+    rem,
+    rems,
+    sel,
+    sels,
+    store,
+    subc,
+    subsc,
+    tri,
+)
+from .tile_ops import (
+    tmov_x2zz as tmov_x2zz,
+)
+
+# Unified dispatch (overlapping ops). Imported AFTER tile_ops so the
+# unified versions override any same-named imports above (e.g. ``abs``) —
+# direct ``pl.abs(tensor)`` users get the unified dispatch rather than the
+# Tile-only path. Only names that genuinely dispatch on Tensor/Tile belong
+# here: a pure forwarder would shadow the tile_ops version with a narrower
+# signature, and the parser resolves ``pl.<op>`` against this namespace.
+from .unified_ops import (
+    abs,  # noqa: A004 (intentionally shadows builtin via DSL surface)
+    add,
+    and_,
+    ands,
+    assemble,
+    batch_matmul,
+    cast,
+    cmp,
+    col_argmax,
+    col_argmin,
+    col_expand,
+    col_expand_add,
+    col_expand_div,
+    col_expand_expdif,
+    col_expand_max,
+    col_expand_min,
+    col_expand_mul,
+    col_expand_sub,
+    col_max,
+    col_min,
+    col_prod,
+    col_sum,
+    concat,
+    cos,
+    div,
+    exp,
+    expands,
+    fillpad,
+    fillpad_expand,
+    fmod,
+    fmods,
+    gather_row,
+    log,
+    matmul,
+    matmul_acc,
+    matmul_mx,
+    maximum,
+    minimum,
+    mrgsort,
+    mul,
+    neg,
+    not_,
+    or_,
+    ors,
+    part_add,
+    part_max,
+    part_min,
+    part_mul,
+    quant_mx,
+    read,
+    recip,
+    reinterpret_view,
+    reshape,
+    row_argmax,
+    row_argmin,
+    row_expand,
+    row_expand_add,
+    row_expand_div,
+    row_expand_expdif,
+    row_expand_max,
+    row_expand_min,
+    row_expand_mul,
+    row_expand_sub,
+    row_max,
+    row_min,
+    row_prod,
+    row_sum,
+    rsqrt,
+    scatter_update,
+    set_validshape,
+    shl,
+    shls,
+    shr,
+    shrs,
+    sin,
+    slice,
+    sort32,
+    sqrt,
+    sub,
+    transpose,
+    write,
+    xor,
+    xors,
+)
+
+__all__ = [
+    "array",
+    "prefetch",
+    "tile",
+    "system",
+    "tensor",
+    # Unified dispatch
+    "add",
+    "sub",
+    "mul",
+    "div",
+    "part_add",
+    "part_mul",
+    "part_max",
+    "part_min",
+    "maximum",
+    "min",
+    "max",
+    "exp",
+    "log",
+    "sqrt",
+    "rsqrt",
+    "cast",
+    "reshape",
+    "reinterpret_view",
+    "transpose",
+    "slice",
+    "matmul",
+    "matmul_mx",
+    "quant_mx",
+    "matmul_acc",
+    "row_max",
+    "row_sum",
+    "row_min",
+    "row_prod",
+    "col_sum",
+    "col_max",
+    "col_min",
+    "col_prod",
+    "row_argmax",
+    "row_argmin",
+    "col_argmax",
+    "col_argmin",
+    "row_expand",
+    "row_expand_add",
+    "row_expand_sub",
+    "row_expand_mul",
+    "row_expand_div",
+    "row_expand_max",
+    "row_expand_min",
+    "row_expand_expdif",
+    "col_expand",
+    "col_expand_mul",
+    "col_expand_div",
+    "col_expand_sub",
+    "col_expand_add",
+    "col_expand_max",
+    "col_expand_min",
+    "col_expand_expdif",
+    "expands",
+    "neg",
+    "read",
+    "recip",
+    "write",
+    "concat",
+    "batch_matmul",
+    # Promoted tile-only
+    "create_tile",
+    "fillpad",
+    "fillpad_expand",
+    "load",
+    "store",
+    "move",
+    "abs",
+    "relu",
+    "matmul_bias",
+    "matmul_mx_acc",
+    "matmul_mx_bias",
+    "gemv",
+    "gemv_acc",
+    "gemv_bias",
+    "minimum",
+    "cmp",
+    "cmps",
+    "set_validshape",
+    "rem",
+    "rems",
+    "fmod",
+    "fmods",
+    "and_",
+    "ands",
+    "or_",
+    "ors",
+    "xor",
+    "xors",
+    "shl",
+    "shls",
+    "shr",
+    "shrs",
+    "maximums",
+    "minimums",
+    "gatherb",
+    "mgather",
+    "mscatter",
+    "prelu",
+    "not_",
+    "addc",
+    "subc",
+    "addsc",
+    "subsc",
+    "lrelu",
+    "sel",
+    "sels",
+    "tri",
+    # Unified dispatch (also defined at tile level)
+    "assemble",
+    "cos",
+    "gather_row",
+    "mrgsort",
+    "scatter_update",
+    "sin",
+    "sort32",
+    # MX helpers
+    "tmov_x2zz",
+    # Promoted tensor-only
+    "arange",
+    "create_tensor",
+    "dim",
+    "expand_clone",
+    "full",
+    "scatter",
+    "gather",
+    "paged_gather",
+    "random",
+    "create_l1",
+    "get_block_idx",
+    "get_block_num",
+    "get_subblock_idx",
+    # Promoted system ops
+    "aic_initialize_pipe",
+    "aiv_initialize_pipe",
+    "import_peer_buffer",
+    "reserve_buffer",
+    "tfree_to_aic",
+    "tfree_to_aiv",
+    "tpop_from_aic",
+    "tpop_from_aiv",
+    "tpush_to_aic",
+    "tpush_to_aiv",
+    "aiv_shard",
+    "aic_gather",
+]

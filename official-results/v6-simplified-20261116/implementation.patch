@@ -1,0 +1,1786 @@
+--- before/docs/investigations/2026-11-aicpu-cluster-bgemm.md
++++ after/docs/investigations/2026-11-aicpu-cluster-bgemm.md
+@@ -346,3 +346,89 @@
+ `../official-results/v5-future/`. Its `summary.json` contains both variants;
+ the revised suite can also be analyzed with `analyze_cluster_placement.py`
+ against `../official-results/v5-future/reserved/performance`.
++
++### Fixed calibration, no cross-pickup and snapshot batches, 2026-11-16
++
++This revision replaces shape-maturity checks and repeated online updates with
++a fixed 256-placement cold prefix. Before placement 257, O reads one coherent
++snapshot of cumulative pickup samples, fits eligible channels once and freezes
++the coefficients. Sparse or racing channels retain priors. The remaining
++16/32-sample guards protect individual fits and never delay the fixed phase
++transition. There is no rolling window, EWMA, update time gate or later retry.
++Ordinary latency sampling stops after calibration; resource feedback continues.
++
++Cross-cluster pickup and its move counters are removed. Automatic and strict
++work share the same target-side queues; separate automatic queues and their
++staging passes are removed. Each side's initial assignments must equal its
++actual dispatches for the single-block BGEMM cases.
++
++Every eight automatic placements define a snapshot epoch. Each shape reads
++queue depths, publication/dispatch counts and resource state once on its first
++use in the epoch. O adds new tasks locally to blocked or ready pressure in
++block units. Concurrent S progress becomes visible at the next refresh.
++These are advisory, per-shape snapshots, not an atomic global view.
++
++This implements snapshot batching, not buffered parallel scoring. The current
++synchronous submit API immediately returns tensors used to generate dependent
++nodes. Generation, dependency handling and scoring still execute on O; S
++execution overlaps them. No extra scheduler is borrowed for placement, no
++task waits for a batch to fill, and scope exit needs no new flush protocol.
++True parallel planning with deferred publication would require a different
++submit/buffering protocol and is not measured by this revision.
++
++The container now exposes logical device 0 on **physical 910B2 card 4**, rather
++than the physical card 1 used for v4/v5. Card 4 reported healthy before and
++after the suite. Both the unmodified v5 baseline and this revision were freshly
++measured on card 4; previous-card measurements are not pooled. The topology
++remained CPUs 2–7 with O fixed on CPU 7, and there was no O-position comparison.
++The default precheck queried unavailable card 0; a direct card-4 board query
++and CANN configuration confirmed 910B2 / Ascend910B. No running NPU processes
++were reported at preflight, but task-submit was absent, so timing was unlocked.
++
++Each build passed four separate golden checks, followed by two reversed
++15-round batches per policy with swimlane disabled. All 30 device_wall samples
++per case are retained, including the first round of each process. Runtime
++hashes matched before and after each suite; compute-code hashes matched across
++builds. The two builds were measured sequentially.
++
++| Workload / variant | Shared median / p95 ms | Automatic median / p95 ms | Automatic vs shared |
++| --- | ---: | ---: | ---: |
++| Case0 / v5 baseline | 1.048 / 1.142 | 1.419 / 1.497 | +35.42% |
++| Case0 / simplified | 1.047 / 1.139 | 1.197 / 1.323 | +14.32% |
++| Scale / v5 baseline | 4.963 / 4.998 | 6.629 / 6.686 | +33.58% |
++| Scale / simplified | 4.913 / 4.950 | 5.809 / 5.867 | +18.23% |
++
++Automatic medians decreased by 15.66% for Case0 and 12.37% for Scale. Both
++reversed batches show the same direction: Case0 automatic batch medians were
++1.414/1.422 ms before and 1.193/1.207 ms after; Scale was 6.648/6.593 ms before
++and 5.792/5.843 ms after. Shared controls shifted by approximately -0.09% and
++-0.99%. This is evidence of an improvement for the combined revision on this
++board, but neither a per-change attribution nor a general speedup over Shared.
++Independent ablations and exclusive-device runs have not been performed.
++
++Separate revised golden diagnostics recorded:
++
++| Case | Initial assignments = dispatched per side | Cold / scored decisions | Calibrations | Snapshots |
++| --- | --- | --- | ---: | ---: |
++| Case0 | 327 / 673 | 256 / 744 | 1 | 250 |
++| Scale | 1437 / 2659 | 256 / 3840 | 1 | 1024 |
++
++Both AIC and AIV occur in every epoch, producing two snapshots per eight
++nodes. These info-logging runs are excluded from timing and do not establish
++timing-run cut counts or optimal load balance.
++
++Validation passed 17 controller tests, 32 scheduler-state tests and 45 wiring
++tests. Coverage includes fixed phase transition without shape evidence, frozen
++weights, sparse/racing calibration channels, local batch reservations,
++multi-block units, shared versus targeted routing, and sampling shutdown with
++ready accounting intact. Runtime-only unit targets received a disabled
++swimlane stub, and their synthetic descriptors explicitly select shared
++placement rather than zero-initializing the new target field to strict side 0.
++Four-thread Bgemm64, automatic 4/16/24/48/96-block AIV, automatic sync-start
++fallback and the automatic DUMMY chain also passed device golden checks.
++
++Source snapshots, the implementation patch, build/test logs, raw device/host
++logs, hashes and per-batch samples are under
++`../official-results/v6-simplified-20261116/`. Its `summary.json` contains both
++variants. The analyzer accepts historical version-2 and fixed-calibration
++version-3 reports and checks per-side assignment/dispatch equality for v3.
+--- before/docs/user/how-to/use-aicpu-cluster-placement.md
++++ after/docs/user/how-to/use-aicpu-cluster-placement.md
+@@ -1,198 +1,183 @@
+ # Use AICPU cluster placement on a2a3
+ 
+-The a2a3 TensorMap and RingBuffer runtime supports explicit and automatic
+-AICPU scheduler-cluster placement. On the observed 910B2 six-CPU user pool,
+-`aicpu_thread_num=6` gives two schedulers on CPUs 2–3, three schedulers on
+-CPUs 4–6, and one orchestrator on CPU 7. The default remains four threads.
+-The host topology probe supplies cluster IDs; queues are in shared memory,
+-so the single orchestrator can publish work to either cluster.
++The a2a3 TensorMap and RingBuffer runtime supports shared, explicit and automatic
++AICPU scheduler-cluster placement. On the observed 910B2 six-thread pool,
++cluster 0 has S0/S1 on CPUs 2/3; cluster 1 has S2/S3/S4 on CPUs 4/5/6 and
++one orchestrator O on CPU 7. The default thread count remains four. Host
++probing supplies cluster IDs. O can publish ready work directly to either side.
+ 
+ ```cpp
+ CoreTaskArgs args;
+ args.set_aicpu_cluster_auto();
+-// Add tensor arguments and submit the task as usual.
+ rt_submit_aiv_task(kernel_id, args);
+ ```
+ 
+-`set_aicpu_cluster(0/1)` is strict placement; no hint uses shared queues.
+-Python graph generation does not automatically insert the C++ automatic hint.
+-The decision is made after WAIT reduction, before dependency or ready publication.
+-Automatic unstarted single-block compute tasks can be taken by an idle peer
+-cluster. Strict targets, DUMMY queues and automatic multi-block tasks cannot
+-be taken across clusters. Automatic sync-start requests retain the shared path;
+-explicit multi-block sync-start targets are rejected.
++No hint uses shared queues; `set_aicpu_cluster(0/1)` is strict placement.
++Python graph generation does not insert automatic hints. The automatic choice
++is made after WAIT reduction, before dependency wiring or ready publication.
++The graph is generated online; scope boundaries do not trigger whole-graph
++partitioning or execution barriers.
+ 
+-## Cold start and transition
++## Blocks, capacities and queues
+ 
+-Cold start uses predecessor-cluster affinity and capacity-normalized future
+-work, without evaluating the time-cost score below. Affinity can override the
+-least-loaded side only within a bounded imbalance (0.25 in normalized capacity
+-units). Future work includes blocked tasks so a burst of dependent submissions
+-does not all reserve the same cluster. A multi-block task reserves its block
+-count. This future-work measure is a balancing measure, not resource occupancy.
++A block is one logical execution instance of a task. A task may have several
++blocks. AIC/AIV capacity counts compatible cores; MIX capacity counts owned
++AI Core groups; DUMMY capacity is one per scheduler. A MIX block can involve
++multiple compute cores. These resource groups are distinct from AICPU clusters.
++Block backlog divided by capacity estimates resource waves, not execution time
++or occupied resources; kernels can have different durations.
+ 
+-Each resource shape (AIC, AIV, MIX, DUMMY) switches to scoring only after:
++Automatic and strict tasks use the same cluster-specific per-shape queues.
++There is no separate automatic queue and no cross-cluster pickup. Shared tasks
++use global per-shape queues. Schedulers service their own targeted queues and
++the shared queues. A targeted multi-block task can dispatch in partial ranges
++and requeue the remainder on its original side. DUMMY and failed-predicate
++tasks use the appropriate shared or targeted DUMMY queue.
+ 
+-- at least 128 automatic submissions overall;
+-- at least 64 first-pickup observations for that shape, including at least
+-  16 on each cluster that has schedulers;
+-- at least one coefficient for that shape has actually been fitted.
++Automatic multi-block sync-start requests retain the shared sync-start path;
++strict multi-block sync-start targets are rejected. Targeted tasks cannot use
++global early dispatch to bypass placement. The initial target is immutable.
++A shared producer can still publish its actual pickup side for later consumers.
++Placement does not copy tensor data between clusters.
+ 
+-Coefficients without sufficient evidence retain their priors. The first
+-coefficient update cannot happen before submission 256. States and learned
+-coefficients reset for each runtime execution; they are not carried across
+-benchmark rounds.
++## Fixed calibration prefix
+ 
+-## Separate ready pressure from blocked work
++The first 256 automatic placements use cold-start balancing and predecessor
++affinity. Before decision 257, O takes one nonblocking, versioned snapshot of
++S's cumulative first-pickup observations and fits each eligible channel once.
++The transition depends only on the submission count, not shape maturity.
+ 
+-For automatic tasks, a cumulative ready-publication counter advances once
+-when the task first becomes ready. Dispatch and cross-cluster pickup counters
+-allow the orchestrator to estimate ready-but-not-dispatched **block units**:
++Queue fitting requires 32 observations; publication, dependency and quiet
++pickup channels require 16. Missing, sparse or racing channels retain priors;
++there is no retry or extension of the prefix. Quiet pickup is fitted before
++subtracting it from the normalized queue observation. Fitted observations
++are bounded to 20–32000 ns and 0.5–2 times their priors, then assigned directly.
++There is no EWMA, rolling window, elapsed-time update gate or repeated polling.
++
++S's ordinary latency sampling stops after calibration is frozen. Resource
++feedback and publication/dispatch accounting continue. Late completions cannot
++change frozen coefficients. Diagnostics can still record ready-wait spans.
++Every runtime execution resets calibration, counts and parameters; no training
++state is carried between benchmark rounds. Runs of at most 256 automatic
++placements stay entirely in cold start.
++
++Each of AIC, AIV, MIX and DUMMY has its own coefficients. Queue priors are
++2000 ns on both sides; O-to-S publication and S-to-S dependency matrices both
++start at 250 ns on the diagonal and 750 ns off diagonal. Quiet pickup starts
++unknown. These are control priors, not hardware communication measurements.
++
++## Eight-node snapshot batches
++
++O still generates, scores and publishes each task synchronously so that submit
++can immediately return output tensor handles to subsequent task generation.
++It does not wait to accumulate eight tasks and does not run parallel scoring.
++O does not wait for a submitted kernel to finish before generating the next
++node, except for existing backpressure or explicit synchronization.
++
++Every eight automatic decisions define a snapshot epoch. Each resource shape
++reads queues, resources and publication/dispatch counters once on its first
++appearance in that epoch. Later nodes of that shape reuse the snapshot. O adds
++each newly assigned task locally to blocked pressure if it has pending WAIT
++predecessors, otherwise to ready pressure. It adds block units, not queue
++entries. This prevents all batch nodes from seeing an unchanged empty queue.
++
++S execution progress and blocked-to-ready transitions within an epoch become
++visible at the next snapshot. Different shapes take their snapshots lazily,
++so snapshots are advisory, not atomic across threads or shapes. Batching saves
++shared reads at the cost of freshness. All S threads remain available for
++scheduling rather than being borrowed to run placement calculations.
++
++## State and scores
++
++At snapshot refresh, with shape omitted:
+ 
+ ```text
+-ready_auto[c] = max(0, published[c] + moves_in[c] - moves_out[c] - dispatched[c])
+-blocked[c]   = max(0, assigned[c] - published[c])
+-B[c]         = max(ready_auto[c], observed queue depth including shared/strict work)
++blocked[c] = max(0, assigned[c] - ready_published[c])
++ready_auto[c] = max(0, ready_published[c] - dispatched[c])
++depth[c] = targeted_queue_entries[c]
++           + shared_queue_entries * S_count[c] / total_S_count
++B[c] = max(ready_auto[c], depth[c])
+ ```
+ 
+-`blocked` affects cold-start future-work balancing and a separate, bounded
+-future-reservation term after warm-up. It does not increase the scored ready
+-queue pressure or mark an idle resource as busy. The queue-depth
+-fallback counts queue entries; for explicit/shared multi-block work it is an
+-approximation. Resource snapshots and dispatch/move snapshots are advisory and
+-cached for up to eight decisions, while publication counters are read fresh.
++Only automatic work enters the cumulative block ledger. Targeted and shared
++queue depth also reflect nonautomatic work. Queue entries approximate blocks
++for multi-block tasks. Publication is counted once at first readiness;
++dispatch is counted after publishing each dispatched block range, not at
++completion or CONSUMED. There are no move counters. Within an epoch, local
++new-task reservations are added to this snapshot until refresh.
+ 
+-## Score after warm-up
+-
+-All coefficients below depend on resource shape, omitted for readability:
++Cold start chooses the smallest score and can favor the side with more known
++WAIT predecessors when its score is at most 256 above the minimum:
+ 
+ ```text
+-Q[c] = B[c] / scheduler_count[c]
++cold_score[c] = 1024 * (blocked[c] + B[c] + new_task_blocks) / capacity[c]
++```
++
++Unknown capacity falls back to scheduler count. After the fixed prefix:
++
++```text
++Q[c] = B[c] / S_count[c]
+ R[c] = 2*(capacity[c]-free_dispatch[c])/capacity[c]
+        + (capacity[c]-idle[c])/capacity[c]
+-
+ C[v,c] = publish_ns[O_cluster][c]                         if no pending WAIT
+-       = max(dependency_ns[p][c] over known source p)    otherwise
+-
+-extra_remote(v,c) = known remote pending WAIT sources
+-                    - (1 if the selected handoff is remote, else 0)
+-budget[c] = capacity[c] (scheduler_count[c] if capacity is not yet published)
++       = max(applicable dependency_ns[source][c])       otherwise
++X[v,c] = known remote pending WAIT count,
++         minus one if C equals the remote dependency coefficient and X > 0
++budget[c] = capacity[c], or S_count[c] if capacity is unknown
+ F[v,c] = min(blocked[c] + (new_task_blocks if pending WAIT else 0), budget[c])
+          / budget[c]
+-score(v,c) = C[v,c] + 0.5*queue_ns[c]*Q[c]
+-           + 0.25*queue_ns[c]*R[c] + 128 ns*extra_remote(v,c)
+-           + 0.25*queue_ns[c]*F[v,c]
++score[v,c] = C[v,c] + 0.5*queue_ns[c]*Q[c]
++             + 0.25*queue_ns[c]*R[c] + 128 ns*X[v,c]
++             + 0.25*queue_ns[c]*F[v,c]
+ ```
+ 
+-Future reservations count automatic block units, with DUMMY counting as one.
+-Each side's future cost is capped at `queue_ns[c]/4`, independent of how many
+-blocked tasks exist. The current pending task contributes before assignment;
+-its block count is not multiplied by its number of WAIT predecessors. Existing
+-reservations disappear as tasks publish ready and enter the ready-pressure
+-ledger. Free and idle resource snapshots are unchanged. The calculation uses
+-the existing assigned/publication counts, without extra shared counters or
+-predecessor scans. This is an aggregate heuristic, not a common-predecessor
+-group model or a prediction of release time. Both sides can saturate, at which
+-point this term cannot distinguish further backlog growth; it is a soft
+-placement preference, not a hard balance constraint.
++Unknown predecessor locations include both possible source channels in the
++maximum, without extra structural charge. Free includes IDLE and dispatchable
++PENDING resources; the score clamps free/idle to capacity. Unknown capacity
++uses one queue-cost unit before the resource term's quarter weight. Equal
++scores favor the lower cumulative assignment count normalized by S count.
+ 
+-`capacity/free_dispatch/idle` describe the schedulers' owned AI Core dispatch
+-resources, not AICPU counts. Free includes IDLE and dispatchable PENDING slots.
+-If capacity has not yet been published, use one queue-cost unit for R's cost.
+-Unknown predecessor locations use the larger of the two source-channel costs.
+-Multiple WAIT predecessors can progress concurrently, so the score uses the
+-maximum applicable handoff estimate. A small structural prior charges only
+-known remote WAIT predecessors beyond the one represented by the handoff term,
+-if that handoff is remote. Unknown locations receive the conservative
+-handoff estimate but no structural charge. The 0.5, 0.25 and 128 ns constants
+-are provisional policy weights, not measured optimums. The idle-peer steal
+-remains available for unstarted automatic single-block compute tasks.
+-The score estimates scheduling pressure, not kernel completion time. AIC/AIV
+-execution durations are excluded.
++Future pressure is capped at queue_ns/4 per side and never marks a resource
++busy. Both sides can saturate, so it is a soft preference, not a balance
++constraint or a common-predecessor release model. Fixed weights are policy
++choices. The score predicts neither kernel duration nor predecessor remaining
++time and does not account for the full cost of the placement implementation.
+ 
+-Priors are `queue=2000 ns`; O-to-S and S-to-S matrices both start with 250 ns
+-on the diagonal and 750 ns off the diagonal. The idle-pickup baseline starts
+-unknown and is fitted from quiet handoff observations. These are control
+-priors, not measured hardware constants.
++## Calibration measurements
+ 
+-## Sample-count windows and update limits
++Each logical automatic task supplies at most one observation at first resource
++preparation, including multi-block and requeued tasks. If same-shape work was
++already queued at ready publication, the queue sample is:
+ 
+-Each S publishes cumulative, versioned counters per resource shape. Scope IDs
+-are diagnostic task labels only: a late sample is added when the task is first
+-picked up, regardless of how many scopes the orchestrator generated meanwhile.
+-No scope ring can evict it. The orchestrator consumes counter deltas exactly
+-once and keeps a bounded aggregate of up to 512 effective samples per metric,
+-resource shape and destination. A full aggregate proportionally retains recent
+-batch means; it is not an exact FIFO of 512 individual observations. Rare
+-source channels retain evidence across polls instead of waiting for a matching
+-class in the same short scope window.
++```text
++queue_sample = ready_to_first_prepare_ns * S_count / (S_count + ready_depth)
++```
+ 
+-Polling happens every 64 automatic submissions, never on scope entry. An
+-update requires at least 256 new submissions since the previous update and,
+-after the first update, at least 100 microseconds since that update. Each
+-coefficient also requires its own minimum fresh evidence: 32 queued samples
+-or 16 publication/notification/idle-pickup samples. Updates use a 25% EWMA with the new
+-observation bounded to 0.5–2 times the prior and the coefficient range. No new
+-evidence means no repeated update. A poll whose snapshot races an S update is
+-skipped and consumed on a later successful poll.
++Quiet handoff samples require an empty same-shape queue, idle-resource evidence
++at publication, a real IDLE slot at pickup, ready-to-pickup delay at most 5 us,
++source preparation at most 20 us, and a known source cluster. They measure
++source preparation plus receiver pickup wait. The receiver wait also supplies
++a quiet baseline subtracted during queue fitting. The subtraction is approximate
++because the queue observation is depth-normalized but the baseline is not.
+ 
+-## Measurements used by the coefficients
++O publication starts near ready stamping, not at the beginning of full task
++submission. S dependency handoff starts at the releasing producer's fanout
++walk. These estimates include visibility, polling and fanout effects and do
++not isolate hardware cross-cluster latency. Per-S versioned buckets keep the
++single calibration snapshot coherent without blocking dispatch.
+ 
+-Queue samples use ready-publication to first resource-preparation time only
+-when the task found work already queued. They are normalized by
+-`S_count/(S_count+ready_depth)` as a queue-pressure proxy. At fitting time,
+-the destination's quiet idle-pickup baseline is subtracted from that proxy
+-before smoothing the queue coefficient. This subtraction is approximate:
+-the queue sample is depth-normalized but the quiet baseline is not. It avoids
+-charging the same receiver polling time in both the handoff and queue terms
+-when the baseline is representative.
++## Benchmark evidence
+ 
+-O-to-S and S-to-S handoffs have separate counters for each source cluster,
+-destination cluster and resource shape. A task directly published by O uses
+-publication preparation through first receiver preparation. A task made ready
+-by an S uses the final predecessor's fanout-release entry through receiver
+-preparation. Channel fitting accepts only samples with:
++The paired six-thread BGEMM cases use identical graph parameters, kernels and
++deterministic inputs. Check golden outputs separately, then compare repeated
++tracing-disabled device_wall medians and p95; do not select the fastest round.
++Different runtime builds need fresh Shared controls. See the
++[experiment history](../../investigations/2026-11-aicpu-cluster-bgemm.md), including
++negative results from earlier adaptive-learning and cross-pickup variants.
+ 
+-- no preceding same-shape work at ready publication;
+-- an idle-resource snapshot on the target at publication;
+-- an actual IDLE dispatch slot at pickup, rather than a PENDING slot;
+-- at most 5 microseconds of ready-to-pickup delay and 20 microseconds of
+-  source-side preparation.
+-
+-Moved tasks contribute an observation for warm-up but no latency-fitting
+-  sample, since their measured wait includes another cluster's queue. Each
+-logical task is sampled once, even when it is multi-block or requeued.
+-
+-The dependency matrices are fitted directly from these filtered handoff
+-samples. They are not differences between congested remote and local queue
+-means. They still include fanout processing, polling and visibility delays;
+-resource snapshots can be stale, and quiet-period selection can bias the
+-estimate. They are runtime control-path estimates, not isolated hardware
+-communication latency or remaining predecessor compute time. Already-created
+-consumers can retain an old affinity estimate if their unstarted producer is
+-subsequently taken by the other cluster; dependency correctness is unaffected.
+-
+-## Benchmark and evidence
+-
+-The [official BGEMM benchmark](../../../examples/a2a3/tensormap_and_ringbuffer/benchmark_bgemm/README.md)
+-contains paired six-thread shared/automatic cases with identical kernels and
+-inputs. Compare repeated `device_wall` measurements with chip swimlane off;
+-capture diagnostics separately. The [L2 timing guide](../../dfx/l2-timing.md)
+-explains the spans. The [BGEMM investigation](../../investigations/2026-11-aicpu-cluster-bgemm.md)
+-records the initial implementation's negative result and subsequent revisions.
+-
+-At scheduler-phase swimlane level, quiescent teardown also prints
+-`AICPU_PARTITION_TRACE` totals for the orchestrator's decision/wiring stages and
+-each scheduler's feedback/queue passes. These diagnostic totals include clock
+-overhead. Scheduler threads overlap, and pickup observation is nested inside
+-dispatch totals; do not add them together as end-to-end latency. Use
+-`analyze_control_costs.py` in the BGEMM example to read these logs, and use
+-separate tracing-disabled runs for performance comparisons.
+-
+-Empty fixed/shared queue snapshots can skip an inactive staging pass in the
+-automatic path. A concurrent new arrival is serviced in a later scheduler
+-loop. Ready-publication counters for distinct cluster/resource pairs occupy
+-separate cache lines. These changes do not establish a general speedup;
+-see the investigation's controlled timing tables. Learner sampling remains
+-per first pickup: an attempted batched-publication optimization was removed
+-after it failed to show a stable wall-time benefit.
++At scheduler-phase swimlane level, quiescent teardown prints O stages and S
++queue/feedback stages. These include instrumentation cost and overlap across
++threads; do not add them to reconstruct wall time. Version-3 final reports
++include fixed calibration count, batch size, snapshot count and per-side
++assignments/dispatches. With no cross-cluster pickup, assignments must equal
++actual dispatches on each side for these single-block benchmark graphs.
+--- before/examples/a2a3/tensormap_and_ringbuffer/benchmark_bgemm/README.md
++++ after/examples/a2a3/tensormap_and_ringbuffer/benchmark_bgemm/README.md
+@@ -79,7 +79,7 @@
+ `ClusterScaleShared`/`ClusterScaleAdaptive` pairs request six active AICPU
+ threads. Each pair runs the same BGEMM graph and deterministic input tensors;
+ only the C++ task placement request changes. `ClusterCase0` reuses Case0's
+-500-task shape. `ClusterScale` uses 2048 tasks with 64×64 tiles and `grid_k=4`
++500 matmul/add pairs (1000 tasks). `ClusterScale` uses 2048 pairs (4096 tasks) with 64×64 tiles and `grid_k=4`
+ to expose scheduling pressure across many independent groups. For example:
+ 
+ ```bash
+@@ -90,11 +90,14 @@
+ Run each case once with its golden check before using `--skip-golden` for
+ repeated timing. See [AICPU cluster placement](../../../../docs/user/how-to/use-aicpu-cluster-placement.md)
+ for the runtime behavior and measurement boundaries.
+-In the [measured six-thread investigation](../../../../docs/investigations/2026-11-aicpu-cluster-bgemm.md),
+-the cumulative-sample revision increased device-wall median time by 41.38% for Case0 and
+-42.53% for Scale. The paired cases remain useful as a regression and profiling
+-target; current measurements do not support making automatic placement the
+-default.
++The current controller uses a fixed 256-node calibration prefix, immutable
++cluster targets, and eight-node snapshot epochs. It has no cross-cluster
++pickup or repeated model fitting. In the
++[2026-11-16 investigation](../../../../docs/investigations/2026-11-aicpu-cluster-bgemm.md),
++automatic median device-wall time decreased by 15.66%/12.37% against a fresh
++previous-controller baseline, but remained 14.32%/18.23% above the paired
++Shared controls (Case0/Scale). These are combined-change, unlocked-device
++results, not individual-change attribution or evidence for default enablement.
+ 
+ Tolerances are `RTOL = ATOL = 1e-3`, with inputs scaled by `0.01` to keep the
+ `grid_k`-deep float32 accumulation inside them.
+--- before/examples/a2a3/tensormap_and_ringbuffer/benchmark_bgemm/analyze_cluster_placement.py
++++ after/examples/a2a3/tensormap_and_ringbuffer/benchmark_bgemm/analyze_cluster_placement.py
+@@ -3,10 +3,11 @@
+ import argparse
+ import hashlib
+ import json
+-from pathlib import Path
+ import re
+ import statistics
++from pathlib import Path
+ 
++from simpler_setup.tools.swimlane_converter import read_perf_data
+ 
+ DEVICE_WALL = re.compile(r"name=chip\.run\.runner_run\.device_wall ts=\d+ dur=(\d+)\b")
+ CASES = ("ScaleShared", "ScaleAdaptive", "Case0Shared", "Case0Adaptive")
+@@ -35,21 +36,34 @@
+             return result
+ 
+         finals = [fields(line) for line in lines if "AICPU_ADAPTIVE_FINAL" in line]
+-        if len(finals) != 1 or finals[0].get("version") != 2:
+-            raise ValueError(f"expected one v2 terminal report in {device}")
++        if len(finals) != 1 or finals[0].get("version") not in (2, 3):
++            raise ValueError(f"expected one supported terminal report in {device}")
+         final = finals[0]
+         assert sum(final["decisions"]) == sum(final["started"]) == expected
+         assert final["cold"] + final["learned"] == expected and final["cold"] >= 256 and final["learned"] > 0
+-        assert final["polls"] <= expected // 64
+-        for c in (0, 1):
+-            assert final["decisions"][c] + final["moves"][c] - final["moves"][1-c] == final["started"][c]
+         updates = [fields(line) for line in lines if "AICPU_ADAPTIVE_UPDATES" in line]
+-        active = [row for row in updates if row["shape"] < 2]
+-        assert sum(row["o1"] for row in active) > 0
+-        assert sum(row["s1"] if row["cluster"] == 0 else row["s0"] for row in active) > 0
+-        assert max(row[key] for row in updates for key in ("queue", "o0", "o1", "s0", "s1")) <= (expected - 1) // 256
+-        reports[family] = {"final": final, "channel_updates": updates, "device_log": str(device),
+-                           "models": [fields(line) for line in lines if "AICPU_ADAPTIVE_MODEL" in line]}
++        max_updates = max(row[key] for row in updates for key in ("queue", "o0", "o1", "s0", "s1"))
++        if final["version"] == 2:
++            assert final["polls"] <= expected // 64
++            for c in (0, 1):
++                assert final["decisions"][c] + final["moves"][c] - final["moves"][1 - c] == final["started"][c]
++            active = [row for row in updates if row["shape"] < 2]
++            assert sum(row["o1"] for row in active) > 0
++            assert sum(row["s1"] if row["cluster"] == 0 else row["s0"] for row in active) > 0
++            assert max_updates <= (expected - 1) // 256
++        else:
++            assert final["cold"] == 256 and final["calibrations"] == 1
++            assert final["decisions"] == final["started"]
++            assert max_updates <= 1
++            assert final["batch_size"] == 8
++            # Both AIC and AIV appear in every eight-node epoch of these cases.
++            assert final["snapshots"] == 2 * ((expected + 7) // 8)
++        reports[family] = {
++            "final": final,
++            "channel_updates": updates,
++            "device_log": str(device),
++            "models": [fields(line) for line in lines if "AICPU_ADAPTIVE_MODEL" in line],
++        }
+     return reports
+ 
+ 
+@@ -60,10 +74,60 @@
+     return ordered[low] + (ordered[min(low + 1, len(ordered) - 1)] - ordered[low]) * (point - low)
+ 
+ 
++def diagnostics_summary(outputs):
++    diagnostics = {}
++    for family in ("Scale", "Case0"):
++        dependency_paths = list(outputs.glob(f"TestBenchmarkBgemm_Cluster{family}Shared_*/deps.json"))
++        dependency_path = max(dependency_paths, key=lambda path: path.stat().st_mtime)
++        graph = json.loads(dependency_path.read_text())
++        edges = {(int(edge["pred"]), int(edge["succ"])) for edge in graph["edges"] if "wait" in edge["flags"]}
++        expected_tasks = 4096 if family == "Scale" else 1000
++        if len(graph["tasks"]) != expected_tasks:
++            raise ValueError(f"unexpected task count in {dependency_path}")
++        for mode in ("Shared", "Adaptive"):
++            case = family + mode
++            paths = list(outputs.glob(f"TestBenchmarkBgemm_Cluster{case}_*/chip_swimlane_records.json"))
++            path = max(paths, key=lambda item: item.stat().st_mtime)
++            perf = read_perf_data(path)
++            tasks = perf["tasks"]
++            if len(tasks) != expected_tasks or len({task["task_id"] for task in tasks}) != expected_tasks:
++                raise ValueError(f"missing or repeated tasks in {path}")
++            if any(
++                stream["capture"]["dropped"] or stream["capture"]["truncated"] for stream in perf["scheduler_streams"]
++            ):
++                raise ValueError(f"incomplete scheduler capture in {path}")
++            thread = perf["core_to_thread"]
++            task_cluster = {task["task_id"]: int(thread[task["core_id"]] >= 2) for task in tasks}
++            if any(pred not in task_cluster or succ not in task_cluster for pred, succ in edges):
++                raise ValueError(f"dependency tasks missing in {path}")
++            waits = [
++                row["end_time_us"] - row["start_time_us"]
++                for rows in perf["scheduler_records"]
++                for row in rows
++                if row["phase"] == "ready_wait"
++            ]
++            if len(waits) != expected_tasks:
++                raise ValueError(f"ready-wait capture incomplete in {path}")
++            diagnostics[case] = {
++                "capture": str(path),
++                "dependency_graph": str(dependency_path),
++                "tasks": len(tasks),
++                "wait_edges": len(edges),
++                "cross_wait_edges": sum(task_cluster[pred] != task_cluster[succ] for pred, succ in edges),
++                "cluster_tasks": [sum(cluster == c for cluster in task_cluster.values()) for c in (0, 1)],
++                "ready_wait_mean_us": statistics.mean(waits),
++                "ready_wait_median_us": statistics.median(waits),
++                "stream_drops": 0,
++            }
++    return diagnostics
++
++
+ def main():
+     parser = argparse.ArgumentParser(description=__doc__)
+     parser.add_argument("results", type=Path)
+-    parser.add_argument("--outputs", type=Path, help="Runtime outputs directory with separate swimlane and dep-gen runs")
++    parser.add_argument(
++        "--outputs", type=Path, help="Runtime outputs directory with separate swimlane and dep-gen runs"
++    )
+     args = parser.parse_args()
+     results = args.results
+     before = (results / "binaries-before.sha256").read_text()
+@@ -90,7 +154,7 @@
+         records[case] = {
+             "n": len(durations),
+             "median_ms": statistics.median(durations),
+-            "p95_ms": percentile(durations, .95),
++            "p95_ms": percentile(durations, 0.95),
+             "min_ms": min(durations),
+             "max_ms": max(durations),
+         }
+@@ -102,46 +166,7 @@
+     if learning:
+         records["learning"] = learning
+     if args.outputs:
+-        from simpler_setup.tools.swimlane_converter import read_perf_data
+-
+-        diagnostics = {}
+-        for family in ("Scale", "Case0"):
+-            dependency_paths = list(args.outputs.glob(f"TestBenchmarkBgemm_Cluster{family}Shared_*/deps.json"))
+-            dependency_path = max(dependency_paths, key=lambda path: path.stat().st_mtime)
+-            graph = json.loads(dependency_path.read_text())
+-            edges = {(int(edge["pred"]), int(edge["succ"])) for edge in graph["edges"] if "wait" in edge["flags"]}
+-            expected_tasks = 4096 if family == "Scale" else 1000
+-            if len(graph["tasks"]) != expected_tasks:
+-                raise ValueError(f"unexpected task count in {dependency_path}")
+-            for mode in ("Shared", "Adaptive"):
+-                case = family + mode
+-                paths = list(args.outputs.glob(f"TestBenchmarkBgemm_Cluster{case}_*/chip_swimlane_records.json"))
+-                path = max(paths, key=lambda item: item.stat().st_mtime)
+-                perf = read_perf_data(path)
+-                tasks = perf["tasks"]
+-                if len(tasks) != expected_tasks or len({task["task_id"] for task in tasks}) != expected_tasks:
+-                    raise ValueError(f"missing or repeated tasks in {path}")
+-                if any(stream["capture"]["dropped"] or stream["capture"]["truncated"]
+-                       for stream in perf["scheduler_streams"]):
+-                    raise ValueError(f"incomplete scheduler capture in {path}")
+-                thread = perf["core_to_thread"]
+-                task_cluster = {task["task_id"]: int(thread[task["core_id"]] >= 2) for task in tasks}
+-                if any(pred not in task_cluster or succ not in task_cluster for pred, succ in edges):
+-                    raise ValueError(f"dependency tasks missing in {path}")
+-                waits = [row["end_time_us"] - row["start_time_us"] for rows in perf["scheduler_records"]
+-                         for row in rows if row["phase"] == "ready_wait"]
+-                if len(waits) != expected_tasks:
+-                    raise ValueError(f"ready-wait capture incomplete in {path}")
+-                diagnostics[case] = {
+-                    "capture": str(path), "dependency_graph": str(dependency_path),
+-                    "tasks": len(tasks), "wait_edges": len(edges),
+-                    "cross_wait_edges": sum(task_cluster[pred] != task_cluster[succ] for pred, succ in edges),
+-                    "cluster_tasks": [sum(cluster == c for cluster in task_cluster.values()) for c in (0, 1)],
+-                    "ready_wait_mean_us": statistics.mean(waits),
+-                    "ready_wait_median_us": statistics.median(waits),
+-                    "stream_drops": 0,
+-                }
+-        records["diagnostics"] = diagnostics
++        records["diagnostics"] = diagnostics_summary(args.outputs)
+     print(json.dumps(records, indent=2))
+ 
+ 
+--- before/src/a2a3/runtime/tensormap_and_ringbuffer/aicpu/aicpu_executor.cpp
++++ after/src/a2a3/runtime/tensormap_and_ringbuffer/aicpu/aicpu_executor.cpp
+@@ -1066,25 +1066,25 @@
+         if (rt != nullptr) {
+             auto &model = rt->orchestrator.cluster_partitioner;
+             if (model.decisions[0] + model.decisions[1] != 0) {
+-                uint64_t started[2]{}, moved[2]{};
++                uint64_t started[2]{};
+                 for (const auto &thread : rt->scheduler.placement_feedback.threads) {
+                     int c = thread.cluster.load(std::memory_order_relaxed);
+                     if (c < 0 || c > 1) continue;
+                     for (int shape = 0; shape < simpler::tmr::PARTITION_SHAPES; ++shape) {
+                         started[c] += thread.started[shape].load(std::memory_order_relaxed);
+-                        moved[c] += thread.incoming_moves[shape].load(std::memory_order_relaxed);
+                     }
+                 }
+                 LOG_INFO(
+-                    "AICPU_ADAPTIVE_FINAL version=2 decisions=%llu,%llu started=%llu,%llu moves=%llu,%llu "
+-                    "cold=%llu learned=%llu polls=%llu updates=%llu,%llu",
++                    "AICPU_ADAPTIVE_FINAL version=3 decisions=%llu,%llu started=%llu,%llu "
++                    "cold=%llu learned=%llu calibrations=%llu updates=%llu,%llu batch_size=%llu snapshots=%llu",
+                     static_cast<unsigned long long>(model.decisions[0]),
+                     static_cast<unsigned long long>(model.decisions[1]), static_cast<unsigned long long>(started[0]),
+-                    static_cast<unsigned long long>(started[1]), static_cast<unsigned long long>(moved[0]),
+-                    static_cast<unsigned long long>(moved[1]), static_cast<unsigned long long>(model.cold_decisions),
++                    static_cast<unsigned long long>(started[1]), static_cast<unsigned long long>(model.cold_decisions),
+                     static_cast<unsigned long long>(model.learned_decisions),
+-                    static_cast<unsigned long long>(model.polls), static_cast<unsigned long long>(model.updates[0]),
+-                    static_cast<unsigned long long>(model.updates[1])
++                    static_cast<unsigned long long>(model.calibrations), static_cast<unsigned long long>(model.updates[0]),
++                    static_cast<unsigned long long>(model.updates[1]),
++                    static_cast<unsigned long long>(simpler::tmr::PARTITION_BATCH_NODES),
++                    static_cast<unsigned long long>(model.snapshots)
+                 );
+                 for (int shape = 0; shape < simpler::tmr::PARTITION_SHAPES; ++shape) {
+                     const auto &w = model.weights[shape];
+--- before/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/aicpu_cluster_partition.h
++++ after/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/aicpu_cluster_partition.h
+@@ -12,15 +12,12 @@
+ constexpr int PARTITION_SHAPES = 4;
+ constexpr int PARTITION_SCOPE_DEPTH = 64;
+ constexpr int PARTITION_METRICS = 6;  // queued wait, O0/O1 publication, S0/S1 notification, idle pickup
+-constexpr uint32_t PARTITION_MOVED = 1u;
+ constexpr uint32_t PARTITION_FROM_O = 2u;
+ constexpr uint32_t PARTITION_READY = 4u;
+ constexpr uint32_t PARTITION_OBSERVED = 8u;
+ constexpr uint32_t PARTITION_IDLE_AT_PUBLISH = 16u;
+-constexpr uint64_t PARTITION_POLL_NODES = 64;
+-constexpr uint64_t PARTITION_UPDATE_NODES = 256;
+-constexpr uint64_t PARTITION_UPDATE_NS = 100000;
+-constexpr uint64_t PARTITION_WINDOW_SAMPLES = 512;
++constexpr uint64_t PARTITION_CALIBRATION_NODES = 256;
++constexpr uint64_t PARTITION_BATCH_NODES = 8;
+ constexpr uint64_t PARTITION_QUEUE_WEIGHT_NUM = 1;
+ constexpr uint64_t PARTITION_QUEUE_WEIGHT_DEN = 2;
+ constexpr uint64_t PARTITION_RESOURCE_WEIGHT_NUM = 1;
+@@ -87,7 +84,7 @@
+ struct alignas(64) PartitionThread {
+     std::atomic<int32_t> cluster{-1};
+     std::atomic<uint32_t> capacity[PARTITION_SHAPES]{}, free_slots[PARTITION_SHAPES]{}, idle_slots[PARTITION_SHAPES]{};
+-    std::atomic<uint64_t> started[PARTITION_SHAPES]{}, incoming_moves[PARTITION_SHAPES]{};
++    std::atomic<uint64_t> started[PARTITION_SHAPES]{};
+     PartitionBucket samples[PARTITION_SHAPES];
+     alignas(64) PartitionTrace trace;
+     void reset() {
+@@ -98,7 +95,6 @@
+             free_slots[i].store(0, std::memory_order_relaxed);
+             idle_slots[i].store(0, std::memory_order_relaxed);
+             started[i].store(0, std::memory_order_relaxed);
+-            incoming_moves[i].store(0, std::memory_order_relaxed);
+             samples[i].reset();
+         }
+     }
+@@ -115,12 +111,14 @@
+ static_assert(sizeof(PartitionReadyCounter) == 64);
+ struct PartitionShared {
+     std::atomic<bool> enabled{false};
++    std::atomic<bool> calibration_done{false};
+     int32_t schedulers[2]{}, orchestrator_cluster{-1};
+     PartitionReadyCounter ready_published[2][PARTITION_SHAPES]{};
+     std::atomic<uint32_t> idle_mask[2][PARTITION_SHAPES]{};
+     PartitionThread threads[PARTITION_THREADS];
+     void reset() {
+         enabled.store(false, std::memory_order_relaxed);
++        calibration_done.store(false, std::memory_order_relaxed);
+         schedulers[0] = schedulers[1] = 0;
+         orchestrator_cluster = -1;
+         for (auto &cluster : ready_published)
+@@ -148,39 +146,18 @@
+     uint64_t dependency[2][2]{{250, 750}, {750, 250}};
+     uint64_t idle_pickup[2]{};
+ };
+-struct PartitionWindow {
+-    uint64_t count[PARTITION_METRICS]{}, ns[PARTITION_METRICS]{};
+-    void append(int metric, uint64_t n, uint64_t sum) {
+-        if (!n) return;
+-        uint64_t room = PARTITION_WINDOW_SAMPLES - count[metric];
+-        // A full window keeps recent observations without making update cadence depend on scope size.
+-        if (n >= room) {
+-            uint64_t retain = n < PARTITION_WINDOW_SAMPLES ? n : PARTITION_WINDOW_SAMPLES;
+-            uint64_t keep = PARTITION_WINDOW_SAMPLES - retain;
+-            ns[metric] = (count[metric] ? ns[metric] * keep / count[metric] : 0) + sum * retain / n;
+-            count[metric] = (count[metric] ? keep : 0) + retain;
+-        } else {
+-            count[metric] += n;
+-            ns[metric] += sum;
+-        }
+-    }
+-};
+ struct ClusterPartitioner {
+     PartitionTrace trace;
+     PartitionWeights weights[PARTITION_SHAPES];
+     uint64_t assigned[2][PARTITION_SHAPES]{};
+     uint64_t next_scope{0}, last_closed{0}, scope_ids[PARTITION_SCOPE_DEPTH]{},
+         scope_assignments[PARTITION_SCOPE_DEPTH]{};
+-    PartitionSample consumed[PARTITION_THREADS][PARTITION_SHAPES]{};
+-    PartitionWindow pending[PARTITION_SHAPES][2];
+     uint64_t observed[PARTITION_SHAPES][2]{};
+     uint64_t decisions[2]{}, updates[2]{}, channel_updates[PARTITION_SHAPES][2][PARTITION_METRICS]{};
+-    uint64_t idle_choices{0}, cold_decisions{0}, learned_decisions{0}, polls{0};
++    uint64_t idle_choices{0}, cold_decisions{0}, learned_decisions{0}, calibrations{0}, snapshots{0};
+     uint64_t decision_ticks{0}, max_decision_ticks{0};
+-    uint64_t last_poll_decision{0}, last_update_decision{0}, last_update_ns{0};
+-    uint64_t load_refresh[PARTITION_SHAPES]{~uint64_t{0}, ~uint64_t{0}, ~uint64_t{0}, ~uint64_t{0}};
++    uint64_t load_batch[PARTITION_SHAPES]{~uint64_t{0}, ~uint64_t{0}, ~uint64_t{0}, ~uint64_t{0}};
+     PartitionLoad cached_load[PARTITION_SHAPES]{};
+-    uint64_t cached_started[PARTITION_SHAPES][2]{}, cached_moved[PARTITION_SHAPES][2]{};
+     void reset() { *this = ClusterPartitioner{}; }
+     uint64_t open_scope(int depth) {
+         scope_ids[depth] = ++next_scope;
+@@ -190,112 +167,100 @@
+     void close_scope(int depth) {
+         if (scope_assignments[depth]) last_closed = scope_ids[depth];
+     }
+-    static uint64_t smooth(uint64_t prior, uint64_t value) {
+-        if (value < 20) value = 20;
+-        if (value > 32000) value = 32000;
+-        if (value < prior / 2) value = prior / 2;
+-        if (value > prior * 2) value = prior * 2;
+-        return (3 * prior + value) / 4;
+-    }
+-    void poll(const PartitionShared &shared, uint64_t now_ns) {
+-        uint64_t count = decisions[0] + decisions[1];
+-        if (count - last_poll_decision < PARTITION_POLL_NODES) return;
+-        last_poll_decision = count;
+-        ++polls;
+-        for (int t = 0; t < PARTITION_THREADS; ++t) {
+-            int c = shared.threads[t].cluster.load(std::memory_order_relaxed);
++    uint64_t decision_count() const { return decisions[0] + decisions[1]; }
++    // Calibration takes one coherent sample snapshot after a fixed submission
++    // prefix. Busy buckets and sparse channels retain priors; late samples do
++    // not extend calibration or delay the transition to scored placement.
++    void calibrate_once(PartitionShared &shared) {
++        if (calibrations || decision_count() < PARTITION_CALIBRATION_NODES) return;
++        shared.calibration_done.store(true, std::memory_order_release);
++        ++calibrations;
++        PartitionSample totals[PARTITION_SHAPES][2]{};
++        for (const auto &thread : shared.threads) {
++            int c = thread.cluster.load(std::memory_order_relaxed);
+             if (c < 0 || c > 1) continue;
+             for (int shape = 0; shape < PARTITION_SHAPES; ++shape) {
+                 PartitionSample sample;
+-                if (!shared.threads[t].samples[shape].read(sample)) continue;
+-                auto &previous = consumed[t][shape];
+-                observed[shape][c] += sample.observed - previous.observed;
+-                for (int m = 0; m < PARTITION_METRICS; ++m)
+-                    pending[shape][c].append(m, sample.count[m] - previous.count[m], sample.ns[m] - previous.ns[m]);
+-                previous = sample;
+-            }
+-        }
+-        if (count - last_update_decision < PARTITION_UPDATE_NODES ||
+-            (last_update_ns && now_ns - last_update_ns < PARTITION_UPDATE_NS))
+-            return;
+-        bool changed = false;
++                if (!thread.samples[shape].read(sample)) continue;
++                auto &total = totals[shape][c];
++                total.observed += sample.observed;
++                for (int m = 0; m < PARTITION_METRICS; ++m) {
++                    total.count[m] += sample.count[m];
++                    total.ns[m] += sample.ns[m];
++                }
++            }
++        }
+         for (int shape = 0; shape < PARTITION_SHAPES; ++shape) {
+             for (int c = 0; c < 2; ++c) {
+-                auto &window = pending[shape][c];
++                const auto &sample = totals[shape][c];
++                observed[shape][c] = sample.observed;
++                auto &w = weights[shape];
++                // Fit the receiver baseline before subtracting it from queue wait.
+                 for (int k = 0; k < PARTITION_METRICS; ++k) {
+                     int m = k == 0 ? 5 : k - 1;
+-                    uint64_t minimum = m == 0 ? 32 : 16;
+-                    if (window.count[m] < minimum) continue;
+-                    auto &w = weights[shape];
++                    if (sample.count[m] < (m == 0 ? 32u : 16u)) continue;
++                    uint64_t value = sample.ns[m] / sample.count[m];
+                     if (m == 5) {
+-                        uint64_t sample = window.ns[m] / window.count[m];
+-                        w.idle_pickup[c] = w.idle_pickup[c] ? smooth(w.idle_pickup[c], sample) : sample;
++                        w.idle_pickup[c] = value;
+                     } else {
+                         uint64_t &coefficient =
+                             m == 0 ? w.queue[c] : (m <= 2 ? w.publish[m - 1][c] : w.dependency[m - 3][c]);
+-                        uint64_t sample = window.ns[m] / window.count[m];
+-                        if (m == 0) sample = sample > w.idle_pickup[c] ? sample - w.idle_pickup[c] : 20;
+-                        coefficient = smooth(coefficient, sample);
++                        if (m == 0) value = value > w.idle_pickup[c] ? value - w.idle_pickup[c] : 20;
++                        if (value < 20) value = 20;
++                        if (value > 32000) value = 32000;
++                        if (value < coefficient / 2) value = coefficient / 2;
++                        if (value > coefficient * 2) value = coefficient * 2;
++                        coefficient = value;
+                     }
+-                    window.count[m] = window.ns[m] = 0;
+                     ++channel_updates[shape][c][m];
+                     ++updates[c];
+-                    changed = true;
+                 }
+             }
+         }
+-        if (changed) {
+-            last_update_decision = count;
+-            last_update_ns = now_ns;
+-        }
+-    }
++    }
++    bool needs_snapshot(int shape) const {
++        return load_batch[shape] != decision_count() / PARTITION_BATCH_NODES;
++    }
++    // Each shape uses one advisory snapshot per eight-decision epoch. Subsequent
++    // submissions add local reservations; scheduler progress is incorporated at
++    // the next epoch. The snapshot does not constitute a resource reservation.
+     PartitionLoad load(const PartitionShared &shared, int shape, const uint64_t queue_depth[2]) {
+-        uint64_t count = decisions[0] + decisions[1];
+-        if (load_refresh[shape] == ~uint64_t{0} || count - load_refresh[shape] >= 8 ||
+-            cached_load[shape].capacity[0] + cached_load[shape].capacity[1] == 0) {
++        if (needs_snapshot(shape)) {
+             auto &cached = cached_load[shape];
+             cached = PartitionLoad{};
+-            for (int c = 0; c < 2; ++c)
+-                cached_started[shape][c] = cached_moved[shape][c] = 0;
++            uint64_t started[2]{};
+             for (const auto &thread : shared.threads) {
+                 int c = thread.cluster.load(std::memory_order_relaxed);
+                 if (c < 0 || c > 1) continue;
+                 cached.capacity[c] += thread.capacity[shape].load(std::memory_order_relaxed);
+                 cached.free[c] += thread.free_slots[shape].load(std::memory_order_relaxed);
+                 cached.idle[c] += thread.idle_slots[shape].load(std::memory_order_relaxed);
+-                cached_started[shape][c] += thread.started[shape].load(std::memory_order_relaxed);
+-                cached_moved[shape][c] += thread.incoming_moves[shape].load(std::memory_order_relaxed);
+-            }
+-            load_refresh[shape] = count;
+-        }
+-        PartitionLoad result = cached_load[shape];
+-        for (int c = 0; c < 2; ++c) {
+-            result.schedulers[c] = shared.schedulers[c];
+-            uint64_t published = shared.ready_published[c][shape].load(std::memory_order_relaxed);
+-            result.blocked[c] = assigned[c][shape] > published ? assigned[c][shape] - published : 0;
+-            uint64_t supply = published + cached_moved[shape][c];
+-            uint64_t used = cached_started[shape][c] + cached_moved[shape][1 - c];
+-            uint64_t waiting = supply > used ? supply - used : 0;
+-            result.ready[c] = waiting > queue_depth[c] ? waiting : queue_depth[c];
+-        }
+-        return result;
+-    }
+-    bool mature(int shape, const PartitionLoad &load) const {
+-        if (decisions[0] + decisions[1] < 128) return false;
+-        uint64_t total = 0;
+-        bool fitted = false;
+-        for (int c = 0; c < 2; ++c) {
+-            total += observed[shape][c];
+-            if (load.schedulers[c] && observed[shape][c] < 16) return false;
+-            for (int m = 0; m < PARTITION_METRICS; ++m)
+-                fitted = fitted || channel_updates[shape][c][m] != 0;
+-        }
+-        return total >= 64 && fitted;
++                started[c] += thread.started[shape].load(std::memory_order_relaxed);
++            }
++            for (int c = 0; c < 2; ++c) {
++                cached.schedulers[c] = shared.schedulers[c];
++                uint64_t published = shared.ready_published[c][shape].load(std::memory_order_relaxed);
++                cached.blocked[c] = assigned[c][shape] > published ? assigned[c][shape] - published : 0;
++                uint64_t waiting = published > started[c] ? published - started[c] : 0;
++                cached.ready[c] = waiting > queue_depth[c] ? waiting : queue_depth[c];
++            }
++            load_batch[shape] = decision_count() / PARTITION_BATCH_NODES;
++            ++snapshots;
++        }
++        return cached_load[shape];
++    }
++    void commit(int cluster, int shape, uint32_t units, bool pending_wait) {
++        assigned[cluster][shape] += units;
++        // Assignment precedes wiring/publication, so new work enters exactly one
++        // local pressure class even if schedulers concurrently publish or start it.
++        auto &load = cached_load[shape];
++        if (pending_wait) load.blocked[cluster] += units;
++        else load.ready[cluster] += units;
+     }
+     // Future reservations are block units, capped at one capacity wave per side.
+     // They do not consume free/idle slots. Pending new tasks include their own
+     // blocks before assignment; ready publication removes existing reservations
+-    // through assigned - published, independently of dispatch/move snapshots.
++    // through assigned - published, independently of dispatch snapshots.
+     static uint64_t future_reservation_cost(
+         const PartitionLoad &load, int c, uint32_t pending_units, uint64_t queue_ns
+     ) {
+@@ -311,7 +276,7 @@
+         uint32_t units = 1
+     ) {
+         PartitionDecision out;
+-        out.learned = mature(shape, load);
++        out.learned = decision_count() >= PARTITION_CALIBRATION_NODES;
+         auto &w = weights[shape];
+         for (int c = 0; c < 2; ++c) {
+             if (!load.schedulers[c]) continue;
+--- before/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/orchestrator.cpp
++++ after/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/orchestrator.cpp
+@@ -1223,20 +1223,20 @@
+             feedback.schedulers[1] = orch->aicpu_cluster_sched_count[1];
+             feedback.enabled.store(true, std::memory_order_release);
+         }
+-        if (((partitioner.decisions[0] + partitioner.decisions[1]) & 63) == 0)
+-            partitioner.poll(feedback, sys_cnt_ticks_to_ns(decision_begin, get_sys_cnt_aicpu_frequency_hz()));
++        partitioner.calibrate_once(feedback);
+         trace_stage(0);
+         ResourceShape shape = active_mask.to_shape();
+         int shape_index = static_cast<int>(shape);
+         uint64_t ready[2]{};
+-        uint64_t shared_ready =
+-            shape == ResourceShape::DUMMY ? sched->dummy_ready_queue.size() : sched->ready_queues[shape_index].size();
+-        int sched_total = feedback.schedulers[0] + feedback.schedulers[1];
+-        for (int c = 0; c < 2; c++) {
+-            ready[c] = shape == ResourceShape::DUMMY ? sched->cluster_dummy_queues[c].size() :
+-                                                       sched->cluster_ready_queues[c][shape_index].size() +
+-                                                           sched->auto_ready_queues[c][shape_index].size();
+-            if (sched_total) ready[c] += shared_ready * feedback.schedulers[c] / sched_total;
++        if (partitioner.needs_snapshot(shape_index)) {
++            uint64_t shared_ready = shape == ResourceShape::DUMMY ?
++                                        sched->dummy_ready_queue.size() : sched->ready_queues[shape_index].size();
++            int sched_total = feedback.schedulers[0] + feedback.schedulers[1];
++            for (int c = 0; c < 2; ++c) {
++                ready[c] = shape == ResourceShape::DUMMY ? sched->cluster_dummy_queues[c].size() :
++                                                           sched->cluster_ready_queues[c][shape_index].size();
++                if (sched_total) ready[c] += shared_ready * feedback.schedulers[c] / sched_total;
++            }
+         }
+         trace_stage(1);
+         uint32_t pending = 0, sources[2]{};
+@@ -1264,7 +1264,7 @@
+             partitioner.decision_ticks += ticks;
+             if (ticks > partitioner.max_decision_ticks) partitioner.max_decision_ticks = ticks;
+             partitioner.scope_assignments[depth]++;
+-            partitioner.assigned[decision.cluster][shape_index] += units;
++            partitioner.commit(decision.cluster, shape_index, units, pending != 0);
+             cur_slot_state.task_attrs.set_early_resolve(false);
+         }
+         trace_stage(4);
+--- before/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler.cpp
++++ after/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler.cpp
+@@ -313,7 +313,6 @@
+                 "  cluster %d %s: count=%" PRIu64, cluster, shape_names[i],
+                 sched->cluster_ready_queues[cluster][i].size()
+             );
+-            LOG_DEBUG("  automatic cluster %d %s: count=%" PRIu64, cluster, shape_names[i], sched->auto_ready_queues[cluster][i].size());
+         }
+     }
+     LOG_DEBUG("  DUMMY: count=%" PRIu64, sched->dummy_ready_queue.size());
+--- before/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler.h
++++ after/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler.h
+@@ -435,7 +435,6 @@
+     size_t off_ready_sync_queue_slots[NUM_RESOURCE_SHAPES];
+     size_t off_dummy_ready_queue_slots;
+     size_t off_cluster_ready_queue_slots[2][NUM_RESOURCE_SHAPES];
+-    size_t off_auto_ready_queue_slots[2][NUM_RESOURCE_SHAPES];
+     size_t off_cluster_dummy_queue_slots[2];
+     size_t off_early_dispatch_queue_slots[NUM_RESOURCE_SHAPES];
+     size_t off_early_sync_start_queue_slots;
+@@ -524,7 +523,6 @@
+     // Ready queues remain global (scheduling is ring-agnostic)
+     ChipReadyQueue ready_queues[NUM_RESOURCE_SHAPES];
+     ChipReadyQueue cluster_ready_queues[2][NUM_RESOURCE_SHAPES];
+-    ChipReadyQueue auto_ready_queues[2][NUM_RESOURCE_SHAPES];
+ 
+     // Ready sync_start queues, one per shape. A ready sync_start cohort parks here
+     // instead of ready_queues[] so the dispatch loop can drain it as a strict Tier-0
+@@ -549,10 +547,6 @@
+             always_assert(cluster < 0);
+             return ready_sync_queues[static_cast<int32_t>(shape)];
+         }
+-        if (slot_state.payload->placement.scope && slot_state.logical_block_num == 1) {
+-            int actual = slot_state.payload->placement.dispatch_cluster.load(std::memory_order_relaxed);
+-            return auto_ready_queues[actual >= 0 ? actual : cluster][static_cast<int>(shape)];
+-        }
+         return cluster < 0 ? ready_queues[static_cast<int32_t>(shape)]
+                            : cluster_ready_queues[cluster][static_cast<int32_t>(shape)];
+     }
+@@ -575,9 +569,10 @@
+ 
+     void stamp_ready_queue(ChipTaskSlotState &slot_state) {
+         bool adaptive = slot_state.payload->placement.scope != 0;
++        bool sample = adaptive && !placement_feedback.calibration_done.load(std::memory_order_acquire);
+         if (adaptive) {
+             auto &metadata = slot_state.payload->placement;
+-            if (metadata.release_tick == 0) {
++            if (sample && metadata.release_tick == 0) {
+                 metadata.release_tick = get_sys_cnt_aicpu();
+                 metadata.release_cluster = placement_feedback.orchestrator_cluster;
+                 metadata.reserved |= simpler::tmr::PARTITION_FROM_O;
+@@ -591,25 +586,26 @@
+                 );
+                 metadata.reserved |= simpler::tmr::PARTITION_READY;
+             }
+-            uint64_t depth = shape == ResourceShape::DUMMY ? cluster_dummy_queues[c].size() + dummy_ready_queue.size() :
++            if (sample) {
++                uint64_t depth = shape == ResourceShape::DUMMY ? cluster_dummy_queues[c].size() + dummy_ready_queue.size() :
+                                                              cluster_ready_queues[c][static_cast<int>(shape)].size() +
+-                                                                 auto_ready_queues[c][static_cast<int>(shape)].size() +
+                                                                  ready_queues[static_cast<int>(shape)].size();
+-            slot_state.payload->placement.ready_depth = static_cast<uint32_t>(depth);
+-            if (depth == 0 && placement_feedback.idle_mask[c][static_cast<int>(shape)].load(std::memory_order_relaxed))
+-                metadata.reserved |= simpler::tmr::PARTITION_IDLE_AT_PUBLISH;
++                metadata.ready_depth = static_cast<uint32_t>(depth);
++                if (depth == 0 && placement_feedback.idle_mask[c][static_cast<int>(shape)].load(std::memory_order_relaxed))
++                    metadata.reserved |= simpler::tmr::PARTITION_IDLE_AT_PUBLISH;
++            }
+         }
+ #if SIMPLER_DFX
+-        if (adaptive || get_chip_swimlane_level() >= ChipSwimlaneLevel::SCHED_PHASES) {
++        if (sample || get_chip_swimlane_level() >= ChipSwimlaneLevel::SCHED_PHASES) {
+             slot_state.payload->ready_queue_timestamp.store(get_sys_cnt_aicpu(), std::memory_order_relaxed);
+         }
+ #else
+-        if (adaptive) slot_state.payload->ready_queue_timestamp.store(get_sys_cnt_aicpu(), std::memory_order_relaxed);
++        if (sample) slot_state.payload->ready_queue_timestamp.store(get_sys_cnt_aicpu(), std::memory_order_relaxed);
+ #endif
+     }
+ 
+     static void record_ready_origin(ChipTaskSlotState &slot_state, const ChipTaskSlotState *producer, uint64_t tick) {
+-        if (!slot_state.payload->placement.scope || producer == nullptr) return;
++        if (!slot_state.payload->placement.scope || producer == nullptr || tick == 0) return;
+         auto &record = slot_state.payload->placement;
+         record.release_tick = tick;
+         int c = producer->payload->placement.dispatch_cluster.load(std::memory_order_acquire);
+@@ -1394,7 +1390,9 @@
+         // below; their dispatch_fanin propagation is collected here and replayed
+         // after the walk, so no consumer's doorbell waits on a sibling's propagate.
+         EarlyDispatchReleaseSink rel_sink;
+-        uint64_t placement_release_tick = placement_feedback.enabled.load(std::memory_order_acquire) ? get_sys_cnt_aicpu() : 0;
++        uint64_t placement_release_tick = placement_feedback.enabled.load(std::memory_order_acquire) &&
++                                                  !placement_feedback.calibration_done.load(std::memory_order_acquire) ?
++                                              get_sys_cnt_aicpu() : 0;
+         while (current != nullptr) {
+             ChipTaskSlotState &consumer_slot = *current->slot_state;
+ #if SIMPLER_SCHED_PROFILING
+--- before/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler_dispatch.cpp
++++ after/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler_dispatch.cpp
+@@ -118,29 +118,6 @@
+     (void)thread_idx;
+     int count = sched_->get_ready_tasks_batch(queues, shape, out, max_count);
+ #endif
+-    int cluster = aicpu_cluster_ids_[thread_idx];
+-    if (count == 0 && max_count > 0 && queues == sched_->auto_ready_queues[cluster] &&
+-        sched_->cluster_ready_queues[cluster][static_cast<int>(shape)].size() == 0 &&
+-        sched_->ready_queues[static_cast<int>(shape)].size() == 0) {
+-        ChipTaskSlotState *stolen = sched_->auto_ready_queues[1 - cluster][static_cast<int>(shape)].pop();
+-        if (stolen != nullptr) {
+-            always_assert(stolen->logical_block_num == 1 && stolen->payload->placement.scope != 0);
+-            int old = stolen->payload->placement.dispatch_cluster.load(std::memory_order_relaxed);
+-            if (old < 0) old = stolen->task->target_aicpu_cluster;
+-            stolen->payload->placement.dispatch_cluster.store(cluster, std::memory_order_release);
+-            stolen->payload->placement.reserved |= 1u;
+-            if (old != cluster) {
+-                sched_->placement_feedback.threads[thread_idx].incoming_moves[static_cast<int>(shape)].fetch_add(
+-                    1, std::memory_order_relaxed
+-                );
+-            }
+-            out[0] = stolen;
+-            count = 1;
+-#if SIMPLER_DFX
+-            if (chip_swimlane_level_ >= ChipSwimlaneLevel::SCHED_PHASES) chip_swimlane.pop_hit++;
+-#endif
+-        }
+-    }
+     return count;
+ }
+ 
+@@ -191,11 +168,14 @@
+     auto observe = [&]() -> uint64_t {
+         auto &metadata = slot_state.payload->placement;
+         bool adaptive = metadata.scope != 0;
+-        bool record = adaptive;
++        bool sample = adaptive && !sched_->placement_feedback.calibration_done.load(std::memory_order_acquire);
++        bool record = sample;
+ #if SIMPLER_DFX
+         record = record || chip_swimlane_level_ >= ChipSwimlaneLevel::SCHED_PHASES;
+ #endif
+-        if (adaptive || sched_->placement_feedback.enabled.load(std::memory_order_acquire)) {
++        // Automatic targets are immutable. Shared producers still publish their
++        // actual pickup side for consumers generated after feedback is enabled.
++        if (!adaptive && sched_->placement_feedback.enabled.load(std::memory_order_acquire)) {
+             int expected = -1;
+             metadata.dispatch_cluster.compare_exchange_strong(
+                 expected, aicpu_cluster_ids_[thread_idx], std::memory_order_release
+@@ -205,7 +185,7 @@
+         uint64_t ready = slot_state.payload->ready_queue_timestamp.exchange(0, std::memory_order_relaxed);
+         if (!ready) return 0;
+         uint64_t now = get_sys_cnt_aicpu();
+-        if (adaptive && !(metadata.reserved & simpler::tmr::PARTITION_OBSERVED)) {
++        if (sample && !(metadata.reserved & simpler::tmr::PARTITION_OBSERVED)) {
+             metadata.reserved |= simpler::tmr::PARTITION_OBSERVED;
+             int cluster = aicpu_cluster_ids_[thread_idx];
+             uint64_t n = static_cast<uint64_t>(sched_->placement_feedback.schedulers[cluster]);
+@@ -213,22 +193,20 @@
+             uint64_t wait_ns = sys_cnt_ticks_to_ns(now - ready, get_sys_cnt_aicpu_frequency_hz());
+             int metric = -1;
+             uint64_t cost = 0;
+-            if (!(metadata.reserved & simpler::tmr::PARTITION_MOVED)) {
+-                if (metadata.ready_depth > 0) {
+-                    metric = 0;
+-                    cost = wait_ns * n / (n + metadata.ready_depth);
+-                } else if (
+-                    (metadata.reserved & simpler::tmr::PARTITION_IDLE_AT_PUBLISH) && !to_pending && wait_ns <= 5000 &&
+-                    metadata.release_tick && ready >= metadata.release_tick && metadata.release_cluster >= 0 &&
+-                    metadata.release_cluster < 2
+-                ) {
+-                    uint64_t preparation =
+-                        sys_cnt_ticks_to_ns(ready - metadata.release_tick, get_sys_cnt_aicpu_frequency_hz());
+-                    if (preparation <= 20000) {
+-                        metric =
+-                            ((metadata.reserved & simpler::tmr::PARTITION_FROM_O) ? 1 : 3) + metadata.release_cluster;
+-                        cost = preparation + wait_ns;
+-                    }
++            if (metadata.ready_depth > 0) {
++                metric = 0;
++                cost = wait_ns * n / (n + metadata.ready_depth);
++            } else if (
++                (metadata.reserved & simpler::tmr::PARTITION_IDLE_AT_PUBLISH) && !to_pending && wait_ns <= 5000 &&
++                metadata.release_tick && ready >= metadata.release_tick && metadata.release_cluster >= 0 &&
++                metadata.release_cluster < 2
++            ) {
++                uint64_t preparation =
++                    sys_cnt_ticks_to_ns(ready - metadata.release_tick, get_sys_cnt_aicpu_frequency_hz());
++                if (preparation <= 20000) {
++                    metric =
++                        ((metadata.reserved & simpler::tmr::PARTITION_FROM_O) ? 1 : 3) + metadata.release_cluster;
++                    cost = preparation + wait_ns;
+                 }
+             }
+             auto &bucket = sched_->placement_feedback.threads[thread_idx]
+@@ -754,22 +732,6 @@
+     // An empty snapshot can defer a concurrent arrival until the next loop.
+     // Tier 1: regular ready work.
+     if (sched_->has_cluster_targets.load(std::memory_order_acquire)) {
+-        if (adaptive) {
+-            run_staging_order(
+-                thread_idx, pmu_active,
+-                [&](ResourceShape shape, CoreTracker::DispatchPhase phase) {
+-                    dispatch_shape(
+-                        thread_idx, sched_->auto_ready_queues[cluster], shape, phase, tracker, entered_drain,
+-                        made_progress, try_pushed
+-                    );
+-                    return entered_drain;
+-                },
+-                [&] {
+-                    return sched_->auto_ready_queues[cluster][static_cast<int>(ResourceShape::MIX)].size() > 0;
+-                }
+-            );
+-            trace_stage(2);
+-        }
+         if (has_work(sched_->cluster_ready_queues[cluster])) {
+             run_staging_order(
+                 thread_idx, pmu_active,
+@@ -1022,7 +984,6 @@
+     if (pmu_active || !tracker.has_any_free_slot()) return 0;
+     for (int s = 0; s < NUM_RESOURCE_SHAPES; s++) {
+         if (sched_->ready_sync_queues[s].size() > 0 || sched_->ready_queues[s].size() > 0 ||
+-            sched_->auto_ready_queues[aicpu_cluster_ids_[thread_idx]][s].size() > 0 ||
+             (sched_->has_cluster_targets.load(std::memory_order_acquire) &&
+              sched_->cluster_ready_queues[aicpu_cluster_ids_[thread_idx]][s].size() > 0)) {
+             return 0;
+@@ -1180,8 +1141,7 @@
+                 // sync_start Tier-0 lane; both feed dispatch_ready_tasks for this shape.
+                 size_t qsize = sched_->ready_queues[s].size() + sched_->ready_sync_queues[s].size();
+                 for (int cluster = 0; cluster < 2; cluster++) {
+-                    qsize +=
+-                        sched_->cluster_ready_queues[cluster][s].size() + sched_->auto_ready_queues[cluster][s].size();
++                    qsize += sched_->cluster_ready_queues[cluster][s].size();
+                 }
+                 iter_shared_snapshot[s] = static_cast<int16_t>(std::min(qsize, kMax));
+             }
+--- before/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/shared/runtime_init.cpp
++++ after/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/shared/runtime_init.cpp
+@@ -145,7 +145,6 @@
+     for (int c = 0; c < 2; c++) {
+         for (int i = 0; i < NUM_RESOURCE_SHAPES; i++) {
+             layout.off_cluster_ready_queue_slots[c][i] = ready_queue_reserve_layout(arena, CHIP_READY_QUEUE_SIZE);
+-            layout.off_auto_ready_queue_slots[c][i] = ready_queue_reserve_layout(arena, CHIP_READY_QUEUE_SIZE);
+         }
+         layout.off_cluster_dummy_queue_slots[c] = ready_queue_reserve_layout(arena, CHIP_READY_QUEUE_SIZE);
+     }
+@@ -201,10 +200,6 @@
+     for (int c = 0; c < 2; c++) {
+         for (int i = 0; i < NUM_RESOURCE_SHAPES; i++) {
+             if (!ready_queue_init_data_from_layout(
+-                    &sched->auto_ready_queues[c][i], arena, layout.off_auto_ready_queue_slots[c][i],
+-                    layout.ready_queue_capacity
+-                )) return false;
+-            if (!ready_queue_init_data_from_layout(
+                     &sched->cluster_ready_queues[c][i], arena, layout.off_cluster_ready_queue_slots[c][i],
+                     layout.ready_queue_capacity
+                 )) {
+@@ -269,7 +264,6 @@
+     for (int c = 0; c < 2; c++) {
+         for (int i = 0; i < NUM_RESOURCE_SHAPES; i++) {
+             sched->cluster_ready_queues[c][i].reset_for_reuse();
+-            sched->auto_ready_queues[c][i].reset_for_reuse();
+         }
+         sched->cluster_dummy_queues[c].reset_for_reuse();
+     }
+@@ -296,9 +290,6 @@
+             ready_queue_wire_arena_pointers(
+                 &sched->cluster_ready_queues[c][i], arena, layout.off_cluster_ready_queue_slots[c][i]
+             );
+-            ready_queue_wire_arena_pointers(
+-                &sched->auto_ready_queues[c][i], arena, layout.off_auto_ready_queue_slots[c][i]
+-            );
+         }
+         ready_queue_wire_arena_pointers(&sched->cluster_dummy_queues[c], arena, layout.off_cluster_dummy_queue_slots[c]);
+     }
+@@ -330,7 +321,6 @@
+     for (int c = 0; c < 2; c++) {
+         for (int i = 0; i < NUM_RESOURCE_SHAPES; i++) {
+             ready_queue_destroy(&sched->cluster_ready_queues[c][i]);
+-            ready_queue_destroy(&sched->auto_ready_queues[c][i]);
+         }
+         ready_queue_destroy(&sched->cluster_dummy_queues[c]);
+     }
+--- before/tests/ut/cpp/a2a3/runtime/tensormap_and_ringbuffer/test_scheduler_state.cpp
++++ after/tests/ut/cpp/a2a3/runtime/tensormap_and_ringbuffer/test_scheduler_state.cpp
+@@ -118,6 +118,7 @@
+     // payload, and the scheduler's release/propagate paths dereference it.
+     static constexpr int kSlotPayloadPoolSize = 16;
+     TaskPayload slot_payload_pool_[kSlotPayloadPoolSize];
++    TaskDescriptor slot_task_pool_[kSlotPayloadPoolSize];
+     int slot_payload_pool_idx_ = 0;
+ 
+     void SetUp() override {
+@@ -151,9 +152,15 @@
+         slot.completed_subtasks.store(0);
+         slot.total_required_subtasks = 1;
+         slot.logical_block_num = 1;
+-        TaskPayload &slot_pl = slot_payload_pool_[slot_payload_pool_idx_++ % kSlotPayloadPoolSize];
++        int pool_index = slot_payload_pool_idx_++ % kSlotPayloadPoolSize;
++        TaskPayload &slot_pl = slot_payload_pool_[pool_index];
+         memset(&slot_pl, 0, sizeof(slot_pl));
++        slot_pl.placement.reset();
+         slot.payload = &slot_pl;
++        TaskDescriptor &task = slot_task_pool_[pool_index];
++        memset(&task, 0, sizeof(task));
++        task.target_aicpu_cluster = -1;
++        slot.task = &task;
+     }
+ 
+     void init_ring_slot(
+@@ -166,6 +173,7 @@
+         memset(&slot, 0, sizeof(slot));
+         memset(&payload, 0, sizeof(payload));
+         memset(&task, 0, sizeof(task));
++        task.target_aicpu_cluster = -1;
+         slot.task_state.store(state, std::memory_order_relaxed);
+         slot.fanin_count = 0;
+         slot.fanin_refcount.store(0, std::memory_order_relaxed);
+@@ -427,6 +435,39 @@
+     EXPECT_EQ(out[1], &slot_b);
+ }
+ 
++TEST_F(SchedulerStateTest, AutomaticAndStrictTasksShareOnlyTheirTargetQueue) {
++    alignas(64) ChipTaskSlotState automatic, strict;
++    init_slot(automatic, CHIP_TASK_PENDING, 1, 1);
++    init_slot(strict, CHIP_TASK_PENDING, 1, 1);
++    automatic.task->target_aicpu_cluster = 0;
++    strict.task->target_aicpu_cluster = 0;
++    automatic.payload->placement.scope = 1;
++    sched.placement_feedback.calibration_done.store(true);
++    sched.push_ready_routed(&automatic);
++    sched.push_ready_routed(&strict);
++
++    ChipTaskSlotState *out[2];
++    EXPECT_EQ(sched.get_ready_tasks_batch(sched.ready_queues, ResourceShape::AIC, out, 2), 0);
++    EXPECT_EQ(sched.get_ready_tasks_batch(sched.cluster_ready_queues[1], ResourceShape::AIC, out, 2), 0);
++    ASSERT_EQ(sched.get_ready_tasks_batch(sched.cluster_ready_queues[0], ResourceShape::AIC, out, 2), 2);
++    EXPECT_EQ(out[0], &automatic);
++    EXPECT_EQ(out[1], &strict);
++}
++
++TEST_F(SchedulerStateTest, FrozenCalibrationKeepsReadyAccountingWithoutSampleStamp) {
++    alignas(64) ChipTaskSlotState slot;
++    init_slot(slot, CHIP_TASK_PENDING, 1, 1);
++    slot.task->target_aicpu_cluster = 1;
++    slot.logical_block_num = 16;
++    slot.payload->placement.scope = 1;
++    sched.placement_feedback.calibration_done.store(true);
++    sched.stamp_ready_queue(slot);
++    sched.stamp_ready_queue(slot);
++    EXPECT_EQ(sched.placement_feedback.ready_published[1][0].load(), 16u);
++    EXPECT_EQ(slot.payload->ready_queue_timestamp.load(), 0u);
++    EXPECT_EQ(slot.payload->placement.release_tick, 0u);
++}
++
+ TEST(CoreTrackerTest, MixPartiallyRunningClusterAdmittedAsPerCorePlacement) {
+     CoreTracker tracker;
+     tracker.init(1);
+--- before/tests/ut/cpp/a2a3/runtime/tensormap_and_ringbuffer/test_wiring.cpp
++++ after/tests/ut/cpp/a2a3/runtime/tensormap_and_ringbuffer/test_wiring.cpp
+@@ -96,6 +96,7 @@
+         slot.payload = &slot_pl;
+         TaskDescriptor &slot_task = slot_task_pool_[(slot_payload_pool_idx_ - 1) % kSlotPayloadPoolSize];
+         memset(&slot_task, 0, sizeof(slot_task));
++        slot_task.target_aicpu_cluster = -1;
+         slot.task = &slot_task;
+     }
+ 
+@@ -126,6 +127,7 @@
+     alignas(64) TaskPayload payload;
+     memset(&payload, 0, sizeof(payload));
+     TaskDescriptor desc{};
++    desc.target_aicpu_cluster = -1;
+ 
+     init_slot(task_slot, CHIP_TASK_PENDING, 0, 1);
+     payload.fanin_actual_count = 0;
+@@ -156,6 +158,7 @@
+     alignas(64) TaskPayload payload;
+     memset(&payload, 0, sizeof(payload));
+     TaskDescriptor desc{};
++    desc.target_aicpu_cluster = -1;
+ 
+     // Set up 2 producers that are already COMPLETED
+     for (int i = 0; i < 2; i++) {
+@@ -195,6 +198,7 @@
+     alignas(64) TaskPayload payload;
+     memset(&payload, 0, sizeof(payload));
+     TaskDescriptor desc{};
++    desc.target_aicpu_cluster = -1;
+ 
+     // Producers are PENDING (not yet completed)
+     for (int i = 0; i < 2; i++) {
+@@ -259,6 +263,7 @@
+     alignas(64) TaskPayload payload;
+     memset(&payload, 0, sizeof(payload));
+     TaskDescriptor desc{};
++    desc.target_aicpu_cluster = -1;
+ 
+     init_slot(producers[0], CHIP_TASK_COMPLETED, 1, 2);  // early finished
+     init_slot(producers[1], CHIP_TASK_PENDING, 1, 2);    // in flight (< COMPLETED)
+@@ -302,6 +307,7 @@
+     alignas(64) TaskPayload payload;
+     memset(&payload, 0, sizeof(payload));
+     TaskDescriptor desc{};
++    desc.target_aicpu_cluster = -1;
+ 
+     for (int i = 0; i < 2; i++) {
+         init_slot(producer_slots[i], CHIP_TASK_COMPLETED, 1, 2);
+@@ -333,6 +339,7 @@
+     alignas(64) TaskPayload payload;
+     memset(&payload, 0, sizeof(payload));
+     TaskDescriptor desc{};
++    desc.target_aicpu_cluster = -1;
+ 
+     init_slot(producer, CHIP_TASK_COMPLETED, 1, 1);
+     producer.task_attrs.set_early_resolve(false);  // unflagged
+@@ -357,6 +364,7 @@
+     alignas(64) TaskPayload payload;
+     memset(&payload, 0, sizeof(payload));
+     TaskDescriptor desc{};
++    desc.target_aicpu_cluster = -1;
+ 
+     init_slot(producers[0], CHIP_TASK_COMPLETED, 1, 2);
+     producers[0].task_attrs.set_early_resolve(true);  // flagged
+@@ -386,6 +394,7 @@
+     alignas(64) TaskPayload payload;
+     memset(&payload, 0, sizeof(payload));
+     TaskDescriptor desc{};
++    desc.target_aicpu_cluster = -1;
+ 
+     init_slot(p_flagged, CHIP_TASK_PENDING, 1, 1);
+     p_flagged.task_attrs.set_early_resolve(true);
+@@ -419,6 +428,7 @@
+     alignas(64) TaskPayload payload;
+     memset(&payload, 0, sizeof(payload));
+     TaskDescriptor desc{};
++    desc.target_aicpu_cluster = -1;
+ 
+     init_slot(p_flagged, CHIP_TASK_PENDING, 1, 1);
+     p_flagged.task_attrs.set_early_resolve(true);
+@@ -452,6 +462,7 @@
+     alignas(64) TaskPayload payload;
+     memset(&payload, 0, sizeof(payload));
+     TaskDescriptor desc{};
++    desc.target_aicpu_cluster = -1;
+ 
+     init_slot(producer, CHIP_TASK_PENDING, 1, 1);
+     producer.task_attrs.set_early_resolve(true);
+@@ -582,6 +593,7 @@
+     alignas(64) TaskPayload consumer_payload;
+     memset(&consumer_payload, 0, sizeof(consumer_payload));
+     TaskDescriptor consumer_desc{};
++    consumer_desc.target_aicpu_cluster = -1;
+ 
+     init_slot(producer, CHIP_TASK_PENDING, 1, 1);
+     producer.task_attrs.set_early_resolve(true);
+@@ -610,6 +622,7 @@
+     alignas(64) TaskPayload consumer_payload;
+     memset(&consumer_payload, 0, sizeof(consumer_payload));
+     TaskDescriptor consumer_desc{};
++    consumer_desc.target_aicpu_cluster = -1;
+ 
+     init_slot(producers[0], CHIP_TASK_COMPLETED, 1, 1);
+     init_slot(producers[1], CHIP_TASK_PENDING, 1, 1);
+@@ -1075,6 +1088,7 @@
+     alignas(64) TaskPayload payload;
+     memset(&payload, 0, sizeof(payload));
+     TaskDescriptor desc{};
++    desc.target_aicpu_cluster = -1;
+ 
+     init_slot(p_flagged, CHIP_TASK_PENDING, 1, 1);
+     p_flagged.task_attrs.set_early_resolve(true);
+@@ -1138,6 +1152,7 @@
+     alignas(64) TaskPayload payload;
+     memset(&payload, 0, sizeof(payload));
+     TaskDescriptor desc{};
++    desc.target_aicpu_cluster = -1;
+ 
+     init_slot(creator, CHIP_TASK_COMPLETED, 1, 1);
+     creator.task_attrs.set_early_resolve(true);  // alloc creator: flagged -> transparent
+@@ -1170,6 +1185,7 @@
+     alignas(64) TaskPayload prod_payload;
+     memset(&prod_payload, 0, sizeof(prod_payload));
+     TaskDescriptor desc{};
++    desc.target_aicpu_cluster = -1;
+ 
+     // Producer in flight (PENDING, not yet COMPLETED) with 2 consumers in fanout chain
+     init_slot(producer, CHIP_TASK_PENDING, 1, 1);
+@@ -1220,6 +1236,7 @@
+     alignas(64) TaskPayload payload;
+     memset(&payload, 0, sizeof(payload));
+     TaskDescriptor desc{};
++    desc.target_aicpu_cluster = -1;
+ 
+     // 2 producers, each COMPLETED with fanout_count=1
+     for (int i = 0; i < 2; i++) {
+@@ -1265,6 +1282,7 @@
+     alignas(64) TaskPayload payload;
+     memset(&payload, 0, sizeof(payload));
+     TaskDescriptor desc{};
++    desc.target_aicpu_cluster = -1;
+ 
+     // Both live (PENDING) with a single submit pin (fanout_count = 1).
+     init_slot(wait_producer, CHIP_TASK_PENDING, 1, 1);
+@@ -1308,6 +1326,7 @@
+     alignas(64) TaskPayload payload;
+     memset(&payload, 0, sizeof(payload));
+     TaskDescriptor desc{};
++    desc.target_aicpu_cluster = -1;
+ 
+     // filler carries a large fanout_count so releasing it can never consume it.
+     init_slot(filler, CHIP_TASK_COMPLETED, 1, 100);
+@@ -1411,6 +1430,7 @@
+     alignas(64) TaskPayload payload;
+     memset(&payload, 0, sizeof(payload));
+     TaskDescriptor desc{};
++    desc.target_aicpu_cluster = -1;
+ 
+     init_slot(task_slot, CHIP_TASK_PENDING, 0, 1);
+     payload.fanin_actual_count = 0;
+--- before/tests/ut/cpp/a2a3/runtime/test_cluster_partitioner.cpp
++++ after/tests/ut/cpp/a2a3/runtime/test_cluster_partitioner.cpp
+@@ -14,10 +14,8 @@
+     load.idle[0] = load.idle[1] = 20;
+     return load;
+ }
+-void mature(ClusterPartitioner &model, int shape = 0) {
++void mature(ClusterPartitioner &model) {
+     model.decisions[0] = model.decisions[1] = 128;
+-    model.observed[shape][0] = model.observed[shape][1] = 32;
+-    model.channel_updates[shape][0][0] = 1;
+ }
+ void samples(PartitionBucket &bucket, int metric, int count, uint64_t ns) {
+     for (int i = 0; i < count; ++i)
+@@ -128,93 +126,154 @@
+     auto blocked = model.load(shared, 0, depths);
+     EXPECT_EQ(ClusterPartitioner::future_reservation_cost(blocked, 0, 0, 2000), 500u);
+     shared.ready_published[0][0].store(20);
++    model.decisions[0] = PARTITION_BATCH_NODES;
+     auto ready = model.load(shared, 0, depths);
+     EXPECT_EQ(ready.blocked[0], 0u);
+     EXPECT_EQ(ready.ready[0], 20u);
+     EXPECT_EQ(ClusterPartitioner::future_reservation_cost(ready, 0, 0, 2000), 0u);
+ }
+-TEST(ClusterPartitioner, IdlePickupBaselineReducesQueuedCoefficient) {
++TEST(ClusterPartitioner, FixedPrefixCalibratesOnceThenFreezes) {
+     PartitionShared shared;
+     shared.reset();
+     shared.threads[0].cluster.store(0);
+     ClusterPartitioner model;
+     samples(shared.threads[0].samples[0], 5, 16, 100);
+     samples(shared.threads[0].samples[0], 0, 32, 1200);
++    model.decisions[0] = 255;
++    model.calibrate_once(shared);
++    EXPECT_EQ(model.calibrations, 0u);
++    EXPECT_FALSE(shared.calibration_done.load());
+     model.decisions[0] = 256;
+-    model.poll(shared, 1000000);
++    model.calibrate_once(shared);
++    EXPECT_TRUE(shared.calibration_done.load());
+     EXPECT_EQ(model.weights[0].idle_pickup[0], 100u);
+-    EXPECT_EQ(model.weights[0].queue[0], 1775u);
+-}
+-TEST(ClusterPartitioner, AccumulatesAcrossSmallScopesAndAcceptsLateSamples) {
+-    PartitionShared shared;
+-    shared.reset();
+-    shared.threads[0].cluster.store(0);
+-    ClusterPartitioner model;
+-    for (int burst = 1; burst <= 8; ++burst) {
+-        for (int i = 0; i < 100; ++i) {
+-            model.open_scope(0);
+-            model.scope_assignments[0] = 1;
+-            model.close_scope(0);
+-        }
+-        samples(shared.threads[0].samples[0], 0, 4, 1000);
+-        model.decisions[0] = burst * 64;
+-        model.poll(shared, burst * 100000);
+-        if (burst < 8) EXPECT_EQ(model.weights[0].queue[0], 2000u);
+-    }
+-    EXPECT_EQ(model.weights[0].queue[0], 1750u);
+-    EXPECT_EQ(model.observed[0][0], 32u);
+-    EXPECT_EQ(model.updates[0], 1u);
+-}
+-TEST(ClusterPartitioner, SampleThresholdAndTimeLimitBothApply) {
+-    PartitionShared shared;
+-    shared.reset();
+-    shared.threads[0].cluster.store(0);
+-    ClusterPartitioner model;
+-    samples(shared.threads[0].samples[0], 3, 16, 1000);
++    EXPECT_EQ(model.weights[0].queue[0], 1100u);
++    // Samples arriving after the prefix do not refit or prolong calibration.
++    samples(shared.threads[0].samples[0], 0, 64, 6000);
++    model.decisions[0] = 1024;
++    model.calibrate_once(shared);
++    EXPECT_EQ(model.weights[0].queue[0], 1100u);
++    EXPECT_EQ(model.calibrations, 1u);
++    EXPECT_EQ(model.channel_updates[0][0][0], 1u);
++}
++TEST(ClusterPartitioner, ScoredTransitionDoesNotWaitForShapeMaturity) {
++    PartitionShared shared;
++    shared.reset();
++    ClusterPartitioner model;
++    auto load = idle_load();
++    uint32_t none[2]{};
++    model.decisions[0] = 255;
++    EXPECT_FALSE(model.choose(load, 0, none, 3, 1).learned);
++    model.calibrate_once(shared);
++    // This shape has no observations or fitted coefficients, but uses priors.
++    EXPECT_TRUE(model.choose(load, 0, none, 3, 1).learned);
++    EXPECT_EQ(model.observed[3][0] + model.observed[3][1], 0u);
++    EXPECT_EQ(model.weights[3].queue[0], 2000u);
++}
++TEST(ClusterPartitioner, SparseAndRacingChannelsRetainPriorsWithoutRetry) {
++    PartitionShared shared;
++    shared.reset();
++    shared.threads[0].cluster.store(0);
++    shared.threads[1].cluster.store(1);
++    samples(shared.threads[0].samples[0], 3, 15, 1000);
++    samples(shared.threads[1].samples[0], 3, 16, 1000);
++    shared.threads[1].samples[0].version.fetch_add(1);
++    ClusterPartitioner model;
+     model.decisions[0] = 256;
+-    model.poll(shared, 1000000);
+-    EXPECT_EQ(model.updates[0], 1u);
+-    samples(shared.threads[0].samples[0], 3, 16, 1000);
+-    model.decisions[0] = 512;
+-    model.poll(shared, 1050000);
+-    EXPECT_EQ(model.updates[0], 1u);
+-    model.decisions[0] = 576;
+-    model.poll(shared, 1100000);
+-    EXPECT_EQ(model.updates[0], 2u);
+-    model.decisions[0] = 832;
+-    model.poll(shared, 2100000);
+-    EXPECT_EQ(model.updates[0], 2u);
+-}
+-TEST(ClusterPartitioner, QueueSamplesCannotChangeChannelCoefficients) {
++    model.calibrate_once(shared);
++    EXPECT_EQ(model.weights[0].dependency[0][0], 250u);
++    EXPECT_EQ(model.weights[0].dependency[0][1], 750u);
++    shared.threads[1].samples[0].version.fetch_add(1);
++    model.calibrate_once(shared);
++    EXPECT_EQ(model.weights[0].dependency[0][1], 750u);
++    EXPECT_EQ(model.calibrations, 1u);
++}
++TEST(ClusterPartitioner, CalibrationFitsOnlyObservedChannelsAndBoundsOutliers) {
+     PartitionShared shared;
+     shared.reset();
+     shared.threads[0].cluster.store(1);
+-    ClusterPartitioner model;
+-    samples(shared.threads[0].samples[1], 0, 64, 6000);
++    samples(shared.threads[0].samples[1], 0, 32, 6000);
++    samples(shared.threads[0].samples[1], 3, 16, 10000);
++    ClusterPartitioner model;
+     model.decisions[0] = 256;
+-    model.poll(shared, 1000000);
+-    EXPECT_EQ(model.weights[1].queue[1], 2500u);
++    model.calibrate_once(shared);
++    EXPECT_EQ(model.weights[1].queue[1], 4000u);
++    EXPECT_EQ(model.weights[1].dependency[0][1], 1500u);
++    EXPECT_EQ(model.weights[1].publish[0][1], 750u);
+     EXPECT_EQ(model.weights[0].queue[1], 2000u);
+-    EXPECT_EQ(model.weights[1].dependency[0][1], 750u);
+-    EXPECT_EQ(model.weights[1].publish[0][1], 750u);
+-}
+-TEST(ClusterPartitioner, ReadyCountersAndTransfersExcludeBlockedWork) {
++}
++TEST(ClusterPartitioner, FixedBatchReusesSnapshotAndReservesPendingWorkLocally) {
+     PartitionShared shared;
+     shared.reset();
+     shared.schedulers[0] = shared.schedulers[1] = 2;
+     shared.threads[0].cluster.store(0);
+-    shared.threads[2].cluster.store(1);
++    shared.threads[0].capacity[0].store(20);
++    ClusterPartitioner model;
++    uint64_t depth[2]{};
++    auto initial = model.load(shared, 0, depth);
++    EXPECT_EQ(initial.ready[0] + initial.blocked[0], 0u);
++    // O commits a blocked multi-block task; concurrent S publication and
++    // dispatch remain invisible until the next eight-decision epoch.
++    model.commit(0, 0, 4, true);
++    shared.ready_published[0][0].store(4);
++    shared.threads[0].started[0].store(4);
++    model.decisions[0] = 1;
++    auto cached = model.load(shared, 0, depth);
++    EXPECT_EQ(cached.blocked[0], 4u);
++    EXPECT_EQ(cached.ready[0], 0u);
++    EXPECT_EQ(model.snapshots, 1u);
++    model.decisions[0] = 8;
++    auto refreshed = model.load(shared, 0, depth);
++    EXPECT_EQ(refreshed.blocked[0] + refreshed.ready[0], 0u);
++    EXPECT_EQ(model.snapshots, 2u);
++}
++TEST(ClusterPartitioner, BatchReadyReservationsAreCountedOnceAndRefreshInBlockUnits) {
++    PartitionShared shared;
++    shared.reset();
++    shared.schedulers[0] = shared.schedulers[1] = 2;
++    shared.threads[0].cluster.store(0);
++    ClusterPartitioner model;
++    uint64_t depth[2]{};
++    (void)model.load(shared, 0, depth);
++    model.commit(0, 0, 16, false);
++    auto cached = model.load(shared, 0, depth);
++    EXPECT_EQ(cached.ready[0], 16u);
++    EXPECT_EQ(cached.blocked[0], 0u);
++    shared.ready_published[0][0].store(16);
++    shared.threads[0].started[0].store(6);
++    depth[0] = 1;  // One multi-block queue entry, ten undispatched blocks.
++    model.decisions[0] = 8;
++    EXPECT_EQ(model.load(shared, 0, depth).ready[0], 10u);
++}
++TEST(ClusterPartitioner, ShapesHaveIndependentSnapshotsWithinGlobalBatch) {
++    PartitionShared shared;
++    shared.reset();
++    ClusterPartitioner model;
++    uint64_t depth[2]{};
++    (void)model.load(shared, 0, depth);
++    (void)model.load(shared, 0, depth);
++    (void)model.load(shared, 1, depth);
++    (void)model.load(shared, 1, depth);
++    EXPECT_EQ(model.snapshots, 2u);
++    model.decisions[0] = 7;
++    EXPECT_FALSE(model.needs_snapshot(0));
++    model.decisions[0] = 8;
++    EXPECT_TRUE(model.needs_snapshot(0));
++    EXPECT_TRUE(model.needs_snapshot(1));
++}
++TEST(ClusterPartitioner, ReadyLedgerHasNoTransfersAndSeparatesBlockedWork) {
++    PartitionShared shared;
++    shared.reset();
++    shared.schedulers[0] = shared.schedulers[1] = 2;
++    shared.threads[0].cluster.store(0);
+     ClusterPartitioner model;
+     model.assigned[0][0] = 100;
+     shared.ready_published[0][0].store(40);
+     shared.threads[0].started[0].store(10);
+-    shared.threads[2].incoming_moves[0].store(5);
+-    shared.threads[2].started[0].store(5);
+-    uint64_t queue_depth[2]{};
+-    auto load = model.load(shared, 0, queue_depth);
++    uint64_t depth[2]{};
++    auto load = model.load(shared, 0, depth);
+     EXPECT_EQ(load.blocked[0], 60u);
+-    EXPECT_EQ(load.ready[0], 25u);
+-    EXPECT_EQ(load.blocked[1], 0u);
++    EXPECT_EQ(load.ready[0], 30u);
+     EXPECT_EQ(load.ready[1], 0u);
+ }
+ TEST(ClusterPartitioner, ColdStartUsesBoundedAffinityAndBalancesFutureWork) {
+@@ -226,11 +285,6 @@
+     EXPECT_EQ(first.cluster, 1);
+     load.blocked[1] = 1000;
+     EXPECT_EQ(model.choose(load, 1, source1, 0, 1).cluster, 0);
+-    model.decisions[0] = model.decisions[1] = 128;
+-    model.observed[0][0] = model.observed[0][1] = 32;
+-    EXPECT_FALSE(model.mature(0, load));
+-    model.channel_updates[0][0][3] = 1;
+-    EXPECT_TRUE(model.mature(0, load));
+ }
+ TEST(ClusterPartitioner, ConcurrentSnapshotsRemainCoherent) {
+     PartitionBucket bucket;
+--- before/tests/ut/cpp/support/weak_link_placeholders.cpp
++++ after/tests/ut/cpp/support/weak_link_placeholders.cpp
+@@ -9,7 +9,7 @@
+  * -----------------------------------------------------------------------------------------------------------
+  */
+ /**
+- * Definitions that only have to resolve, never to run.
++ * Minimal stand-ins for subsystems a unit-test target does not link.
+  *
+  * All are weak: a target that links the real translation unit gets the real
+  * behaviour, and one that does not still links. Grouped because they share
+@@ -19,6 +19,11 @@
+ #include <cstdint>
+ 
+ #include "host/host_graph_runs.h"
++
++// Zero is ChipSwimlaneLevel::DISABLED. This stand-in has no runtime-specific
++// include paths and runtime-only tests without the collector have no capture.
++enum class ChipSwimlaneLevel : uint32_t;
++__attribute__((weak)) ChipSwimlaneLevel get_chip_swimlane_level() { return static_cast<ChipSwimlaneLevel>(0); }
+ 
+ // A recorder worker stands its recording storage up as it starts
+ // (host/graph_recorder_pool.h). The real one is in orchestrator.cpp, which the

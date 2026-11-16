@@ -1,0 +1,266 @@
+# PTO 项目生态
+
+## 概述
+
+PTO（Parallel Tensor/Tile Operation）项目是一个多仓库工具链，用于 AI 加速器编程。它覆盖了从 Python 级别的张量程序到硬件指令执行的完整栈。
+
+本文档描述**每个仓库的职责**、**它们之间的连接方式**以及**各仓库的边界**。
+
+## 仓库列表
+
+所有仓库位于 [github.com/hw-native-sys](https://github.com/hw-native-sys) 组织下。
+
+| 仓库 | 角色 | URL |
+| ---- | ---- | --- |
+| **pypto** | 编译器框架 | [hw-native-sys/pypto](https://github.com/hw-native-sys/pypto) |
+| **pypto-lib** | 模型库与实际案例 | [hw-native-sys/pypto-lib](https://github.com/hw-native-sys/pypto-lib) |
+| **PTOAS** | PTO 汇编器与优化器 | [hw-native-sys/PTOAS](https://github.com/hw-native-sys/PTOAS) |
+| **pto-isa** | 指令集架构（ISA）定义 | [hw-native-sys/pto-isa](https://github.com/hw-native-sys/pto-isa) |
+| **simpler** | 任务运行时 | [hw-native-sys/simpler](https://github.com/hw-native-sys/simpler) |
+
+## 编译流水线
+
+```text
+                    ┌─────────────────────────────────────────────┐
+                    │              pypto-lib                      │
+                    │  实际模型与原语张量函数                         │
+                    │  （以 pypto 作为编译框架）                     │
+                    └──────────────────┬──────────────────────────┘
+                                       │ imports & compiles via
+                    ┌──────────────────▼──────────────────────────┐
+                    │                pypto                        │
+                    │  Python DSL → IR → Passes → CodeGen         │
+                    │                                             │
+                    │  产出:                                       │
+                    │   • .pto 文件（InCore 内核 → AICore）         │
+                    │   • Orchestration C++（任务调度 → AICPU）     │
+                    └───┬─────────────────────────────────────┬───┘
+          .pto files    │                                     │  orchestration C++
+        (仅 InCore)     │                                     │  (运行在 AICPU)
+                    ┌───▼────────────────────┐                │
+                    │       PTOAS            │                │
+                    │  汇编器与优化器          │                │
+                    │                        │                │
+                    │  .pto MLIR → C++       │                │
+                    │  （使用 pto-isa 头文件）  │                │
+                    └───┬────────────────────┘                │
+                        │ kernel C++                          │
+                        │  (includes pto-isa)                 │
+                    ┌───▼────────────────────┐                │
+                    │       pto-isa          │                │
+                    │  ISA 定义：             │                │
+                    │  tile 指令 C++ 头文件    │                │
+                    └───┬────────────────────┘                │
+                        │ compiled AICore binaries            │
+                    ┌───▼─────────────────────────────────────▼───┐
+                    │              simpler                        │
+                    │  运行时：设备上的任务图执行                     │
+                    │  Host ↔ AICPU ↔ AICore 协调                  │
+                    └─────────────────────────────────────────────┘
+```
+
+**pypto 的两条代码生成路径：**
+
+- **InCore 函数**（tile 级计算）→ `.pto` → PTOAS → pto-isa → AICore 二进制
+- **Orchestration 函数**（任务调度）→ 使用 simpler runtime API 的 C++ → 编译到 AICPU
+
+## 组件详情
+
+### pypto — 编译器框架
+
+核心编译器。将 Python 张量程序编译为设备可执行代码。
+
+**输入：** 使用 `pypto.language` DSL 编写的 Python 程序（`@pl.program`、`@pl.function`）
+
+**输出：**
+
+- `.pto` 文件 — PTO-ISA MLIR 方言，每个 InCore 内核函数一个文件（运行在 AICore 上）
+- Orchestration C++ — 使用 simpler runtime API 的任务调度代码（运行在 AICPU 上）
+
+**内部流水线：**
+
+```text
+Python DSL → IR（不可变树）→ Pass Pipeline（20+ passes）→ CodeGen
+```
+
+- **IR 层**：多级表示 — Tensor ops、Tile ops 和 system ops 共存于同一 IR 中
+- **Pass pipeline**：逐步将 tensor 级 IR 降低为 tile 级 IR（循环展开、SSA 转换、tiling、内存分配等）
+- **CodeGen**：两个后端 — PTO codegen（InCore → `.pto` MLIR，运行在 AICore）和 Orchestration codegen（→ C++，运行在 AICPU）
+
+**关键目录：**
+
+| 路径 | 内容 |
+| ---- | ---- |
+| `include/pypto/ir/` | C++ IR 节点定义 |
+| `src/ir/transforms/` | 编译 passes |
+| `src/codegen/` | PTO 和 Orchestration 代码生成器 |
+| `python/pypto/language/` | Python DSL 前端 |
+| `python/pypto/ir/` | Pass manager、compile API |
+
+### pypto-lib — 模型库与原语
+
+基于 pypto 构建的实际模型和原语张量函数库。作用包括：
+
+1. **模型库** — 端到端模型示例（如 DeepSeek、FFN、LLaMA），覆盖完整编译流水线
+2. **原语张量函数** — 可复用的张量级构建块（elementwise、reduction、matmul），由编译器 tiling 并降低到 PTO-ISA
+
+**依赖：** pypto（导入 `pypto.language`，通过 `pypto.ir.compile` 编译）
+
+**与 pypto 的接口：** pypto-lib 程序就是标准的 pypto 程序 — 使用相同的 `@pl.program`/`@pl.function` DSL，通过相同的流水线编译。两者之间没有特殊 API；pypto-lib 是 pypto 框架的使用者。
+
+**编译器 CI 覆盖：** `pypto-lib-compile` job 编译 pypto-lib 的
+`.github/scripts/detect_changes.py --all` 选出的全部正式可运行入口，
+按库的平台归属规则分别覆盖 A2/A3 和 A5。排除草稿、不可独立运行的辅助模块，
+以及仅使用 CPU 的 GLM 权重往返测试和 prefill 参考实现自测；
+辅助模块通过调用它们的入口进行覆盖。编译不需要 NPU，因此仅支持真机的入口也会纳入。
+适配器强制 `golden.run` 使用仅编译模式（compile-only），同时记录直接编译调用，
+并强制执行 PTOAS，覆盖前端、passes、验证、代码生成和 PTOAS。
+不构建设备二进制，也不验证数值结果；
+`pypto-lib-model` 提供独立的设备冒烟测试。
+
+A2/A3 编译分支运行在安装了 CANN 的 `npu` 主机上，并激活工具包，
+以便外部 CCE 封装在导入时解析开发套件头文件。
+该分支不申请或执行 NPU；A5 分支运行在 `cpu` 主机上。
+
+激活已构建的 PyPTO 环境并配置固定版本的 PTOAS 后，可本地复现：
+
+```bash
+python tests/ci/compile_pypto_lib.py --lib /path/to/pypto-lib \
+  --platform a2a3 --jobs 4 --output build/lib-compile-a2a3
+```
+
+使用 `--platform a5` 重复测试。每个入口默认超时 1200 秒，可通过
+`--timeout` 修改。编译失败、进程失败、超时和未记录到编译均会使 job 失败。
+损坏或不可读的编译回执只使对应入口失败，不会中断其他入口或丢失矩阵汇总。
+若入口通过当前 Python 解释器再次运行自身脚本来分发用例，每个子进程都会进入同一仅编译适配器。
+子用例的参数、环境、工作目录和进程隔离均保留，父进程负责汇总编译记录。
+子进程失败，或其编译记录缺失、为空、格式错误，都会使入口失败，即使父进程正常退出。
+该拦截仅作用于同一 Python 解释器启动的当前入口脚本。
+CI 上传逐入口日志、结果，以及记录库版本和所选入口的清单。
+
+### PTOAS — PTO 汇编器与优化器
+
+基于 MLIR 的汇编器，消费 pypto codegen 生成的 `.pto` 文件，产出优化后的 C++ 内核代码。
+
+**输入：** `.pto` 文件（PTO-ISA MLIR 方言）
+
+**输出：** `#include` pto-isa 头文件的 C++ 源文件
+
+**职责：**
+
+- 解析 PTO-ISA MLIR 方言
+- 应用 PTO 级优化 passes（同步插入、内存规划）
+- 将 PTO MLIR 降低为调用 pto-isa tile 指令的 C++ 代码
+
+**与 pypto 的接口：** `.pto` 文件是两者的契约。pypto 的 PTO codegen 使用 PTO 方言发射 MLIR（如 `pto.tload`、`pto.tmul`、`pto.alloc_tile` 等 ops），PTOAS 解析该方言。两个仓库必须在 PTO MLIR 方言定义上保持一致。
+
+### pto-isa — 指令集架构
+
+定义目标硬件的 tile 级指令集。提供声明硬件 tile 指令（load、store、compute、sync 等）的 C++ 头文件。
+
+**被以下仓库消费：**
+
+- **PTOAS** — PTOAS 生成的 C++ 代码调用 pto-isa 指令
+- **simpler** — 首次构建时克隆 pto-isa 头文件用于运行时编译
+
+**接口：** 定义指令 API 的 C++ 头文件库。下游消费者 `#include` pto-isa 头文件；硬件厂商提供支撑这些头文件的目标特定实现。
+
+`runtime/pto_isa.pin` 是版本的唯一真相来源，解析器只有 simpler 一份
+（`simpler_setup.pto_isa.ensure_pto_isa_root`）：它在 runtime 的 `build/pto-isa`
+下管理唯一一份检出，仅当该工作树干净且已停在 pin 上时才复用，否则重新克隆，并在
+返回前校验 `HEAD`。PyPTO 委托给它而不自行解析 pin —— 第二份解析器可能把偏离 pin
+的目录交给 kernel 编译器，而编译器正是因为"解析器已保证 pin"才跳过自己的版本复
+查。如需更改版本，应更新 runtime 侧的 pin。
+
+`PTO_ISA_ROOT` 会被*导出*为解析结果，供构建 extern CCE kernel 的下游消费者找到
+ISA 头文件；但它永远不会被*读取* —— 环境里的值不等于 pin。需要头文件路径的代码应
+调用 `pypto.runtime.pto_isa_include_dir()`，而不是读这个环境变量。
+
+### simpler — 任务运行时
+
+在 Ascend 硬件上执行编译后的程序。管理三程序执行模型：Host、AICPU kernel 和 AICore kernel。
+
+**输入：**
+
+- 编译后的 AICore 内核二进制文件（InCore 路径：pypto → PTOAS → pto-isa → 设备编译器）
+- 编译后的 AICPU orchestration 二进制文件（Orchestration 路径：pypto → 使用 simpler runtime API 的 C++ → 设备编译器）
+
+**职责：**
+
+- 构建和执行任务依赖图
+- 协调 Host ↔ AICPU ↔ AICore 执行
+- 管理设备内存、同步和握手协议
+
+**与 pypto 的接口：** pypto 生成的 orchestration C++ 代码使用 simpler runtime API（`rt_submit_task`、`make_tensor_external` 等），simpler 实现该 API。运行时 API 是 pypto orchestration codegen 和 simpler 之间的契约。
+
+#### runtime pin {#the-runtime-pin}
+
+`runtime/` 本身就是 simpler 的 submodule，所以 PyPTO 对它的 pin 就是 gitlink ——
+`git rev-parse HEAD:runtime`。不存在第二份会漂移的 pin 文件，理由与
+`toolchain/versions.env` 不重复声明 pto-isa revision 相同。
+
+已安装的一侧没有任何能跟踪它的版本号：simpler 的 `pyproject.toml` 写着 `0.1.0`，而且永远
+如此。它唯一的 revision 身份是 `_task_interface.__build_commit__`，由
+`runtime/python/bindings/CMakeLists.txt` 在构建时用 `git rev-parse HEAD` 烧入。
+
+`pypto.runtime.runtime_pin.check_runtime_pin()` 比较两者。它在唯二于模块作用域导入 simpler
+的两个 PyPTO 模块（`pypto.runtime.task_interface` 与 `pypto.runtime.kernel_compiler`）导入时
+运行；不一致时抛出 `RuntimePinMismatch`（一个 `ImportError`），消息中给出两侧 revision 和重装
+命令。
+
+simpler 自带一道等价的守卫（`simpler.task_interface._assert_bindings_match_source_tree`），
+但它比较的是扩展与**它自己的**源码树，并且在旁边没有 `.git` 时直接返回。因此 wheel 安装，或
+把文件拷进 `site-packages` 的 `pip install ./runtime`，从来不会被检查 —— 而恰恰是这类安装最
+难发现陈旧：struct layout 变了之后，字段会静默读成 0，不报任何错。
+
+两组比较，两种严重级别：
+
+| 比较 | 含义 | 结果 |
+| ---- | ---- | ---- |
+| `__build_commit__` vs `git -C runtime rev-parse HEAD` | 已安装的 simpler 不是从这份源码构建的 | 报错 |
+| `git -C runtime rev-parse HEAD` vs `git rev-parse HEAD:runtime` | 你的 runtime 检出偏离了 PyPTO 的 pin | 警告（`RuntimePinWarning`） |
+
+第二项只是警告：在 runtime 分支上开发是正当的。
+
+其余情况一律**跳过**，绝不失败 —— wheel 安装的 PyPTO 没有 `runtime/`、`runtime/` 子模块未初始化（空目录，没有自己的
+revision）、环境里没有 git、或
+simpler 构建时无 git（空 stamp）。因为问题无法回答就拒绝运行，会弄坏每一个正当的安装。但
+「`_task_interface` 可导入却**没有** `__build_commit__` 属性」不算跳过：该属性只会在 stamp
+出现之前编译的扩展上缺失，那按定义就是另一个 revision。
+
+手动检查用 `pypto-runtime-pin`，它打印两侧并在不一致时返回非零；`pypto-runtime-pin --fix`
+重装 `runtime/` 并在全新解释器中复验。`PYPTO_SKIP_RUNTIME_PIN_CHECK=1` 可绕过检查。单元测试
+套件在 `tests/ut/conftest.py` 中设置了它，因为它把 simpler 整个 stub 掉了，不应被已安装的
+revision 绑架；系统测试跑真实 kernel，刻意不豁免。
+
+## 接口总结
+
+每个仓库边界都有明确定义的接口：
+
+```text
+pypto-lib ──[ Python API: pypto.language / pypto.ir ]──► pypto
+     pypto ──[ .pto files: PTO-ISA MLIR dialect     ]──► PTOAS
+   pto-isa ──[ C++ #include: tile instruction hdrs  ]──► PTOAS
+   pto-isa ──[ C++ #include: ISA headers            ]──► simpler
+     pypto ──[ C++ API: simpler runtime API calls      ]──► simpler
+```
+
+| 边界 | 格式 | 提供者 | 消费者 |
+| ---- | ---- | ------ | ------ |
+| pypto-lib → pypto | Python imports | pypto-lib | pypto 编译器 |
+| pypto → PTOAS | `.pto` MLIR 文件 | pypto PTO codegen | PTOAS 解析器 |
+| pto-isa → PTOAS | C++ `#include` | pto-isa 头文件 | PTOAS codegen |
+| pto-isa → simpler | C++ `#include` | pto-isa 头文件 | simpler 构建 |
+| pypto → simpler | Orchestration C++ | pypto orchestration codegen | simpler 运行时 |
+
+## 跨仓库开发
+
+当变更涉及多个仓库时，识别受影响的接口：
+
+| 变更 | 涉及仓库 | 受影响接口 |
+| ---- | -------- | ---------- |
+| 新增 tile 指令 | pto-isa + PTOAS + pypto | ISA 头文件、PTO MLIR 方言、pypto op/codegen |
+| 新增张量原语 | pypto-lib + pypto | Python DSL（如需新 ops） |
+| 新增运行时特性 | simpler + pypto | simpler runtime API、orchestration codegen |
+| 新增 PTO MLIR op | PTOAS + pypto | PTO MLIR 方言、pypto PTO codegen |
+| 新增模型示例 | 仅 pypto-lib | 无（现有 API 的消费者） |

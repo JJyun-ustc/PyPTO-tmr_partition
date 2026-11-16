@@ -1,0 +1,94 @@
+{
+  "ScaleShared": {
+    "n": 30,
+    "median_ms": 4.82405,
+    "p95_ms": 4.855231,
+    "min_ms": 4.20924,
+    "max_ms": 4.87682
+  },
+  "ScaleAdaptive": {
+    "n": 30,
+    "median_ms": 6.38489,
+    "p95_ms": 6.476097,
+    "min_ms": 5.7904,
+    "max_ms": 6.5163
+  },
+  "Case0Shared": {
+    "n": 30,
+    "median_ms": 1.04107,
+    "p95_ms": 1.1264755499999997,
+    "min_ms": 1.022399,
+    "max_ms": 1.21154
+  },
+  "Case0Adaptive": {
+    "n": 30,
+    "median_ms": 1.46666,
+    "p95_ms": 1.5447869999999997,
+    "min_ms": 1.43978,
+    "max_ms": 1.60096
+  },
+  "Scale": {
+    "adaptive_vs_shared_median_pct": 32.355386034556034
+  },
+  "Case0": {
+    "adaptive_vs_shared_median_pct": 40.88005609613188
+  },
+  "diagnostics": {
+    "ScaleShared": {
+      "capture": "/data/aicpu-cluster-study/official-worktree/runtime/outputs/TestBenchmarkBgemm_ClusterScaleShared_20261110_110751/chip_swimlane_records.json",
+      "dependency_graph": "/data/aicpu-cluster-study/official-worktree/runtime/outputs/TestBenchmarkBgemm_ClusterScaleShared_20261110_110933/deps.json",
+      "tasks": 4096,
+      "wait_edges": 3584,
+      "cross_wait_edges": 1459,
+      "cluster_tasks": [
+        1144,
+        2952
+      ],
+      "ready_wait_mean_us": 2.7935595703125014,
+      "ready_wait_median_us": 1.400000000000091,
+      "stream_drops": 0
+    },
+    "ScaleAdaptive": {
+      "capture": "/data/aicpu-cluster-study/official-worktree/runtime/outputs/TestBenchmarkBgemm_ClusterScaleAdaptive_20261110_110801/chip_swimlane_records.json",
+      "dependency_graph": "/data/aicpu-cluster-study/official-worktree/runtime/outputs/TestBenchmarkBgemm_ClusterScaleShared_20261110_110933/deps.json",
+      "tasks": 4096,
+      "wait_edges": 3584,
+      "cross_wait_edges": 1381,
+      "cluster_tasks": [
+        1099,
+        2997
+      ],
+      "ready_wait_mean_us": 2.6516357421875014,
+      "ready_wait_median_us": 1.5199999999999818,
+      "stream_drops": 0
+    },
+    "Case0Shared": {
+      "capture": "/data/aicpu-cluster-study/official-worktree/runtime/outputs/TestBenchmarkBgemm_ClusterCase0Shared_20261110_110811/chip_swimlane_records.json",
+      "dependency_graph": "/data/aicpu-cluster-study/official-worktree/runtime/outputs/TestBenchmarkBgemm_ClusterCase0Shared_20261110_111012/deps.json",
+      "tasks": 1000,
+      "wait_edges": 750,
+      "cross_wait_edges": 327,
+      "cluster_tasks": [
+        318,
+        682
+      ],
+      "ready_wait_mean_us": 17.18422,
+      "ready_wait_median_us": 1.990000000000009,
+      "stream_drops": 0
+    },
+    "Case0Adaptive": {
+      "capture": "/data/aicpu-cluster-study/official-worktree/runtime/outputs/TestBenchmarkBgemm_ClusterCase0Adaptive_20261110_110820/chip_swimlane_records.json",
+      "dependency_graph": "/data/aicpu-cluster-study/official-worktree/runtime/outputs/TestBenchmarkBgemm_ClusterCase0Shared_20261110_111012/deps.json",
+      "tasks": 1000,
+      "wait_edges": 750,
+      "cross_wait_edges": 283,
+      "cluster_tasks": [
+        266,
+        734
+      ],
+      "ready_wait_mean_us": 6.061300000000004,
+      "ready_wait_median_us": 1.7200000000000273,
+      "stream_drops": 0
+    }
+  }
+}

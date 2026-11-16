@@ -1,0 +1,703 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
+
+#ifndef PYPTO_IR_VERIFIER_VERIFIER_H_
+#define PYPTO_IR_VERIFIER_VERIFIER_H_
+
+#include <memory>
+#include <string>
+#include <vector>
+
+#include "pypto/backend/common/backend_handler.h"
+#include "pypto/core/dtype.h"
+#include "pypto/core/error.h"
+#include "pypto/ir/program.h"
+
+namespace pypto {
+namespace ir {
+
+/**
+ * @brief Base class for IR property verifiers
+ *
+ * Each verifier implements a specific check on IR programs.
+ * Verifiers can detect errors or warnings and add them to a diagnostics vector.
+ * Each verifier receives a ProgramPtr and internally decides whether to iterate
+ * over functions or check program-level properties.
+ *
+ * To create a new property verifier:
+ * 1. Inherit from PropertyVerifier
+ * 2. Implement GetName() to return a unique name
+ * 3. Implement Verify() to perform the verification logic
+ *
+ * Example:
+ * @code
+ *   class MyVerifier : public PropertyVerifier {
+ *    public:
+ *     std::string GetName() const override { return "MyVerifier"; }
+ *     void Verify(const ProgramPtr& program, std::vector<Diagnostic>& diagnostics) override {
+ *       for (const auto& [gv, func] : program->functions_) {
+ *         // Verification logic per function
+ *       }
+ *     }
+ *   };
+ * @endcode
+ */
+class PropertyVerifier {
+ public:
+  virtual ~PropertyVerifier() = default;
+
+  /**
+   * @brief Get the name of this verifier
+   * @return Unique name (e.g., "SSAVerify", "TypeCheck")
+   */
+  [[nodiscard]] virtual std::string GetName() const = 0;
+
+  /**
+   * @brief Verify a program and collect diagnostics
+   * @param program Program to verify
+   * @param diagnostics Vector to append diagnostics to
+   *
+   * This method should examine the program and add any detected issues
+   * to the diagnostics vector. It should not throw exceptions - all issues
+   * should be reported through diagnostics.
+   */
+  virtual void Verify(const ProgramPtr& program, std::vector<Diagnostic>& diagnostics) = 0;
+};
+
+/// Shared pointer to a property verifier
+using PropertyVerifierPtr = std::shared_ptr<PropertyVerifier>;
+
+/**
+ * @brief Factory function for creating SSA property verifier
+ * @return Shared pointer to SSA PropertyVerifier
+ */
+PropertyVerifierPtr CreateSSAPropertyVerifier();
+
+/**
+ * @brief Factory function for creating type check property verifier
+ * @return Shared pointer to TypeCheck PropertyVerifier
+ */
+PropertyVerifierPtr CreateTypeCheckPropertyVerifier();
+
+/**
+ * @brief Factory function for creating no nested call property verifier
+ * @return Shared pointer to NoNestedCall PropertyVerifier
+ */
+PropertyVerifierPtr CreateNoNestedCallPropertyVerifier();
+
+/**
+ * @brief Factory for the Acc->GM store destination-dtype property verifier
+ * @return Shared pointer to AccToGmStoreValid PropertyVerifier
+ */
+PropertyVerifierPtr CreateAccToGmStoreValidPropertyVerifier();
+
+/**
+ * @brief Factory for the Acc->Mat FIXPIPE-epilogue property verifier
+ *
+ * Checks that every ``tile.assemble`` carrying ``pre_quant`` / ``pre_relu`` is
+ * an Acc-to-Mat writeback whose dtype pair the backend's fix-pipe supports. The
+ * Acc->GM half of the same contract is ``AccToGmStoreValid``.
+ *
+ * @return Shared pointer to FixpipeEpilogueValid PropertyVerifier
+ */
+PropertyVerifierPtr CreateFixpipeEpilogueValidPropertyVerifier();
+
+/**
+ * @brief List the fix-pipe pre-quant destinations reachable from @p src_dtype
+ *
+ * Both halves of the epilogue contract reject a dtype pair, and a diagnostic
+ * that only refuses leaves the author guessing which dtype would work. Shared
+ * so the Acc->Mat and Acc->GM messages cannot drift apart while describing the
+ * same backend table.
+ *
+ * @param handler Backend whose table is consulted
+ * @param src_dtype Accumulator element type
+ * @param dest Which writeback is being described
+ * @return Slash-separated dtype names, or "none" when the source reaches nothing
+ */
+std::string DescribeFixpipePreQuantTargets(const backend::BackendHandler& handler, DataType src_dtype,
+                                           backend::BackendHandler::FixpipeDest dest);
+
+/**
+ * @brief Factory for the Acc compact-mode property verifier
+ *
+ * Checks that every ``tile.matmul_acc`` / ``tile.matmul_mx_acc`` accumulates
+ * into a compact buffer whenever ``mad``'s pitch differs from the accumulator's
+ * physical row count, and that no tile outside Left/Right/Acc carries a compact
+ * mode.
+ *
+ * @return Shared pointer to AccCompactValid PropertyVerifier
+ */
+PropertyVerifierPtr CreateAccCompactValidPropertyVerifier();
+
+/**
+ * @brief Factory for the atomic-add destination-dtype property verifier
+ *
+ * Checks every atomic-add write into GM (``tile.store`` / ``tensor.assemble`` /
+ * ``pld.tensor.put`` / ``pld.tile.put`` / ``pld.tensor.remote_store`` /
+ * ``pld.tile.remote_store``) against
+ * ``BackendHandler::SupportsBf16AtomicAdd``. Listed in
+ * ``GetStructuralProperties()``, so it is verified at pipeline input on the
+ * user's own IR.
+ * @return Shared pointer to AtomicAddDtypeValid PropertyVerifier
+ */
+PropertyVerifierPtr CreateAtomicAddDtypeValidPropertyVerifier();
+
+/**
+ * @brief Factory for the device-kernel scalar-return property verifier
+ *
+ * Rejects a ``ScalarType`` anywhere in the ``return_types_`` of any device
+ * function (``InCore`` / ``AIC`` / ``AIV`` / ``Group`` / ``Spmd``) -- those
+ * types mean "a dispatchable task". The search descends into ``TupleType``,
+ * since a ``-> pl.Tuple[...]`` annotation is one ``return_types_`` entry and a
+ * tuple element has no more of a carrier than a bare return does. The runtime
+ * has no scalar output channel:
+ * ``Arg::add_scalar`` passes a scalar *in* by value and ``TaskOutputTensors``
+ * returns only tensors, so orchestration codegen has no carrier to bind such a
+ * return to (#631). ``Scalar[TASK_ID]`` is exempt (a scheduler handle, not
+ * data), and a device-side scalar helper belongs in a ``FunctionType::Inline``
+ * function, which ``InlineFunctions`` splices away. Listed in
+ * ``GetStructuralProperties()``, so it is verified at every pass boundary --
+ * catching both user-written signatures and any pass that synthesises one.
+ * @return Shared pointer to NoScalarKernelReturn PropertyVerifier
+ */
+PropertyVerifierPtr CreateNoScalarKernelReturnPropertyVerifier();
+
+/**
+ * @brief Factory for the InParamWritten warning verifier.
+ *
+ * Reports a parameter declared `In` that its own function body writes, where
+ * "writes" means *declared* as written — by a builtin's registry effects or by
+ * a callee's own `param_directions_`.
+ *
+ * **Best-effort.** It is not registered as an `IRProperty`, and it does not
+ * promise to find every such parameter: it reads the same declarations
+ * direction inference reads, so an operator that declared no effect is
+ * invisible to it, and it runs `PostPipeline`, where `InitMemRef` has already
+ * invalidated `SSAForm`, so its buffer lineage can both miss and misattribute a
+ * write across control flow. See the file comment for the specific shapes.
+ *
+ * @return Shared pointer to the warning verifier
+ */
+PropertyVerifierPtr CreateInParamWrittenWarningVerifier();
+
+/**
+ * @brief Factory for the final accumulator/store phase-pairing verifier
+ *
+ * Checks the bidirectional unit-flag contract between ``tile.gemv``,
+ * ``tile.gemv_acc`` and ``tile.gemv_bias`` calls carrying
+ * ``acc_phase=pl.AccPhase.Final`` and
+ * ``tile.store(..., st_phase=pl.STPhase.Final)``. A final producer must be
+ * consumed exactly once, using that exact SSA value (or a plain SSA alias), in
+ * the same straight-line control-flow region; a final store must have a live
+ * matching producer. Produced by ``InlineFunctions``, so an Inline helper that
+ * returns a final accumulator value is expanded before the producer/store pair
+ * is verified.
+ *
+ * @return Shared pointer to AccStorePhaseValid PropertyVerifier
+ */
+PropertyVerifierPtr CreateAccStorePhaseValidPropertyVerifier();
+
+/**
+ * @brief Factory function for creating NormalizedStmtStructure property verifier
+ * @return Shared pointer to NormalizedStmtStructure PropertyVerifier
+ */
+PropertyVerifierPtr CreateNormalizedStmtPropertyVerifier();
+
+/**
+ * @brief Factory function for creating NoRedundantBlocks property verifier
+ *
+ * Verifies that no SeqStmts has exactly one child (should be unwrapped),
+ * and no SeqStmts contains a nested SeqStmts (should be flattened).
+ * @return Shared pointer to NoRedundantBlocks PropertyVerifier
+ */
+PropertyVerifierPtr CreateNoRedundantBlocksPropertyVerifier();
+
+/**
+ * @brief Factory function for creating SplitIncoreOrch property verifier
+ * @return Shared pointer to SplitIncoreOrch PropertyVerifier
+ */
+PropertyVerifierPtr CreateSplitIncoreOrchPropertyVerifier();
+
+/**
+ * @brief Factory function for creating ClusterOutlined property verifier
+ * @return Shared pointer to ClusterOutlined PropertyVerifier
+ */
+PropertyVerifierPtr CreateClusterOutlinedPropertyVerifier();
+
+/**
+ * @brief Factory function for creating HierarchyOutlined property verifier
+ * @return Shared pointer to HierarchyOutlined PropertyVerifier
+ */
+PropertyVerifierPtr CreateHierarchyOutlinedPropertyVerifier();
+
+/**
+ * @brief Factory function for creating GraphOutlined property verifier
+ * @return Shared pointer to GraphOutlined PropertyVerifier
+ */
+PropertyVerifierPtr CreateGraphOutlinedPropertyVerifier();
+
+/**
+ * @brief Factory function for creating HasMemRefs property verifier
+ * @return Shared pointer to HasMemRefs PropertyVerifier
+ */
+PropertyVerifierPtr CreateHasMemRefsPropertyVerifier();
+
+/**
+ * @brief Factory function for creating IncoreTileOps property verifier
+ * @return Shared pointer to IncoreTileOps PropertyVerifier
+ */
+PropertyVerifierPtr CreateIncoreTileOpsPropertyVerifier();
+
+/**
+ * @brief Factory function for creating MixedKernelExpanded property verifier
+ *
+ * Verifies that no InCore function contains both Cube and Vector tile ops, and
+ * that split AIC/AIV functions keep cross-core tpop results in their required
+ * bridge memory spaces.
+ * @return Shared pointer to MixedKernelExpanded PropertyVerifier
+ */
+PropertyVerifierPtr CreateMixedKernelExpandedPropertyVerifier();
+
+/**
+ * @brief Factory function for creating AivSplitValid property verifier
+ *
+ * Structural verifier for the first-class ``SplitAivScopeStmt`` region (live
+ * between OutlineIncoreScopes and LowerAutoVectorSplit). Keyed on the node, it
+ * checks, per region: (a) no cube compute inside ANY region — a data-parallel
+ * region cannot vector-split it (each AIV lane holds only half the tile) and
+ * every region, task-parallel included, *is* the AIV lane's body; (b) no AIV
+ * reduce over the split axis inside a *data-parallel* region (partial per-lane
+ * reduction; a ``mode=NONE`` region has no split axis to collapse); (c) the
+ * ``tile.aiv_shard`` / ``tile.aic_gather`` boundary ops appear only inside a
+ * region, and never inside a task-parallel ``mode=NONE`` one; (d) the boundary
+ * memory contract — ``tile.aiv_shard`` is ``Acc -> Vec`` and
+ * ``tile.aic_gather`` is ``Vec -> Mat``, since both ops *are* the cross-core
+ * transfer, so the operand must sit on the producing lane and the result on the
+ * consuming one. Each memory side of (d) is skipped until its space is
+ * resolved, which is why ConvertTensorToTileOps and InferTileMemorySpace
+ * re-produce this property (see pass_properties.h) — at OutlineIncoreScopes the
+ * boundary is still the space-less ``tensor.*`` form.
+ *
+ * One further check is gated on a whole-function fact rather than on the node
+ * (MANUAL MODE): (e) in a function that opens at least one region, the regions
+ * are authoritative for vector placement, so a VECTOR-affine op *outside* every
+ * region is rejected — ``tile.load`` / ``tile.store`` are carved out because
+ * ConvertTensorToTileOps materializes them out of region by construction, as is
+ * an op whose lane is *stated* rather than inferred.
+ *
+ * Lane-sharding of once-only side effects (``pld.system.notify``) is
+ * deliberately NOT checked here — see the "NOT CHECKED, DELIBERATELY" note in
+ * verify_aiv_split.cpp: a region cannot mean "exactly once" while the AIV body
+ * runs on both sub-lanes, and the correct and incorrect authoring forms are
+ * structurally identical IR. The rule is documented for authors instead.
+ * @return Shared pointer to AivSplitValid PropertyVerifier
+ */
+PropertyVerifierPtr CreateAivSplitValidPropertyVerifier();
+
+/// Verify the post-LowerAutoVectorSplit region/flat compatibility contract.
+PropertyVerifierPtr CreateAivSplitLoweredValidPropertyVerifier();
+
+/**
+ * @brief Factory function for creating AllocatedMemoryAddr property verifier
+ *
+ * Verifies that all non-DDR MemRefs have valid allocated addresses and
+ * that total memory usage per space does not exceed platform buffer limits.
+ * @return Shared pointer to AllocatedMemoryAddr PropertyVerifier
+ */
+PropertyVerifierPtr CreateAllocatedMemoryAddrPropertyVerifier();
+
+/**
+ * @brief Factory function for creating TileOps2D property verifier
+ *
+ * Verifies that all tile op calls (excluding tile.load, tile.store,
+ * tile.reshape) in InCore functions operate on ≤2D tiles.
+ * @return Shared pointer to TileOps2D PropertyVerifier
+ */
+PropertyVerifierPtr CreateTileOps2DPropertyVerifier();
+
+/**
+ * @brief Factory function for creating BreakContinueCheck property verifier
+ *
+ * Verifies that break/continue statements only appear inside sequential
+ * (ForKind::Sequential) or while loops. Reports errors for break/continue
+ * in parallel or unrolled loops, or outside any loop.
+ * @return Shared pointer to BreakContinueCheck PropertyVerifier
+ */
+PropertyVerifierPtr CreateBreakContinuePropertyVerifier();
+
+/**
+ * @brief Factory function for creating InlineFunctionsEliminated property verifier
+ *
+ * Verifies that no FunctionType::Inline function and no Call expression
+ * resolving to one survives in the program. Should hold after the
+ * InlineFunctions pass runs (i.e. for the entire post-pass-01 pipeline).
+ * @return Shared pointer to InlineFunctionsEliminated PropertyVerifier
+ */
+PropertyVerifierPtr CreateInlineFunctionsEliminatedPropertyVerifier();
+
+/**
+ * @brief Factory function for creating TileMemoryInferred property verifier
+ *
+ * Verifies that all TileType variables in InCore functions have
+ * memory_space_ set (not nullopt).
+ * @return Shared pointer to TileMemoryInferred PropertyVerifier
+ */
+PropertyVerifierPtr CreateTileMemoryInferredPropertyVerifier();
+
+/**
+ * @brief Factory function for creating UseAfterDef property verifier
+ *
+ * Verifies that every Var reference in an expression is dominated by a
+ * definition (function parameter, ForStmt/WhileStmt loop variable,
+ * iter_arg, return_var, or AssignStmt).
+ * @return Shared pointer to UseAfterDef PropertyVerifier
+ */
+PropertyVerifierPtr CreateUseAfterDefPropertyVerifier();
+
+/**
+ * @brief Create the UseAfterDef check with strict lexical scopes for final SSA IR.
+ *
+ * Branch- and loop-local definitions never leak into their enclosing scope;
+ * only explicit return_vars become visible there. Uses indexed membership and
+ * scope undo records instead of copying the whole visible-definition set.
+ * Type-metadata uses are checked identically to the legacy UseAfterDef property.
+ * This is an internal composition helper, not a separate IR property or pass option.
+ */
+PropertyVerifierPtr CreateLexicalUseAfterDefPropertyVerifier();
+
+/**
+ * @brief Factory function for creating StructuredCtrlFlow property verifier
+ *
+ * Verifies that no BreakStmt or ContinueStmt remains in InCore-type function
+ * bodies (InCore, AIC, AIV). Host and Orchestration functions are skipped
+ * because they support break/continue natively.
+ * @return Shared pointer to StructuredCtrlFlow PropertyVerifier
+ */
+PropertyVerifierPtr CreateStructuredCtrlFlowPropertyVerifier();
+
+/**
+ * @brief Factory function for creating OutParamNotShadowed property verifier
+ *
+ * Verifies that no Out/InOut function parameter is reassigned via a
+ * tensor-creating call (tensor.create, tensor.full), which would shadow
+ * the external output tensor.
+ * @return Shared pointer to OutParamNotShadowed PropertyVerifier
+ */
+PropertyVerifierPtr CreateOutParamNotShadowedPropertyVerifier();
+
+/**
+ * @brief Factory function for creating ArrayNotEscaped property verifier
+ *
+ * Verifies that ``ArrayType`` never appears as a function parameter or
+ * return type. ArrayType values live on the on-core scalar register file /
+ * C stack and cannot be passed across function boundaries (the storage
+ * backing them disappears when the function returns). Local create/use
+ * within a function/region is allowed; this verifier only blocks escape.
+ *
+ * @return Shared pointer to ArrayNotEscaped PropertyVerifier
+ */
+PropertyVerifierPtr CreateArrayNotEscapedPropertyVerifier();
+
+/**
+ * @brief Factory function for creating NoNestedInCore property verifier
+ *
+ * Verifies that no ScopeStmt(InCore) is nested inside another ScopeStmt(InCore).
+ * @return Shared pointer to NoNestedInCore PropertyVerifier
+ */
+PropertyVerifierPtr CreateNoNestedIncorePropertyVerifier();
+
+/**
+ * @brief Factory function for creating InOutUseValid property verifier
+ *
+ * Verifies the InOut-use discipline (RFC #1026): no statement reachable in CFG
+ * order from a user-function call that passes variable `v` as InOut or Out may
+ * read `v`. Post-mutation values must flow through the call's return slots.
+ * Built-in ops (tile.*, tensor.*, system.*) are out of scope — their memory
+ * effects are handled separately.
+ * @return Shared pointer to InOutUseValid PropertyVerifier
+ */
+PropertyVerifierPtr CreateInOutUseValidPropertyVerifier();
+
+/**
+ * @brief Factory function for creating PipelineLoopValid property verifier
+ *
+ * Verifies the bidirectional structural invariant on every ``ForStmt``:
+ *   - ``kind_ == ForKind::Pipeline``  ⇔  ``HasAttr("pipeline_stages")``
+ *
+ * Either direction failing indicates a malformed pipeline loop. Listed in
+ * ``GetStructuralProperties()``, so ``VerificationInstrument`` checks it
+ * before/after every pass — not just post-``CanonicalizeIOOrder``.
+ *
+ * @return Shared pointer to PipelineLoopValid PropertyVerifier
+ */
+PropertyVerifierPtr CreatePipelineLoopValidPropertyVerifier();
+
+/**
+ * @brief Factory function for creating ManualDepsOnSubmitOnly property verifier
+ *
+ * Verifies that no plain cross-function Call (GlobalVar callee) carries
+ * ``attrs["manual_dep_edges"]`` — manual dependency edges live in the typed
+ * ``Submit::deps_`` field. Op calls (``system.task_dummy``) keep the attr as
+ * their codegen fanin contract and are exempt. Listed in
+ * ``GetStructuralProperties()``, so ``VerificationInstrument`` checks it
+ * before/after every pass.
+ *
+ * @return Shared pointer to ManualDepsOnSubmitOnly PropertyVerifier
+ */
+PropertyVerifierPtr CreateManualDepsOnSubmitOnlyPropertyVerifier();
+
+/**
+ * @brief Factory function for creating PipelineResolved property verifier
+ *
+ * Verifies the post-canonicalize invariant: no ``ForStmt`` may carry
+ * ``kind_ == ForKind::Pipeline``. ``ForKind::Pipeline`` is a transient marker
+ * lowered by ``LowerPipelineLoops`` and demoted by ``CanonicalizeIOOrder``;
+ * any survivor downstream of CanonicalizeIOOrder indicates a missing demotion.
+ *
+ * The bidirectional kind ⇔ attr invariant is checked separately by
+ * ``PipelineLoopValid`` (a structural property).
+ *
+ * @return Shared pointer to PipelineResolved PropertyVerifier
+ */
+PropertyVerifierPtr CreatePipelineResolvedPropertyVerifier();
+
+/**
+ * @brief Factory function for creating UnrollResolved property verifier
+ *
+ * Verifies the post-unroll invariant: no ``ForStmt`` may carry
+ * ``kind_ == ForKind::Unroll``. ``ForKind::Unroll`` is a compile-time marker
+ * expanded by ``UnrollLoops`` into ``SeqStmts``; any survivor downstream of
+ * UnrollLoops indicates the pass failed to expand it.
+ *
+ * @return Shared pointer to UnrollResolved PropertyVerifier
+ */
+PropertyVerifierPtr CreateUnrollResolvedPropertyVerifier();
+
+/**
+ * @brief Factory function for creating IterArgCarryClassified property verifier
+ *
+ * Verifies that every ``ForStmt`` with iter_args inside a
+ * ``FunctionType::Orchestration`` function carries the per-slot
+ * ``iter_arg_rebind_<i>`` attr stamped by ``ClassifyIterArgCarry``, and that a
+ * positive ``iter_arg_array_size_<i>`` only accompanies a rebind carry.
+ *
+ * @return Shared pointer to IterArgCarryClassified PropertyVerifier
+ */
+PropertyVerifierPtr CreateIterArgCarryClassifiedPropertyVerifier();
+
+/**
+ * @brief Factory function for creating RuntimeScopesMaterialized property verifier
+ *
+ * Verifies that every ``FunctionType::Orchestration`` function has
+ * ``attrs_["auto_scope"] == false``. That marker is set when
+ * ``MaterializeRuntimeScopes`` inserts explicit ``RuntimeScopeStmt`` nodes, or
+ * when the user declares ``@pl.function(auto_scope=False)`` (the pass is a
+ * no-op and codegen still accepts the function). Orchestration codegen emits
+ * ``SIMPLER_SCOPE()`` only from those nodes; skipping the pass leaves
+ * ``auto_scope=True`` and would silently omit scopes.
+ *
+ * @return Shared pointer to RuntimeScopesMaterialized PropertyVerifier
+ */
+PropertyVerifierPtr CreateRuntimeScopesMaterializedPropertyVerifier();
+
+/**
+ * @brief Create a verifier for the GraphBoundaryLegalized property
+ *
+ * Re-states the boundary contract LegalizeGraphBoundary enforces, so a later
+ * pass that reintroduces a violation is caught. That matters more here than for
+ * a typical property: almost every host_build_graph constraint degrades to a
+ * *silent* non-graph fallback at runtime — the program stays numerically correct
+ * and merely loses the speedup — so this verifier is the automated detector.
+ *
+ * @return Property verifier instance
+ */
+PropertyVerifierPtr CreateGraphBoundaryLegalizedPropertyVerifier();
+
+/**
+ * @brief Factory function for creating CallDirectionsResolved property verifier
+ *
+ * Verifies that every non-builtin ``Call`` in the program carries a fully
+ * populated ``attrs_["arg_directions"]`` vector (accessed via
+ * ``Call::GetArgDirections``) that is internally consistent with the callee's
+ * ``param_directions_``. Specifically, for each call:
+ *   - the ``arg_directions`` attr is present, has size ``args_.size()`` and
+ *     is non-empty;
+ *   - tensor arguments carry a non-Scalar direction; scalar arguments carry
+ *     ``ArgDirection::Scalar``;
+ *   - the per-argument ``ArgDirection`` is consistent with the callee's
+ *     ``ParamDirection`` (``In`` ↔ ``Input``; ``InOut`` ↔ ``InOut`` /
+ *     ``OutputExisting`` after auto-deps rewrite; ``Out`` ↔ ``Output`` /
+ *     ``OutputExisting`` / ``InOut`` for WAW promotion).
+ *
+ * The runtime requirement that ``add_input/add_output`` come before
+ * ``add_scalar`` is satisfied by orchestration codegen (``stable_partition``
+ * over ``ParamEntry``); the IR Call itself is allowed to interleave tensors
+ * and scalars to preserve the user's parameter order.
+ *
+ * This is the post-condition of the ``DeriveCallDirections`` pass and is
+ * automatically run by ``PassPipeline`` whenever that pass is executed.
+ *
+ * @return Shared pointer to CallDirectionsResolved PropertyVerifier
+ */
+PropertyVerifierPtr CreateCallDirectionsResolvedPropertyVerifier();
+
+/**
+ * @brief Factory function for creating TileTypeCoherence property verifier
+ *
+ * Asserts the canonical encoding of TileType: a TileView matching the implicit
+ * semantics for the tile's (shape, memory_space) is stored as nullopt. The
+ * TileType constructor enforces this at construction; the verifier catches
+ * passes that mutate the public ``tile_view_`` field directly without going
+ * through the constructor.
+ *
+ * @return Shared pointer to TileTypeCoherence PropertyVerifier
+ */
+PropertyVerifierPtr CreateTileTypeCoherencePropertyVerifier();
+
+/**
+ * @brief Verify explicit buffer representation in InCore/AIC/AIV functions.
+ *
+ * Validates registered buffer calls and composes SSA, use-after-definition, and
+ * assignment-type checks. Does not prove storage lifetimes or initialized data.
+ */
+PropertyVerifierPtr CreateBufferIRPropertyVerifier();
+
+/// Verify canonical device region storage before allocation addresses are assigned.
+PropertyVerifierPtr CreateTileStorageLegalizedPropertyVerifier();
+
+/// Verify canonical region storage and transfer overlap using effective physical addresses.
+PropertyVerifierPtr CreateTileStorageAllocatedPropertyVerifier();
+
+/**
+ * @brief Factory function for creating OrchestrationReferencesResolved property verifier
+ *
+ * Verifies that every non-builtin Call inside an Orchestration function targets
+ * a Function that exists in the surrounding Program. Replaces the codegen-side
+ * ValidateOrchestrationReferences check that used to throw at codegen time.
+ * @return Shared pointer to OrchestrationReferencesResolved PropertyVerifier
+ */
+PropertyVerifierPtr CreateOrchestrationReferencesResolvedPropertyVerifier();
+
+/**
+ * @brief Factory function for creating TensorViewCanonical property verifier
+ *
+ * Verifies that every TensorType.tensor_view_ in the program satisfies the
+ * canonical form per RFC #1300 §2.2:
+ *   - layout is one of {ND, DN} (NZ is tile-only and rejected)
+ *   - when stride is non-empty: rank matches shape, innermost-stride is 1 at
+ *     the layout-specific axis, and outer dims are valid packed/strided
+ *   - when stride is empty: this is allowed in the "weak" mode (default —
+ *     pre-MaterializeTensorStrides) and rejected in the "strict" mode
+ *     (post-MaterializeTensorStrides, P3+)
+ *
+ * Symbolic strides are accepted under relaxed_symbolic semantics (RFC Open Q2).
+ *
+ * @param require_materialized When true, reject tensor_view_ with empty stride
+ *   (the strict, codegen-entry contract). When false, accept empty stride as
+ *   "implicitly packed canonical" — used during early pipeline stages.
+ * @return Shared pointer to TensorViewCanonical PropertyVerifier
+ */
+PropertyVerifierPtr CreateTensorViewCanonicalPropertyVerifier(bool require_materialized = false);
+
+/**
+ * @brief Factory function for creating CommDomainScopesMaterialized property verifier
+ *
+ * Walks each function body for ``CommDomainScopeStmt`` nodes and verifies:
+ * (a) every scope's ``slots_`` is non-empty (an empty domain would emit
+ * ``window_size=0`` and the runtime would reject it); (b) every slot is
+ * non-null; (c) each ``WindowBuffer`` appears as a slot in at most one
+ * scope program-wide. ``DistributedCodegen`` relies on this shared_ptr-identity
+ * uniqueness to route each Submit's per-arg ``device_ctx`` handle to the
+ * correct domain; a duplicate slot would misroute communication traffic at
+ * runtime. The ``MaterializeCommDomainScopes`` pass enforces this invariant by
+ * construction; the verifier independently checks it.
+ *
+ * @return Shared pointer to CommDomainScopesMaterialized PropertyVerifier
+ */
+PropertyVerifierPtr CreateCommDomainScopesMaterializedPropertyVerifier();
+
+/**
+ * @brief Factory function for creating DistTensorCtxMaterialized property verifier
+ *
+ * Flags every ``pld.system.get_comm_ctx`` call left in a function that is not
+ * host orchestration. Host codegen resolves the query from the window's
+ * per-rank runtime context, so it is legitimate there; device and
+ * chip-orchestration codegen have no runtime representation for it, and
+ * ``MaterializeDistTensorCtx`` must have replaced it with the explicit
+ * ``CommCtxType`` parameter. The pass enforces this by construction for every
+ * function it rewrites, but a Program with no DistributedTensor parameter at
+ * all is returned untouched; the verifier catches that independently.
+ *
+ * @return Shared pointer to DistTensorCtxMaterialized PropertyVerifier
+ */
+PropertyVerifierPtr CreateDistTensorCtxMaterializedPropertyVerifier();
+
+/**
+ * @brief Factory function for creating AssignTypeSymmetry property verifier
+ *
+ * Verifies that every ``AssignStmt(var, value)`` satisfies
+ * ``structural_equal(var->GetType(), value->GetType())``. ``structural_equal``
+ * is the IR's own type-equality contract (the one the roundtrip verifier uses).
+ * It compares, per type kind: TileType → dtype, shape, tile_view, memory_space;
+ * TensorType → dtype, shape, tensor_view (DistributedTensorType also compares
+ * window_buffer); TupleType → every element recursively. It intentionally
+ * excludes ``memref_`` — a MemRef is an allocation detail bound to the Var, not
+ * part of the value's structural type — so MemRef asymmetry (legitimate after
+ * ``InitMemRef``) is out of scope here and is governed instead by
+ * ``HasMemRefs`` / ``AllocatedMemoryAddr``. (``memory_space`` exists only on
+ * TileType, not TensorType.)
+ *
+ * Catches passes that mutate one side of an AssignStmt without keeping the
+ * other in sync — e.g. #1262, where ``InferTileMemorySpace`` wrote ``Mem.Acc``
+ * onto a Var whose producing ``tile.full`` Call still declared ``Mem.Vec``.
+ * Turning silent type corruption into a hard error localises the bug to the
+ * pass that caused it instead of a downstream consumer.
+ *
+ * @return Shared pointer to AssignTypeSymmetry PropertyVerifier
+ */
+PropertyVerifierPtr CreateAssignTypeSymmetryPropertyVerifier();
+
+/**
+ * @brief Create a verifier for IRProperty::ReturnParamsExplicit
+ *
+ * Checks every InCore/Group/Spmd function: each tensor return value that is a
+ * param writeback must reference the param by pointer identity (not an SSA
+ * alias of it), and tensor-returning functions must carry a ReturnStmt.
+ * Kernel-allocated tensors (untraceable to any param) and scalars are exempt.
+ * Keeps orchestration return->arg aliasing a lookup (#1702).
+ *
+ * @return Shared pointer to ReturnParamsExplicit PropertyVerifier
+ */
+PropertyVerifierPtr CreateReturnParamsExplicitPropertyVerifier();
+
+/**
+ * @brief Factory function for creating HardSyncallOccupancyValid property verifier
+ *
+ * Verifies that every hard (FFTS) ``system.syncall`` is launched at full core
+ * occupancy: the enclosing ``pl.spmd(N)`` fills all physical cores of the
+ * barrier's ``core_type``. Runs after ExpandMixedKernel (kernel FunctionType
+ * resolved), mapping spmd blocks to physical cores per launch shape:
+ *   - Spmd -> standalone AIV kernel : required N == #VECTOR cores (aiv_only)
+ *   - Spmd -> standalone AIC kernel : required N == #CUBE cores (aic_only)
+ *   - Spmd -> Group (mixed kernel)  : required N == #CUBE core-groups (any barrier)
+ * A partial or over-occupancy launch deadlocks on device (507018); the error
+ * message points users at ``mode="soft"`` for partial occupancy. Bare
+ * hard-syncall kernels with no ``pl.spmd`` launch are not checked.
+ *
+ * @return Shared pointer to HardSyncallOccupancy PropertyVerifier
+ */
+PropertyVerifierPtr CreateHardSyncallOccupancyPropertyVerifier();
+
+}  // namespace ir
+}  // namespace pypto
+
+#endif  // PYPTO_IR_VERIFIER_VERIFIER_H_

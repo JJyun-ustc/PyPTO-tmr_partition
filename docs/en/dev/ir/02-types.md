@@ -1,0 +1,845 @@
+# PyPTO IR Types and Examples
+
+This document covers the type system and provides practical usage examples.
+
+## Type System
+
+### ScalarType
+
+Represents primitive scalar types.
+
+```python
+from pypto import DataType, ir
+
+int_type = ir.ScalarType(DataType.INT64)
+float_type = ir.ScalarType(DataType.FP32)
+```
+
+**Supported DataTypes:** INT8, INT16, INT32, INT64, UINT8, UINT16, UINT32, UINT64, FP16, FP32, FP64, BOOL, INDEX, TASK_ID
+
+> **Note:** `INDEX` is a distinct integer type used for index computations (loop variables, dimensions, offsets, strides). It has its own type code and string representation (`"index"`). While semantically similar to `INT64`, `INDEX != INT64` — they are separate types. Implicit casts between INDEX and INT64 are suppressed in codegen.
+>
+> **Note:** `TASK_ID` is an opaque 64-bit handle (type code `0x50`) representing a runtime `TaskId`. It is **not** a numeric type — no arithmetic is defined on it. A `Scalar[TASK_ID]` value is produced by `pl.submit(...)` (the second tuple element it returns names the producer task) inside `with pl.manual_scope():` regions. The Python literal `None` is the "no producer yet" sentinel — it seeds a TaskId loop iter_arg and is accepted as a `deps=[None]` entry; in a TaskId position it lowers to the [`system.task_invalid`](05-operators.md#syncop-synchronization-operations) builtin → `TaskId::invalid()`. TaskId values are passed in the `deps=[tid1, tid2]` kwarg of `pl.submit(...)`. Codegen lowers `TASK_ID` to `TaskId`.
+
+### Register IR descriptors
+
+`RegType(shape, dtype, kind)` inherits directly from `Type`. Its shape is a
+single positive integer counting logical lanes, independent of the physical
+vector width. `lanes` aliases that integer. `RegKind.VecReg` rejects `BOOL`;
+`RegKind.MaskReg` requires `BOOL`. Invalid shapes, unknown dtypes and unknown kinds fail at
+construction or deserialization.
+
+```python
+vector = ir.RegType(64, DataType.FP32, ir.RegKind.VecReg)
+mask = ir.RegType(64, DataType.BOOL, ir.RegKind.MaskReg)
+```
+
+The annotation forms are `pl.Reg[64, pl.FP32]` (VecReg by default) and
+`pl.Reg[64, pl.BOOL, pl.RegKind.MaskReg]`. These descriptors, the fieldless
+`ir.RegScopeStmt(name_hint, body, span, leading_comments=[], attrs=None)`, and
+`ir.ForStmt.hardware_loop_policy` are IR infrastructure. Direct construction,
+visitor/mutator traversal, structural comparison and binary serialization are
+supported. Register operations, `pl.reg_scope`, complete scope DSL roundtrips
+and VF code generation are reserved for later changes.
+
+`HardwareLoopPolicy.Auto` is the default for new loops and old serialized
+loops that omit the field. `Require` is persistent semantic metadata; it must
+never silently become Auto. Unknown serialized policy values fail. Hardware
+loop analysis and emission are not implemented by this infrastructure change.
+Simplify may remove proven zero-trip Sequential Require loops and return initial
+carried values; nonempty Require loops, including single-trip loops, are preserved.
+
+### Internal buffer types
+
+`BufferType` describes a mutable on-chip buffer in the final device IR. It
+inherits directly from `Type`: it has no `MemRef`, base pointer, address, or
+runtime expression fields. Storage identity belongs to the defining SSA value;
+ownership is declared by the defining operator.
+
+```python
+buffer_type = ir.BufferType(
+    [32, 64], DataType.FP32, ir.Mem.Vec, valid_shape=[-1, 64]
+)
+multi_type = ir.MultiBufferType(buffer_type, slot_count=2)
+```
+
+Physical extents must currently be static positive integers. `valid_shape`
+contains static extents between zero and the physical extent, or `-1` to mark
+a runtime valid extent supplied as an operator operand. Omitting it means the
+full physical shape. Layout, fractal size in bytes, padding, and compact mode
+are explicit descriptor fields. `MultiBufferType` describes identical slots of
+one multi-buffer allocation; its slot count must be positive. Control-flow
+type checking compares the complete descriptors, including slot counts and
+nested tuple elements, across branch results and loop-carried values.
+
+`VoidType` means a known absence of an SSA result, distinct from `UnknownType`.
+Void calls belong in `EvalStmt`; they cannot be bound to variables, passed as
+operands, packed into tuples, yielded, or returned as values. Allocation-size
+expressions, including `WindowBuffer.size`, must also produce a value.
+Expression values in `Call` and `Submit` attrs and kwargs follow the same
+rule at construction, including when attributes are attached with
+`ir.set_call_attrs`.
+
+These are initial buffer IR building blocks. Automatic tile-to-buffer lowering
+is not yet enabled; the public Tile DSL and default pipeline still use
+`TileType`. Direct PTO emission accepts explicitly constructed buffer programs
+with dense row-major Vec FP16/BF16/FP32/INT32 descriptors of rank one or two,
+scalar parameters and control flow, and the buffer operations below. Ordinary GM
+parameters support dense ND rank-2 FP16/BF16/FP32/INT32 tensors with static
+physical shapes and more than one column. Arithmetic recipes impose their own
+narrower dtype contracts. Normalized Tensor returns alias those parameters;
+the native kernel still returns void. Buffer parameter ABI, native function
+results, boxed subviews, mutable view metadata at allocation, slots, helpers, and other physical layouts are not yet supported
+and produce explicit errors. Buffer type dumps use native
+`pypto.ir.BufferType(...)` constructors; binary serialization preserves their
+complete descriptors. Reparsing complete buffer-program dumps through the
+DSL parser is not yet supported.
+
+#### Buffer operator contracts
+
+Registrations default to `OpIRStage::Functional`. Internal buffer operators
+explicitly select `OpIRStage::Buffer` and `set_internal_only()`. Their output
+arity is declared: zero requires `VoidType`, one a native result, and multiple
+results a matching `TupleType`. Functional registrations still require at least
+one result under the existing contract.
+
+Every buffer operand declares data and metadata access separately with
+`set_buffer_arg_effect(i, data, metadata)`; scalar operands use
+`set_buffer_non_memory_arg(i)`. Both access dimensions use `BufferAccess`
+(`None`, `Read`, `Write`, `ReadWrite`). No declaration defaults to read access.
+`set_buffer_result_behavior(...)` classifies results as allocation, alias,
+borrowed handle, or native value; void calls declare `None`. Alias and borrowed
+results name their source operand. `Allocate` declares a root handle; an explicit
+address may overlap other roots. It does not prove freshness or initialization.
+Descriptor and memory-space legality remain part of each operator's type
+deduction or explicit result validation.
+
+`buffer.alloc` uses `f_validate_explicit_type(...)` instead of a deducer: its
+physical descriptor exists only in `Call.type`. These mutually exclusive modes
+prevent a second copy of the descriptor in kwargs. The private IR builder
+accepts the result type before the span:
+
+```python
+from pypto.pypto_core import ir as _ir
+
+span = ir.Span.unknown()
+valid_rows = ir.Var("valid_rows", ir.ScalarType(DataType.INDEX), span)
+descriptor = ir.BufferType([32, 64], DataType.FP32, ir.Mem.Vec, valid_shape=[-1, 64])
+allocation = _ir._create_internal_op_call(
+    "buffer.alloc", [ir.MakeTuple([valid_rows], span)], {}, descriptor, span
+)
+```
+
+The first operand is always a `MakeTuple` containing just the runtime valid
+extents, in the order of the descriptor's `-1` dimensions. Static descriptors
+use an empty tuple. The optional second operand is the final effective byte
+address, with no additional base or offset. An omitted address requests fresh
+storage; an explicit zero is a valid addressed allocation. Negative constant
+addresses, including `-1`, are rejected. Both operands are non-memory values.
+Runtime values must be integer or `INDEX` scalars. Constant valid extents must
+lie between zero and their physical extent; runtime bounds and address
+nonnegativity are preconditions when they cannot be checked statically.
+
+`buffer.set_validshape(buffer, valid_extents)` returns `VoidType` and writes
+metadata only. Its `MakeTuple` operand includes **all** dimensions. Dimensions
+marked `-1` may change within their physical bounds; static valid dimensions
+must be supplied as matching constants. The operation changes neither the
+immutable type nor buffer identity. Lowering must select a dynamic descriptor
+in advance for any valid dimension that changes over a handle's lifetime.
+The initial PTO emitter additionally requires rank two and both native valid
+dimensions dynamic (`valid_shape=[-1, -1]`) for `set_validshape`, as required by
+the native instruction. A fixed initial extent can still be a constant operand
+of such a dynamic descriptor. Mixed static/dynamic descriptors remain supported
+for allocation, but cannot be silently promoted when emitting a metadata update.
+
+`OpRegistry::ValidateBufferCall` validates an existing call against the same
+schema as creation, including its original result type and kwargs. The
+`BufferIR` property applies this check in device functions and rejects logical
+tiles, implicit buffer aliases, and buffer-valued control-flow carries. It
+composes SSA, use-after-definition, and assignment-type checks. This establishes
+the representation contract; storage lifetime, overlap, and initialization
+proofs belong to subsequent verification.
+
+The `buffer.copy(src, dst)`, `buffer.mul(lhs, rhs, dst)`, and `buffer.add(lhs, rhs, dst)` operations
+write their explicit destination and return `VoidType`. They currently require
+matching Vec buffer descriptors, except that `buffer.copy` also moves a Mat cube
+operand into Left or Right: the element type and physical/valid extents stay
+the same while the destination descriptor supplies its own fractal layout. A write effect does not imply that all bytes
+are initialized. Exact input/destination aliases are allowed; equality of
+runtime valid extents and legalization of partially overlapping views are
+preconditions for constructing these calls. Existing Functional-stage `ArgEffect` queries deliberately
+reject buffer operators; buffer consumers must use `GetBufferArgEffect`.
+Direct codegen validates `BufferIR` and emits allocation, destination writes,
+and valid-state updates directly from these calls and their `BufferType`.
+Address emission depends only on the allocation operand; the legacy
+`emit_tile_addr` flag cannot remove or invent a buffer address. Dynamic
+operands remain in their lexical scope. No logical `TileType` or `MemRef` is
+reconstructed, and no implicit tile allocation pass runs on this path. The
+pipeline with `enable_buffer_ir=True` converts Tile IR before emission through
+[LowerTileToBuffer](../passes/55-lower_tile_to_buffer.md).
+
+Static storage views use ordinary SSA alias edges in the same Buffer stage:
+
+```text
+%root = buffer.alloc(()) : Buffer<[128, 32], UINT8, Vec>
+%bytes = buffer.subview(%root, (2, 0)) : Buffer<[64, 32], UINT8, Vec>
+%tile = buffer.reshape(%bytes) : Buffer<[16, 32], FP32, Vec>
+```
+
+`buffer.subview(source, (row, col)[, valid])` is a strided window of a dense
+row-major rank-2 Vec buffer: the result keeps the source's element type and row
+pitch, and its static shape must fit the source. Offsets are integer or `INDEX`
+scalars, constant or runtime; constant offsets are bounds-checked. The optional
+valid tuple states every result valid extent (constants for static descriptor
+dimensions) and is required when a result dimension is dynamic or its static
+valid extent is smaller than the physical shape. Constant valid operands must
+be positive and no larger than the corresponding window dimension; zero-valid
+windows are not supported. Full-width
+`UINT8[N,32]` byte windows of a storage root are the static special case. `buffer.reshape` preserves the exact physical byte count and accepts
+static dense row-major rank-2 Vec FP16, BF16, FP32, INT16, INT32 and UINT8 descriptors, with physical
+rows aligned to 32 bytes. In Mat, Left, Right and Acc it only relabels one
+whole fractal window in the same space (for example NZ to ZN) with the same
+element type, byte count and static valid extents. Both operations declare `Alias(0)`, no data access, and
+source-metadata read. They neither allocate storage nor initialize data.
+Every intermediate shape, dtype and valid extent is explicit in its result type.
+`buffer.set_validshape` cannot mutate these static view handles.
+
+A runtime-offset window is only known to lie within its source window, so
+`BufferIR` uses that whole source range when proving disjointness, including
+through subsequent static subviews and reshapes. Equal conservative ranges
+do not prove exact aliasing.
+
+`BufferIR` memoizes root identity, relative offset, byte extent, inherited row
+pitch and offset certainty for these views. Subviews retain their parent's pitch;
+reshapes establish the result layout's pitch. Elementwise recipes, and copies involving views, check source/destination
+windows using relative offsets within one root or effective addresses across
+placed roots. Distinct addressless allocations are disjoint; distinct unproven
+incoming roots are not a disjointness proof. Same-root disjoint windows remain
+provable even with a runtime base address. This does not establish initialization
+or lifetime safety. Legacy copies between incoming non-view buffers retain their
+existing overlap precondition. Placed addresses are compared only within one
+memory space; windows in different spaces never overlap.
+
+Cube operations write an explicit Acc destination from Left/Right operands:
+
+```text
+buffer.matmul(lhs_left, rhs_right, acc) : Void        # acc = lhs @ rhs
+buffer.matmul_acc(lhs_left, rhs_right, acc) : Void    # acc = acc + lhs @ rhs
+buffer.extract(src, row, col, dst) : Void             # static-shape window copy
+```
+
+Operands are rank-2 `[M, K] x [K, N] -> [M, N]` physical descriptors with
+identical FP16, BF16, FP32 or INT8 operand types and the matching FP32/INT32
+accumulator. Static rhs valid K must cover lhs valid K. Both forms write exactly
+the product rectangle (lhs valid rows by rhs valid columns), and a static
+destination's valid extents must equal it, as PTOAS requires. `buffer.matmul`
+overwrites that rectangle; `buffer.matmul_acc` adds to it in place and has no
+separate accumulator input. A wider accumulator is written through a
+product-shaped view of the same storage. The cube writes whole fractal boxes
+(16x16 in Acc): boxes outside the product keep their data, but the rest of a
+partially covered box is not preserved (zeros were measured on a2a3, as on the
+legacy path). `buffer.extract` copies a
+destination-shaped window at integer or `INDEX` offsets from Mat into Left/Right,
+or within Vec; constant offsets are bounds-checked and the offsets are
+non-memory operands.
+
+GM transfers expose their complete window as ordinary operands:
+
+```text
+buffer.load(tensor, offsets_tuple, valid_extents_tuple, dst_buffer) : Void
+buffer.store(src_buffer, offsets_tuple, valid_extents_tuple, tensor) : Void
+```
+
+These transfer schemas require ordinary rank-2 Tensor/Vec Buffer operands
+with matching FP16, BF16, FP32 or INT32 element types. `buffer.load` may also
+fill a Mat cube operand (FP16, BF16, FP32 or INT8; the transfer converts ND to
+the fractal layout). `buffer.store` may also drain an Acc accumulator through
+the fix-pipe, whose only unscaled conversions keep the accumulator type or turn
+FP32 into FP16/BF16. Offsets are nonnegative element indices. The tuples contain two
+integer or `INDEX` scalars. Each transfer extent must equal the buffer's current
+valid extent; a static descriptor axis requires that exact constant. Constant
+extents and windows are checked against buffer capacity, GM physical shape,
+and the tensor's effective valid region (`TensorView.valid_shape`, or the full
+shape when omitted). Transfers cannot expand the tensor's valid metadata.
+Dynamic equality, nonnegativity, and bounds are lowering/runtime preconditions.
+Neither transfer changes buffer valid metadata or initializes untouched data.
+The source has data-read/metadata-read effects and the destination has
+data-write/metadata-read effects; both tuples are non-memory operands. A GM
+store writes its selected region without reading the untouched remainder.
+
+Direct emission currently requires the Tensor operand to be a function parameter
+with packed ND strides and no padding. Loads require `In` or `InOut`, stores
+require `Out` or `InOut`. GM pointer parameters precede scalars in the native ABI
+regardless of their IR order. Parameter directions, Tensor return types, and
+normalized output-parameter return values remain intact in IR for orchestration;
+only scalar region results/carries are accepted. Dynamic physical shapes,
+non-parameter GM views, cache-policy/atomic kwargs, and other transfer layouts
+require later recipes and are rejected explicitly.
+
+The initial emitter accepts unsigned scalar values directly as allocation
+addresses, GM offsets, or valid extents, preserving their unsigned value when widening.
+Unsigned arithmetic and casts other than BOOL-to-integer, index-to-integer,
+and same-width integer conversions require a future native recipe and are rejected
+before emission. For loops require an `INDEX` induction variable and `INDEX` or signed
+integer bounds, with a provably positive constant step. Runtime-valued, zero,
+and negative steps are rejected before emission. These are emitter limits, not restrictions on the Buffer IR
+representation itself.
+
+### TensorType
+
+Multi-dimensional tensor with optional memory reference.
+
+```python
+span = ir.Span.unknown()
+
+# Tensor with shape [10, 20]
+shape = [ir.ConstInt(10, DataType.INT64, span), ir.ConstInt(20, DataType.INT64, span)]
+tensor_type = ir.TensorType(shape, DataType.FP32)
+
+# Tensor with MemRef: base allocation, byte offset within it, size in bytes
+memref = ir.MemRef("mem_ddr_0", 0, 800)
+tensor_with_memref = ir.TensorType(shape, DataType.FP32, memref)
+```
+
+`TensorType.memory_space` is always `ir.Mem.DDR`. A `MemRef` names an
+allocation (`base_`) and a byte range within it (`byte_offset_`, `size_`);
+memory space is not stored on `MemRef` itself. See
+[MemRef](01-hierarchy.md#memref-memory-reference) for the full field list.
+
+### DistributedTensorType
+
+`DistributedTensorType` is a precise-`ObjectKind` subclass of `TensorType`
+used as the function-signature type for chip orchestrator / InCore parameters
+that slice a HCCL window buffer carved by a CommDomainScopeStmt. It exists so cross-rank op
+verifiers (introduced in later milestones) can reject plain `Tensor`
+arguments — `As<TensorType>` does NOT match a `DistributedTensorType`
+(precise `ObjectKind` semantics; see
+[ir-kind-traits.md](../../../../.claude/rules/ir-kind-traits.md)). Use
+`As<DistributedTensorType>` to dispatch on the distributed variant.
+
+The DSL surface is `pld.DistributedTensor[[shape], dtype]`:
+
+```python
+import pypto.language.distributed as pld
+import pypto.language as pl
+
+@pl.function(type=pl.FunctionType.InCore)
+def kernel(self, data: pld.DistributedTensor[[256], pl.FP32]): ...
+```
+
+At the IR level:
+
+```python
+t = ir.DistributedTensorType([64], DataType.FP32)
+assert isinstance(t, ir.TensorType)            # C++ inheritance preserved
+# As<TensorType>(t) → null; As<DistributedTensorType>(t) → cast.
+```
+
+Allocation-side metadata (per-rank size, host-staging flags) lives on the
+`ir.WindowBuffer` `Var` subclass that the `pld.tensor.alloc_window_buffer` op binds.
+Slices materialised through `pld.tensor.window(buf, [shape], dtype=...)` carry an
+optional back-reference (`DistributedTensorType.window_buffer`) to the source
+`WindowBuffer`, so two same-shape / same-dtype slices of different
+allocations stay structurally distinct. User-declared parameter annotations
+like `pld.DistributedTensor[[shape], dtype]` leave this field as `None`.
+Tile types do not have a distributed variant; cross-rank ops always operate
+on `DistributedTensor`.
+
+**Local compute over a window.** Inside an InCore scope a window slice *is*
+this rank's local GM, so the ordinary tensor ops read and write it like any
+other GM tensor. Those ops match their operand with
+[`AsTensorTypeLike`](../../../../include/pypto/ir/kind_traits.h) (both kinds)
+rather than the exact-kind `As<TensorType>`. What the result type is depends on
+whether the op yields a *view of* the window or *new data*:
+
+| Ops accepting a window | Result kind |
+| ---------------------- | ----------- |
+| `tensor.slice`, `tensor.assemble`, `tensor.view`, `tensor.write` | `DistributedTensorType` — still a view into the same comm-group allocation |
+| the element-wise and unary families, the reductions, `tensor.matmul`, `tensor.matmul_acc` (`lhs` / `rhs` only) | plain `TensorType` — the result is fresh local data |
+| `tensor.read` | `ScalarType` — one element, no view |
+
+Two documented rejections: `tensor.reinterpret_view` refuses a window outright,
+and `tensor.matmul_acc`'s **`acc`** operand must be a plain `TensorType` — only
+the matrix unit writes L0C, so there is no data path from a window into a Cube
+accumulator. Accumulate locally and store into the window afterwards.
+
+Many other tensor ops still reject a window although they read or write plain
+GM (all the broadcasts, `reshape`, `transpose`, `concat`, the gather / scatter
+family, …). `tests/ut/ir/operators/test_window_operand_acceptance.py` holds the
+authoritative per-operator classification and keeps it honest.
+
+### TensorType with TensorView
+
+Tensor with layout and stride information for optimized memory access.
+
+```python
+# Create tensor with tensor view (stride/valid_shape accept int or Expr)
+tensor_view = ir.TensorView(stride=[1, 128], layout=ir.TensorLayout.ND)
+tensor_with_view = ir.TensorType([128, 256], DataType.FP32, memref=None, tensor_view=tensor_view)
+
+# With valid_shape
+tensor_view = ir.TensorView(stride=[1, 128], layout=ir.TensorLayout.ND, valid_shape=[64, 128])
+
+# With pad mode for out-of-valid-shape accesses (symmetric with TileView)
+tensor_view = ir.TensorView(
+    stride=[1, 128], layout=ir.TensorLayout.ND, valid_shape=[64, 128], pad=ir.PadValue.zero
+)
+
+# Different layouts
+nd_view = ir.TensorView(stride=[1, 128], layout=ir.TensorLayout.ND)  # ND layout
+dn_view = ir.TensorView(stride=[1, 128], layout=ir.TensorLayout.DN)  # DN layout
+nz_view = ir.TensorView(stride=[1, 128], layout=ir.TensorLayout.NZ)  # NZ layout
+
+# Expr values also accepted (e.g., symbolic dimensions)
+stride = [ir.ConstInt(1, DataType.INT64, span), ir.ConstInt(128, DataType.INT64, span)]
+tensor_view = ir.TensorView(stride=stride, layout=ir.TensorLayout.ND)
+
+# Tensor with both MemRef and TensorView
+memref = ir.MemRef("mem_ddr_1", 0, 16384)
+tensor_with_both = ir.TensorType([128, 256], DataType.FP16, memref=memref, tensor_view=tensor_view)
+```
+
+**TensorLayout values:**
+
+- `ND`: ND layout
+- `DN`: DN layout
+- `NZ`: NZ layout
+
+**TensorView fields:**
+
+- `stride`: stride for each dimension
+- `layout`: `TensorLayout.ND` / `DN` / `NZ` / `MX_A_ZZ` / `MX_B_NN`
+- `valid_shape`: optional valid-region dimensions (empty means use full shape)
+- `pad`: `PadValue.null` (default) / `zero` / `max` / `min` — padding mode used
+  when loads/slices read outside the `valid_shape`. Peer of `TileView.pad`;
+  `tensor.slice(..., pad_value=PadValue.zero)` writes this field.
+
+#### Canonical TensorView form (RFC #1300)
+
+Per RFC #1300, the `(shape, stride, layout)` triple has a single canonical
+interpretation across passes / verifiers / codegen:
+
+- `shape` is the **logical** shape — the dimensions consumers index by.
+- `stride[i]` is the element step when the *i-th* logical dim increments by 1.
+- `layout` is a derivable / asserted *tag* over `(shape, stride)`, not an
+  independent description. ND and DN each have a packed canonical and a
+  strided family (sub-views inheriting the parent's stride).
+
+The packed canonical formulas (`BuildLogicalStridesFromLayout` in
+[`tensor_view_semantics.h`](../../../../include/pypto/ir/transforms/utils/tensor_view_semantics.h)):
+
+| Layout | Packed canonical |
+| ------ | ---------------- |
+| `ND` | `stride[n-1] = 1; stride[k] = stride[k+1] * shape[k+1]` |
+| `DN` (`n ≥ 2`) | `stride[n-2] = 1`; `stride[n-1] = shape[n-2]`; `stride[n-3] = shape[n-2] * shape[n-1]`; outer dims row-major |
+| `NZ` | row-major over the *blocked* rank-5 shape `[B, C/c0, R/16, 16, c0]` — see [BlockNzTensorViews](../passes/16-block_nz_tensor_views.md) |
+
+**Two ways to spell the same canonical TensorView**:
+
+- **Implicit** — `view.has_value() && view.stride.empty()`: layout tag is
+  set, stride is left blank; consumers must treat it as the packed
+  canonical for the carried layout.
+- **Explicit** — every dimension's stride is spelled out.
+
+The [`MaterializeTensorStrides`](../passes/34-materialize_tensor_strides.md)
+pass rewrites every implicit form to its explicit packed canonical so
+codegen sees a single contract. The `TensorViewCanonical` `IRProperty` +
+verifier enforces this:
+
+- **Weak mode** (registry default, `passes.PropertyVerifierRegistry.verify`):
+  `stride.empty()` is accepted as implicitly packed canonical.
+- **Strict mode** (codegen-entry contract,
+  `passes.verify_tensor_view_canonical(program, require_materialized=True)`):
+  `view.stride` must be non-empty and match the layout family.
+
+Both modes reject an *unblocked* `NZ` shape on `TensorType` and accept
+symbolic dims under `relaxed_symbolic` semantics.
+
+### TileType
+
+Specialized tensor with optional memory and view information for hardware-optimized operations.
+
+```python
+# Basic 16x16 tile
+shape = [ir.ConstInt(16, DataType.INT64, span)] * 2
+tile_type = ir.TileType(shape, DataType.FP16)
+
+# 3D tile (supported at IR level)
+shape_3d = [ir.ConstInt(4, DataType.INT64, span),
+            ir.ConstInt(16, DataType.INT64, span),
+            ir.ConstInt(16, DataType.INT64, span)]
+tile_type_3d = ir.TileType(shape_3d, DataType.FP16)
+
+# Tile with MemRef and TileView. TileView is immutable — every field is passed
+# to the constructor; valid_shape / stride / start_offset accept int or Expr.
+memref = ir.MemRef("mem_left_0", 0, 512)
+
+tile_view = ir.TileView(valid_shape=[8, 16], stride=[1, 16], start_offset=0)
+
+tile_with_view = ir.TileType(shape, DataType.FP16, memref, tile_view, ir.Mem.Left)
+```
+
+`TileType.memory_space` is the source of truth for tile placement. If a
+`TileType` carries a `MemRef`, provide the tile memory space on the `TileType`
+itself.
+
+The `valid_shape` above is a genuine sub-region (`[8, 16]` of a `[16, 16]`
+tile). A `valid_shape` equal to the full shape is redundant, so the constructor
+clears it — see the canonicalization rules below.
+
+For Python DSL annotations, omitted `TileView` syntax is normalized to an
+implicit TileView derived from the tile shape and, when present, the tile
+memory space. Redundant explicit defaults such as `pl.TileView()` are treated
+as semantically equivalent to the omitted form and may print back in canonical
+syntax. `TileView.compact` records whether a partial boxed tile uses PTO's
+valid-region-packed representation (`CompactMode.normal`) or the ordinary
+physical-box representation (`CompactMode.null`, the default). It is meaningful
+only in the fractal spaces — `Left` / `Right` / `Acc` — because it *is* an
+N-fractal pitch; the `AccCompactValid` verifier rejects it anywhere else. The
+compiler sets it automatically for partial `tile.extract` transfers into
+L0A/L0B and for a row-narrowed matmul accumulator (whose L0C pitch `mad`
+derives from the L0A operand's valid rows), and `AutoTileMatmulL0` declares it
+on a synthesized accumulator seed via `tile.create(..., compact=True)`. Normal
+user code does not need to select it.
+
+The implicit view depends on the memory space, so the constructor collapses a
+view to `nullopt` only against the space it is given. An `f_deduce_type`
+producing a tile in a known space **must pass that space** — deducing against
+`nullopt` and letting `OpRegistry::Create` stamp it afterwards canonicalizes
+twice, against two different implicit layouts, making the result depend on
+whether the view happened to collapse (i.e. on `valid_shape` and `pad`).
+
+### ArrayType
+
+On-core fixed-size homogeneous 1-D array. Lives on the scalar register file /
+C stack (memory space `ScalarLocal`). Distinct from `TensorType` (GM/DDR
+pointer) and `TileType` (vector/cube hardware state).
+
+```python
+arr_type = ir.ArrayType(DataType.INT32, 16)       # 16 INT32 elements
+# DSL annotation form:
+arr: pl.Array[16, pl.INT32]
+```
+
+**v1 constraints:**
+
+- Element dtype must be integer (`INT8/16/32/64`, `UINT8/16/32/64`) or `BOOL`.
+- Shape is rank-1 only; extent must be a compile-time `ConstInt`.
+- No `MemRef` — codegen lowers to a bare C stack array `dtype name[N]`.
+- Cannot cross function boundaries (enforced by `ArrayNotEscaped` verifier).
+
+**Operations:**
+
+| Op | Semantics | Orchestration (C++) | InCore (`.pto`) |
+| -- | --------- | ------------------- | --------------- |
+| `array.create(N, dtype)` | Allocate stack-local array | `dtype arr[N] = {0};` | `pto.declare_local_array -> !pto.local_array<NxT>` |
+| `array.get_element(arr, i)` → `Scalar` | Read element `i` | `dtype v = arr[i];` | `pto.local_array_get arr[i] : !pto.local_array<NxT> -> T` |
+| `array.update_element(arr, i, v)` → `Array` | Functional update (SSA-pure) | `arr[i] = v;` (alias LHS to input) | `pto.local_array_set arr[i], v : !pto.local_array<NxT>, T` |
+
+`array.update_element` is the SSA-functional equivalent of `tensor.assemble`:
+it returns a new SSA value of `ArrayType` representing "the array with element
+i replaced by v". Both codegen paths alias the result Var to the input array's
+storage, emitting in-place writes — no copy.
+
+The InCore path mirrors PTOAS's stack-local array triad
+(`pto.declare_local_array` / `pto.local_array_get` / `pto.local_array_set`).
+Subscripts are lowered to MLIR `index` (`arith.index_cast` when the source is
+not already `index`), and the `set` value is cast to the element dtype `T` when
+it differs (the verifier permits an `index`-typed value into an integer array).
+
+**DSL indexing sugar:**
+
+```python
+arr = pl.array.create(8, pl.INT32)
+arr[i] = v          # desugars to: arr = pl.array.update_element(arr, i, v)
+x = arr[i]          # desugars to: x = pl.array.get_element(arr, i)
+```
+
+The parser rebinds the LHS variable on `arr[i] = v` so subsequent reads see the
+updated array — same idiom as the Tensor/Tile subscript-write sugar.
+
+### TupleType
+
+Heterogeneous tuple of types.
+
+```python
+# Scalar tuple: (int, float)
+scalar_tuple = ir.TupleType([
+    ir.ScalarType(DataType.INT64),
+    ir.ScalarType(DataType.FP32)
+])
+
+# Nested tuple
+nested = ir.TupleType([
+    ir.TupleType([ir.ScalarType(DataType.INT64)]),
+    ir.ScalarType(DataType.FP32)
+])
+```
+
+### PipeType
+
+Hardware execution pipelines or synchronization barriers.
+
+```python
+pipe_s = ir.PipeType(ir.PipeType.S)    # Scalar pipe
+pipe_v = ir.PipeType(ir.PipeType.V)    # Vector pipe
+pipe_m = ir.PipeType(ir.PipeType.M)    # Matrix pipe
+pipe_all = ir.PipeType(ir.PipeType.ALL) # All pipes
+```
+
+### UnknownType
+
+Placeholder for unknown or inferred types.
+
+```python
+unknown = ir.UnknownType()
+```
+
+### MemRef Type Annotations in DSL
+
+MemRef can be specified as a positional argument in type annotations within `@pl.program` / `@pl.function` DSL code:
+
+```python
+import pypto.language as pl
+
+@pl.program
+class MyProgram:
+    @pl.function(type=pl.FunctionType.InCore)
+    def kernel(self, x: pl.Tensor[[64, 64], pl.FP32]):
+        # Tile with MemRef and explicit tile memory space
+        tile_a: pl.Tile[[64, 64], pl.FP32, pl.MemRef(0, 16384, 0), pl.Mem.Vec] = pl.tile.load(
+            x, offsets=[0, 0], shapes=[64, 64]
+        )
+
+        # Tensor with MemRef (3-arg: shape, dtype, memref)
+        y: pl.Tensor[[64, 64], pl.FP32, pl.MemRef(0, 16384, 1)] = pl.add(x, 1.0)
+
+        # Tensor with layout and MemRef (4-arg: shape, dtype, layout, memref)
+        z: pl.Tensor[[64, 64], pl.FP32, pl.NZ, pl.MemRef(0, 16384, 2)] = pl.add(x, 1.0)
+```
+
+**`pl.MemRef(addr, size, id)` parameters:**
+
+| Parameter | Type | Description |
+| --------- | ---- | ----------- |
+| `addr` | `int` | Base address offset |
+| `size` | `int` | Memory allocation size in bytes |
+| `id` | `int` | Memory buffer identifier |
+
+`TensorType` annotations are implicitly in `DDR`. Legacy
+`pl.MemRef(pl.Mem.DDR, addr, size, id)` is still accepted for tensor
+annotations for compatibility, but new code should prefer the 3-argument form.
+
+**Disambiguation (3-arg Tensor):** The parser distinguishes `pl.MemRef(...)`
+from `pl.NZ`/`pl.DN`/`pl.ND` layout enums automatically.
+
+**Tile rule:** If you use `pl.MemRef(...)` in a `pl.Tile[...]` annotation, you
+must also provide the tile memory space as a separate `pl.Mem.*` argument.
+
+### MemorySpace Enum (`pl.Mem` / `ir.Mem`)
+
+| Value | Description |
+| ----- | ----------- |
+| `DDR` | Main memory (off-chip) |
+| `Vec` | Vector/unified buffer (on-chip) |
+| `Mat` | Matrix/L1 buffer |
+| `Left` | Left matrix operand buffer |
+| `Right` | Right matrix operand buffer |
+| `Acc` | Accumulator buffer |
+| `Bias` | Bias buffer |
+| `ScalarLocal` | On-core scalar register file / C stack (`ArrayType`) |
+
+> **Note:** `pl.Mem` and `ir.Mem` are short aliases for `pl.MemorySpace` and `ir.MemorySpace` respectively. Both forms are accepted; the short form is preferred in new code.
+
+## Python Usage Examples
+
+### Example 1: Building Expressions
+
+```python
+from pypto import DataType, ir
+
+span = ir.Span.unknown()
+dtype = DataType.INT64
+
+# Variables and constants
+x = ir.Var("x", ir.ScalarType(dtype), span)
+y = ir.Var("y", ir.ScalarType(dtype), span)
+one = ir.ConstInt(1, dtype, span)
+two = ir.ConstInt(2, dtype, span)
+
+# Build: ((x + 1) * (y - 2)) / (x + y)
+x_plus_1 = ir.Add(x, one, dtype, span)
+y_minus_2 = ir.Sub(y, two, dtype, span)
+numerator = ir.Mul(x_plus_1, y_minus_2, dtype, span)
+denominator = ir.Add(x, y, dtype, span)
+result = ir.FloatDiv(numerator, denominator, dtype, span)
+```
+
+### Example 2: Control Flow (Absolute Value)
+
+```python
+# if (x >= 0) then { result = x } else { result = -x }
+x = ir.Var("x", ir.ScalarType(dtype), span)
+result = ir.Var("result", ir.ScalarType(dtype), span)
+zero = ir.ConstInt(0, dtype, span)
+
+condition = ir.Ge(x, zero, dtype, span)
+then_assign = ir.AssignStmt(result, x, span)
+else_assign = ir.AssignStmt(result, ir.Neg(x, dtype, span), span)
+
+abs_stmt = ir.IfStmt(condition, then_assign, else_assign, [result], span)
+```
+
+### Example 3: Loop with Accumulation
+
+```python
+# for i, (sum,) in pl.range(n, init_values=(0,)):
+#     sum = pl.yield_(sum + i)
+
+n = ir.Var("n", ir.ScalarType(dtype), span)
+i = ir.Var("i", ir.ScalarType(dtype), span)
+zero = ir.ConstInt(0, dtype, span)
+one = ir.ConstInt(1, dtype, span)
+
+sum_iter = ir.IterArg("sum", ir.ScalarType(dtype), zero, span)
+add_expr = ir.Add(sum_iter, i, dtype, span)
+yield_stmt = ir.YieldStmt([add_expr], span)
+sum_final = ir.Var("sum_final", ir.ScalarType(dtype), span)
+
+loop = ir.ForStmt(i, zero, n, one, [sum_iter], yield_stmt, [sum_final], span)
+```
+
+### Example 4: Function with Operator Calls
+
+```python
+# def matmul(a, b) -> tensor:
+#     result = tensor.matmul(a, b, out_dtype=FP32)
+
+shape_m = ir.ConstInt(128, DataType.INT64, span)
+shape_k = ir.ConstInt(64, DataType.INT64, span)
+shape_n = ir.ConstInt(256, DataType.INT64, span)
+
+a = ir.Var("a", ir.TensorType([shape_m, shape_k], DataType.FP16), span)
+b = ir.Var("b", ir.TensorType([shape_k, shape_n], DataType.FP16), span)
+
+matmul_call = ir.op.tensor.matmul(a, b, out_dtype=DataType.FP32)
+result = ir.Var("result", ir.TensorType([shape_m, shape_n], DataType.FP32), span)
+body = ir.AssignStmt(result, matmul_call, span)
+
+return_types = [ir.TensorType([shape_m, shape_n], DataType.FP32)]
+func = ir.Function("matmul", [a, b], return_types, body, span)
+```
+
+### Example 5: Program with Multiple Functions
+
+```python
+# Helper: square(x) -> int { return x * x }
+x = ir.Var("x", ir.ScalarType(dtype), span)
+square_result = ir.Var("result", ir.ScalarType(dtype), span)
+square_body = ir.AssignStmt(square_result, ir.Mul(x, x, dtype, span), span)
+square_func = ir.Function("square", [x], [ir.ScalarType(dtype)], square_body, span)
+
+# Main: sum_squares(a, b) -> int { return square(a) + square(b) }
+a = ir.Var("a", ir.ScalarType(dtype), span)
+b = ir.Var("b", ir.ScalarType(dtype), span)
+
+program = ir.Program([square_func], "math", span)
+square_gvar = program.get_global_var("square")
+
+call_a = ir.Call(square_gvar, [a], span)
+call_b = ir.Call(square_gvar, [b], span)
+sum_expr = ir.Add(call_a, call_b, dtype, span)
+
+main_result = ir.Var("result", ir.ScalarType(dtype), span)
+main_body = ir.AssignStmt(main_result, sum_expr, span)
+main_func = ir.Function("sum_squares", [a, b], [ir.ScalarType(dtype)], main_body, span)
+
+program = ir.Program([square_func, main_func], "math", span)
+```
+
+### Example 6: Memory Layout with TileType
+
+```python
+# 32x32 tile in Left memory, viewing a 16x32 valid region with custom stride
+shape = [ir.ConstInt(32, DataType.INT64, span)] * 2
+memref = ir.MemRef("mem_left_0", 0, 2048)
+
+tile_view = ir.TileView(valid_shape=[16, 32], stride=[1, 32], start_offset=0)
+
+tile_type = ir.TileType(shape, DataType.FP16, memref, tile_view, ir.Mem.Left)
+```
+
+## Type System Summary
+
+| Type | Dimensions | Memory Info | Use Case |
+| ---- | ---------- | ----------- | -------- |
+| **ScalarType** | 0 | - | Single values |
+| **TensorType** | N (any) | Optional MemRef | General tensors |
+| **TileType** | N (any)* | Optional MemRef + TileView | Hardware-optimized tiles |
+| **BufferType** | Static physical dimensions | Defining SSA handle | Explicit device storage |
+| **MultiBufferType** | Element BufferType | Native slot group | Uniform buffer slots |
+| **VoidType** | - | - | Known absence of an SSA result |
+| **TupleType** | - | - | Multiple return values |
+| **PipeType** | - | - | Hardware synchronization |
+| **UnknownType** | - | - | Type inference placeholder |
+
+## Common Patterns
+
+**Creating constants:**
+
+```python
+i32 = ir.ConstInt(42, DataType.INT32, span)
+f32 = ir.ConstFloat(3.14, DataType.FP32, span)
+```
+
+**Creating operators:**
+
+```python
+# High-level API (recommended)
+call = ir.op.tensor.matmul(a, b, out_dtype=DataType.FP32)
+
+# Generic operator with kwargs
+call = ir.create_op_call("tensor.matmul", [a, b], {"out_dtype": DataType.FP32}, span)
+```
+
+**Statement sequences:**
+
+```python
+seq = ir.SeqStmts([stmt1, stmt2, stmt3], span)
+```
+
+## Type Checking and Casting
+
+```python
+# Check expression types
+if isinstance(expr, ir.Var):
+    print(expr.name_)
+
+# Check type objects
+if isinstance(type_obj, ir.TileType):
+    # Access tile-specific properties
+    shape = type_obj.shape
+```
+
+## Related Documentation
+
+- [IR Overview](00-overview.md) - Core concepts and design principles
+- [IR Node Hierarchy](01-hierarchy.md) - Complete node type reference
+- [Structural Comparison](03-structural_comparison.md) - Equality and hashing utilities
+
+## Summary
+
+PyPTO's type system provides:
+
+- **Scalar types** for primitive values
+- **Tensor/Tile types** for multi-dimensional data with memory layout
+- **Tuple types** for heterogeneous collections
+- **Pipe types** for hardware synchronization
+
+The IR construction API supports:
+
+- Immutable node creation with shared pointers
+- Type-safe operations with compile-time checking
+- Hardware-aware memory management via MemRef and TileView
+- Intra-program function calls via GlobalVar
+- Loop-carried dependencies via IterArg

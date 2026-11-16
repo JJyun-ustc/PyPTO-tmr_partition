@@ -1,0 +1,322 @@
+# IR Parser for DSL Functions
+
+## Overview
+
+The IR parser converts Python DSL code to PyPTO IR using decorators (`@pl.function`, `@pl.program`). It enforces SSA properties, tracks source locations, and supports nested control flow.
+
+**Key components**: Decorator → AST Parser → IR Builder → Scope Manager (SSA) → ir.Function
+
+See [IR Builder](06-builder.md) for manual IR construction and [Python IR Syntax](../language/00-python_syntax.md) for full syntax.
+
+## Implementation Structure
+
+`ASTParser` remains the entry point for function parsing, statement/expression dispatch,
+and variable binding. It composes specialized parsers rather than inheriting parsing mixins.
+
+| Module | Responsibility |
+| ------ | -------------- |
+| `control_flow_parser.py` | Loops, conditionals, yields, break and continue |
+| `scope_parser.py` | Scope directives, SPMD and split-AIV expansion through shared scope emission |
+| `call_parser.py` | Kernel, external and inline calls; submit result binding |
+| `op_parser.py` | Operator calls, distributed operations and buffer metadata |
+| `subscript_parser.py` | Tensor/tile indexing, slicing and subscript assignment |
+| `attr_parser.py` | Function and call attribute parsing |
+| `dispatch_semantics.py` | TaskId producers, dependencies and dispatch predicates |
+| `source_comments.py` | Comment attachment and block-boundary handling |
+| `region_context.py` | Active scope, split and manual-region state |
+| `parser_state.py` | Shared services, recursive callbacks and state contracts |
+| `syntax_helpers.py`, `type_semantics.py` | Shared syntax recognition and type/shape helpers |
+
+Components receive explicit dependencies and a small set of recursive callbacks; they do
+not retain the entire `ASTParser`. Shared services keep one builder, scope manager,
+evaluator, type resolver and source tracker per parser. In particular, inline expansion
+changes the existing evaluator and source tracker temporarily, so indexing, operators and
+nested statements all observe the same closure and source coordinates.
+
+Function metadata, control-flow state and inline state have separate owners. Program-wide
+buffer metadata retains the identity supplied by the decorator. TaskId producer and binding
+generation tracking share one `DispatchSemantics` instance across calls and scopes.
+
+## Usage
+
+### Basic Function
+
+```python
+import pypto
+import pypto.language as pl
+
+@pl.function
+def simple_add(
+    x: pl.Tensor[[64, 128], pl.FP16],
+    y: pl.Tensor[[64, 128], pl.FP16],
+) -> pl.Tensor[[64, 128], pl.FP16]:
+    result: pl.Tensor[[64, 128], pl.FP16] = pl.add(x, y)
+    return result
+
+# simple_add is now an ir.Function object
+assert isinstance(simple_add, pypto.ir.Function)
+```
+
+### Type Annotations
+
+All parameters and local variables require type annotations:
+
+```python
+x: pl.Tensor[[64, 128], pl.FP16]  # Recommended subscript syntax
+x: pl.Tensor((64, 128), pl.FP16)  # Legacy call syntax (also accepted)
+```
+
+Both syntaxes are equivalent; printer always outputs subscript notation.
+
+### For Loops with Iteration Arguments
+
+Use `pl.range()` with tuple unpacking for loop-carried values (iter_args):
+
+```python
+for i, (sum_val,) in pl.range(10, init_values=(sum_init,)):
+    new_sum: pl.Tensor[[1], pl.INT32] = pl.add(sum_val, i)
+    sum_out = pl.yield_(new_sum)  # Use pl.yield_ (not yield)
+```
+
+**Syntax**: `loop_var, (iter_arg1, ...)` - number of iter_args must match init_values.
+
+The same explicit syntax is accepted for `pl.unroll()` to preserve transitional
+SSA IR in print/parse roundtrips. It retains `ForKind.Unroll`; it does not convert
+the loop to sequential or expand it. `UnrollLoops` requires non-SSA input, so
+executable kernels still use ordinary assignments and unroll before SSA conversion.
+
+### Yielding and If Statements
+
+Use `pl.yield_()` to return values from nested scopes:
+
+```python
+# Single/multiple value yield
+result = pl.yield_(expr)
+v1, v2, v3 = pl.yield_(expr1, expr2, expr3)
+
+# If statements create phi nodes
+if x > 0:
+    positive: pl.Tensor[[64], pl.FP32] = pl.mul(x, 2.0)
+    result = pl.yield_(positive)
+else:
+    negative: pl.Tensor[[64], pl.FP32] = pl.mul(x, -1.0)
+    result = pl.yield_(negative)
+```
+
+## Text-Based Parsing
+
+Parse DSL code from strings or files for dynamic code generation:
+
+| Function | Purpose | Example |
+| -------- | ------- | ------- |
+| `pl.parse(code)` | Parse from string (auto-detects function/program) | `result = pl.parse("@pl.function\ndef f(x): ...")` |
+| `pl.loads(path)` | Load from file (auto-detects function/program) | `result = pl.loads('kernel.py')` |
+
+**Features**:
+
+- **Auto-detection**: Automatically detects whether code contains `@pl.function` or `@pl.program`
+- Returns `ir.Function` or `ir.Program` based on what's found
+- Single function/program per parse (raises `ValueError` otherwise)
+- Produces identical `ir.Function`/`ir.Program` objects as decorators
+- See `examples/utils/parse_from_text.py` for examples
+
+**Deprecated aliases** (still supported):
+
+- `pl.parse_program(code)` → Use `pl.parse(code)` instead
+- `pl.loads_program(path)` → Use `pl.loads(path)` instead
+
+## Internal IR Text Forms
+
+Text parsing reads annotations as AST syntax without executing them as Python
+expressions first. This preserves symbolic shape expressions even when the DSL
+runtime wrappers do not implement the corresponding Python operator. Typed
+constant leaves in printed shapes reconstruct arithmetic, power, bitwise and
+shift nodes without constant folding. Ordinary user constant expressions may
+still fold; simplification of reconstructed IR belongs to a separate pass.
+
+Shape dimensions also restore private `pl._dump.call(...)` snapshots through
+the expression parser, preserving recorded result types, operand bindings, and
+metadata. These calls must return integer/index scalars. A `tensor.dim` read
+whose operand carries storage can use this form without folding the read.
+
+Nested `pl.Tuple[...]` denotes a recursive tuple value type. The built-in
+`tuple[...]` return annotation continues to denote a list of function results;
+a nested result list is not a tuple value type and remains rejected.
+
+The printer also uses private `pl._dump` spellings. These are serialization
+syntax, not new kernel authoring APIs:
+
+| Printed form | Reconstructed IR |
+| ------------ | ---------------- |
+| `pl._dump.logical_xor(x, y)` | BOOL `Xor`; `x ^ y` instead denotes integer `BitXor` |
+| `pl.const(pl._dump.float64("7ff0000000000000"), pl.FP32)` | Positive infinity with explicit dtype |
+| `pl._dump.WindowBuffer`, `pl._dump.Unknown` | Internal fieldless type markers |
+
+`pl.Ptr` continues to represent `PtrType`, including in signatures. Marker
+round-tripping does not establish that an arbitrary internal signature can be
+lowered to an executable kernel. Unknown types remain inference placeholders;
+void value types and non-BOOL logical XOR operands are not made legal.
+
+Non-finite `ConstFloat` values use 16 hexadecimal digits encoding their stored
+IEEE 754 binary64 value, irrespective of the declared dtype. NaN sign and
+payload are retained. Structural comparison treats NaNs with identical bits as
+equal and different NaN representations as unequal; this is structural identity,
+not IEEE runtime comparison. Finite values, infinity signs, dtype checks, and
+the existing equality of positive and negative zero retain their semantics.
+
+## SSA Properties
+
+The parser enforces Static Single Assignment:
+
+**Single Assignment**: Each variable assigned once per scope
+
+```python
+# ✓ Valid
+y: pl.Tensor[[64], pl.FP32] = pl.add(x, 1.0)
+
+# ✗ Invalid - SSA violation
+y: pl.Tensor[[64], pl.FP32] = pl.add(x, 1.0)
+y = pl.mul(x, 2.0)  # Error: y already defined
+```
+
+**Scope Isolation**: Variables from inner scopes must be yielded
+
+```python
+# ✗ Invalid - temp not yielded
+for i, (sum_val,) in pl.range(10, init_values=(x,)):
+    temp: pl.Tensor[[64], pl.FP32] = pl.add(sum_val, i)
+return temp  # Error: temp not in outer scope
+
+# ✓ Valid - explicit yield
+for i, (sum_val,) in pl.range(10, init_values=(x,)):
+    temp: pl.Tensor[[64], pl.FP32] = pl.add(sum_val, i)
+    result = pl.yield_(temp)
+return result  # OK
+```
+
+**Iteration Arguments**: Create new SSA values each iteration via phi nodes.
+
+## Span Tracking and Operations
+
+**Span Tracking**: Preserves source locations for better error messages
+
+- Each IR node includes `Span` with filename, line/column ranges
+- Enables debugging, error reporting, and source-to-IR mapping
+
+**Coordinate conversion** (`span_tracker.ast_column_to_span_column`): `ast` nodes
+and `ir.Span` use different column conventions, so the parser converts at the
+boundary:
+
+| Aspect | `ast` node | `ir.Span` |
+| ------ | ---------- | --------- |
+| Line | 1-indexed (`lineno`) | 1-indexed (`begin_line`) |
+| Column | **0**-indexed (`col_offset`) | **1**-indexed (`begin_column`) |
+| Column unit | UTF-8 **bytes** | **characters** |
+
+CPython makes the same shift when it turns an internal `col_offset` into the
+reported `SyntaxError.offset`. Both aspects matter: the `+1` keeps a left-margin
+node out of `Span::is_valid()`'s rejected `column <= 0` range, and the
+byte-to-character conversion keeps the column pointing at its token on lines
+containing non-ASCII text. The inverse conversion happens once on the consumer
+side, in `ErrorRenderer._caret_index`, before any column indexes a source line.
+
+**Source-map provenance** (`pl.parse(code, source_map=...)`): When `code` is
+*generated* from another source — as `@pl.jit` does, re-deriving a kernel into a
+`@pl.program` string via `ast.unparse` — a `generated_line → (orig_file,
+orig_line, orig_col)` map remaps each span back to the user's real `.py`. With
+it, both parse and compile/pass errors point at the original file (e.g.
+`--> kernel.py:8:13`) instead of an anonymous `<string>`, and the error renderer
+reads the snippet from that real file via `linecache`. Mapping is
+**statement-granular**: a multi-line user statement resolves to its start line,
+and *synthesized* statements (loop-bridge assignments, expanded `M, N = a.shape`,
+stripped `bind_dynamic`) have no original line and keep the generated
+coordinates. `@pl.jit` builds this map in `Specializer.source_map`; the
+default (`None`) is a no-op for ordinary parsing. See issue #1612.
+
+**Supported Operations**:
+
+| Category | Examples |
+| -------- | -------- |
+| **Tensor Ops** | `pl.{add, mul, sub, div, matmul, cast, slice, ...}` |
+| **Binary Expr** | `a + b`, `a - b`, `a * b`, `a / b`, `i == 0`, `x < 10` |
+| **Literals** | `42` → `ConstInt` (INDEX), `pl.const(42, pl.INT64)` → typed `ConstInt`, `3.14` → `ConstFloat` |
+
+See [Python IR Syntax](../language/00-python_syntax.md) for complete operation list.
+
+## Complete Example
+
+Nested control flow example:
+
+```python
+@pl.function
+def flash_attn_simplified(
+    q: pl.Tensor[[64, 128], pl.FP16],
+    k: pl.Tensor[[1024, 128], pl.FP16],
+) -> pl.Tensor[[64, 128], pl.FP32]:
+    attn_init: pl.Tensor[[64, 128], pl.FP32] = pl.create_tensor([64, 128], dtype=pl.FP32)
+
+    for i, (attn,) in pl.range(16, init_values=(attn_init,)):
+        k_block: pl.Tensor[[64, 128], pl.FP16] = pl.slice(k, [64, 128], [i * 64, 0])
+        scores: pl.Tensor[[64, 128], pl.FP16] = pl.matmul(q, k_block, b_trans=True)
+
+        if i == 0:
+            new_attn: pl.Tensor[[64, 128], pl.FP32] = pl.cast(scores, target_type=pl.FP32)
+            result = pl.yield_(new_attn)
+        else:
+            updated: pl.Tensor[[64, 128], pl.FP32] = pl.add(attn, scores)
+            result = pl.yield_(updated)
+
+        final = pl.yield_(result)
+
+    return final
+```
+
+## Multi-Function Programs with @pl.program
+
+Define programs containing multiple functions that can call each other:
+
+```python
+@pl.program
+class MathOps:
+    @pl.function
+    def square(self, x: pl.Tensor[[1], pl.INT32]) -> pl.Tensor[[1], pl.INT32]:
+        result: pl.Tensor[[1], pl.INT32] = pl.mul(x, x)
+        return result
+
+    @pl.function
+    def sum_of_squares(self, a: pl.Tensor[[1], pl.INT32], b: pl.Tensor[[1], pl.INT32]) -> pl.Tensor[[1], pl.INT32]:
+        a_squared: pl.Tensor[[1], pl.INT32] = self.square(a)  # Cross-function call
+        b_squared: pl.Tensor[[1], pl.INT32] = self.square(b)
+        result: pl.Tensor[[1], pl.INT32] = pl.add(a_squared, b_squared)
+        return result
+```
+
+**Key Rules**:
+
+- Class-based syntax with `@pl.program`
+- Methods require `self` parameter (automatically stripped from IR)
+- Cross-function calls use `self.method_name()` → resolved to `GlobalVar` references
+- Two-pass parsing: collect `GlobalVar`s, then parse bodies (supports forward references)
+- Access functions: `program.get_function("name")`
+- Text parsing: `pl.parse(code)`, `pl.loads(path)` (auto-detects program/function)
+- Printing: `program.as_python()` generates valid `@pl.program` class; pass `concise=True` to omit intermediate type annotations
+
+**Examples**: See `examples/utils/cross_function_calls.py`
+
+## Limitations and Testing
+
+**Current Limitations**:
+
+- Scalar comparisons only in if conditions (not tensors)
+- No nested function definitions inside `@pl.function`
+- Limited Python subset (no classes, decorators within functions)
+- Explicit yields required for all scope outputs
+- Type annotations required for all variables
+
+**Testing**: Run `pytest tests/ut/language/parser/` for comprehensive parser tests.
+
+## See Also
+
+- [Python IR Syntax](../language/00-python_syntax.md) - Full syntax specification
+- [IR Builder](06-builder.md) - Manual IR construction API
+- [IR Overview](00-overview.md) - Core IR concepts

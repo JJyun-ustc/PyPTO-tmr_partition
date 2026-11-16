@@ -1,0 +1,165 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
+#include "pypto/ir/expr.h"
+
+#include <any>
+#include <cstddef>
+#include <memory>
+#include <optional>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "pypto/core/dtype.h"
+#include "pypto/core/error.h"
+#include "pypto/core/logging.h"
+#include "pypto/ir/kind_traits.h"
+#include "pypto/ir/scalar_expr.h"
+#include "pypto/ir/span.h"
+#include "pypto/ir/type.h"
+
+namespace pypto {
+namespace ir {
+
+void detail::CheckValueOperand(const ExprPtr& expr, const Span& span, const char* context) {
+  if (expr) CheckValueType(expr->GetType(), span.is_valid() ? span : expr->span_, context);
+}
+
+void detail::CheckValueOperands(const std::vector<ExprPtr>& exprs, const Span& span, const char* context) {
+  for (const auto& expr : exprs) {
+    CheckValueOperand(expr, span, context);
+  }
+}
+
+void detail::CheckValueAttrs(const std::vector<std::pair<std::string, std::any>>& attrs, const Span& span,
+                             const char* context) {
+  for (const auto& entry : attrs) {
+    ForEachAttrExpr(entry.second, [&](const ExprPtr& expr) {
+      CheckValueOperand(expr, span, (std::string(context) + " '" + entry.first + "'").c_str());
+    });
+  }
+}
+
+MakeTuple::MakeTuple(std::vector<ExprPtr> elements, Span span)
+    : Expr(std::move(span)), elements_(std::move(elements)) {
+  // Collect types from all element expressions
+  std::vector<TypePtr> element_types;
+  element_types.reserve(elements_.size());
+  for (const auto& elem : elements_) {
+    detail::CheckValueOperand(elem, span_, "MakeTuple element");
+    element_types.push_back(elem->GetType());
+  }
+
+  // Set result type to TupleType
+  type_ = std::make_shared<TupleType>(std::move(element_types));
+}
+
+TupleGetItemExpr::TupleGetItemExpr(ExprPtr tuple, int index, Span span)
+    : Expr(std::move(span)), tuple_(std::move(tuple)), index_(index) {
+  // Type checking: tuple must have TupleType
+  auto tuple_type = As<TupleType>(tuple_->GetType());
+  CHECK(tuple_type) << "TupleGetItemExpr requires tuple to have TupleType, got "
+                    << tuple_->GetType()->TypeName();
+
+  // Bounds checking
+  CHECK(index >= 0 && index < static_cast<int>(tuple_type->types_.size()))
+      << "TupleGetItemExpr index " << index << " out of bounds for tuple with " << tuple_type->types_.size()
+      << " elements";
+
+  // Set result type to the accessed element's type
+  type_ = tuple_type->types_[index];
+}
+
+namespace {
+
+/// The scalar dtype an expression evaluates to, or nullopt when it is not scalar.
+std::optional<DataType> ScalarDataTypeOf(const ExprPtr& e) {
+  auto scalar = std::dynamic_pointer_cast<const ScalarType>(e->GetType());
+  if (!scalar) return std::nullopt;
+  return scalar->dtype_;
+}
+
+}  // namespace
+
+bool AreExprsEqual(const ExprPtr& e1, const ExprPtr& e2) {
+  if (e1 == e2) return true;
+  if (!e1 || !e2) return false;
+  auto c1 = As<ConstInt>(e1);
+  auto c2 = As<ConstInt>(e2);
+  if (c1 && c2) return c1->value_ == c2->value_;
+  // Composite dims (e.g. two reparsed `m + 0` nodes) compare structurally:
+  // same op kind, recursively equal operands. Leaf Vars keep pointer identity.
+  auto b1 = As<BinaryExpr>(e1);
+  auto b2 = As<BinaryExpr>(e2);
+  if (b1 && b2 && e1->GetKind() == e2->GetKind()) {
+    return AreExprsEqual(b1->left_, b2->left_) && AreExprsEqual(b1->right_, b2->right_);
+  }
+  // Unary nodes compare the same way, plus their result dtype. `Cast` is the one
+  // that matters in practice: a declared allocation's runtime slot subscript
+  // lowers to `cast(index, INDEX) % n * stride`, and two sites that write the
+  // same subscript build two such trees. Without this they compare unequal by
+  // pointer and a carry looks like it moved between slots when it never left one.
+  //
+  // The dtype is part of the value here and not derivable from the operand:
+  // `cast(x, INT32)` and `cast(x, INDEX)` share a kind and an operand while
+  // denoting different numbers, and callers comparing byte offsets would read
+  // that as one address.
+  auto u1 = As<UnaryExpr>(e1);
+  auto u2 = As<UnaryExpr>(e2);
+  if (u1 && u2 && e1->GetKind() == e2->GetKind()) {
+    return ScalarDataTypeOf(e1) == ScalarDataTypeOf(e2) && AreExprsEqual(u1->operand_, u2->operand_);
+  }
+  // Call nodes produced by different invocation sites have different pointer
+  // identities but may be structurally identical (e.g. two pld.world_size()
+  // calls). Compare by op name (per operator-identity-checks.md) plus
+  // recursive arg equality.  Avoids false negatives after deserialization
+  // where two Ops share a name but are distinct objects.
+  auto call1 = As<Call>(e1);
+  auto call2 = As<Call>(e2);
+  if (call1 && call2 && call1->op_ && call2->op_ && call1->op_->name_ == call2->op_->name_) {
+    if (call1->args_.size() != call2->args_.size()) return false;
+    for (size_t i = 0; i < call1->args_.size(); ++i) {
+      if (!AreExprsEqual(call1->args_[i], call2->args_[i])) return false;
+    }
+    return true;
+  }
+  return false;
+}
+
+bool AreExprVectorsEqual(const std::vector<ExprPtr>& v1, const std::vector<ExprPtr>& v2) {
+  if (v1.size() != v2.size()) return false;
+  for (size_t i = 0; i < v1.size(); ++i) {
+    if (!AreExprsEqual(v1[i], v2[i])) return false;
+  }
+  return true;
+}
+
+std::string CachePolicyToString(CachePolicy policy) {
+  switch (policy) {
+    case CachePolicy::kDefault:
+      return "default";
+    case CachePolicy::kBypass:
+      return "bypass";
+  }
+  throw TypeError("Unknown CachePolicy value: " + std::to_string(static_cast<int>(policy)));
+}
+
+CachePolicy StringToCachePolicy(const std::string& str) {
+  if (str == "default") {
+    return CachePolicy::kDefault;
+  } else if (str == "bypass") {
+    return CachePolicy::kBypass;
+  }
+  throw TypeError("Unknown CachePolicy string: " + str);
+}
+
+}  // namespace ir
+}  // namespace pypto

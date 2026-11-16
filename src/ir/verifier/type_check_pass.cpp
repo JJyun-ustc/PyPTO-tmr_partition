@@ -1,0 +1,958 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
+
+#include <algorithm>
+#include <cstddef>
+#include <memory>
+#include <optional>
+#include <sstream>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
+#include <vector>
+
+#include "pypto/core/error.h"
+#include "pypto/ir/core.h"
+#include "pypto/ir/expr.h"
+#include "pypto/ir/function.h"
+#include "pypto/ir/kind_traits.h"
+#include "pypto/ir/op_registry.h"
+#include "pypto/ir/program.h"
+#include "pypto/ir/scalar_expr.h"
+#include "pypto/ir/span.h"
+#include "pypto/ir/stmt.h"
+#include "pypto/ir/tile_view_semantics.h"
+#include "pypto/ir/transforms/base/visitor.h"
+#include "pypto/ir/transforms/printer.h"
+#include "pypto/ir/transforms/structural_comparison.h"
+#include "pypto/ir/type.h"
+#include "pypto/ir/type_inference.h"
+#include "pypto/ir/verifier/verification_error.h"
+#include "pypto/ir/verifier/verifier.h"
+
+namespace pypto {
+namespace ir {
+
+// Implement type check error type to string conversion
+namespace typecheck {
+std::string ErrorTypeToString(ErrorType type) {
+  switch (type) {
+    case ErrorType::TYPE_KIND_MISMATCH:
+      return "TYPE_KIND_MISMATCH";
+    case ErrorType::DTYPE_MISMATCH:
+      return "DTYPE_MISMATCH";
+    case ErrorType::SHAPE_DIMENSION_MISMATCH:
+      return "SHAPE_DIMENSION_MISMATCH";
+    case ErrorType::SHAPE_VALUE_MISMATCH:
+      return "SHAPE_VALUE_MISMATCH";
+    case ErrorType::SIZE_MISMATCH:
+      return "SIZE_MISMATCH";
+    case ErrorType::IF_CONDITION_MUST_BE_SCALAR:
+      return "IF_CONDITION_MUST_BE_SCALAR";
+    case ErrorType::FOR_RANGE_MUST_BE_SCALAR:
+      return "FOR_RANGE_MUST_BE_SCALAR";
+    case ErrorType::CONDITION_MUST_BE_BOOL:
+      return "CONDITION_MUST_BE_BOOL";
+    case ErrorType::TENSOR_PADDING_MISMATCH:
+      return "TENSOR_PADDING_MISMATCH";
+    case ErrorType::DISTRIBUTED_WINDOW_IDENTITY_MISMATCH:
+      return "DISTRIBUTED_WINDOW_IDENTITY_MISMATCH";
+    case ErrorType::TILE_VIEW_MISMATCH:
+      return "TILE_VIEW_MISMATCH";
+    case ErrorType::BUFFER_DESCRIPTOR_MISMATCH:
+      return "BUFFER_DESCRIPTOR_MISMATCH";
+    case ErrorType::TENSOR_LAYOUT_MISMATCH:
+      return "TENSOR_LAYOUT_MISMATCH";
+    default:
+      return "UNKNOWN";
+  }
+}
+}  // namespace typecheck
+
+namespace {
+
+/// What an ND argument of a ``device=`` dispatch hands an NZ parameter, from
+/// best to worst so the worst of several possible values wins.
+enum class NzDispatchArg {
+  kWholeMatrices,  ///< A host parameter, or slices of one keeping its last two axes whole
+  kUntraced,       ///< Produced by something the check does not follow
+  kWindow,         ///< A slice cutting inside the last two axes
+};
+
+/**
+ * @brief Helper visitor class for type checking
+ *
+ * Traverses the IR tree and checks type consistency in control flow constructs
+ */
+class TypeChecker : public IRVisitor {
+ public:
+  explicit TypeChecker(std::vector<Diagnostic>& diagnostics, ProgramPtr program = nullptr)
+      : diagnostics_(diagnostics), program_(std::move(program)) {}
+
+  void VisitFunction(const FunctionPtr& func) override;
+  void VisitExpr(const ExprPtr& expr) override;
+  void VisitExpr_(const CallPtr& op) override;
+  void VisitExpr_(const SubmitPtr& op) override;
+  void VisitStmt_(const ForStmtPtr& op) override;
+  void VisitStmt_(const WhileStmtPtr& op) override;
+  void VisitStmt_(const IfStmtPtr& op) override;
+
+  [[nodiscard]] const std::vector<Diagnostic>& GetDiagnostics() const { return diagnostics_; }
+
+ private:
+  std::vector<Diagnostic>& diagnostics_;
+  /// Owning program, when available: lets a call resolve its callee's signature.
+  ProgramPtr program_;
+  /// The function being checked; its body is where a dispatch argument is traced.
+  FunctionPtr func_;
+  /// Every value each Var can hold in ``func_``, and ``func_``'s parameters,
+  /// built on first use: only an ND-to-NZ dispatch argument needs tracing.
+  std::unordered_map<const Var*, std::vector<ExprPtr>> var_values_;
+  std::unordered_set<const Var*> func_params_;
+  bool var_values_built_ = false;
+  /// Memoized ``ClassifyNzDispatchArg`` result per Var.
+  std::unordered_map<const Var*, NzDispatchArg> nz_dispatch_args_;
+
+  /**
+   * @brief Check that each argument's tensor layout matches the callee parameter's
+   */
+  void CheckCallArgLayouts(const OpPtr& callee_op, const std::vector<ExprPtr>& args, const Span& span,
+                           bool is_device_dispatch);
+
+  /// Check packed numerical formats independently of layouts and return types.
+  void CheckCallPackedFp4Formats(const OpPtr& callee_op, const std::vector<ExprPtr>& args, const Span& span,
+                                 bool is_submit);
+
+  /**
+   * @brief Trace an ND argument of a ``device=`` dispatch back to what it hands
+   * an NZ parameter
+   */
+  NzDispatchArg ClassifyNzDispatchArg(const ExprPtr& arg);
+
+  /**
+   * @brief Record an error
+   */
+  void RecordError(typecheck::ErrorType type, const std::string& message, const Span& span);
+
+  /**
+   * @brief Get the last statement in a statement block (recursive for SeqStmts)
+   */
+  StmtPtr GetLastStmt(const StmtPtr& stmt);
+
+  /**
+   * @brief Check strict type equality at a call/control-flow boundary
+   */
+  void CheckTypeEquality(const TypePtr& type1, const TypePtr& type2, const std::string& context,
+                         const std::string& desc1, const std::string& desc2, const Span& span);
+
+  /**
+   * @brief Check if expression type is ScalarType
+   */
+  void CheckIsScalarType(const ExprPtr& expr, const std::string& context, const Span& span);
+
+  /**
+   * @brief Check if expression is a ScalarType with BOOL dtype (for if/while conditions)
+   */
+  void CheckIsBoolCondition(const ExprPtr& expr, const std::string& context, const Span& span);
+
+  /**
+   * @brief Recursively validate explicit valid shapes carried by a type
+   */
+  void ValidateTypeValidShape(const TypePtr& type, const std::string& context, const Span& span);
+};
+
+// TypeChecker implementation
+
+void TypeChecker::RecordError(typecheck::ErrorType type, const std::string& message, const Span& span) {
+  diagnostics_.emplace_back(DiagnosticSeverity::Error, "TypeCheck", static_cast<int>(type), message, span);
+}
+
+void TypeChecker::VisitFunction(const FunctionPtr& func) {
+  if (!func) return;
+  func_ = func;
+  var_values_.clear();
+  func_params_.clear();
+  var_values_built_ = false;
+  nz_dispatch_args_.clear();
+
+  for (size_t i = 0; i < func->params_.size(); ++i) {
+    const auto& param = func->params_[i];
+    if (!param) continue;
+    ValidateTypeValidShape(
+        param->GetType(),
+        "Function '" + func->name_ + "' parameter[" + std::to_string(i) + "] '" + param->name_hint_ + "'",
+        param->span_);
+  }
+  for (size_t i = 0; i < func->return_types_.size(); ++i) {
+    ValidateTypeValidShape(func->return_types_[i],
+                           "Function '" + func->name_ + "' return type[" + std::to_string(i) + "]",
+                           func->span_);
+  }
+  if (func->body_) {
+    VisitStmt(func->body_);
+  }
+}
+
+void TypeChecker::VisitExpr(const ExprPtr& expr) {
+  if (!expr) return;
+
+  std::string context = expr->TypeName() + " expression";
+  if (auto var = AsVarLike(expr)) {
+    context = var->TypeName() + " '" + var->name_hint_ + "'";
+  } else if (As<Call>(expr)) {
+    context = "Call result";
+  } else if (As<Submit>(expr)) {
+    context = "Submit result";
+  }
+  ValidateTypeValidShape(expr->GetType(), context, expr->span_);
+  IRVisitor::VisitExpr(expr);
+}
+
+namespace {
+
+/// The layout a tensor-like type carries. An absent ``tensor_view_`` means ND —
+/// the ``TensorType`` constructor drops a view that adds nothing to the default,
+/// so "no view" and "an ND view" are the same layout claim.
+std::optional<TensorLayout> TensorLayoutOf(const TypePtr& type) {
+  auto tensor_type = AsTensorTypeLike(type);
+  if (!tensor_type) return std::nullopt;
+  if (!tensor_type->tensor_view_) return TensorLayout::ND;
+  return tensor_type->tensor_view_->layout;
+}
+
+/// Every value each Var can hold in a function body: what an ``AssignStmt``
+/// binds it to (several before SSA), an ``IterArg``'s initial value and each
+/// value yielded back into it, and each value a loop or ``if`` result variable
+/// receives. A Var absent from the map is bound some other way.
+class VarValueCollector : public IRVisitor {
+ public:
+  std::unordered_map<const Var*, std::vector<ExprPtr>> values;
+
+  void VisitStmt_(const AssignStmtPtr& op) override {
+    if (op && op->var_) values[op->var_.get()].push_back(op->value_);
+    IRVisitor::VisitStmt_(op);
+  }
+
+  void VisitStmt_(const ForStmtPtr& op) override {
+    if (!op) return;
+    yield_targets_.push_back(RecordLoopCarried(op->iter_args_, op->return_vars_));
+    IRVisitor::VisitStmt_(op);
+    yield_targets_.pop_back();
+  }
+
+  void VisitStmt_(const WhileStmtPtr& op) override {
+    if (!op) return;
+    yield_targets_.push_back(RecordLoopCarried(op->iter_args_, op->return_vars_));
+    IRVisitor::VisitStmt_(op);
+    yield_targets_.pop_back();
+  }
+
+  void VisitStmt_(const IfStmtPtr& op) override {
+    if (!op) return;
+    std::vector<const Var*> targets;
+    targets.reserve(op->return_vars_.size());
+    for (const auto& return_var : op->return_vars_) targets.push_back(return_var.get());
+    yield_targets_.push_back(std::move(targets));
+    IRVisitor::VisitStmt_(op);
+    yield_targets_.pop_back();
+  }
+
+  void VisitStmt_(const YieldStmtPtr& op) override {
+    if (op && !yield_targets_.empty()) {
+      const auto& targets = yield_targets_.back();
+      for (size_t i = 0; i < op->value_.size() && i < targets.size(); ++i) {
+        if (targets[i]) values[targets[i]].push_back(op->value_[i]);
+      }
+    }
+    IRVisitor::VisitStmt_(op);
+  }
+
+ private:
+  /// Per enclosing For / While / If, innermost last: the Vars its yields bind.
+  std::vector<std::vector<const Var*>> yield_targets_;
+
+  /// Record a loop's carried values; return the Vars its body's yields bind.
+  std::vector<const Var*> RecordLoopCarried(const std::vector<IterArgPtr>& iter_args,
+                                            const std::vector<VarPtr>& return_vars) {
+    std::vector<const Var*> targets;
+    targets.reserve(iter_args.size());
+    for (size_t i = 0; i < iter_args.size(); ++i) {
+      const auto& iter_arg = iter_args[i];
+      targets.push_back(iter_arg.get());
+      if (!iter_arg) continue;
+      values[iter_arg.get()].push_back(iter_arg->initValue_);
+      // The result holds the carried value after the last trip (or the initial
+      // value after none), which is exactly what the IterArg can hold.
+      if (i < return_vars.size() && return_vars[i]) values[return_vars[i].get()].push_back(iter_arg);
+    }
+    return targets;
+  }
+};
+
+/// Whether a ``tensor.slice`` takes the last two axes of its source whole: full
+/// extent at offset 0, and neither one dropped. Only such a slice selects whole
+/// matrices, whose bytes are the same run under ND and NZ order.
+bool SliceKeepsMatrixWhole(const CallPtr& slice) {
+  if (slice->args_.size() < 3) return false;
+  auto source = AsTensorTypeLike(slice->args_[0]->GetType());
+  auto shapes = As<MakeTuple>(slice->args_[1]);
+  auto offsets = As<MakeTuple>(slice->args_[2]);
+  if (!source || !shapes || !offsets) return false;
+  const size_t rank = source->shape_.size();
+  if (rank < 2 || shapes->elements_.size() != rank || offsets->elements_.size() != rank) return false;
+  for (size_t axis = rank - 2; axis < rank; ++axis) {
+    if (!AreExprsEqual(shapes->elements_[axis], source->shape_[axis]) ||
+        !IsConstValue(offsets->elements_[axis], 0)) {
+      return false;
+    }
+  }
+  if (slice->args_.size() >= 5) {
+    auto drop_dims = As<MakeTuple>(slice->args_[4]);
+    if (!drop_dims) return false;
+    for (const auto& dim_expr : drop_dims->elements_) {
+      auto dim = As<ConstInt>(dim_expr);
+      if (!dim || dim->value_ < 0 || static_cast<size_t>(dim->value_) + 2 >= rank) return false;
+    }
+  }
+  return true;
+}
+
+}  // namespace
+
+NzDispatchArg TypeChecker::ClassifyNzDispatchArg(const ExprPtr& arg) {
+  if (auto var = AsVarLike(arg)) {
+    if (!var_values_built_) {
+      VarValueCollector collector;
+      if (func_ && func_->body_) collector.VisitStmt(func_->body_);
+      var_values_ = std::move(collector.values);
+      if (func_) {
+        for (const auto& param : func_->params_) func_params_.insert(param.get());
+      }
+      var_values_built_ = true;
+    }
+    // Only a parameter is the buffer as the host holds it. The trace stays in
+    // this function, so a window passed into a helper arrives there as a
+    // parameter and is not followed back to the caller.
+    const bool is_param = func_params_.count(var.get()) > 0;
+    auto values = var_values_.find(var.get());
+    if (values == var_values_.end()) {
+      return is_param ? NzDispatchArg::kWholeMatrices : NzDispatchArg::kUntraced;
+    }
+    // Provisionally whole, so a pre-SSA self-reassignment terminates; each
+    // value the Var can hold still has to pass on its own.
+    auto [cached, inserted] = nz_dispatch_args_.emplace(var.get(), NzDispatchArg::kWholeMatrices);
+    if (!inserted) return cached->second;
+    NzDispatchArg worst = NzDispatchArg::kWholeMatrices;
+    for (const auto& value : values->second) {
+      worst = std::max(worst, ClassifyNzDispatchArg(value));
+      if (worst == NzDispatchArg::kWindow) break;
+    }
+    nz_dispatch_args_[var.get()] = worst;
+    return worst;
+  }
+  // Any producer other than a slice (a reshape, a fresh tensor) re-associates
+  // the axes in ways this check does not follow, so it is not trusted.
+  auto call = As<Call>(arg);
+  if (!call || !IsOp(call, "tensor.slice")) return NzDispatchArg::kUntraced;
+  if (!SliceKeepsMatrixWhole(call)) return NzDispatchArg::kWindow;
+  return ClassifyNzDispatchArg(call->args_[0]);
+}
+
+void TypeChecker::CheckCallArgLayouts(const OpPtr& callee_op, const std::vector<ExprPtr>& args,
+                                      const Span& span, bool is_device_dispatch) {
+  // Only a call to another function in this program has a signature to check
+  // against; a registered operator validates its own operands via f_deduce_type.
+  if (!program_ || !As<GlobalVar>(callee_op)) return;
+  auto callee = program_->GetFunction(callee_op->name_);
+  if (!callee) return;  // Opaque / external — no signature to compare.
+
+  // ``Call`` maps args to params by identity with full coverage; ``Submit``
+  // coverage is only bounded (``args_.size() <= params_.size()``), because a
+  // ``pl.submit`` may omit trailing runtime-allocated ``Out`` params. Identity
+  // still holds over the *leading* args, but once a gap and a trailing
+  // ``CommCtxType`` suffix coexist (after ``MaterializeDistTensorCtx``) the
+  // suffix args bind ``params_[i + gap]``. Rather than re-derive that mapping,
+  // stop before the suffix: those args carry no layout to compare anyway.
+  // See ``Submit::args_`` in include/pypto/ir/expr.h for the canonical rule.
+  size_t n = args.size() < callee->params_.size() ? args.size() : callee->params_.size();
+  if (args.size() != callee->params_.size()) {
+    while (n > 0 && callee->params_[n - 1] && As<CommCtxType>(callee->params_[n - 1]->GetType())) {
+      --n;
+    }
+  }
+  for (size_t i = 0; i < n; ++i) {
+    const auto& param = callee->params_[i];
+    if (!param || !args[i]) continue;
+    auto want = TensorLayoutOf(param->GetType());
+    auto got = TensorLayoutOf(args[i]->GetType());
+    if (!want || !got || *want == *got) continue;
+    // DN is the one layout a parameter cannot declare: ``pl.Tensor[..., pl.DN]``
+    // is rejected by the parser, and a DN value is *derived* at the use site
+    // (``pl.transpose(x, -2, -1)``, or a slice of such a view) rather than
+    // annotated. An ND parameter is therefore not making a competing claim
+    // about those bytes -- it is the only thing the author is able to write --
+    // so a DN argument binding it is the documented workflow, not a mismatch.
+    // ``OptimizeOrchTensors`` also rewrites such a parameter's view with
+    // explicit strides, which is what makes the pattern lower correctly.
+    if (*want == TensorLayout::DN || *got == TensorLayout::DN) continue;
+    // A ``device=`` dispatch crosses from a host driver into a device program,
+    // and what crosses it is a buffer: the driver never reads these bytes, it
+    // only says which card they are on. The callee's parameter is therefore the
+    // only claim about their order, and an ND argument is the absence of a
+    // competing one -- the shape a host allocates a weight in, whatever the
+    // kernel makes of it. The reverse stays an error: an NZ argument bound to an
+    // ND parameter means the callee reads fractals as row-major, which nothing
+    // downstream would notice.
+    //
+    // NZ only: it is the one layout whose logical-to-blocked boundary the
+    // orchestration entry restates. An MX parameter is blocked the same way but
+    // has no such restatement, so an ND buffer bound to one would reach the
+    // kernel as ordinary bytes read as packed MX data.
+    //
+    // And only for whole matrices. A host slice *does* read the bytes -- it
+    // addresses them row-major -- and a window inside the last two axes of
+    // NZ-packed bytes selects runs from several fractal column blocks, which the
+    // device then reads as one NZ matrix. ``w[r * R : (r + 1) * R]`` of a packed
+    // ``[N * R, C]`` weight is contiguous, so nothing downstream notices.
+    if (is_device_dispatch && *want == TensorLayout::NZ && *got == TensorLayout::ND) {
+      const NzDispatchArg handed_over = ClassifyNzDispatchArg(args[i]);
+      if (handed_over == NzDispatchArg::kWholeMatrices) continue;
+      std::ostringstream msg;
+      msg << "Layout mismatch at argument " << i << " of dispatch to '" << callee->name_ << "': parameter '"
+          << param->name_hint_
+          << "' is declared NZ, so the ND argument must be a host parameter, or a slice of one that keeps "
+             "its last two axes whole, such as the leading-axis shard w[r]. ";
+      if (handed_over == NzDispatchArg::kWindow) {
+        msg << "This argument is a window inside the matrix: NZ-packed bytes cut that way are not "
+               "themselves NZ-packed, so the device would read the wrong elements. Pack each shard "
+               "separately, stack the shards as [N, R, C], and pass w[r].";
+      } else {
+        msg << "This argument is produced some other way (for example a reshape or a newly created "
+               "tensor), so nothing shows its bytes are whole NZ-packed matrices. Pass the host "
+               "parameter, or a leading-axis slice of it.";
+      }
+      RecordError(typecheck::ErrorType::TENSOR_LAYOUT_MISMATCH, msg.str(), span);
+      continue;
+    }
+    std::ostringstream msg;
+    msg << "Layout mismatch at argument " << i << " of call to '" << callee->name_ << "': parameter '"
+        << param->name_hint_ << "' is declared " << TensorLayoutToString(*want) << " but the argument is "
+        << TensorLayoutToString(*got)
+        << ". A layout annotation is a claim about byte order in memory, so the two ends must agree"
+        << " -- annotate the argument " << TensorLayoutToString(*want) << " as well, or drop "
+        << TensorLayoutToString(*want) << " from the parameter.";
+    RecordError(typecheck::ErrorType::TENSOR_LAYOUT_MISMATCH, msg.str(), span);
+  }
+}
+
+void TypeChecker::CheckCallPackedFp4Formats(const OpPtr& callee_op, const std::vector<ExprPtr>& args,
+                                            const Span& span, bool is_submit) {
+  if (!program_ || !As<GlobalVar>(callee_op)) return;
+  auto callee = program_->GetFunction(callee_op->name_);
+  if (!callee) return;
+
+  // Match the parser's optional Out/InOut binding in one linear walk. Reserve
+  // actuals for all required inputs, including a trailing CommCtx suffix, so
+  // an omitted output never shifts a packed input onto the wrong formal.
+  size_t remaining_required = static_cast<size_t>(
+      std::count(callee->param_directions_.begin(), callee->param_directions_.end(), ParamDirection::In));
+  const bool omitted_outputs = is_submit && args.size() < callee->params_.size();
+  size_t arg_index = 0;
+  for (size_t param_index = 0; param_index < callee->params_.size() && arg_index < args.size();
+       ++param_index) {
+    if (omitted_outputs) {
+      if (callee->param_directions_[param_index] == ParamDirection::In) {
+        --remaining_required;
+      } else if (args.size() - arg_index <= remaining_required) {
+        continue;
+      }
+    }
+    const size_t actual_index = arg_index++;
+    const auto& param = callee->params_[param_index];
+    if (!param || !args[actual_index]) continue;
+    auto expected = std::dynamic_pointer_cast<const ShapedType>(param->GetType());
+    auto actual = std::dynamic_pointer_cast<const ShapedType>(args[actual_index]->GetType());
+    if (!expected || !actual || !expected->dtype_.IsPackedFp4() || !actual->dtype_.IsPackedFp4() ||
+        expected->dtype_ == actual->dtype_) {
+      continue;
+    }
+    std::ostringstream msg;
+    msg << "Dtype mismatch at argument " << actual_index << " of call to '" << callee->name_
+        << "': parameter '" << param->name_hint_ << "' expects " << expected->dtype_.ToString()
+        << " but the argument is " << actual->dtype_.ToString()
+        << "; packed FP4 formats must match; use an explicit numerical cast";
+    RecordError(typecheck::ErrorType::DTYPE_MISMATCH, msg.str(), span);
+  }
+}
+
+void TypeChecker::VisitExpr_(const CallPtr& op) {
+  if (op) {
+    CheckCallArgLayouts(op->op_, op->args_, op->span_, op->HasAttr(kAttrDevice));
+    CheckCallPackedFp4Formats(op->op_, op->args_, op->span_, false);
+  }
+  IRVisitor::VisitExpr_(op);
+}
+
+void TypeChecker::VisitExpr_(const SubmitPtr& op) {
+  if (op) {
+    CheckCallArgLayouts(op->op_, op->args_, op->span_, op->HasAttr(kAttrDevice));
+    CheckCallPackedFp4Formats(op->op_, op->args_, op->span_, true);
+  }
+  IRVisitor::VisitExpr_(op);
+}
+
+void TypeChecker::ValidateTypeValidShape(const TypePtr& type, const std::string& context, const Span& span) {
+  if (!type) return;
+
+  if (auto tuple_type = As<TupleType>(type)) {
+    for (size_t i = 0; i < tuple_type->types_.size(); ++i) {
+      ValidateTypeValidShape(tuple_type->types_[i], context + " TupleType element[" + std::to_string(i) + "]",
+                             span);
+    }
+    return;
+  }
+
+  const std::vector<ExprPtr>* valid_shape = nullptr;
+  const std::vector<ExprPtr>* physical_shape = nullptr;
+  if (auto distributed_type = As<DistributedTensorType>(type)) {
+    if (distributed_type->tensor_view_) {
+      valid_shape = &distributed_type->tensor_view_->valid_shape;
+    }
+    physical_shape = &distributed_type->shape_;
+  } else if (auto tensor_type = As<TensorType>(type)) {
+    if (tensor_type->tensor_view_) {
+      valid_shape = &tensor_type->tensor_view_->valid_shape;
+    }
+    physical_shape = &tensor_type->shape_;
+  } else if (auto tile_type = As<TileType>(type)) {
+    if (tile_type->tile_view_) {
+      valid_shape = &tile_type->tile_view_->valid_shape;
+    }
+    physical_shape = &tile_type->shape_;
+  }
+
+  if (!valid_shape || !physical_shape || valid_shape->empty()) return;
+  for (const auto& error : ValidateValidShapeBounds(*valid_shape, *physical_shape, type->TypeName())) {
+    auto error_type = error.violation == ValidShapeBoundsViolation::kRankMismatch
+                          ? typecheck::ErrorType::SHAPE_DIMENSION_MISMATCH
+                          : typecheck::ErrorType::SHAPE_VALUE_MISMATCH;
+    RecordError(error_type, context + " has invalid " + error.message, span);
+  }
+}
+
+StmtPtr TypeChecker::GetLastStmt(const StmtPtr& stmt) {
+  if (!stmt) return nullptr;
+
+  // If it's a SeqStmts, recursively get the last statement
+  if (auto seq = As<SeqStmts>(stmt)) {
+    if (!seq->stmts_.empty()) {
+      return GetLastStmt(seq->stmts_.back());
+    }
+  }
+
+  return stmt;
+}
+
+void TypeChecker::CheckTypeEquality(const TypePtr& type1, const TypePtr& type2, const std::string& context,
+                                    const std::string& desc1, const std::string& desc2, const Span& span) {
+  if (!type1 || !type2) return;
+
+  if (type1->GetKind() != type2->GetKind()) {
+    std::ostringstream msg;
+    msg << "Type kind mismatch in " << context << ": " << desc1 << " type '" << type1->TypeName()
+        << "' != " << desc2 << " type '" << type2->TypeName() << "'";
+    RecordError(typecheck::ErrorType::TYPE_KIND_MISMATCH, msg.str(), span);
+    return;
+  }
+
+  if (auto tuple1 = As<TupleType>(type1)) {
+    auto tuple2 = As<TupleType>(type2);
+    if (tuple1->types_.size() != tuple2->types_.size()) {
+      std::ostringstream msg;
+      msg << "Tuple size mismatch in " << context << ": " << desc1 << " has " << tuple1->types_.size()
+          << " elements, but " << desc2 << " has " << tuple2->types_.size() << " elements";
+      RecordError(typecheck::ErrorType::SIZE_MISMATCH, msg.str(), span);
+      return;
+    }
+    for (size_t i = 0; i < tuple1->types_.size(); ++i) {
+      CheckTypeEquality(tuple1->types_[i], tuple2->types_[i], context,
+                        desc1 + " tuple element[" + std::to_string(i) + "]",
+                        desc2 + " tuple element[" + std::to_string(i) + "]", span);
+    }
+    return;
+  }
+
+  if (IsA<BufferType>(type1) || IsA<MultiBufferType>(type1)) {
+    if (!structural_equal(type1, type2)) {
+      std::ostringstream msg;
+      msg << "Buffer descriptor mismatch in " << context << ": " << desc1 << " type " << PythonPrint(type1)
+          << " != " << desc2 << " type " << PythonPrint(type2);
+      RecordError(typecheck::ErrorType::BUFFER_DESCRIPTOR_MISMATCH, msg.str(), span);
+    }
+    return;
+  }
+
+  auto scalar1 = As<ScalarType>(type1);
+  if (scalar1) {
+    auto scalar2 = As<ScalarType>(type2);
+    if (scalar1->dtype_ != scalar2->dtype_) {
+      std::ostringstream msg;
+      msg << "Dtype mismatch in " << context << ": " << desc1 << " dtype != " << desc2 << " dtype";
+      RecordError(typecheck::ErrorType::DTYPE_MISMATCH, msg.str(), span);
+    }
+    return;
+  }
+
+  auto shaped1 = std::dynamic_pointer_cast<const ShapedType>(type1);
+  auto shaped2 = std::dynamic_pointer_cast<const ShapedType>(type2);
+  if (!shaped1 || !shaped2) return;
+
+  if (shaped1->dtype_ != shaped2->dtype_) {
+    std::ostringstream msg;
+    msg << "Dtype mismatch in " << context << ": " << desc1 << " dtype != " << desc2 << " dtype";
+    RecordError(typecheck::ErrorType::DTYPE_MISMATCH, msg.str(), span);
+  }
+
+  auto check_shape = [&](const std::vector<ExprPtr>& shape1, const std::vector<ExprPtr>& shape2,
+                         const std::string& shape_name) {
+    if (shape1.size() != shape2.size()) {
+      std::ostringstream msg;
+      msg << shape_name << " dimension count mismatch in " << context << ": " << desc1 << " has "
+          << shape1.size() << " dimensions, but " << desc2 << " has " << shape2.size() << " dimensions";
+      RecordError(typecheck::ErrorType::SHAPE_DIMENSION_MISMATCH, msg.str(), span);
+      return false;
+    }
+    for (size_t i = 0; i < shape1.size(); ++i) {
+      const auto& dim1 = shape1[i];
+      const auto& dim2 = shape2[i];
+      if (!dim1 || !dim2) continue;
+      auto proof = ProveValidExtentEqual(dim1, dim2);
+      if (proof != ProofResult::kTrue) {
+        std::ostringstream msg;
+        msg << shape_name << " dimension mismatch in " << context << ": " << desc1 << " dimension[" << i
+            << "] = " << PythonPrint(dim1) << ", but " << desc2 << " dimension[" << i
+            << "] = " << PythonPrint(dim2);
+        if (proof == ProofResult::kUnknown) {
+          msg << "; equality is not provable and this boundary has no runtime guard";
+        }
+        RecordError(typecheck::ErrorType::SHAPE_VALUE_MISMATCH, msg.str(), span);
+      }
+    }
+    return true;
+  };
+
+  if (!check_shape(shaped1->shape_, shaped2->shape_, "Shape")) return;
+
+  if (auto tensor1 = AsTensorTypeLike(type1)) {
+    auto tensor2 = AsTensorTypeLike(type2);
+    const auto& valid1 = tensor1->tensor_view_ && !tensor1->tensor_view_->valid_shape.empty()
+                             ? tensor1->tensor_view_->valid_shape
+                             : tensor1->shape_;
+    const auto& valid2 = tensor2->tensor_view_ && !tensor2->tensor_view_->valid_shape.empty()
+                             ? tensor2->tensor_view_->valid_shape
+                             : tensor2->shape_;
+    check_shape(valid1, valid2, "Valid shape");
+
+    const auto pad1 = tensor1->tensor_view_ ? tensor1->tensor_view_->pad : PadValue::null;
+    const auto pad2 = tensor2->tensor_view_ ? tensor2->tensor_view_->pad : PadValue::null;
+    if (pad1 != pad2) {
+      std::ostringstream msg;
+      msg << "Tensor padding mismatch in " << context << ": " << desc1 << " pad != " << desc2 << " pad";
+      RecordError(typecheck::ErrorType::TENSOR_PADDING_MISMATCH, msg.str(), span);
+    }
+
+    if (auto dist1 = As<DistributedTensorType>(type1)) {
+      auto dist2 = As<DistributedTensorType>(type2);
+      const bool same_window = dist1->window_buffer_ == dist2->window_buffer_;
+      if (!same_window) {
+        std::ostringstream msg;
+        msg << "Distributed window-buffer identity mismatch in " << context << ": " << desc1 << " and "
+            << desc2 << " refer to different window buffers";
+        RecordError(typecheck::ErrorType::DISTRIBUTED_WINDOW_IDENTITY_MISMATCH, msg.str(), span);
+      }
+    }
+    return;
+  }
+
+  auto tile1 = As<TileType>(type1);
+  auto tile2 = As<TileType>(type2);
+  if (!tile1 || !tile2) return;
+  const auto view1 = tile_view_semantics::GetEffectiveTileView(*tile1);
+  const auto view2 = tile_view_semantics::GetEffectiveTileView(*tile2);
+  const auto& valid1 = view1.valid_shape.empty() ? tile1->shape_ : view1.valid_shape;
+  const auto& valid2 = view2.valid_shape.empty() ? tile2->shape_ : view2.valid_shape;
+  check_shape(valid1, valid2, "Valid shape");
+
+  // Explicit views carry authoritative layout/access metadata. An omitted view
+  // is still provisional for operations whose memory space is inferred by a
+  // later pass, so only compare the remaining fields when both sides explicitly
+  // declare them. GetEffectiveTileView above canonicalizes sparse explicit
+  // views before the comparison.
+  if (!tile1->tile_view_ || !tile2->tile_view_) return;
+
+  auto metadata1 = view1;
+  auto metadata2 = view2;
+  metadata1.valid_shape.clear();
+  metadata2.valid_shape.clear();
+  if (metadata1 != metadata2) {
+    std::ostringstream msg;
+    msg << "Tile view metadata mismatch in " << context << ": " << desc1 << " and " << desc2
+        << " have different effective layout, stride, start offset, fractal, or padding metadata";
+    RecordError(typecheck::ErrorType::TILE_VIEW_MISMATCH, msg.str(), span);
+  }
+}
+
+void TypeChecker::CheckIsScalarType(const ExprPtr& expr, const std::string& context, const Span& span) {
+  if (!expr || !expr->GetType()) return;
+
+  if (!As<ScalarType>(expr->GetType())) {
+    std::ostringstream msg;
+    msg << context << " must be ScalarType, but got " << expr->GetType()->TypeName();
+
+    // Determine error type based on context
+    auto error_type = (context.find("condition") != std::string::npos)
+                          ? typecheck::ErrorType::IF_CONDITION_MUST_BE_SCALAR
+                          : typecheck::ErrorType::FOR_RANGE_MUST_BE_SCALAR;
+
+    RecordError(error_type, msg.str(), span);
+  }
+}
+
+void TypeChecker::CheckIsBoolCondition(const ExprPtr& expr, const std::string& context, const Span& span) {
+  if (!expr || !expr->GetType()) return;
+
+  auto scalar = As<ScalarType>(expr->GetType());
+  if (!scalar) return;  // Already reported by CheckIsScalarType
+
+  if (scalar->dtype_ != DataType::BOOL) {
+    std::ostringstream msg;
+    msg << context << " dtype must be BOOL, but got " << scalar->dtype_.ToString();
+    RecordError(typecheck::ErrorType::CONDITION_MUST_BE_BOOL, msg.str(), span);
+  }
+}
+
+void TypeChecker::VisitStmt_(const ForStmtPtr& op) {
+  if (!op) return;
+
+  // Check start, stop, step must be ScalarType
+  if (op->start_ && op->start_->GetType()) {
+    CheckIsScalarType(op->start_, "ForStmt start", op->span_);
+  }
+  if (op->stop_ && op->stop_->GetType()) {
+    CheckIsScalarType(op->stop_, "ForStmt stop", op->span_);
+  }
+  if (op->step_ && op->step_->GetType()) {
+    CheckIsScalarType(op->step_, "ForStmt step", op->span_);
+  }
+
+  // Check type consistency between iter_args initValue, yield values, and return_vars
+  if (!op->iter_args_.empty()) {
+    StmtPtr last_stmt = GetLastStmt(op->body_);
+    auto yield_stmt = As<YieldStmt>(last_stmt);
+
+    if (yield_stmt) {
+      // Check that all three vectors have the same size
+      size_t num_iter_args = op->iter_args_.size();
+      size_t num_yield_values = yield_stmt->value_.size();
+      size_t num_return_vars = op->return_vars_.size();
+
+      if (num_iter_args != num_yield_values || num_iter_args != num_return_vars) {
+        std::ostringstream msg;
+        msg << "ForStmt size mismatch: iter_args=" << num_iter_args << ", yield values=" << num_yield_values
+            << ", return_vars=" << num_return_vars;
+        RecordError(typecheck::ErrorType::SIZE_MISMATCH, msg.str(), op->span_);
+      } else {
+        // Check type consistency for each index
+        for (size_t i = 0; i < num_iter_args; ++i) {
+          const auto& iter_arg = op->iter_args_[i];
+          const auto& yield_value = yield_stmt->value_[i];
+          const auto& return_var = op->return_vars_[i];
+
+          if (!iter_arg || !iter_arg->initValue_ || !yield_value || !return_var) continue;
+
+          auto init_type = iter_arg->initValue_->GetType();
+          auto declared_type = iter_arg->GetType();
+          auto yield_type = yield_value->GetType();
+          auto return_type = return_var->GetType();
+
+          if (!init_type || !declared_type || !yield_type || !return_type) continue;
+
+          // Check every edge of the loop-carried type contract.
+          CheckTypeEquality(init_type, declared_type, "ForStmt",
+                            "iter_arg[" + std::to_string(i) + "] initValue",
+                            "declared iter_arg[" + std::to_string(i) + "]", op->span_);
+
+          CheckTypeEquality(declared_type, yield_type, "ForStmt",
+                            "declared iter_arg[" + std::to_string(i) + "]",
+                            "yield value[" + std::to_string(i) + "]", op->span_);
+
+          CheckTypeEquality(yield_type, return_type, "ForStmt", "yield value[" + std::to_string(i) + "]",
+                            "return_var[" + std::to_string(i) + "]", op->span_);
+        }
+      }
+    }
+  }
+
+  // Continue with default traversal
+  IRVisitor::VisitStmt_(op);
+}
+
+void TypeChecker::VisitStmt_(const WhileStmtPtr& op) {
+  if (!op) return;
+
+  // Check condition must be ScalarType with BOOL dtype
+  if (op->condition_ && op->condition_->GetType()) {
+    CheckIsScalarType(op->condition_, "WhileStmt condition", op->span_);
+    CheckIsBoolCondition(op->condition_, "WhileStmt condition", op->span_);
+  }
+
+  // Check type consistency between iter_args initValue, yield values, and return_vars
+  if (!op->iter_args_.empty()) {
+    StmtPtr last_stmt = GetLastStmt(op->body_);
+    auto yield_stmt = As<YieldStmt>(last_stmt);
+
+    if (yield_stmt) {
+      // Check that all three vectors have the same size
+      size_t num_iter_args = op->iter_args_.size();
+      size_t num_yield_values = yield_stmt->value_.size();
+      size_t num_return_vars = op->return_vars_.size();
+
+      if (num_iter_args != num_yield_values || num_iter_args != num_return_vars) {
+        std::ostringstream msg;
+        msg << "WhileStmt size mismatch: iter_args=" << num_iter_args << ", yield values=" << num_yield_values
+            << ", return_vars=" << num_return_vars;
+        RecordError(typecheck::ErrorType::SIZE_MISMATCH, msg.str(), op->span_);
+      } else {
+        // Check type consistency for each index
+        for (size_t i = 0; i < num_iter_args; ++i) {
+          const auto& iter_arg = op->iter_args_[i];
+          const auto& yield_value = yield_stmt->value_[i];
+          const auto& return_var = op->return_vars_[i];
+
+          if (!iter_arg || !iter_arg->initValue_ || !yield_value || !return_var) continue;
+
+          auto init_type = iter_arg->initValue_->GetType();
+          auto declared_type = iter_arg->GetType();
+          auto yield_type = yield_value->GetType();
+          auto return_type = return_var->GetType();
+
+          if (!init_type || !declared_type || !yield_type || !return_type) continue;
+
+          // Check every edge of the loop-carried type contract.
+          CheckTypeEquality(init_type, declared_type, "WhileStmt",
+                            "iter_arg[" + std::to_string(i) + "] initValue",
+                            "declared iter_arg[" + std::to_string(i) + "]", op->span_);
+
+          CheckTypeEquality(declared_type, yield_type, "WhileStmt",
+                            "declared iter_arg[" + std::to_string(i) + "]",
+                            "yield value[" + std::to_string(i) + "]", op->span_);
+
+          CheckTypeEquality(yield_type, return_type, "WhileStmt", "yield value[" + std::to_string(i) + "]",
+                            "return_var[" + std::to_string(i) + "]", op->span_);
+        }
+      }
+    }
+  }
+
+  // Continue with default traversal
+  IRVisitor::VisitStmt_(op);
+}
+
+void TypeChecker::VisitStmt_(const IfStmtPtr& op) {
+  if (!op) return;
+
+  // Check condition must be ScalarType with BOOL dtype
+  if (op->condition_ && op->condition_->GetType()) {
+    CheckIsScalarType(op->condition_, "IfStmt condition", op->span_);
+    CheckIsBoolCondition(op->condition_, "IfStmt condition", op->span_);
+  }
+
+  // Check type consistency only if return_vars is not empty
+  if (!op->return_vars_.empty() && op->else_body_.has_value()) {
+    StmtPtr then_last = GetLastStmt(op->then_body_);
+    StmtPtr else_last = GetLastStmt(op->else_body_.value());
+
+    auto then_yield = As<YieldStmt>(then_last);
+    auto else_yield = As<YieldStmt>(else_last);
+
+    if (then_yield && else_yield) {
+      // Check type consistency between then yield and else yield
+      size_t num_then_values = then_yield->value_.size();
+      size_t num_else_values = else_yield->value_.size();
+      size_t num_return_vars = op->return_vars_.size();
+
+      if (num_then_values != num_else_values || num_then_values != num_return_vars) {
+        std::ostringstream msg;
+        msg << "IfStmt size mismatch: then yield=" << num_then_values << ", else yield=" << num_else_values
+            << ", return_vars=" << num_return_vars;
+        RecordError(typecheck::ErrorType::SIZE_MISMATCH, msg.str(), op->span_);
+      } else {
+        // Check type consistency for each index
+        for (size_t i = 0; i < num_then_values; ++i) {
+          const auto& then_value = then_yield->value_[i];
+          const auto& else_value = else_yield->value_[i];
+          const auto& return_var = op->return_vars_[i];
+
+          if (!then_value || !else_value || !return_var) continue;
+
+          auto then_type = then_value->GetType();
+          auto else_type = else_value->GetType();
+          auto return_type = return_var->GetType();
+
+          if (!then_type || !else_type || !return_type) continue;
+
+          CheckTypeEquality(then_type, else_type, "IfStmt", "then yield value[" + std::to_string(i) + "]",
+                            "else yield value[" + std::to_string(i) + "]", op->span_);
+          CheckTypeEquality(then_type, return_type, "IfStmt", "then yield value[" + std::to_string(i) + "]",
+                            "return_var[" + std::to_string(i) + "]", op->span_);
+        }
+      }
+    }
+  }
+
+  // Continue with default traversal
+  IRVisitor::VisitStmt_(op);
+}
+
+}  // namespace
+
+/**
+ * @brief Type check property verifier for use with PropertyVerifierRegistry
+ */
+class TypeCheckPropertyVerifierImpl : public PropertyVerifier {
+ public:
+  [[nodiscard]] std::string GetName() const override { return "TypeCheck"; }
+
+  void Verify(const ProgramPtr& program, std::vector<Diagnostic>& diagnostics) override {
+    if (!program) {
+      return;
+    }
+
+    for (const auto& [global_var, func] : program->functions_) {
+      if (!func) {
+        continue;
+      }
+
+      // Create type checker and run checking
+      TypeChecker checker(diagnostics, program);
+      checker.VisitFunction(func);
+    }
+  }
+};
+
+// Factory function for creating TypeCheck property verifier
+PropertyVerifierPtr CreateTypeCheckPropertyVerifier() {
+  return std::make_shared<TypeCheckPropertyVerifierImpl>();
+}
+
+}  // namespace ir
+}  // namespace pypto

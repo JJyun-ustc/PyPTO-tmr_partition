@@ -1,0 +1,238 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
+
+#include <any>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "pypto/core/any_cast.h"
+#include "pypto/core/logging.h"
+#include "pypto/ir/expr.h"
+#include "pypto/ir/kind_traits.h"
+#include "pypto/ir/op_registry.h"
+#include "pypto/ir/pipe.h"
+#include "pypto/ir/type.h"
+
+namespace pypto {
+namespace ir {
+
+namespace {
+
+constexpr int kPipelineEventSlots = 8;
+
+// Helper to deduce UnknownType (for ops with no return value)
+TypePtr DeduceUnknownType(const std::vector<ExprPtr>& args,
+                          const std::vector<std::pair<std::string, std::any>>& kwargs) {
+  return GetUnknownType();
+}
+
+TypePtr DeducePipelineFlagType(const std::vector<ExprPtr>& args,
+                               const std::vector<std::pair<std::string, std::any>>& kwargs,
+                               const char* name) {
+  CHECK(args.size() <= 1) << name << " accepts at most one dynamic event-id operand";
+  bool has_src = false;
+  bool has_dst = false;
+  bool has_static_id = false;
+  int src = -1;
+  int dst = -1;
+  for (const auto& [key, value] : kwargs) {
+    if (key == "src_pipe" || key == "dst_pipe") {
+      int pipe = AnyCast<int>(value, key);
+      CHECK(pipe >= static_cast<int>(PipeType::MTE1) && pipe < static_cast<int>(PipeType::ALL))
+          << name << " " << key << " must be a concrete PipeType, got " << pipe;
+      if (key == "src_pipe") {
+        CHECK(!has_src) << name << " has duplicate src_pipe";
+        has_src = true;
+        src = pipe;
+      } else {
+        CHECK(!has_dst) << name << " has duplicate dst_pipe";
+        has_dst = true;
+        dst = pipe;
+      }
+    } else if (key == "event_id") {
+      CHECK(!has_static_id) << name << " has duplicate event_id";
+      int id = AnyCast<int>(value, key);
+      CHECK(id >= 0 && id < kPipelineEventSlots) << name << " event_id must be in [0, 7], got " << id;
+      has_static_id = true;
+    } else if (key == "core_type") {
+      const auto core = AnyCast<std::string>(value, key);
+      CHECK(core == "aic" || core == "aiv") << name << " core_type must be 'aic' or 'aiv', got " << core;
+    } else {
+      CHECK(false) << name << " has unknown attribute '" << key << "'";
+    }
+  }
+  CHECK(has_src && has_dst) << name << " requires src_pipe and dst_pipe";
+  CHECK(src != dst) << name << " requires different source and destination pipes";
+  CHECK(has_static_id != (args.size() == 1))
+      << name << " requires exactly one static event_id attribute or dynamic event-id operand";
+  if (!args.empty()) {
+    CHECK(args[0]) << name << " dynamic event id is null";
+    auto type = As<ScalarType>(args[0]->GetType());
+    CHECK(type && type->dtype_ == DataType::INDEX) << name << " dynamic event id must be a ScalarType(INDEX)";
+  }
+  return GetUnknownType();
+}
+
+}  // namespace
+
+// ============================================================================
+// Registration Function for Sync Operations
+// ============================================================================
+
+// Register system.sync_src (Set Flag)
+// Attributes: set_pipe, wait_pipe, event_id
+REGISTER_OP("system.sync_src")
+    .set_description("Send a synchronization signal (Set Flag)")
+    .set_op_category("SyncOp")
+    .no_argument()
+    .set_attr<int>("set_pipe")
+    .set_attr<int>("wait_pipe")
+    .set_attr<int>("event_id")
+    .f_deduce_type(DeduceUnknownType);
+
+// Register system.sync_dst (Wait Flag)
+// Attributes: set_pipe, wait_pipe, event_id
+REGISTER_OP("system.sync_dst")
+    .set_description("Wait for a synchronization signal (Wait Flag)")
+    .set_op_category("SyncOp")
+    .no_argument()
+    .set_attr<int>("set_pipe")
+    .set_attr<int>("wait_pipe")
+    .set_attr<int>("event_id")
+    .f_deduce_type(DeduceUnknownType);
+
+REGISTER_OP("system.set_flag")
+    .set_description("Signal an intra-core hardware pipeline event")
+    .set_op_category("SyncOp")
+    .add_argument("event_id_dyn", "Optional dynamic INDEX event id")
+    .set_attr<int>("src_pipe")
+    .set_attr<int>("dst_pipe")
+    .set_attr<int>("event_id")
+    .set_attr<std::string>("core_type")
+    .f_deduce_type([](const auto& args, const auto& kwargs) {
+      return DeducePipelineFlagType(args, kwargs, "system.set_flag");
+    });
+
+REGISTER_OP("system.wait_flag")
+    .set_description("Wait on an intra-core hardware pipeline event")
+    .set_op_category("SyncOp")
+    .add_argument("event_id_dyn", "Optional dynamic INDEX event id")
+    .set_attr<int>("src_pipe")
+    .set_attr<int>("dst_pipe")
+    .set_attr<int>("event_id")
+    .set_attr<std::string>("core_type")
+    .f_deduce_type([](const auto& args, const auto& kwargs) {
+      return DeducePipelineFlagType(args, kwargs, "system.wait_flag");
+    });
+
+// Register system.bar_v (Vector Barrier)
+// Attributes: None
+REGISTER_OP("system.bar_v")
+    .set_description("Vector unit barrier")
+    .set_op_category("SyncOp")
+    .no_argument()
+    .f_deduce_type(DeduceUnknownType);
+
+// Register system.bar_m (Matrix Barrier)
+// Attributes: None
+REGISTER_OP("system.bar_m")
+    .set_description("Matrix unit barrier")
+    .set_op_category("SyncOp")
+    .no_argument()
+    .f_deduce_type(DeduceUnknownType);
+
+// Register system.bar_all (Global Barrier)
+// Attributes: None
+REGISTER_OP("system.bar_all")
+    .set_description("Global barrier synchronization")
+    .set_op_category("SyncOp")
+    .no_argument()
+    .f_deduce_type(DeduceUnknownType);
+
+// Register system.fence (Memory Barrier)
+// Attributes: None
+REGISTER_OP("system.fence")
+    .set_description("Memory barrier over global memory")
+    .set_op_category("SyncOp")
+    .no_argument()
+    .f_deduce_type(DeduceUnknownType);
+
+// Register system.cacheinvalid (Cache Maintenance Operation).
+// Two forms selected by arg count:
+//   - No args: invalidate the whole GM address space
+//     (`pto.cmo.cacheinvalid all #pto.address_space<gm>`). Used as the coarse
+//     data-before-signal release marker before a bare barrier notify, and on the
+//     consume side after a wait before the next cacheable GM read.
+//   - (tensor, shapes, offsets): locate a tensor sub-region, then invalidate only
+//     the cache line containing that view's base address. Codegen emits one
+//     shape-independent form — `pto.partition_view` + `pto.cmo.cacheinvalid
+//     %view single_cache_line` — for every region size, a single element
+//     included. `shapes` does not make the operation walk the region. A raw
+//     `!pto.ptr` operand is rejected by ptoas outright, so there is no scalar/ptr
+//     variant to dispatch to.
+// Variadic arity (0 or 3): the three arguments below describe ONLY the region
+// form; omitting all of them selects the whole-GM form. The registry does not
+// enforce argument count.
+REGISTER_OP("system.cacheinvalid")
+    .set_description(
+        "Invalidate whole GM when called with no args, else the cache line containing a tensor-view base "
+        "(always lowered through a partition view; shapes do not cause a range walk)")
+    .set_op_category("SyncOp")
+    .add_argument("tensor", "Region form: target tensor whose view base addresses the cache line")
+    .add_argument("shapes", "Region form: per-dimension view sizes (does not request a cache-line range)")
+    .add_argument("offsets", "Region form: per-dimension start offsets (N-D tuple matching tensor rank)")
+    .f_deduce_type([](const std::vector<ExprPtr>& args,
+                      const std::vector<std::pair<std::string, std::any>>& kwargs) -> TypePtr {
+      CHECK(kwargs.empty()) << "system.cacheinvalid takes no kwargs";
+      CHECK(args.empty() || args.size() == 3)
+          << "system.cacheinvalid requires either no arguments or (tensor, shapes, offsets), but got "
+          << args.size();
+      if (!args.empty()) {
+        auto tensor_type = AsTensorTypeLike(args[0]->GetType());
+        CHECK(tensor_type) << "system.cacheinvalid region form requires a tensor as its first argument";
+        CHECK_SPAN(!tensor_type->tensor_view_ || !IsMxTensorLayout(tensor_type->tensor_view_->layout),
+                   args[0]->span_)
+            << "system.cacheinvalid does not support MX-layout tensors";
+      }
+      return GetUnknownType();
+    });
+
+// Register system.syncall (Cross-core all-participant barrier). Models
+// pto::SYNCALL with two modes selected by the `mode` attribute:
+//   - "hard" (default): FFTS barrier, no operands. Codegen emits
+//     `pto.syncall() mode = <hard>`. Requires full-core occupancy.
+//   - "soft": GM-polling barrier with operands. Codegen emits
+//     `pto.syncall(%gm[, %used] : ...) mode = <soft>` for every core_type.
+//     gm_workspace is a shared, zero-initialized GM int32 buffer with at least
+//     16 elements (one exclusive 64-byte cache line). used_cores is an optional
+//     i32 participant count; omitting it asks PTO-ISA to derive the count from
+//     the launch configuration.
+// Attributes: core_type ("aiv_only"|"aic_only"|"mix"), mode ("hard"|"soft").
+REGISTER_OP("system.syncall")
+    .set_description("Cross-core all-participant barrier (pto::SYNCALL)")
+    .set_op_category("SyncOp")
+    .add_argument("gm_workspace", "Soft form: shared GM int32 workspace (at least 16 elements, zero-init)")
+    .add_argument("used_cores", "Soft form: optional participant core count (i32; omitted = auto)")
+    .set_attr<std::string>("core_type")
+    .set_attr<std::string>("mode")
+    // Soft form: every core writes its arrival counter into `gm_workspace` and
+    // polls it, so the workspace is read and written. The hard form is an FFTS
+    // barrier that touches no workspace at all.
+    .set_arg_effect(0,
+                    [](const std::vector<std::pair<std::string, std::any>>& kwargs) {
+                      return GetStringKwarg(kwargs, "mode", "hard") == "soft" ? ArgEffect::ReadWrite
+                                                                              : ArgEffect::Read;
+                    })
+    .f_deduce_type(DeduceUnknownType);
+
+}  // namespace ir
+}  // namespace pypto

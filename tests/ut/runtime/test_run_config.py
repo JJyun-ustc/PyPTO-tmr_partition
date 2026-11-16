@@ -1,0 +1,1246 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+
+"""Unit tests for ``pypto.runtime.runner.RunConfig`` and DFX plumbing."""
+
+import dataclasses
+import sys
+import types
+import warnings
+from typing import Any, cast
+from unittest.mock import MagicMock, patch
+
+import pytest
+from pypto.backend import BackendType
+from pypto.pypto_core.passes import MemoryPlanner
+from pypto.runtime.runner import (
+    CompileOptions,
+    DfxOptions,
+    ExecutionMode,
+    RunConfig,
+    RunOptions,
+    _execute_compiled,
+)
+
+
+class TestRunConfigPlatformResolution:
+    """Verify platform/backend synchronization in ``RunConfig``."""
+
+    @pytest.mark.parametrize(
+        ("platform", "expected_backend"),
+        [
+            ("a2a3", BackendType.Ascend910),
+            ("a2a3sim", BackendType.Ascend910),
+            ("a5", BackendType.Ascend950),
+            ("a5sim", BackendType.Ascend950),
+        ],
+    )
+    def test_platform_selects_matching_backend(self, platform, expected_backend):
+        cfg = RunConfig(platform=platform)
+
+        assert cfg.platform == platform
+        assert cfg.backend_type == expected_backend
+
+    def test_enable_chip_swimlane_forces_save_kernels(self):
+        cfg = RunConfig(platform="a5", enable_chip_swimlane=True)
+
+        assert cfg.platform == "a5"
+        assert cfg.backend_type == BackendType.Ascend950
+        assert cfg.save_kernels is True
+
+    def test_auto_scope_deps_switch_defaults_off(self):
+        cfg = RunConfig(platform="a5")
+
+        assert cfg.analyze_auto_scopes_for_deps is False
+
+    def test_ptoas_pass_dump_defaults_off(self):
+        cfg = RunConfig(platform="a5")
+
+        assert cfg.dump_ptoas_passes is False
+
+
+class TestRunConfigDfxFlags:
+    """Verify the five DFX flags are independent and propagate correctly."""
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"enable_chip_swimlane": True},
+            {"enable_dump_args": True},
+            {"enable_pmu": 2},
+            {"enable_dep_gen": True},
+            {"enable_scope_stats": True},
+        ],
+    )
+    def test_any_dfx_flag_forces_save_kernels(self, kwargs):
+        cfg = RunConfig(platform="a5", **kwargs)
+        assert cfg.save_kernels is True, f"save_kernels not auto-enabled for {kwargs}"
+        assert cfg.any_dfx_enabled() is True
+
+    def test_no_dfx_leaves_save_kernels_default(self):
+        cfg = RunConfig(platform="a5")
+        assert cfg.save_kernels is False
+        assert cfg.any_dfx_enabled() is False
+
+    def test_pmu_zero_means_disabled(self):
+        cfg = RunConfig(platform="a5", enable_pmu=0)
+        assert cfg.any_dfx_enabled() is False
+        assert cfg.save_kernels is False
+
+    def test_pmu_positive_means_enabled(self):
+        # The runtime maps enable_pmu > 0 to "enabled, event type N".
+        cfg = RunConfig(platform="a5", enable_pmu=4)
+        assert cfg.any_dfx_enabled() is True
+        assert cfg.enable_pmu == 4
+        assert cfg.save_kernels is True
+
+    def test_dump_args_level_enables_dfx(self):
+        # enable_dump_args is a level: 0=off, 1=partial, 2=full. Any
+        # positive level enables DFX and forces save_kernels (artefact dir).
+        off = RunConfig(platform="a5", enable_dump_args=0)
+        assert off.any_dfx_enabled() is False
+        for level in (1, 2):
+            cfg = RunConfig(platform="a5", enable_dump_args=level)
+            assert cfg.enable_dump_args == level
+            assert cfg.any_dfx_enabled() is True
+            assert cfg.save_kernels is True
+
+    def test_dump_args_bool_maps_to_level(self):
+        # Back-compat: True is the partial level (1), False is off (0). bool is
+        # an int subtype so `> 0` truthiness and pass-through to CallConfig hold.
+        assert RunConfig(platform="a5", enable_dump_args=True).enable_dump_args == 1
+        assert RunConfig(platform="a5", enable_dump_args=False).enable_dump_args == 0
+        assert RunConfig(platform="a5", enable_dump_args=True).any_dfx_enabled() is True
+
+    def test_chip_swimlane_level_is_reachable(self):
+        # Regression (issue #2385): every collection level the runtime supports
+        # must be requestable from RunConfig, not just "on" == full.
+        assert RunConfig(platform="a5", enable_chip_swimlane=0).enable_chip_swimlane == 0
+        for level in (1, 2, 3, 4):
+            cfg = RunConfig(platform="a5", enable_chip_swimlane=level)
+            assert cfg.enable_chip_swimlane == level
+            assert cfg.any_dfx_enabled() is True
+            assert cfg.save_kernels is True
+
+    def test_chip_swimlane_bool_maps_to_full_level(self):
+        # ``True`` means the runtime's bare-flag level 4, matching the
+        # CallConfig setter and the runtime harness's --enable-chip-swimlane.
+        assert RunConfig(platform="a5", enable_chip_swimlane=True).enable_chip_swimlane == 4
+        assert RunConfig(platform="a5", enable_chip_swimlane=False).enable_chip_swimlane == 0
+        assert RunConfig(platform="a5", enable_chip_swimlane=False).any_dfx_enabled() is False
+
+    @pytest.mark.parametrize("bad", [-1, 5, 99])
+    def test_chip_swimlane_rejects_out_of_range_level(self, bad):
+        with pytest.raises(ValueError, match="collection level in"):
+            RunConfig(platform="a5", enable_chip_swimlane=bad)
+
+    def test_chip_swimlane_rejects_non_int(self):
+        with pytest.raises(TypeError, match="enable_chip_swimlane"):
+            RunConfig(platform="a5", enable_chip_swimlane="full")  # pyright: ignore[reportArgumentType]
+
+    def test_dfx_opts_normalizes_swimlane_bool(self):
+        # DfxOptions is constructed directly by the harness and by the CLI, so it
+        # normalizes too — _dfx_to_cli stringifies this field.
+        assert DfxOptions(enable_chip_swimlane=True).enable_chip_swimlane == 4
+        assert DfxOptions(enable_chip_swimlane=2).enable_chip_swimlane == 2
+        assert DfxOptions(enable_chip_swimlane=0).any() is False
+
+    def test_dfx_flags_are_independent(self):
+        # Enabling one flag must not implicitly enable another.
+        cfg = RunConfig(platform="a5", enable_dep_gen=True)
+        assert cfg.enable_dep_gen is True
+        assert cfg.enable_chip_swimlane == 0
+        assert cfg.enable_dump_args == 0
+        assert cfg.enable_pmu == 0
+        assert cfg.enable_scope_stats is False
+
+    def test_scope_stats_forces_save_kernels(self):
+        # scope_stats is the fifth DFX flag; like the others it must be
+        # independent and auto-force kernel retention.
+        cfg = RunConfig(platform="a5", enable_scope_stats=True)
+        assert cfg.enable_scope_stats is True
+        assert cfg.any_dfx_enabled() is True
+        assert cfg.save_kernels is True
+        assert cfg.enable_chip_swimlane == 0
+        assert cfg.enable_dump_args == 0
+        assert cfg.enable_pmu == 0
+        assert cfg.enable_dep_gen is False
+
+    def test_dfx_options_carry_all_five(self):
+        cfg = RunConfig(
+            platform="a5",
+            enable_chip_swimlane=True,
+            enable_dump_args=2,
+            enable_pmu=2,
+            enable_dep_gen=True,
+            enable_scope_stats=True,
+        )
+        opts = cfg.dfx_options()
+        assert opts.enable_chip_swimlane == 4  # True normalizes to the full level
+        assert opts.enable_dump_args == 2
+        assert opts.enable_pmu == 2
+        assert opts.enable_dep_gen is True
+        assert opts.enable_scope_stats is True
+        assert opts.any() is True
+
+    def test_dfx_opts_any_true_for_scope_stats_only(self):
+        # DfxOptions.any() must report True when scope_stats is the sole flag.
+        assert DfxOptions(enable_scope_stats=True).any() is True
+
+    def test_dfx_opts_any_false_when_all_off(self):
+        assert DfxOptions().any() is False
+
+
+class TestSwimlaneAliasDeprecation:
+    """``enable_l2_swimlane`` is the deprecated spelling of ``enable_chip_swimlane``.
+
+    The alias is deliberately not a dataclass field, so ``dataclasses.replace``
+    keeps working on the canonical name — that is the property most of these
+    tests pin down.
+    """
+
+    def test_deprecated_kwarg_maps_and_warns(self):
+        with pytest.warns(DeprecationWarning, match="enable_l2_swimlane is deprecated"):
+            cfg = RunConfig(
+                backend_type=BackendType.Ascend950, execution_mode=ExecutionMode.ONBOARD, enable_l2_swimlane=2
+            )
+        assert cfg.enable_chip_swimlane == 2
+
+    def test_deprecated_kwarg_still_normalizes_bool(self):
+        with pytest.warns(DeprecationWarning):
+            assert (
+                RunConfig(
+                    backend_type=BackendType.Ascend950,
+                    execution_mode=ExecutionMode.ONBOARD,
+                    enable_l2_swimlane=True,
+                ).enable_chip_swimlane
+                == 4
+            )
+        with pytest.warns(DeprecationWarning):
+            assert (
+                RunConfig(
+                    backend_type=BackendType.Ascend950,
+                    execution_mode=ExecutionMode.ONBOARD,
+                    enable_l2_swimlane=False,
+                ).enable_chip_swimlane
+                == 0
+            )
+
+    def test_alias_read_returns_canonical_without_warning(self, recwarn):
+        # Reads stay silent on purpose: dataclasses.replace() goes through this
+        # property, so warning here would fire on unrelated replace() calls.
+        cfg = RunConfig(
+            backend_type=BackendType.Ascend950, execution_mode=ExecutionMode.ONBOARD, enable_chip_swimlane=3
+        )
+        assert cfg.enable_l2_swimlane == 3
+        assert not [w for w in recwarn if issubclass(w.category, DeprecationWarning)]
+
+    def test_alias_assignment_warns_and_writes_through(self):
+        cfg = RunConfig(backend_type=BackendType.Ascend950, execution_mode=ExecutionMode.ONBOARD)
+        with pytest.warns(DeprecationWarning, match="enable_l2_swimlane is deprecated"):
+            cfg.enable_l2_swimlane = 2
+        assert cfg.enable_chip_swimlane == 2
+
+    def test_alias_assignment_normalizes_and_validates(self):
+        cfg = RunConfig(backend_type=BackendType.Ascend950, execution_mode=ExecutionMode.ONBOARD)
+        with pytest.warns(DeprecationWarning):
+            cfg.enable_l2_swimlane = True
+        assert cfg.enable_chip_swimlane == 4
+        with pytest.raises(ValueError, match="collection level in"), pytest.warns(DeprecationWarning):
+            cfg.enable_l2_swimlane = 9
+
+    def test_both_spellings_is_an_error(self):
+        with (
+            pytest.raises(ValueError, match="pass only enable_chip_swimlane"),
+            pytest.warns(DeprecationWarning),
+        ):
+            RunConfig(
+                backend_type=BackendType.Ascend950,
+                execution_mode=ExecutionMode.ONBOARD,
+                enable_chip_swimlane=1,
+                enable_l2_swimlane=3,
+            )
+
+    def test_canonical_name_does_not_warn(self, recwarn):
+        cfg = RunConfig(
+            backend_type=BackendType.Ascend950, execution_mode=ExecutionMode.ONBOARD, enable_chip_swimlane=2
+        )
+        assert cfg.enable_chip_swimlane == 2
+        assert not [w for w in recwarn if issubclass(w.category, DeprecationWarning)]
+
+    def test_replace_on_canonical_name_is_silent_and_wins(self, recwarn):
+        # Regression guard for the alias design: an alias *field* (or InitVar)
+        # would be re-supplied by replace() from the old instance and could
+        # silently override the value the caller just passed.
+        cfg = RunConfig(
+            backend_type=BackendType.Ascend950, execution_mode=ExecutionMode.ONBOARD, enable_chip_swimlane=4
+        )
+        assert dataclasses.replace(cfg, enable_chip_swimlane=1).enable_chip_swimlane == 1
+        assert dataclasses.replace(cfg, enable_chip_swimlane=0).enable_chip_swimlane == 0
+        assert dataclasses.replace(cfg, enable_dep_gen=True).enable_chip_swimlane == 4
+        assert not [w for w in recwarn if issubclass(w.category, DeprecationWarning)]
+
+    def test_alias_is_not_a_dataclass_field(self):
+        names = {f.name for f in dataclasses.fields(RunConfig)}
+        assert "enable_chip_swimlane" in names
+        assert "enable_l2_swimlane" not in names
+
+
+class TestRunConfigRingSizing:
+    """Verify per-task ring-sizing overrides on ``RunConfig``.
+
+    ``None`` (default) means "unset" so the runtime falls back to its
+    compile-time default. Provided values must
+    satisfy the same constraints the runtime's ``RuntimeEnv::validate()``
+    enforces — ``RunConfig`` checks them early for a clear error message.
+    """
+
+    def test_ring_fields_default_none(self):
+        cfg = RunConfig(platform="a2a3sim")
+        assert cfg.ring_task_window is None
+        assert cfg.ring_heap is None
+        assert cfg.ring_dep_pool is None
+
+    def test_valid_ring_values_accepted(self):
+        cfg = RunConfig(
+            platform="a2a3sim",
+            ring_task_window=128,
+            ring_heap=8 * 1024 * 1024,
+            ring_dep_pool=256,
+        )
+        assert cfg.ring_task_window == 128
+        assert cfg.ring_heap == 8 * 1024 * 1024
+        assert cfg.ring_dep_pool == 256
+
+    def test_ring_min_boundaries_accepted(self):
+        cfg = RunConfig(
+            platform="a2a3sim",
+            ring_task_window=4,
+            ring_heap=1024,
+            ring_dep_pool=4,
+        )
+        assert cfg.ring_task_window == 4
+        assert cfg.ring_heap == 1024
+        assert cfg.ring_dep_pool == 4
+
+    @pytest.mark.parametrize("bad", [3, 5, 0, 6, 100])
+    def test_ring_task_window_must_be_pow2_ge4(self, bad):
+        with pytest.raises(ValueError, match="ring_task_window must be a power of 2 >= 4"):
+            RunConfig(platform="a2a3sim", ring_task_window=bad)
+
+    @pytest.mark.parametrize("bad", [512, 1000, 1536, 0])
+    def test_ring_heap_must_be_pow2_ge1024(self, bad):
+        with pytest.raises(ValueError, match="ring_heap must be a power of 2 >= 1024"):
+            RunConfig(platform="a2a3sim", ring_heap=bad)
+
+    @pytest.mark.parametrize("bad", [3, 0, -1, 2**31])
+    def test_ring_dep_pool_must_be_in_int32_range(self, bad):
+        with pytest.raises(ValueError, match=r"ring_dep_pool must be in \[4, INT32_MAX\]"):
+            RunConfig(platform="a2a3sim", ring_dep_pool=bad)
+
+    def test_ring_dep_pool_need_not_be_pow2(self):
+        # Unlike task_window / heap, the dep pool is a plain int range.
+        cfg = RunConfig(platform="a2a3sim", ring_dep_pool=100)
+        assert cfg.ring_dep_pool == 100
+
+    @pytest.mark.parametrize(
+        ("field", "bad"),
+        [
+            ("ring_task_window", 16.0),  # float, even when value would be valid as int
+            ("ring_heap", 1024.0),
+            ("ring_dep_pool", 64.5),
+            ("ring_task_window", True),  # bool must not masquerade as a size
+            ("ring_dep_pool", False),
+        ],
+    )
+    def test_non_int_ring_values_rejected(self, field, bad):
+        # Reject floats / bools with a clear ValueError instead of letting the
+        # pow2 bitwise check raise TypeError or a float slip through.
+        with pytest.raises(ValueError, match=f"{field} must"):
+            RunConfig(platform="a2a3sim", **{field: bad})
+
+
+class TestRunConfigPerRingList:
+    """Verify the per-scope-depth ring list form of the ring overrides.
+
+    A list sizes rings 0..3 independently; a ``0`` entry means "leave that ring
+    at its env/compile-time default". A scalar (validated elsewhere) is broadcast
+    to every ring by the runtime.
+    """
+
+    def test_valid_per_ring_lists_accepted(self):
+        cfg = RunConfig(
+            platform="a2a3sim",
+            ring_task_window=[16, 32, 128, 256],
+            ring_heap=[1024, 2048, 4096, 8192],
+            ring_dep_pool=[8, 16, 100, 256],
+        )
+        assert cfg.ring_task_window == [16, 32, 128, 256]
+        assert cfg.ring_heap == [1024, 2048, 4096, 8192]
+        assert cfg.ring_dep_pool == [8, 16, 100, 256]
+
+    def test_zero_entry_is_per_ring_unset_sentinel(self):
+        # 0 = leave that ring at its default; other entries still validated.
+        cfg = RunConfig(platform="a2a3sim", ring_task_window=[16, 0, 0, 256])
+        assert cfg.ring_task_window == [16, 0, 0, 256]
+
+    def test_tuple_accepted_and_normalized_to_list(self):
+        # A tuple is a valid per-ring form and is normalized to a list so
+        # downstream transcription always sees a list.
+        cfg = RunConfig(platform="a2a3sim", ring_heap=(1024, 2048, 4096, 8192))
+        assert cfg.ring_heap == [1024, 2048, 4096, 8192]
+        assert isinstance(cfg.ring_heap, list)
+
+    @pytest.mark.parametrize(
+        "field",
+        ["ring_task_window", "ring_heap", "ring_dep_pool"],
+    )
+    @pytest.mark.parametrize("length", [0, 1, 3, 5])
+    def test_wrong_length_list_rejected(self, field, length):
+        with pytest.raises(ValueError, match=f"{field} must have exactly 4 entries"):
+            RunConfig(platform="a2a3sim", **{field: [4] * length})
+
+    @pytest.mark.parametrize(
+        ("field", "bad_list"),
+        [
+            ("ring_task_window", [16, 32, 48, 64]),  # 48 not a power of 2
+            ("ring_heap", [1024, 2048, 512, 4096]),  # 512 < 1024
+            ("ring_dep_pool", [8, 16, 2, 256]),  # 2 < 4
+        ],
+    )
+    def test_invalid_entry_rejected(self, field, bad_list):
+        with pytest.raises(ValueError, match=f"{field} entries must"):
+            RunConfig(platform="a2a3sim", **{field: bad_list})
+
+    @pytest.mark.parametrize(
+        ("field", "bad_list"),
+        [
+            ("ring_task_window", [16, 32, True, 64]),  # bool must not pass as 0/size
+            ("ring_dep_pool", [8, False, 16, 32]),  # False must not pass as the 0 sentinel
+            ("ring_heap", [1024, 2048.0, 4096, 8192]),  # float entry
+        ],
+    )
+    def test_non_int_entry_rejected(self, field, bad_list):
+        with pytest.raises(ValueError, match=f"{field} entries must"):
+            RunConfig(platform="a2a3sim", **{field: bad_list})
+
+
+class _SpyRuntimeEnv:
+    """Records writes to ``ring_*`` fields; defaults mirror the runtime (0)."""
+
+    def __init__(self) -> None:
+        self.ring_task_window = 0
+        self.ring_heap = 0
+        self.ring_dep_pool = 0
+
+
+class _SpyCallConfig:
+    """Stand-in for simpler's ``CallConfig`` with a nested ``runtime_env``.
+
+    Carries the same DFX defaults as the real ``CallConfig`` (all off,
+    ``output_prefix`` empty) so tests can assert the builder leaves them
+    untouched on the no-DFX path.
+    """
+
+    def __init__(self) -> None:
+        self.runtime_env = _SpyRuntimeEnv()
+        self.enable_chip_swimlane = False
+        self.enable_dump_args = 0
+        self.enable_pmu = 0
+        self.enable_dep_gen = False
+        self.enable_scope_stats = False
+        self.output_prefix = ""
+
+
+def _build_with_fake_callconfig(run_config, monkeypatch, **kwargs):
+    """Invoke ``_build_call_config`` with a spy ``CallConfig`` so the test
+    runs without the optional ``simpler`` package installed.
+    """
+    fake_task_interface = types.SimpleNamespace(CallConfig=_SpyCallConfig)
+    monkeypatch.setitem(sys.modules, "pypto.runtime.task_interface", fake_task_interface)
+    from pypto.runtime.runner import _build_call_config  # noqa: PLC0415
+
+    return _build_call_config(run_config, runtime_config={}, **kwargs)
+
+
+class TestBuildCallConfigRing:
+    """Verify ``_build_call_config`` transcribes ring sizing into ``runtime_env``."""
+
+    def test_unset_leaves_runtime_env_at_zero(self, monkeypatch):
+        cfg = _build_with_fake_callconfig(RunConfig(platform="a2a3sim"), monkeypatch)
+        assert cfg.runtime_env.ring_task_window == 0
+        assert cfg.runtime_env.ring_heap == 0
+        assert cfg.runtime_env.ring_dep_pool == 0
+
+    def test_set_values_transcribed(self, monkeypatch):
+        run_config = RunConfig(
+            platform="a2a3sim",
+            ring_task_window=16,
+            ring_heap=1024 * 1024,
+            ring_dep_pool=64,
+        )
+        cfg = _build_with_fake_callconfig(run_config, monkeypatch)
+        assert cfg.runtime_env.ring_task_window == 16
+        assert cfg.runtime_env.ring_heap == 1024 * 1024
+        assert cfg.runtime_env.ring_dep_pool == 64
+
+    def test_partial_set_only_touches_provided_fields(self, monkeypatch):
+        run_config = RunConfig(platform="a2a3sim", ring_heap=2 * 1024 * 1024)
+        cfg = _build_with_fake_callconfig(run_config, monkeypatch)
+        assert cfg.runtime_env.ring_heap == 2 * 1024 * 1024
+        # Unset fields stay at the runtime's 0 default.
+        assert cfg.runtime_env.ring_task_window == 0
+        assert cfg.runtime_env.ring_dep_pool == 0
+
+    def test_per_ring_list_transcribed_unchanged(self, monkeypatch):
+        # A per-ring list flows straight through to runtime_env; the runtime's
+        # RuntimeEnv setter accepts both a scalar (broadcast) and a 4-list.
+        run_config = RunConfig(
+            platform="a2a3sim",
+            ring_task_window=[16, 32, 128, 256],
+            ring_dep_pool=[8, 0, 0, 64],
+        )
+        cfg = _build_with_fake_callconfig(run_config, monkeypatch)
+        assert cfg.runtime_env.ring_task_window == [16, 32, 128, 256]
+        assert cfg.runtime_env.ring_dep_pool == [8, 0, 0, 64]
+        assert cfg.runtime_env.ring_heap == 0
+
+
+def _make_dist_call_config_with_fake(dc, run_config, monkeypatch, *, dfx_base=None):
+    """Invoke ``distributed_runner._make_call_config`` with a spy ``CallConfig``.
+
+    Injects a fake ``simpler.task_interface`` so the L3 config builder runs
+    without the optional ``simpler`` package installed, mirroring
+    :func:`_build_with_fake_callconfig` for the L2 path.
+    """
+    fake_task_interface = types.SimpleNamespace(CallConfig=_SpyCallConfig)
+    fake_simpler = types.ModuleType("simpler")
+    fake_simpler.task_interface = fake_task_interface  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "simpler", fake_simpler)
+    monkeypatch.setitem(sys.modules, "simpler.task_interface", fake_task_interface)
+    from pypto.runtime.distributed_runner import _make_call_config  # noqa: PLC0415
+
+    return _make_call_config(dc, run_config, dfx_base=dfx_base)
+
+
+class TestMakeCallConfigRing:
+    """Verify L3 ``_make_call_config`` overlays per-dispatch ring sizing.
+
+    The ``aicpu_thread_num`` baseline always comes from the
+    program's :class:`DistributedConfig`; a per-dispatch :class:`RunConfig`
+    overlays the ``ring_*`` overrides on top. ``None`` leaves every ring field
+    at the runtime's ``0`` default.
+    """
+
+    def test_no_run_config_leaves_runtime_env_at_zero(self, monkeypatch):
+        from pypto.ir import DistributedConfig  # noqa: PLC0415
+
+        cfg = _make_dist_call_config_with_fake(DistributedConfig(), None, monkeypatch)
+        assert cfg.aicpu_thread_num == 0
+        assert cfg.runtime_env.ring_task_window == 0
+        assert cfg.runtime_env.ring_heap == 0
+        assert cfg.runtime_env.ring_dep_pool == 0
+
+    def test_run_config_ring_overrides_transcribed(self, monkeypatch):
+        from pypto.ir import DistributedConfig  # noqa: PLC0415
+
+        run_config = RunConfig(
+            platform="a2a3sim",
+            ring_task_window=32,
+            ring_heap=2 * 1024 * 1024,
+            ring_dep_pool=128,
+        )
+        cfg = _make_dist_call_config_with_fake(DistributedConfig(), run_config, monkeypatch)
+        assert cfg.runtime_env.ring_task_window == 32
+        assert cfg.runtime_env.ring_heap == 2 * 1024 * 1024
+        assert cfg.runtime_env.ring_dep_pool == 128
+
+    def test_baseline_preserved_and_partial_ring_overlay(self, monkeypatch):
+        from pypto.ir import DistributedConfig  # noqa: PLC0415
+
+        dc = DistributedConfig(aicpu_thread_num=3)
+        run_config = RunConfig(platform="a2a3sim", ring_heap=1024 * 1024)
+        cfg = _make_dist_call_config_with_fake(dc, run_config, monkeypatch)
+        # DistributedConfig baseline is preserved.
+        assert cfg.aicpu_thread_num == 3
+        # Only the provided ring field is written; the rest stay at 0.
+        assert cfg.runtime_env.ring_heap == 1024 * 1024
+        assert cfg.runtime_env.ring_task_window == 0
+        assert cfg.runtime_env.ring_dep_pool == 0
+
+    def test_per_ring_list_overlaid_on_l3_dispatch(self, monkeypatch):
+        # A per-program L3 dispatch can size each scope-depth ring independently
+        # (e.g. a wider task window for prefill than decode).
+        from pypto.ir import DistributedConfig  # noqa: PLC0415
+
+        run_config = RunConfig(platform="a2a3sim", ring_task_window=[16, 32, 128, 256])
+        cfg = _make_dist_call_config_with_fake(DistributedConfig(), run_config, monkeypatch)
+        assert cfg.runtime_env.ring_task_window == [16, 32, 128, 256]
+        assert cfg.runtime_env.ring_heap == 0
+        assert cfg.runtime_env.ring_dep_pool == 0
+
+
+class TestMakeCallConfigDfx:
+    """Verify L3 ``_make_call_config`` wires the runtime DFX diagnostics.
+
+    The runtime-diagnostic flags (``enable_dump_args`` / ``enable_pmu`` /
+    ``enable_dep_gen`` / ``enable_scope_stats`` / public
+    ``enable_chip_swimlane``) are transcribed onto the shared ``CallConfig`` and
+    their artifacts rooted at ``dfx_base``. The public swimlane option maps to
+    Simpler's ``enable_chip_swimlane`` and additionally co-enables ``dep_gen``
+    so the converter has a task graph.
+    """
+
+    def test_dfx_flags_transcribed_and_prefix_set(self, monkeypatch, tmp_path):
+        from pypto.ir import DistributedConfig  # noqa: PLC0415
+
+        dfx_base = tmp_path / "dfx_outputs"
+        run_config = RunConfig(
+            platform="a2a3sim",
+            enable_dump_args=2,
+            enable_pmu=1,
+            enable_dep_gen=True,
+            enable_scope_stats=True,
+        )
+        cfg = _make_dist_call_config_with_fake(
+            DistributedConfig(), run_config, monkeypatch, dfx_base=dfx_base
+        )
+        assert cfg.enable_dump_args == 2
+        assert cfg.enable_pmu == 1
+        assert cfg.enable_dep_gen is True
+        assert cfg.enable_scope_stats is True
+        assert cfg.output_prefix == str(dfx_base)
+        # The builder creates the base dir so the runtime's validate() accepts it.
+        assert dfx_base.is_dir()
+
+    def test_swimlane_sets_flag_and_co_enables_dep_gen(self, monkeypatch, tmp_path):
+        from pypto.ir import DistributedConfig  # noqa: PLC0415
+
+        dfx_base = tmp_path / "dfx_outputs"
+        # User asks for swimlane only; dep_gen is auto-enabled because the
+        # converter needs deps.json to resolve task arrows / kernel names.
+        run_config = RunConfig(platform="a2a3sim", enable_chip_swimlane=True)
+        cfg = _make_dist_call_config_with_fake(
+            DistributedConfig(), run_config, monkeypatch, dfx_base=dfx_base
+        )
+        assert cfg.enable_chip_swimlane == 4  # True normalizes to the full level
+        assert cfg.enable_dep_gen is True  # co-enabled
+        assert cfg.output_prefix == str(dfx_base)
+
+    def test_dfx_without_base_raises(self, monkeypatch):
+        from pypto.ir import DistributedConfig  # noqa: PLC0415
+
+        run_config = RunConfig(platform="a2a3sim", enable_pmu=1)
+        with pytest.raises(ValueError, match="dfx_base is required"):
+            _make_dist_call_config_with_fake(DistributedConfig(), run_config, monkeypatch, dfx_base=None)
+
+    def test_no_run_config_leaves_dfx_off(self, monkeypatch):
+        from pypto.ir import DistributedConfig  # noqa: PLC0415
+
+        cfg = _make_dist_call_config_with_fake(DistributedConfig(), None, monkeypatch)
+        assert cfg.output_prefix == ""
+        assert cfg.enable_pmu == 0
+        assert cfg.enable_dep_gen is False
+
+    def test_ring_only_run_config_creates_no_dfx_dir(self, monkeypatch, tmp_path):
+        from pypto.ir import DistributedConfig  # noqa: PLC0415
+
+        dfx_base = tmp_path / "dfx_outputs"
+        run_config = RunConfig(platform="a2a3sim", ring_heap=1024 * 1024)
+        cfg = _make_dist_call_config_with_fake(
+            DistributedConfig(), run_config, monkeypatch, dfx_base=dfx_base
+        )
+        # Ring sizing applied, DFX untouched, and no artifact dir materialized.
+        assert cfg.runtime_env.ring_heap == 1024 * 1024
+        assert cfg.output_prefix == ""
+        assert not dfx_base.exists()
+
+
+class TestRunConfigCompileForwarding:
+    """Compile-side RunConfig fields are forwarded into ``ir.compile``."""
+
+    def test_compile_kwargs_forwards_auto_scope_deps_switch(self):
+        kwargs = RunConfig(platform="a2a3sim", analyze_auto_scopes_for_deps=True).compile_kwargs()
+
+        assert kwargs["analyze_auto_scopes_for_deps"] is True
+
+    def test_compile_kwargs_forwards_memory_planner(self):
+        kwargs = RunConfig(platform="a2a3sim", memory_planner=MemoryPlanner.DSA_RP).compile_kwargs()
+
+        assert kwargs["memory_planner"] == MemoryPlanner.DSA_RP
+
+    def test_compile_kwargs_forwards_ptoas_pass_dump(self):
+        kwargs = RunConfig(platform="a2a3sim", dump_ptoas_passes=True).compile_kwargs()
+
+        assert kwargs["dump_ptoas_passes"] is True
+
+    def test_compile_kwargs_omits_unset_optional_fields(self):
+        """Unset optionals must be absent, not ``None``.
+
+        ``ir.compile`` rejects an explicit ``memory_planner`` while a
+        ``PassContext`` is active, so an unset planner has to defer to that
+        context rather than arrive as an explicit ``None``.
+        """
+        kwargs = RunConfig(platform="a2a3sim").compile_kwargs()
+
+        assert "memory_planner" not in kwargs
+        assert "output_dir" not in kwargs
+        assert "distributed_config" not in kwargs
+
+    def test_compile_kwargs_excludes_dispatch_only_fields(self):
+        """Dispatch-side fields are consumed by ``__call__``, not by compilation."""
+        kwargs = RunConfig(
+            platform="a2a3sim",
+            device_id=3,
+            rtol=1e-3,
+            enable_pmu=2,
+            ring_heap=1024 * 1024,
+        ).compile_kwargs()
+
+        for dispatch_only in ("device_id", "rtol", "atol", "enable_pmu", "ring_heap"):
+            assert dispatch_only not in kwargs
+
+    def test_compile_kwargs_are_accepted_by_ir_compile(self):
+        """Every key must name a real ``ir.compile`` parameter."""
+        import inspect  # noqa: PLC0415
+
+        from pypto import ir  # noqa: PLC0415
+
+        accepted = set(inspect.signature(ir.compile).parameters)
+        kwargs = RunConfig(
+            platform="a2a3sim",
+            save_kernels_dir="/tmp/pypto-compile-kwargs",
+            memory_planner=MemoryPlanner.DSA_RP,
+        ).compile_kwargs()
+
+        assert set(kwargs) <= accepted
+
+    def test_execute_compiled_accepts_auto_scope_deps_switch(self, tmp_path, stub_device_runner):
+        config = RunConfig(platform="a2a3sim", ring_heap=1024 * 1024)
+        stub_device_runner._compile_and_assemble.return_value = (object(), "fake_runtime", {})
+
+        _execute_compiled(
+            tmp_path,
+            [],
+            platform="a2a3sim",
+            device_id=0,
+            analyze_auto_scopes_for_deps=True,
+            config=config,
+        )
+
+        assert stub_device_runner._compile_and_assemble.call_args.args[1] == "a2a3sim"
+        execute_call = stub_device_runner._execute_on_device.call_args
+        assert execute_call.args[3] == "fake_runtime"
+        assert execute_call.kwargs["aicpu_thread_num"] is None
+        assert execute_call.kwargs["config"] is config
+
+    def test_execute_compiled_serializes_ring_config_for_dep_capture(
+        self, tmp_path, monkeypatch, stub_device_runner
+    ):
+        captured: dict = {}
+        stub_device_runner._compile_and_assemble.return_value = (object(), "fake_runtime", {})
+
+        import pypto.runtime.runner as runner_mod  # noqa: PLC0415
+
+        monkeypatch.setattr(
+            runner_mod,
+            "_capture_deps_subprocess",
+            lambda spec, *_args: captured.update(spec=spec),
+        )
+        monkeypatch.setattr(runner_mod, "_collect_dfx_artifacts", lambda *_args: None)
+
+        config = RunConfig(
+            platform="a2a3",
+            ring_task_window=[16, 32, 64, 128],
+            ring_heap=512 * 1024 * 1024,
+            ring_dep_pool=[64, 0, 0, 256],
+        )
+        _execute_compiled(
+            tmp_path,
+            [],
+            platform="a2a3",
+            device_id=0,
+            dfx=DfxOptions(enable_chip_swimlane=True),
+            config=config,
+        )
+
+        assert stub_device_runner._execute_on_device.call_args.kwargs["config"] is config
+        assert captured["spec"]["ring_overrides"] == {
+            "ring_task_window": [16, 32, 64, 128],
+            "ring_heap": 512 * 1024 * 1024,
+            "ring_dep_pool": [64, 0, 0, 256],
+        }
+
+    @pytest.mark.parametrize(
+        ("runtime_config", "expected_enable_sdma"),
+        [
+            ({}, False),
+            ({"enable_sdma": 1}, True),
+        ],
+    )
+    def test_execute_compiled_forwards_sdma_capability(
+        self,
+        tmp_path,
+        monkeypatch,
+        runtime_config,
+        expected_enable_sdma,
+        stub_device_runner,
+    ):
+        stub_device_runner._compile_and_assemble.return_value = (
+            object(),
+            "fake_runtime",
+            runtime_config,
+        )
+
+        _execute_compiled(tmp_path, [], platform="a2a3sim", device_id=0)
+
+        kwargs = stub_device_runner._execute_on_device.call_args.kwargs
+        assert kwargs["enable_sdma"] is expected_enable_sdma
+
+    def test_compile_kwargs_name_the_target_once(self):
+        """The compiler receives the two axes without deprecated inputs."""
+        cfg = RunConfig(backend_type=BackendType.Ascend950)
+        kwargs = cfg.compile_kwargs()
+        assert kwargs["backend_type"] == BackendType.Ascend950
+        assert kwargs["execution_mode"] is ExecutionMode.SIM
+        assert "platform" not in kwargs
+
+    def test_a_backend_type_that_contradicts_the_platform_warns(self):
+        """It was always discarded here; now it says so."""
+        with pytest.warns(DeprecationWarning, match=r"backend_type=\.\.\.\) is deprecated"):
+            cfg = RunConfig(platform="a5sim", backend_type=BackendType.Ascend910)
+
+        assert cfg.backend_type == BackendType.Ascend950
+
+    def test_replace_platform_warns_without_a_stale_backend_warning(self):
+        assert "backend_type" not in {f.name for f in dataclasses.fields(RunConfig)}
+        cfg = RunConfig(execution_mode=ExecutionMode.ONBOARD)
+        with pytest.warns(DeprecationWarning, match=r"RunConfig\(platform=") as caught:
+            switched = dataclasses.replace(cfg, platform="a5")
+        assert len(caught) == 1
+        assert switched.platform == "a5"
+        assert switched.backend_type == BackendType.Ascend950
+
+    def test_matching_backend_only_warns_about_platform(self):
+        with pytest.warns(DeprecationWarning, match=r"RunConfig\(platform=") as caught:
+            cfg = RunConfig(platform="a5sim", backend_type=BackendType.Ascend950)
+        assert len(caught) == 1
+        assert cfg.backend_type == BackendType.Ascend950
+
+    def test_compile_kwargs_forward_distributed_config_by_identity(self):
+        """A set ``distributed_config`` is forwarded as the same object.
+
+        ``ir.compile`` bakes it into the ``DistributedCompiledProgram`` and the
+        per-rank dispatch reads it back, so a copy would let the two disagree.
+        """
+        from pypto.ir import DistributedConfig  # noqa: PLC0415
+
+        dc = DistributedConfig(device_ids=[0, 1])
+        assert RunConfig(distributed_config=dc).compile_kwargs()["distributed_config"] is dc
+
+
+class TestOptionObjects:
+    """``RunConfig`` as an aggregate of ``CompileOptions`` / ``RunOptions`` / ``DfxOptions``."""
+
+    # RunConfig field -> the option-object field it becomes. Only the renames
+    # are listed; everything else keeps its name.
+    #
+    # CompileOptions names the architecture backend_type; execution_mode keeps
+    # its name. Runtime mappings still serialize both axes as platform.
+    _COMPILE_RENAMES = {
+        "save_kernels_dir": "output_dir",
+        "compile_profiling": "profiling",
+        "arch": "backend_type",
+    }
+    _HARNESS_ONLY = {"rtol", "atol", "golden_data_dir", "save_kernels", "codegen_only"}
+    # Consumed by JIT before choosing a compiled object, not by compiler or launcher.
+    _JIT_POLICY_ONLY = {"cache_config"}
+
+    def test_every_run_config_field_is_claimed_by_exactly_one_concern(self):
+        """The split must stay total: a new field lands in a view, or in the harness set.
+
+        Without this, adding a field to ``RunConfig`` silently leaves it out of
+        both views — readable through the aggregate, invisible to any caller
+        that took the half it belongs to.
+        """
+        run_config_fields = {f.name for f in dataclasses.fields(RunConfig)}
+        compile_fields = {f.name for f in dataclasses.fields(CompileOptions)}
+        dispatch_fields = {f.name for f in dataclasses.fields(RunOptions) if f.name != "dfx"}
+        dispatch_fields |= {f.name for f in dataclasses.fields(DfxOptions)}
+
+        claimed = set()
+        for name in run_config_fields:
+            renamed = self._COMPILE_RENAMES.get(name, name)
+            if renamed in compile_fields or name in dispatch_fields:
+                claimed.add(name)
+
+        assert run_config_fields - claimed == self._HARNESS_ONLY | self._JIT_POLICY_ONLY
+
+    def test_compile_kwargs_is_the_compile_options_view(self):
+        """``compile_kwargs()`` must be exactly what the typed object produces."""
+        cfg = RunConfig(
+            platform="a5sim",
+            save_kernels_dir="/tmp/pypto-options",
+            compile_profiling=True,
+            memory_planner=MemoryPlanner.DSA_RP,
+        )
+        assert cfg.compile_kwargs() == cfg.compile_options().as_compile_kwargs()
+
+    def test_compile_options_use_the_compilers_field_names(self):
+        """``save_kernels_dir`` / ``compile_profiling`` are ``ir.compile``'s names here."""
+        options = RunConfig(save_kernels_dir="/tmp/pypto-options", compile_profiling=True).compile_options()
+
+        assert options.output_dir == "/tmp/pypto-options"
+        assert options.profiling is True
+
+    def test_compile_options_stand_alone_without_a_run_config(self):
+        """A caller that only compiles needs no ``RunConfig``."""
+        import inspect  # noqa: PLC0415
+
+        from pypto import ir  # noqa: PLC0415
+
+        kwargs = CompileOptions(platform="a5sim").as_compile_kwargs()
+
+        assert set(kwargs) <= set(inspect.signature(ir.compile).parameters)
+        assert kwargs["backend_type"] == BackendType.Ascend950
+        assert kwargs["execution_mode"] is ExecutionMode.SIM
+        assert "platform" not in kwargs
+        # Unset optionals stay absent so ir.compile's own defaults apply.
+        assert "memory_planner" not in kwargs
+        assert "output_dir" not in kwargs
+        assert "distributed_config" not in kwargs
+
+    def test_run_options_carry_the_dispatch_half_with_dfx_nested(self):
+        cfg = RunConfig(
+            platform="a2a3",
+            device_id=3,
+            aicpu_thread_num=7,
+            ring_heap=1024 * 1024,
+            enable_pmu=2,
+        )
+        options = cfg.run_options()
+
+        assert (options.platform, options.device_id, options.aicpu_thread_num) == ("a2a3", 3, 7)
+        assert options.ring_heap == 1024 * 1024
+        assert options.dfx == cfg.dfx_options()
+        assert options.dfx.enable_pmu == 2
+
+    def test_the_two_axes_are_independent_fields(self):
+        """``platform`` is a serialization of two fields, not a field itself.
+
+        Packed into one string, the axes could disagree with each other and with
+        the backend, which is what the old ``__post_init__`` spent a validation
+        and a rebuild guarding against. As separate fields that state is simply
+        unrepresentable.
+        """
+        names = {f.name for f in dataclasses.fields(RunConfig)}
+        assert {"arch", "execution_mode"} <= names
+        assert "platform" not in names
+
+        cfg = RunConfig(arch=BackendType.Ascend950, execution_mode=ExecutionMode.ONBOARD)
+        assert cfg.platform == "a5"
+        assert cfg.backend_type == BackendType.Ascend950
+
+    def test_platform_keyword_sets_both_axes(self):
+        """The wire spelling stays constructible: 238 call sites use it."""
+        cfg = RunConfig(platform="a2a3sim")
+
+        assert cfg.arch == BackendType.Ascend910
+        assert cfg.execution_mode is ExecutionMode.SIM
+        assert cfg.platform == "a2a3sim"
+
+    def test_a_non_enum_execution_mode_is_rejected(self):
+        """``execution_mode="sim"`` must not read as ONBOARD.
+
+        The packed string used to be checked against four literals. Splitting it
+        made a *disagreeing* platform unrepresentable but not a nonsensical one:
+        anything that is not ``ExecutionMode.SIM`` fails the identity test, so a
+        plausible-looking ``"sim"`` would have turned a simulator request into a
+        hardware run — silently, and named ``a2a3`` rather than ``a2a3sim``.
+        """
+        for bad in ("sim", True, 1, None):
+            with pytest.raises(TypeError, match=r"execution_mode must be an ExecutionMode"):
+                RunConfig(execution_mode=bad)  # pyright: ignore[reportArgumentType]
+
+    def test_a_non_backend_type_arch_is_rejected_at_construction(self):
+        """Otherwise it fails later, inside a nanobind call, far from the caller."""
+        for bad in ("a5", "Ascend950", 0):
+            with pytest.raises(TypeError, match=r"arch must be a BackendType"):
+                RunConfig(arch=bad)  # pyright: ignore[reportArgumentType]
+
+    def test_the_axes_are_keyword_only(self):
+        """``platform=`` can only win over an axis if the axis is a keyword.
+
+        The wrapper rewrites ``kwargs``. A positional ``arch`` would reach the
+        generated ``__init__`` alongside the rewritten keyword and raise
+        "multiple values for argument", contradicting the documented precedence.
+        No call site passes positionally, so the class is ``kw_only``.
+        """
+        with pytest.raises(TypeError, match=r"positional argument"):
+            RunConfig(BackendType.Ascend950)  # pyright: ignore[reportCallIssue]
+
+        assert RunConfig(arch=BackendType.Ascend950, platform="a2a3sim").platform == "a2a3sim"
+
+    def test_platform_is_visible_to_introspection(self):
+        """``platform=`` must appear in the signature, not just work.
+
+        ``functools.wraps`` on the ``__init__`` wrapper copies the
+        dataclass-generated signature, which lists the two axes and not the
+        spelling almost every call site uses. Doc tools and IDEs read that
+        signature, so an accepted-but-unadvertised keyword reads as unsupported.
+        """
+        import inspect  # noqa: PLC0415
+
+        params = inspect.signature(RunConfig).parameters
+        assert "platform" in params
+        assert {"arch", "execution_mode"} <= set(params)
+        assert RunConfig(platform="a5sim").platform == "a5sim"
+
+    def test_replace_by_either_axis_or_by_platform(self):
+        """``replace`` works through both spellings; only legacy platform warns.
+
+        ``replace(cfg, platform=...)`` re-supplies both axes from the instance
+        alongside the new platform. The platform has to win over that echo —
+        there is no way to tell it from a caller contradicting themselves, the
+        same ambiguity the deprecated keywords carry.
+        """
+        cfg = RunConfig(arch=BackendType.Ascend950, execution_mode=ExecutionMode.ONBOARD)
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", DeprecationWarning)
+            assert dataclasses.replace(cfg, arch=BackendType.Ascend910).platform == "a2a3"
+            assert dataclasses.replace(cfg, execution_mode=ExecutionMode.SIM).platform == "a5sim"
+        with pytest.warns(DeprecationWarning, match=r"RunConfig\(platform="):
+            assert dataclasses.replace(cfg, platform="a2a3sim").platform == "a2a3sim"
+
+    def test_an_invalid_platform_string_still_names_the_four_spellings(self):
+        with pytest.raises(ValueError, match=r"Invalid platform 'bogus'"):
+            RunConfig(platform="bogus")
+
+    def test_the_arch_name_comes_from_the_backend_handler(self):
+        """The wire arch string has one owner: the C++ handler that stamps it.
+
+        ``pto.target_arch`` in the emitted ``.pto`` is the same string, so a
+        second copy in Python would be a second thing to keep in step.
+        """
+        from pypto.pypto_core import backend as backend_core  # noqa: PLC0415
+
+        for arch in (BackendType.Ascend910, BackendType.Ascend950):
+            handler_name = backend_core.get_backend_instance(arch).get_handler().get_pto_target_arch()
+            assert RunConfig(arch=arch, execution_mode=ExecutionMode.ONBOARD).platform == handler_name
+
+    def test_only_the_option_types_something_accepts_are_exported(self):
+        """An exported option type must be one a caller can actually hand somewhere.
+
+        ``CompileOptions`` unpacks into ``ir.compile`` and ``DfxOptions`` is the
+        ``dfx=`` parameter of ``execute_compiled``. ``RunOptions`` is neither:
+        every dispatch entry point takes a ``RunConfig`` and calls
+        ``run_options()`` itself, so handing one in raises ``AttributeError``.
+        Exporting it would advertise an entry point that does not exist.
+        """
+        import inspect  # noqa: PLC0415
+
+        from pypto import runtime  # noqa: PLC0415
+
+        assert "CompileOptions" in runtime.__all__
+        assert "DfxOptions" in runtime.__all__
+        assert isinstance(inspect.signature(runtime.execute_compiled).parameters["dfx"].default, DfxOptions)
+
+        assert "RunOptions" not in runtime.__all__
+        assert not hasattr(runtime, "RunOptions")
+
+    def test_dispatch_still_requires_a_run_config(self):
+        """Records why ``RunOptions`` stays internal: the dispatch path calls back into it."""
+        with pytest.raises(AttributeError, match="dfx_options"):
+            RunOptions(platform="a2a3sim").dfx_options()  # pyright: ignore[reportAttributeAccessIssue]
+
+    def test_any_dfx_enabled_agrees_with_the_dfx_view(self):
+        """One predicate, not two: the aggregate answers through the view."""
+        for cfg in (RunConfig(), RunConfig(enable_scope_stats=True), RunConfig(enable_chip_swimlane=True)):
+            assert cfg.any_dfx_enabled() == cfg.dfx_options().any()
+
+
+# ``_execute_on_device`` lives in ``device_runner`` which eagerly imports the
+# ``simpler`` package (via ``task_interface``). Unit-tests CI runs without
+# ``simpler`` installed, so the import fails at collection time. Mirror the
+# skip pattern from ``test_worker_reuse.py``.
+try:
+    import simpler  # noqa: F401  # pyright: ignore[reportMissingImports, reportUnusedImport] — presence probe
+except ImportError:
+    _has_simpler = False
+else:
+    _has_simpler = True
+
+
+@pytest.mark.skipif(not _has_simpler, reason="_execute_on_device requires the simpler package")
+class TestExecuteOnDeviceDfxValidation:
+    """Verify ``_execute_on_device`` rejects DFX flags without ``output_prefix``."""
+
+    def test_dfx_without_output_prefix_raises_value_error(self):
+        from pypto.runtime.device_runner import _execute_on_device  # noqa: PLC0415
+
+        with pytest.raises(ValueError, match="output_prefix is required"):
+            _execute_on_device(
+                chip_callable=MagicMock(),
+                orch_args=MagicMock(),
+                platform="a5sim",
+                runtime_name="tensormap_and_ringbuffer",
+                device_id=0,
+                output_prefix=None,
+                enable_chip_swimlane=True,
+            )
+
+    def test_dfx_without_output_prefix_raises_for_each_flag(self):
+        from pypto.runtime.device_runner import _execute_on_device  # noqa: PLC0415
+
+        # Heterogeneous flag dicts; the ``dict[str, Any]`` element type
+        # keeps ``**flag`` unpacking honest against the keyword surface
+        # (``enable_pmu`` is an int level, the rest bools).
+        flags: list[dict[str, Any]] = [
+            {"enable_chip_swimlane": True},
+            {"enable_dump_args": True},
+            {"enable_pmu": 2},
+            {"enable_dep_gen": True},
+            {"enable_scope_stats": True},
+        ]
+        for flag in flags:
+            with pytest.raises(ValueError, match="output_prefix is required"):
+                _execute_on_device(
+                    chip_callable=MagicMock(),
+                    orch_args=MagicMock(),
+                    platform="a5sim",
+                    runtime_name="tensormap_and_ringbuffer",
+                    device_id=0,
+                    output_prefix=None,
+                    **flag,
+                )
+
+    def test_no_dfx_without_output_prefix_is_ok(self):
+        # When no DFX flag is set, output_prefix=None must NOT raise.
+        # The function would fail later on the actual device call, so we
+        # patch the Worker plumbing to short-circuit after CallConfig setup.
+        from pypto.runtime import device_runner  # noqa: PLC0415
+
+        with patch.object(device_runner, "Worker") as worker_cls:
+            worker = worker_cls.return_value
+            # _PyptoWorker.current returns None → falls to the new-Worker path.
+            # ``current`` lives on ``ChipWorker``, not the ABC base ``Worker``.
+            with patch("pypto.runtime.worker.ChipWorker.current", return_value=None):
+                device_runner._execute_on_device(
+                    chip_callable=MagicMock(),
+                    orch_args=MagicMock(),
+                    platform="a5sim",
+                    runtime_name="tensormap_and_ringbuffer",
+                    device_id=0,
+                    output_prefix=None,
+                )
+            assert worker.init.called
+            assert worker.run.called
+            assert worker.close.called
+
+    def test_public_option_maps_to_simpler_chip_field(self, tmp_path):
+        """The compatibility option must populate Simpler's renamed member."""
+        from pypto.runtime import device_runner  # noqa: PLC0415
+
+        with patch.object(device_runner, "Worker") as worker_cls:
+            worker = worker_cls.return_value
+            with patch("pypto.runtime.worker.ChipWorker.current", return_value=None):
+                device_runner._execute_on_device(
+                    chip_callable=MagicMock(),
+                    orch_args=MagicMock(),
+                    platform="a5sim",
+                    runtime_name="tensormap_and_ringbuffer",
+                    device_id=0,
+                    output_prefix=str(tmp_path),
+                    enable_chip_swimlane=True,
+                )
+
+        call_config = worker.init.call_args.kwargs["prewarm_config"]
+        # Simpler maps bool True to its full chip-swimlane collection level.
+        assert call_config.enable_chip_swimlane == 4
+
+
+@pytest.mark.parametrize("backend_type", [BackendType.Ascend910, BackendType.Ascend950])
+@pytest.mark.parametrize("mode", [ExecutionMode.ONBOARD, ExecutionMode.SIM])
+def test_backend_type_and_execution_mode_match_legacy_target(backend_type, mode):
+    """New callers must produce exactly the legacy compile/cache identity."""
+    config = RunConfig(backend_type=backend_type, execution_mode=mode)
+    legacy = RunConfig(platform=config.platform)
+    assert config.backend_type == backend_type
+    assert config.execution_mode is mode
+    assert config.compile_kwargs() == legacy.compile_kwargs()
+    assert config.run_options() == legacy.run_options()
+    options = CompileOptions(backend_type=backend_type, execution_mode=mode)
+    assert options == CompileOptions(platform=config.platform)
+    assert options.as_compile_kwargs() == legacy.compile_kwargs()
+
+
+def test_replace_backend_type_preserves_execution_mode():
+    config = RunConfig(backend_type=BackendType.Ascend950, execution_mode=ExecutionMode.ONBOARD)
+    changed = dataclasses.replace(config, backend_type=BackendType.Ascend910)
+    assert changed.platform == "a2a3"
+    assert config.platform == "a5"
+    options = config.compile_options()
+    assert dataclasses.replace(options, execution_mode=ExecutionMode.SIM).platform == "a5sim"
+    assert dataclasses.replace(options, platform="a2a3sim").backend_type == BackendType.Ascend910
+    assert cast(Any, CompileOptions)("a5", options.strategy).execution_mode is ExecutionMode.ONBOARD
+
+
+def test_invalid_new_backend_type_is_rejected():
+    with pytest.raises(TypeError, match="BackendType"):
+        RunConfig(backend_type=cast(Any, "a5"))
+
+
+@pytest.mark.parametrize("mode", [None, "sim"])
+def test_compile_options_rejects_invalid_execution_mode(mode):
+    with pytest.raises(TypeError, match="CompileOptions.execution_mode must be an ExecutionMode"):
+        CompileOptions(execution_mode=mode)
+    with pytest.raises(TypeError, match="CompileOptions.execution_mode must be an ExecutionMode"):
+        dataclasses.replace(CompileOptions(), execution_mode=mode)
+
+
+@pytest.mark.parametrize("config_type", [RunConfig, CompileOptions])
+@pytest.mark.parametrize(
+    ("platform", "backend", "mode"),
+    [
+        ("a2a3", BackendType.Ascend910, ExecutionMode.ONBOARD),
+        ("a2a3sim", BackendType.Ascend910, ExecutionMode.SIM),
+        ("a5", BackendType.Ascend950, ExecutionMode.ONBOARD),
+        ("a5sim", BackendType.Ascend950, ExecutionMode.SIM),
+    ],
+)
+def test_legacy_platform_warns_at_caller_and_preserves_target(config_type, platform, backend, mode):
+    with pytest.warns(DeprecationWarning, match="use backend_type and execution_mode") as caught:
+        legacy = config_type(platform=platform)
+    assert len(caught) == 1
+    assert caught[0].filename == __file__
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", DeprecationWarning)
+        preferred = config_type(backend_type=backend, execution_mode=mode)
+        assert legacy == preferred
+        assert legacy.platform == preferred.platform == platform
+        assert dataclasses.replace(preferred).platform == platform
+        options = preferred.compile_options() if config_type is RunConfig else preferred
+        kwargs = options.as_compile_kwargs()
+        assert kwargs["backend_type"] == backend
+        assert kwargs["execution_mode"] is mode
+        assert "platform" not in kwargs
+
+
+def test_positional_compile_options_platform_is_deprecated():
+    with pytest.warns(DeprecationWarning, match=r"CompileOptions\(platform=") as caught:
+        options = cast(Any, CompileOptions)("a5")
+    assert len(caught) == 1
+    assert caught[0].filename == __file__
+    assert options.backend_type == BackendType.Ascend950
+    assert options.execution_mode is ExecutionMode.ONBOARD
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

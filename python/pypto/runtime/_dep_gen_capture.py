@@ -1,0 +1,165 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+
+"""Subprocess entry point that captures a dep_gen ``deps.json`` for swimlane.
+
+When ``enable_chip_swimlane`` is requested on an onboard platform, the swimlane
+converter needs a task graph that only a dep_gen run produces. dep_gen and
+swimlane cannot share one in-process run: the runtime's per-run finalize does
+not reliably reclaim the SVM host-register mappings the DFX collectors allocate,
+so a second DFX run in the same process hits the registration cap
+(``halHostRegister`` rc 8). Running the dep_gen pass in a **separate process**
+sidesteps that — the OS reclaims all device/SVM state on exit, leaving the
+in-process swimlane pass a clean slate.
+
+This module is invoked by :mod:`pypto.runtime.runner` as
+``python -m pypto.runtime._dep_gen_capture <spec.json>``. The spec is a small
+JSON file (see :func:`pypto.runtime.runner` for the writer) describing how to
+reconstruct the orchestration arguments:
+
+* ``mode="golden"`` — regenerate the exact inputs from ``golden.py`` (the test
+  harness path; inputs are deterministic, so the captured graph is faithful).
+* ``mode="argspec"`` — the compiled-program path. The task graph can be routed
+  by tensor *values* (e.g. paged-attention ``block_tables`` / ``seq_lens``), so
+  host tensors are saved verbatim and reloaded with real data and scalars are
+  preserved exactly; only device-resident tensors (unreachable from a fresh
+  child) fall back to zero-filled tensors of the recorded shape.
+"""
+
+import ctypes
+import json
+import sys
+from pathlib import Path
+from typing import Any
+
+import torch
+
+
+def _torch_dtype(name: str) -> torch.dtype:
+    """Resolve a ``"float32"``-style name to a ``torch.dtype``."""
+    dtype = getattr(torch, name, None)
+    if not isinstance(dtype, torch.dtype):
+        raise ValueError(f"Unknown torch dtype name: {name!r}")
+    return dtype
+
+
+def _build_argspec_orch_args(args_spec: list[dict[str, Any]]) -> list[Any]:
+    """Rebuild ordered args from a recorded spec (see ``runner._build_args_spec``).
+
+    Host tensors are reloaded from disk with real data (so data-as-control
+    inputs route the same graph); device-resident tensors are rebuilt as zeros;
+    scalars are reconstructed exactly.
+
+    The tensors/scalars stay unmaterialized until ``_execute_on_device`` has
+    selected their owning Worker.
+    """
+    coerced: list[Any] = []
+    for entry in args_spec:
+        kind = entry["kind"]
+        if kind == "tensor_file":
+            # Saved contiguous in runner._build_args_spec, so no re-contiguous needed.
+            coerced.append(torch.load(entry["path"]))
+        elif kind == "tensor_zeros":
+            coerced.append(torch.zeros(entry["shape"], dtype=_torch_dtype(entry["dtype"])))
+        elif kind == "scalar":
+            ctype = getattr(ctypes, entry["ctype"])
+            coerced.append(ctype(entry["value"]))
+        else:
+            raise ValueError(f"Unknown arg spec kind: {kind!r}")
+    return coerced
+
+
+def _build_golden_orch_args(golden_path: Path) -> list[Any]:
+    """Regenerate ordered args from ``golden.py``'s ``generate_inputs``."""
+    from .device_runner import build_orch_args_from_inputs  # noqa: PLC0415
+    from .runner import _load_golden_module  # noqa: PLC0415
+
+    golden_module = _load_golden_module(golden_path, module_name="_golden_dep_gen")
+
+    result = golden_module.generate_inputs({"name": "Default"})
+    output_names = set(getattr(golden_module, "__outputs__", []))
+    orch_args, _, _, _ = build_orch_args_from_inputs(result, output_names)
+    return orch_args
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) != 1:
+        print("usage: python -m pypto.runtime._dep_gen_capture <spec.json>", file=sys.stderr)
+        return 2
+
+    spec = json.loads(Path(argv[0]).read_text(encoding="utf-8"))
+
+    print(
+        "[swimlane:dep_gen subprocess] capturing the task dependency graph for the swimlane; "
+        "the following compile/run output is for deps.json only (timing is discarded)."
+    )
+
+    from .device_runner import _compile_and_assemble, _execute_on_device  # noqa: PLC0415
+
+    work_dir = Path(spec["work_dir"])
+    platform = spec["platform"]
+    device_id = int(spec["device_id"])
+    dfx_dir = Path(spec["dfx_dir"])
+    level = int(spec.get("level", 2))
+
+    if "prebuilt" in spec:
+        from pypto.jit._artifact_manifest import BuildKind  # noqa: PLC0415
+
+        from ._prebuilt import load_prebuilt  # noqa: PLC0415
+
+        chip_callable, runtime_name, runtime_config = load_prebuilt(
+            Path(spec["prebuilt"]), platform, BuildKind.SINGLE_CHIP
+        )["."]
+    else:
+        chip_callable, runtime_name, runtime_config = _compile_and_assemble(work_dir, platform)
+    enable_sdma = bool(runtime_config.get("enable_sdma", False))
+
+    if spec["mode"] == "golden":
+        orch_args = _build_golden_orch_args(Path(spec["golden_path"]))
+    elif spec["mode"] == "argspec":
+        orch_args = _build_argspec_orch_args(spec["args"])
+    else:
+        raise ValueError(f"Unknown spec mode: {spec['mode']!r}")
+
+    # A caller-supplied aicpu_thread_num takes precedence; fall back to the
+    # value baked into kernel_config.py so the captured graph matches the
+    # in-process run's scheduling.
+    aicpu_thread_num = spec.get("aicpu_thread_num")
+    if aicpu_thread_num is None:
+        aicpu_thread_num = runtime_config.get("aicpu_thread_num")
+
+    from pypto._target import _parse_platform  # noqa: PLC0415
+
+    from .runner import RunConfig  # noqa: PLC0415
+
+    backend_type, execution_mode = _parse_platform(platform)
+    config = RunConfig(
+        backend_type=backend_type, execution_mode=execution_mode, **spec.get("ring_overrides", {})
+    )
+
+    dfx_dir.mkdir(parents=True, exist_ok=True)
+    _execute_on_device(
+        chip_callable,
+        orch_args,
+        platform,
+        runtime_name,
+        device_id,
+        level=level,
+        aicpu_thread_num=aicpu_thread_num,
+        enable_sdma=enable_sdma,
+        host_tensor_indices=runtime_config.get("host_tensor_indices", ()),
+        output_prefix=str(dfx_dir),
+        enable_dep_gen=True,
+        config=config,
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

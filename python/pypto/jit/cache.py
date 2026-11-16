@@ -1,0 +1,263 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+
+"""In-process specialization keys for @pl.jit.
+
+Persistent dispatch uses full typed identities and immutable transactions in
+``_persistent`` and ``artifact_cache``. Dynamic dimensions use None so runtime
+extents do not create unnecessary specializations.
+"""
+
+import dataclasses
+import hashlib
+from collections.abc import Sequence
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Final, NamedTuple, cast
+
+from pypto.pypto_core import DataType
+from pypto.pypto_core.passes import MemoryPlanner, RuntimeKind, runtime_kind_to_name
+
+if TYPE_CHECKING:
+    from pypto.ir.pass_manager import OptimizationStrategy
+    from pypto.pypto_core.ir import TensorLayout
+
+# Stable PyPTO version stamp included in every cache key so that upgrading
+# PyPTO (which may change the pass pipeline or codegen) automatically
+# invalidates all previously cached compilation artifacts.
+try:
+    from pypto import __version__ as _PYPTO_VERSION
+except Exception:
+    # Import-fallback idiom: the except arm rebinds the same name, which pyright
+    # reads as a constant redefinition.
+    _PYPTO_VERSION = "unknown"  # pyright: ignore[reportConstantRedefinition]
+
+SCALAR_SEMANTICS: Final[int] = 2
+"""Version of the scalar-parameter contract this key was built under.
+
+Bumped whenever the meaning of a scalar parameter changes, so an artifact
+compiled under an older contract can never be served to a newer request.
+
+- 1: a numeric argument to a ``pl.Scalar`` parameter was folded into the body
+  and keyed by value, so each value compiled its own artifact.
+- 2: a ``pl.Scalar`` parameter is a runtime value — it stays symbolic in the
+  generated program, its value arrives at dispatch, and it takes no part in
+  this key. Compile-time constants come from module-level or closure names,
+  which ``compute_source_hash`` already folds into ``source_hash``.
+"""
+
+
+@dataclass(frozen=True)
+class TensorCacheInfo:
+    """Per-tensor component of a cache key.
+
+    Attributes:
+        name: Parameter name.
+        shape: Shape tuple with None for dynamic dimensions.
+        dtype: DataType of the tensor.
+        layout: Annotated tensor layout, or None when the annotation omits it.
+            Included because a layout may reach the annotation through a
+            closure variable (``L = pl.NZ; ... pl.Tensor[[...], pl.FP32, L]``),
+            leaving the source text — and thus ``source_hash`` — unchanged
+            while the compiled artifact differs.
+    """
+
+    name: str
+    shape: tuple[int | None, ...]
+    dtype: DataType
+    layout: "TensorLayout | None" = None
+
+
+class CacheKey(NamedTuple):
+    """Named specialization components, retaining tuple equality and hashing.
+
+    Scalar parameters are deliberately absent: they are runtime values, so one
+    artifact serves every value (see :data:`SCALAR_SEMANTICS`).
+    """
+
+    source_hash: str
+    platform: str | None
+    strategy: "OptimizationStrategy | None"
+    tensor_infos: tuple[TensorCacheInfo, ...]
+    dist_config: tuple[Any, ...] | None
+    compile_opts: tuple[Any, ...] | None
+
+
+def _freeze(value: Any) -> Any:
+    """Recursively convert a value into a hashable, deterministic form.
+
+    Dataclasses become a tuple of ``(field_name, frozen_value)`` pairs and
+    lists/tuples become tuples, so a ``DistributedConfig`` (which has a mutable
+    ``device_ids`` list and is therefore unhashable) can participate in the
+    cache key. Field-name pairing keeps the key stable and self-describing if
+    new fields are added.
+    """
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return tuple((f.name, _freeze(getattr(value, f.name))) for f in dataclasses.fields(value))
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze(v) for v in cast("Sequence[Any]", value))
+    return value
+
+
+def compute_source_hash(sources: list[str]) -> str:
+    """Compute a stable hash over one or more source strings.
+
+    The PyPTO version is mixed in so that upgrading PyPTO invalidates all
+    previously cached compilation artifacts without requiring manual cache
+    clearing (addresses issue #878 Q3).
+
+    Args:
+        sources: List of source code strings (main function + all deps).
+
+    Returns:
+        Hex digest string (SHA-256, first 16 chars for brevity).
+    """
+    h = hashlib.sha256()
+    h.update(_PYPTO_VERSION.encode())
+    for src in sources:
+        h.update(src.encode())
+    return h.hexdigest()[:16]
+
+
+def make_cache_key(  # noqa: PLR0913 — args are the key's components, one per cache dimension
+    source_hash: str,
+    param_names: list[str],
+    tensor_shapes: dict[str, tuple[int, ...]],
+    tensor_dtypes: dict[str, DataType],
+    dynamic_dims: set[tuple[str, int]],
+    platform: str | None = None,
+    strategy: "OptimizationStrategy | None" = None,
+    distributed_config: Any = None,
+    analyze_auto_scopes_for_deps: bool = False,
+    emit_source_loc: bool = True,
+    memory_planner: "MemoryPlanner | None" = None,
+    enable_pypto_l0c_double_buffer: bool = False,
+    tensor_layouts: dict[str, "TensorLayout | None"] | None = None,
+    dep_layouts: tuple[tuple[str, str, str], ...] = (),
+    runtime: RuntimeKind = RuntimeKind.TENSORMAP_AND_RINGBUFFER,
+    enable_buffer_ir: bool = True,
+) -> CacheKey:
+    """Build a cache key for a JIT call site.
+
+    Args:
+        source_hash: Hash of captured source dependencies, including folded constants.
+        param_names: Ordered list of all parameter names (preserves arg order).
+        tensor_shapes: Concrete shape per tensor parameter name.
+        tensor_dtypes: DataType per tensor parameter name.
+        tensor_layouts: Annotated layout per tensor parameter name, where the
+            annotation declares one. See :class:`TensorCacheInfo.layout` for
+            why the layout has to split the key on its own.
+        dep_layouts: ``(generated dep name, parameter, layout)`` triples for
+            layouts the reachable deps declare themselves. Same reasoning as
+            ``tensor_layouts``, one call deeper: they shape the generated dep
+            signatures but appear in no entry-parameter meta, and a postponed
+            annotation hides a rebind from ``source_hash``. The name is the
+            *generated* one, so two same-named deps stay distinguishable in
+            this sorted, position-free tuple.
+        dynamic_dims: Set of (param_name, dim_index) pairs that are dynamic.
+            Dynamic dims are stored as None in the cache key so different
+            concrete values for that dimension produce the same cache entry.
+        platform: Target platform string (e.g. "a2a3sim"). Included in the key
+            because compiled artifacts are platform-specific; a cache entry
+            compiled for one platform must not be reused for another.
+        strategy: Optimization strategy applied during compilation, as an
+            ``OptimizationStrategy`` member. ``None`` is a distinct key value
+            for callers that omit the argument entirely; the JIT never passes
+            it, because ``JITFunction._resolve_compiled()`` normalizes a call
+            without a ``RunConfig`` to ``OptimizationStrategy.Default``.
+            Included in the key because the strategy changes the compiled
+            artifact; without it, artifacts compiled under different strategy
+            values would share one cache entry.
+        distributed_config: Optional ``DistributedConfig`` forwarded to
+            ``ir.compile()`` on the ``@pl.jit.host`` path. Included in the key
+            because it is baked into the resulting
+            ``DistributedCompiledProgram`` and drives per-rank dispatch; without
+            it, calling the same host kernel with two different ``device_ids``
+            would silently reuse the first-compiled artifact. ``None`` (the
+            single-chip default) leaves the key unchanged for non-distributed
+            callers.
+        analyze_auto_scopes_for_deps: Compile-side switch for deriving explicit
+            task dependencies from AUTO runtime scopes. Included in the key
+            because it changes generated orchestration dependencies.
+        emit_source_loc: Whether codegen emits source locations, resolved from
+            the environment before key construction and passed to the compiler.
+            Changing this option changes generated code and splits the key.
+            Dump, profiling, and other cache-bypass controls are excluded.
+        memory_planner: Effective on-chip memory planner (``PYPTO``,
+            ``DSA_RP``, or ``PTOAS``) as resolved from the ``RunConfig`` field
+            and any active ``PassContext``. Included in the key because it
+            changes the placement and whether physical addresses are baked
+            into the artifact; without it, compiling one kernel under multiple
+            planners would hand a later call the wrong artifact.
+        enable_pypto_l0c_double_buffer: Stored legacy flag resolved from the
+            active ``PassContext``. Its existing key representation is retained
+            for compatibility: included for ``PYPTO``, canonicalized to false
+            for ``DSA_RP`` and ``PTOAS``. Automatic dbC is disabled for PYPTO
+            and DSA_RP; PTOAS retains it independently of this value.
+        runtime: Effective Simpler runtime ABI resolved from the active
+            ``PassContext``. Included in the key because it is baked into the
+            artifact's ``kernel_config.py`` and decides which worker can bind
+            the program; without it a ``host_build_graph`` call would silently
+            reuse a ``tensormap_and_ringbuffer`` artifact.
+        enable_buffer_ir: Whole-kernel Buffer IR selection from the active
+            ``PassContext``. It changes storage legalization and separates
+            artifacts from explicit Off mode under every memory planner.
+
+    Returns:
+        Hashable CacheKey tuple.
+    """
+    tensor_infos: list[TensorCacheInfo] = []
+    for name in param_names:
+        if name not in tensor_shapes:
+            continue
+        concrete_shape = tensor_shapes[name]
+        keyed_shape = tuple(
+            None if (name, i) in dynamic_dims else dim for i, dim in enumerate(concrete_shape)
+        )
+        tensor_infos.append(
+            TensorCacheInfo(
+                name=name,
+                shape=keyed_shape,
+                dtype=tensor_dtypes[name],
+                layout=(tensor_layouts or {}).get(name),
+            )
+        )
+
+    dist_key = _freeze(distributed_config) if distributed_config is not None else None
+    effective_pypto_dbc = enable_pypto_l0c_double_buffer and memory_planner in (
+        None,
+        MemoryPlanner.PYPTO,
+    )
+    compile_opts = (
+        ("scalar_semantics", SCALAR_SEMANTICS),
+        ("analyze_auto_scopes_for_deps", analyze_auto_scopes_for_deps),
+        ("emit_source_loc", emit_source_loc),
+        ("memory_planner", None if memory_planner is None else str(memory_planner)),
+        ("enable_pypto_l0c_double_buffer", effective_pypto_dbc),
+        ("dep_layouts", dep_layouts),
+        ("runtime", runtime_kind_to_name(runtime)),
+        ("enable_buffer_ir", enable_buffer_ir),
+        ("buffer_ir_version", 7 if enable_buffer_ir else 0),
+    )
+    return CacheKey(
+        source_hash,
+        platform,
+        strategy,
+        tuple(tensor_infos),
+        dist_key,
+        compile_opts,
+    )
+
+
+__all__ = [
+    "SCALAR_SEMANTICS",
+    "CacheKey",
+    "TensorCacheInfo",
+    "compute_source_hash",
+    "make_cache_key",
+]

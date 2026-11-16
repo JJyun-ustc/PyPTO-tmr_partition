@@ -1,0 +1,2511 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
+
+#include <nanobind/nanobind.h>
+#include <nanobind/stl/optional.h>
+#include <nanobind/stl/pair.h>
+#include <nanobind/stl/shared_ptr.h>
+#include <nanobind/stl/string.h>
+#include <nanobind/stl/tuple.h>
+#include <nanobind/stl/vector.h>
+
+#include <algorithm>
+#include <any>
+#include <cctype>
+#include <limits>
+#include <memory>
+#include <optional>
+#include <string>
+#include <tuple>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+#include "../module.h"
+#include "pypto/codegen/distributed/comm_layout.h"
+#include "pypto/core/any_cast.h"
+#include "pypto/core/common.h"
+#include "pypto/core/error.h"
+#include "pypto/ir/comm.h"
+#include "pypto/ir/core.h"
+#include "pypto/ir/expr.h"
+#include "pypto/ir/function.h"
+#include "pypto/ir/memref.h"
+#include "pypto/ir/op_registry.h"
+#include "pypto/ir/phase.h"
+#include "pypto/ir/pipe.h"
+#include "pypto/ir/program.h"
+#include "pypto/ir/reflection/field_visitor.h"
+#include "pypto/ir/scalar_expr.h"
+#include "pypto/ir/serialization/deserializer.h"
+#include "pypto/ir/serialization/serializer.h"
+#include "pypto/ir/stmt.h"
+#include "pypto/ir/tile_view_semantics.h"
+#include "pypto/ir/transforms/op_conversion_registry.h"
+#include "pypto/ir/transforms/printer.h"
+#include "pypto/ir/transforms/structural_comparison.h"
+#include "pypto/ir/transforms/utils/deep_clone_utils.h"
+#include "pypto/ir/transforms/utils/memref_utils.h"
+#include "pypto/ir/transforms/utils/parent_stmt_analysis.h"
+#include "pypto/ir/transforms/utils/return_lineage_utils.h"
+#include "pypto/ir/transforms/utils/tensor_view_semantics.h"
+#include "pypto/ir/transforms/utils/transform_utils.h"
+#include "pypto/ir/type.h"
+#include "pypto/ir/type_inference.h"
+
+namespace nb = nanobind;
+
+namespace pypto {
+namespace python {
+
+using namespace pypto::ir;  // NOLINT(build/namespaces)
+using pypto::DataType;
+
+template <typename T>
+bool TryConvertAnyToPy(const std::any& value, nb::object& out) {
+  if (value.type() != typeid(T)) {
+    return false;
+  }
+  out = nb::cast(AnyCastRef<T>(value, "converting to Python"));
+  return true;
+}
+
+template <typename... Ts>
+nb::object AnyToPyObject(const std::any& value, const std::string& key) {
+  nb::object out;
+  if ((TryConvertAnyToPy<Ts>(value, out) || ...)) {
+    return out;
+  }
+  throw pypto::TypeError("Attribute '" + key + "' has unsupported type");
+}
+
+// Helper to bind a single field using reflection
+template <typename ClassType, typename PyClassType, typename FieldDesc>
+void BindField(PyClassType& nb_class, const FieldDesc& desc) {
+  nb_class.def_ro(desc.name, desc.field_ptr);
+}
+
+// Helper to bind all fields from a tuple of field descriptors
+template <typename ClassType, typename PyClassType, typename DescTuple, std::size_t... Is>
+void BindFieldsImpl(PyClassType& nb_class, const DescTuple& descriptors, std::index_sequence<Is...>) {
+  (BindField<ClassType>(nb_class, std::get<Is>(descriptors)), ...);
+}
+
+// Main function to bind all fields using reflection
+template <typename ClassType, typename PyClassType>
+void BindFields(PyClassType& nb_class) {
+  constexpr auto descriptors = ClassType::GetFieldDescriptors();
+  constexpr auto num_fields = std::tuple_size_v<decltype(descriptors)>;
+  BindFieldsImpl<ClassType>(nb_class, descriptors, std::make_index_sequence<num_fields>{});
+}
+
+// Helper function to convert nb::dict to vector<pair<string, any>>
+std::vector<std::pair<std::string, std::any>> ConvertKwargsDict(const nb::dict& kwargs_dict) {
+  std::vector<std::pair<std::string, std::any>> kwargs;
+  for (auto item : kwargs_dict) {
+    std::string key = nb::cast<std::string>(item.first);
+
+    // Try to cast to common types
+    // NOTE: Check DataType/MemorySpace/PipeType/CoreType/PadValue BEFORE int, and bool BEFORE int
+    if (nb::isinstance<DataType>(item.second)) {
+      kwargs.emplace_back(key, nb::cast<DataType>(item.second));
+    } else if (nb::isinstance<MemorySpace>(item.second)) {
+      kwargs.emplace_back(key, nb::cast<MemorySpace>(item.second));
+    } else if (nb::isinstance<TensorLayout>(item.second)) {
+      kwargs.emplace_back(key, nb::cast<TensorLayout>(item.second));
+    } else if (nb::isinstance<TileLayout>(item.second)) {
+      kwargs.emplace_back(key, nb::cast<TileLayout>(item.second));
+    } else if (nb::isinstance<PipeType>(item.second)) {
+      // Cast enum to int for storage
+      kwargs.emplace_back(key, static_cast<int>(nb::cast<PipeType>(item.second)));
+    } else if (nb::isinstance<CoreType>(item.second)) {
+      // Cast enum to int for storage
+      kwargs.emplace_back(key, static_cast<int>(nb::cast<CoreType>(item.second)));
+    } else if (nb::isinstance<SplitMode>(item.second)) {
+      // Cast enum to int for storage
+      kwargs.emplace_back(key, static_cast<int>(nb::cast<SplitMode>(item.second)));
+    } else if (nb::isinstance<NotifyOp>(item.second)) {
+      // Cast enum to int for storage — pld.system.notify reads as int
+      kwargs.emplace_back(key, static_cast<int>(nb::cast<NotifyOp>(item.second)));
+    } else if (nb::isinstance<WaitCmp>(item.second)) {
+      // Cast enum to int for storage — pld.system.wait reads as int
+      kwargs.emplace_back(key, static_cast<int>(nb::cast<WaitCmp>(item.second)));
+    } else if (nb::isinstance<AtomicType>(item.second)) {
+      // Cast enum to int for storage — pld.tensor.put reads as int
+      kwargs.emplace_back(key, static_cast<int>(nb::cast<AtomicType>(item.second)));
+    } else if (nb::isinstance<AccPhase>(item.second)) {
+      // Cast enum to int for storage — tile.gemv-family ops read as int
+      kwargs.emplace_back(key, static_cast<int>(nb::cast<AccPhase>(item.second)));
+    } else if (nb::isinstance<STPhase>(item.second)) {
+      // Cast enum to int for storage — tile.store reads as int
+      kwargs.emplace_back(key, static_cast<int>(nb::cast<STPhase>(item.second)));
+    } else if (nb::isinstance<PadValue>(item.second)) {
+      kwargs.emplace_back(key, nb::cast<PadValue>(item.second));
+    } else if (nb::isinstance<ArgDirection>(item.second)) {
+      kwargs.emplace_back(key, nb::cast<ArgDirection>(item.second));
+    } else if (key == kAttrTaskIdVar && nb::isinstance<Var>(item.second)) {
+      // ``with pl.at(...) as tid:`` stashes the captured TaskId Var directly
+      // (not wrapped as an Expr). Stored as ``VarPtr`` to match the C++ attr
+      // reader in ``OutlineIncoreScopes``.
+      kwargs.emplace_back(key, nb::cast<VarPtr>(item.second));
+    } else if (nb::isinstance<Expr>(item.second)) {
+      // IR expression (e.g. SpmdScopeStmt core_num stored as Function attr).
+      kwargs.emplace_back(key, nb::cast<ExprPtr>(item.second));
+    } else if (nb::isinstance<nb::bool_>(item.second)) {
+      kwargs.emplace_back(key, nb::cast<bool>(item.second));
+    } else if (nb::isinstance<nb::int_>(item.second)) {
+      kwargs.emplace_back(key, nb::cast<int>(item.second));
+    } else if (nb::isinstance<nb::str>(item.second)) {
+      kwargs.emplace_back(key, nb::cast<std::string>(item.second));
+    } else if (nb::isinstance<nb::float_>(item.second)) {
+      kwargs.emplace_back(key, nb::cast<double>(item.second));
+    } else if (nb::isinstance<nb::list>(item.second) || nb::isinstance<nb::tuple>(item.second)) {
+      // Lists/tuples carry exactly one element type, dispatched by attr key:
+      //   - kAttrArgDirections             -> vector<ArgDirection>
+      //   - kAttrArgDirectionOverrides     -> vector<int32_t>
+      //   - kAttrManualDepEdges /
+      //     kAttrCompilerManualDepEdges /
+      //     kAttrArgDirOverrideVars /
+      //     kAttrDumpVars                  -> vector<VarPtr>
+      // Inferring from the first element would silently accept mismatched
+      // payloads (e.g. ``manual_dep_edges=[1]``) and fail later in codegen
+      // instead of raising at parse time.
+      auto seq = nb::cast<nb::sequence>(item.second);
+      if (key == kAttrArgDirectionOverrides) {
+        std::vector<int32_t> idxs;
+        for (auto elem : seq) {
+          if (nb::isinstance<nb::bool_>(elem) || !nb::isinstance<nb::int_>(elem)) {
+            throw pypto::TypeError("Unsupported list element type for key: " + key + " (expected int)");
+          }
+          int64_t v = nb::cast<int64_t>(elem);
+          if (v < std::numeric_limits<int32_t>::min() || v > std::numeric_limits<int32_t>::max()) {
+            throw pypto::ValueError("List value " + std::to_string(v) + " for key: " + key +
+                                    " is out of int32 range");
+          }
+          idxs.push_back(static_cast<int32_t>(v));
+        }
+        kwargs.emplace_back(key, std::move(idxs));
+      } else if (key == kAttrManualDepEdges || key == kAttrCompilerManualDepEdges ||
+                 key == kAttrArgDirOverrideVars || key == kAttrDumpVars) {
+        std::vector<VarPtr> vars;
+        for (auto elem : seq) {
+          if (!nb::isinstance<Var>(elem)) {
+            throw pypto::TypeError("Unsupported list element type for key: " + key + " (expected Var)");
+          }
+          vars.push_back(nb::cast<VarPtr>(elem));
+        }
+        kwargs.emplace_back(key, std::move(vars));
+      } else if (key == kAttrCachePolicyParams) {
+        // ``cache_policy`` on an outlined Function: (param index, policy) pairs,
+        // reconstructed from a printed pass dump by ast_parser._parse_attr_pair.
+        std::vector<std::pair<int32_t, int>> decls;
+        for (auto elem : seq) {
+          const bool is_pair = (nb::isinstance<nb::tuple>(elem) || nb::isinstance<nb::list>(elem)) &&
+                               nb::len(nb::cast<nb::sequence>(elem)) == 2;
+          if (!is_pair) {
+            throw pypto::TypeError("Unsupported list element type for key: " + key +
+                                   " (expected an (int, int) pair)");
+          }
+          auto pair = nb::cast<nb::sequence>(elem);
+          auto it = pair.begin();
+          nb::handle idx_obj = *it;
+          nb::handle policy_obj = *(++it);
+          if (nb::isinstance<nb::bool_>(idx_obj) || !nb::isinstance<nb::int_>(idx_obj) ||
+              nb::isinstance<nb::bool_>(policy_obj) || !nb::isinstance<nb::int_>(policy_obj)) {
+            throw pypto::TypeError("Unsupported list element type for key: " + key +
+                                   " (expected an (int, int) pair)");
+          }
+          int64_t idx = nb::cast<int64_t>(idx_obj);
+          if (idx < std::numeric_limits<int32_t>::min() || idx > std::numeric_limits<int32_t>::max()) {
+            throw pypto::ValueError("List value " + std::to_string(idx) + " for key: " + key +
+                                    " is out of int32 range");
+          }
+          decls.emplace_back(static_cast<int32_t>(idx), nb::cast<int>(policy_obj));
+        }
+        kwargs.emplace_back(key, std::move(decls));
+      } else if (key == kAttrCachePolicyVars) {
+        // ``pl.set_cache_policy(t, policy)`` scope attr, written by the DSL
+        // parser: a list of ``(Var, int)`` pairs. Keyed rather than sniffed for
+        // the same reason as the arms above — a bare pair list says nothing
+        // about which half is the reference.
+        std::vector<std::pair<VarPtr, int>> decls;
+        for (auto elem : seq) {
+          const bool is_pair = (nb::isinstance<nb::tuple>(elem) || nb::isinstance<nb::list>(elem)) &&
+                               nb::len(nb::cast<nb::sequence>(elem)) == 2;
+          if (!is_pair) {
+            throw pypto::TypeError("Unsupported list element type for key: " + key +
+                                   " (expected a (Var, int) pair)");
+          }
+          auto pair = nb::cast<nb::sequence>(elem);
+          auto it = pair.begin();
+          nb::handle var_obj = *it;
+          nb::handle policy_obj = *(++it);
+          if (!nb::isinstance<Var>(var_obj) || nb::isinstance<nb::bool_>(policy_obj) ||
+              !nb::isinstance<nb::int_>(policy_obj)) {
+            throw pypto::TypeError("Unsupported list element type for key: " + key +
+                                   " (expected a (Var, int) pair)");
+          }
+          decls.emplace_back(nb::cast<VarPtr>(var_obj), nb::cast<int>(policy_obj));
+        }
+        kwargs.emplace_back(key, std::move(decls));
+      } else if (nb::len(seq) > 0 && nb::isinstance<Var>(*seq.begin())) {
+        // Open-world key holding a Var list — ``pl.func_attr({"operands": [x, w]})``.
+        // Function attrs are an open key namespace, so no reserved-key list can
+        // cover them; a non-empty list of Vars is unambiguous by element type.
+        // Reserved keys are matched above, and an EMPTY list still falls through
+        // to the ArgDirection default below, since element type says nothing
+        // there and the key is what carries the intended type.
+        std::vector<VarPtr> vars;
+        for (auto elem : seq) {
+          if (!nb::isinstance<Var>(elem)) {
+            throw pypto::TypeError("Mixed list element types for key: " + key +
+                                   " (expected all Var, matching the first element)");
+          }
+          vars.push_back(nb::cast<VarPtr>(elem));
+        }
+        kwargs.emplace_back(key, std::move(vars));
+      } else {
+        // Default: kAttrArgDirections and any future ArgDirection list key.
+        // Naming only ArgDirection here misleads: reaching this arm usually
+        // means the value's element type is supported for some OTHER key, or
+        // is not a list attr type at all. Report what a list under this key may
+        // hold so the message names something the caller could actually write.
+        std::vector<ArgDirection> dirs;
+        for (auto elem : seq) {
+          if (!nb::isinstance<ArgDirection>(elem)) {
+            throw pypto::TypeError(
+                "Unsupported list element type for key: " + key +
+                ". A list-valued attr under an arbitrary key may hold Var (a reference) or "
+                "ArgDirection. Integer lists are accepted only for the reserved key '" +
+                std::string(kAttrArgDirectionOverrides) + "'.");
+          }
+          dirs.push_back(nb::cast<ArgDirection>(elem));
+        }
+        kwargs.emplace_back(key, std::move(dirs));
+      }
+    } else {
+      throw pypto::TypeError("Unsupported kwarg type for key: " + key);
+    }
+  }
+  return kwargs;
+}
+
+std::vector<std::pair<std::string, std::any>> ConvertAttrsFromPython(const nb::object& attrs_or_none,
+                                                                     bool wrap_core_num) {
+  std::vector<std::pair<std::string, std::any>> attrs;
+  if (attrs_or_none.is_none()) {
+    // no-op
+  } else if (nb::isinstance<nb::dict>(attrs_or_none)) {
+    attrs = ConvertKwargsDict(nb::cast<nb::dict>(attrs_or_none));
+  } else if (nb::isinstance<nb::list>(attrs_or_none)) {
+    for (auto item : nb::cast<nb::list>(attrs_or_none)) {
+      auto tup = nb::cast<nb::tuple>(item);
+      nb::dict d;
+      d[tup[0]] = tup[1];
+      auto converted = ConvertKwargsDict(d);
+      attrs.push_back(converted[0]);
+    }
+  } else {
+    throw pypto::TypeError("attrs must be a dict, list of (key, value) tuples, or None");
+  }
+  // Ergonomic auto-wrap: attrs["core_num"] is typed as ExprPtr, but users and
+  // text-parser reparse sites commonly supply a plain int — wrap it as
+  // ConstInt(DataType::INDEX) so the codegen-side ExprPtr read is uniform.
+  // Load-bearing for the dispatch Call attrs the outliner now emits, as well as
+  // a legacy Function-level spec.
+  for (auto& [key, value] : attrs) {
+    if (wrap_core_num && key == "core_num" && value.type() == typeid(int)) {
+      auto n = std::any_cast<int>(value);
+      value = std::static_pointer_cast<const Expr>(
+          std::make_shared<const ConstInt>(n, DataType::INDEX, Span::unknown()));
+    }
+  }
+  return attrs;
+}
+
+/// Conditionally apply the registered format callback.
+/// When `format` is true, post-processes `code` through the callback (e.g., ruff).
+/// When false, returns `code` unchanged — useful for tests that match exact substrings.
+std::string MaybeFormat(const std::string& code, bool format) {
+  return format ? ApplyFormatCallback(code) : code;
+}
+
+/// Reject a slot count of zero at construction.
+///
+/// The parser validates the `slots=` kwarg it parses out of an annotation, but a
+/// declaration built as a plain Python object (`l0c = pl.MemRef(slots=N)`) reaches
+/// the constructor directly. Zero would otherwise survive as `slot_count_ == 0`
+/// and only surface much later as a zero-sized allocation.
+void CheckSlotCount(uint64_t slots) {
+  CHECK(slots >= 1) << "A declared allocation must have at least one slot, got slots=" << slots;
+}
+
+void BindIR(nb::module_& m) {
+  nb::module_ ir = m.def_submodule("ir", "PyPTO IR (Intermediate Representation) module");
+
+  // Span - value type, copy semantics
+  nb::class_<Span>(ir, "Span", "Source location information tracking file, line, and column positions")
+      .def(nb::init<std::string, int, int, int, int>(), nb::arg("filename"), nb::arg("begin_line"),
+           nb::arg("begin_column"), nb::arg("end_line") = -1, nb::arg("end_column") = -1,
+           "Create a source span")
+      .def("to_string", &Span::to_string, "Convert span to string representation")
+      .def("is_valid", &Span::is_valid, "Check if the span has valid coordinates")
+      .def_static("unknown", &Span::unknown,
+                  "Create an unknown/invalid span for cases where source location is unavailable")
+      .def("__repr__", &Span::to_string)
+      .def("__str__", &Span::to_string)
+      .def_ro("filename", &Span::filename_, "Source filename")
+      .def_ro("begin_line", &Span::begin_line_, "Beginning line (1-indexed)")
+      .def_ro("begin_column", &Span::begin_column_, "Beginning column (1-indexed)")
+      .def_ro("end_line", &Span::end_line_, "Ending line (1-indexed)")
+      .def_ro("end_column", &Span::end_column_, "Ending column (1-indexed)");
+
+  // Op - operation/function
+  nb::class_<Op>(ir, "Op",
+                 "Represents callable operations in the IR. Stores the schema of allowed kwargs (key -> type "
+                 "mapping). Actual kwarg values are stored per-Call instance in Call.kwargs")
+      .def(nb::init<std::string>(), nb::arg("name"), "Create an operation with the given name")
+      .def_ro("name", &Op::name_, "Operation name")
+      .def("has_attr", &Op::HasAttr, nb::arg("key"), "Check if a kwarg is registered in the schema")
+      .def("get_attr_keys", &Op::GetAttrKeys, "Get all registered kwarg keys from the schema");
+
+  // GlobalVar - global function reference
+  nb::class_<GlobalVar, Op>(ir, "GlobalVar",
+                            "Global variable reference for functions in a program. "
+                            "Can be used in Call expressions to invoke functions within the same program.")
+      .def(nb::init<std::string>(), nb::arg("name"),
+           "Create a global variable reference with the given name");
+
+  // Type - abstract base, const shared_ptr
+  auto type_class = nb::class_<Type>(ir, "Type", "Base class for type representations");
+  BindFields<Type>(type_class);
+  type_class.def(
+      "__str__", [](const TypePtr& self) { return ApplyFormatCallback(PythonPrint(self, "pl")); },
+      "Python-style string representation");
+  type_class.def(
+      "__eq__", [](const TypePtr& self, const TypePtr& other) { return structural_equal(self, other); },
+      "Equality comparison");
+  type_class.def(
+      "__hash__", [](const TypePtr& self) { return structural_hash(self); },
+      "Hash by structural identity (consistent with __eq__)");
+
+  // UnknownType - const shared_ptr
+  auto unknown_type_class =
+      nb::class_<UnknownType, Type>(ir, "UnknownType", "Unknown or unspecified type representation");
+  unknown_type_class.def(nb::init<>(), "Create an unknown type");
+  unknown_type_class.def_static(
+      "get", []() { return GetUnknownType(); }, "Get the singleton UnknownType instance");
+  BindFields<UnknownType>(unknown_type_class);
+
+  auto void_type_class = nb::class_<VoidType, Type>(ir, "VoidType", "Known absence of an SSA result");
+  void_type_class.def(nb::init<>(), "Create a void type");
+  void_type_class.def_static("get", &GetVoidType, "Get the singleton VoidType instance");
+  BindFields<VoidType>(void_type_class);
+
+  nb::enum_<RegKind>(ir, "RegKind", "Register descriptor kind")
+      .value("VecReg", RegKind::VecReg, "Vector register holding non-BOOL lanes")
+      .value("MaskReg", RegKind::MaskReg, "Predicate register holding BOOL lanes");
+  auto reg_type_class = nb::class_<RegType, Type>(ir, "RegType", "Static logical register descriptor");
+  // The lane count must be an integer, not text coerced by older nanobind releases.
+  reg_type_class.def(nb::init<int64_t, DataType, RegKind>(), nb::arg("shape").noconvert(), nb::arg("dtype"),
+                     nb::arg("kind"), "Create a register descriptor with a positive logical lane count");
+  BindFields<RegType>(reg_type_class);
+  reg_type_class.def_prop_ro("lanes", &RegType::GetLanes, "Logical lane count (alias of shape)");
+
+  // ScalarType - const shared_ptr
+  auto scalar_type_class = nb::class_<ScalarType, Type>(ir, "ScalarType", "Scalar type representation");
+  scalar_type_class.def(nb::init<DataType>(), nb::arg("dtype"), "Create a scalar type");
+  BindFields<ScalarType>(scalar_type_class);
+
+  // IRNode - abstract base, const shared_ptr
+  auto irnode_class = nb::class_<IRNode>(ir, "IRNode", "Base class for all IR nodes");
+  BindFields<IRNode>(irnode_class);
+  irnode_class
+      .def(
+          "same_as", [](const IRNodePtr& self, const IRNodePtr& other) { return self == other; },
+          nb::arg("other"), "Check if this IR node is the same as another IR node.")
+      .def(
+          "__str__", [](const IRNodePtr& self) { return ApplyFormatCallback(PythonPrint(self, "pl")); },
+          "Python-style string representation")
+      .def(
+          "as_python",
+          [](const IRNodePtr& self, const std::string& prefix, bool concise, bool format) {
+            return MaybeFormat(PythonPrint(self, prefix, concise), format);
+          },
+          nb::arg("prefix") = "pl", nb::arg("concise") = false, nb::arg("format") = true,
+          "Convert to Python-style string representation.\n\n"
+          "Args:\n"
+          "    prefix: Module prefix (default 'pl'). 'pld' is reserved for\n"
+          "        pypto.language.distributed when printing a Program\n"
+          "    concise: If true, omit intermediate type annotations (default false)\n"
+          "    format: If true, apply registered format callback (default true)");
+
+  // Expr - abstract base, const shared_ptr
+  auto expr_class = nb::class_<Expr, IRNode>(ir, "Expr", "Base class for all expressions");
+  BindFields<Expr>(expr_class);
+
+  // ShapedType - abstract base for types with shape and optional memref
+  auto shaped_type_class =
+      nb::class_<ShapedType, Type>(ir, "ShapedType", "Base class for shaped types (tensors and tiles)");
+  BindFields<ShapedType>(shaped_type_class);
+  shaped_type_class.def_prop_ro("memory_space", &ShapedType::GetMemorySpace,
+                                "Canonical memory space for this shaped type");
+  shaped_type_class.def(
+      "shares_memref_with",
+      [](const ShapedTypePtr& self, const ShapedTypePtr& other) {
+        if (!self->memref_.has_value() || !other->memref_.has_value()) {
+          return false;
+        }
+        return self->memref_.value().get() == other->memref_.value().get();
+      },
+      nb::arg("other"), "Check if this ShapedType shares the same MemRef object with another ShapedType");
+
+  // TensorLayout enum - must be before TensorView and TensorType
+  nb::enum_<TensorLayout>(ir, "TensorLayout", "Tensor layout enumeration")
+      .value("ND", TensorLayout::ND, "ND layout")
+      .value("DN", TensorLayout::DN, "DN layout")
+      .value("NZ", TensorLayout::NZ, "NZ layout")
+      .value("MX_A_ZZ", TensorLayout::MX_A_ZZ, "MX Left/A scale GM pack (ZZ)")
+      .value("MX_B_NN", TensorLayout::MX_B_NN, "MX Right/B scale GM pack (NN)")
+      .export_values();
+
+  // PadValue enum - must be before both TensorView and TileView since both carry it
+  nb::enum_<PadValue>(ir, "PadValue", "Pad mode enumeration for tile/tensor views")
+      .value("null", PadValue::null, "No padding")
+      .value("zero", PadValue::zero, "Zero padding")
+      .value("max", PadValue::max, "Max value padding")
+      .value("min", PadValue::min, "Min value padding")
+      .export_values();
+
+  // CachePolicy enum - declared GM cache-access policy for a tensor read.
+  // nb::is_arithmetic like AtomicType: the policy rides the `tile.load` "cache"
+  // kwarg as a plain `int`, so the DSL needs `int(policy)` to work.
+  nb::enum_<CachePolicy>(ir, "CachePolicy", nb::is_arithmetic(),
+                         "GM cache-access policy declared for a tensor read")
+      .value("DEFAULT", CachePolicy::kDefault, "Ordinary cached GM access")
+      .value("BYPASS", CachePolicy::kBypass,
+             "Streaming access declared to bypass the cache: asserts this tensor has no reuse "
+             "worth caching and that nothing writes those bytes while the kernel runs")
+      .export_values();
+
+  // TensorView - struct for tensor view information - must be before TensorType
+  nb::class_<TensorView>(ir, "TensorView",
+                         "Tensor view representation with stride, layout, valid shape, and pad mode")
+      .def(nb::init<>(), "Create an empty tensor view")
+      .def(nb::init<const std::vector<ExprPtr>&, TensorLayout, const std::vector<ExprPtr>&, PadValue>(),
+           nb::arg("stride"), nb::arg("layout"), nb::arg("valid_shape") = std::vector<ExprPtr>{},
+           nb::arg("pad") = PadValue::null,
+           "Create a tensor view with stride, layout, optional valid shape, and optional pad")
+      .def(nb::init<const std::vector<int64_t>&, TensorLayout, const std::vector<int64_t>&, PadValue>(),
+           nb::arg("stride"), nb::arg("layout"), nb::arg("valid_shape") = std::vector<int64_t>{},
+           nb::arg("pad") = PadValue::null,
+           "Create a tensor view with integer stride, layout, optional integer valid shape, and optional pad")
+      .def_rw("stride", &TensorView::stride, "Stride for each dimension")
+      .def_rw("layout", &TensorView::layout, "Tensor layout type")
+      .def_rw("valid_shape", &TensorView::valid_shape, "Valid shape for each dimension")
+      .def_rw("pad", &TensorView::pad, "Pad mode for out-of-valid-shape accesses");
+
+  // ---------------------------------------------------------------------------
+  // tensor_view_semantics free functions (RFC #1300 §2.2/§2.3)
+  // Exposed under ir.tensor_view_semantics so passes/verifiers/tests share one
+  // implementation of the canonical (shape, stride, layout) invariants.
+  auto tvs = ir.def_submodule("tensor_view_semantics",
+                              "Canonical-form helpers for TensorType.tensor_view_ (RFC #1300).");
+
+  tvs.def("build_logical_strides_from_layout", &tensor_view_semantics::BuildLogicalStridesFromLayout,
+          nb::arg("shape"), nb::arg("layout"),
+          "Build packed canonical strides for (shape, layout). "
+          "NZ is row-major over its blocked rank-5 shape, the same rule as ND. "
+          "Raises ValueError on DN with rank < 2.");
+
+  tvs.def(
+      "derive_layout_from_strides",
+      [](const std::vector<ExprPtr>& shape,
+         const std::vector<ExprPtr>& stride) -> std::optional<TensorLayout> {
+        return tensor_view_semantics::DeriveLayoutFromStrides(shape, stride);
+      },
+      nb::arg("shape"), nb::arg("stride"),
+      "Statically derive layout from (shape, stride). "
+      "Returns None for symbolic / non-canonical cases.");
+
+  tvs.def(
+      "check_canonical_view",
+      [](const std::vector<ExprPtr>& shape, const std::vector<ExprPtr>& stride, TensorLayout layout,
+         bool relaxed_symbolic) -> std::pair<bool, std::string> {
+        auto r = tensor_view_semantics::CheckCanonicalView(shape, stride, layout, relaxed_symbolic);
+        return {r.ok, r.reason};
+      },
+      nb::arg("shape"), nb::arg("stride"), nb::arg("layout"), nb::arg("relaxed_symbolic") = true,
+      "Verify (shape, stride, layout) is canonical. Returns (ok, reason).");
+
+  tvs.def("is_canonical_view", &tensor_view_semantics::IsCanonicalView, nb::arg("shape"), nb::arg("stride"),
+          nb::arg("layout"), nb::arg("relaxed_symbolic") = true,
+          "Convenience wrapper around check_canonical_view returning only the ok flag.");
+
+  tvs.def("canonicalize_view", &tensor_view_semantics::CanonicalizeView, nb::arg("shape"), nb::arg("layout"),
+          "Build a packed canonical TensorView for (shape, layout).");
+
+  tvs.def("compute_shape_product", &tensor_view_semantics::ComputeShapeProduct, nb::arg("shape"),
+          "Static product of shape dimensions; -1 if any dim is dynamic.");
+
+  // TensorType - const shared_ptr
+  auto tensor_type_class = nb::class_<TensorType, ShapedType>(ir, "TensorType", "Tensor type representation");
+  tensor_type_class.def(nb::init<const std::vector<ExprPtr>&, DataType, std::optional<MemRefPtr>>(),
+                        nb::arg("shape"), nb::arg("dtype"), nb::arg("memref") = nb::none(),
+                        "Create a tensor type");
+  tensor_type_class.def(nb::init<const std::vector<int64_t>&, DataType, std::optional<MemRefPtr>>(),
+                        nb::arg("shape"), nb::arg("dtype"), nb::arg("memref") = nb::none(),
+                        "Create a tensor type");
+  tensor_type_class.def(
+      nb::init<const std::vector<ExprPtr>&, DataType, std::optional<MemRefPtr>, std::optional<TensorView>>(),
+      nb::arg("shape"), nb::arg("dtype"), nb::arg("memref") = nb::none(), nb::arg("tensor_view") = nb::none(),
+      "Create a tensor type with optional memory reference and tensor view");
+  tensor_type_class.def(
+      nb::init<const std::vector<int64_t>&, DataType, std::optional<MemRefPtr>, std::optional<TensorView>>(),
+      nb::arg("shape"), nb::arg("dtype"), nb::arg("memref") = nb::none(), nb::arg("tensor_view") = nb::none(),
+      "Create a tensor type with constant shape, optional memory reference and tensor view");
+  BindFields<TensorType>(tensor_type_class);
+
+  // DistributedTensorType - subclass of TensorType used as the param type for
+  // cross-rank ops (pld.tile.remote_load / pld.system.notify / pld.system.wait).
+  // Distinguished from TensorType only by ObjectKind so verifiers can reject
+  // plain Tensors. Otherwise mirrors TensorType's ctor overloads — memref /
+  // tensor_view variants are equally valid on the distributed flavour.
+  auto dist_tensor_type_class = nb::class_<DistributedTensorType, TensorType>(
+      ir, "DistributedTensorType",
+      "Tensor backed by a per-rank slice of a HCCL window buffer carved by a CommDomainScopeStmt");
+  dist_tensor_type_class.def(nb::init<const std::vector<ExprPtr>&, DataType>(), nb::arg("shape"),
+                             nb::arg("dtype"), "Create a distributed tensor type");
+  dist_tensor_type_class.def(nb::init<const std::vector<int64_t>&, DataType>(), nb::arg("shape"),
+                             nb::arg("dtype"), "Create a distributed tensor type with constant shape");
+  dist_tensor_type_class.def(nb::init<const std::vector<ExprPtr>&, DataType, std::optional<MemRefPtr>>(),
+                             nb::arg("shape"), nb::arg("dtype"), nb::arg("memref") = nb::none(),
+                             "Create a distributed tensor type with optional memref");
+  dist_tensor_type_class.def(nb::init<const std::vector<int64_t>&, DataType, std::optional<MemRefPtr>>(),
+                             nb::arg("shape"), nb::arg("dtype"), nb::arg("memref") = nb::none(),
+                             "Create a distributed tensor type with constant shape and optional memref");
+  dist_tensor_type_class.def(
+      nb::init<const std::vector<ExprPtr>&, DataType, std::optional<MemRefPtr>, std::optional<TensorView>>(),
+      nb::arg("shape"), nb::arg("dtype"), nb::arg("memref") = nb::none(), nb::arg("tensor_view") = nb::none(),
+      "Create a distributed tensor type with optional memref and tensor_view");
+  dist_tensor_type_class.def(
+      nb::init<const std::vector<int64_t>&, DataType, std::optional<MemRefPtr>, std::optional<TensorView>>(),
+      nb::arg("shape"), nb::arg("dtype"), nb::arg("memref") = nb::none(), nb::arg("tensor_view") = nb::none(),
+      "Create a distributed tensor type with constant shape, optional memref and tensor_view");
+  dist_tensor_type_class.def(
+      nb::init<std::vector<ExprPtr>, DataType, WindowBufferPtr>(), nb::arg("shape"), nb::arg("dtype"),
+      nb::arg("window_buffer"),
+      "Create a distributed tensor type produced by pld.window; window_buffer is the back-"
+      "reference to the source WindowBuffer allocation.");
+  dist_tensor_type_class.def(nb::init<std::vector<ExprPtr>, DataType, std::optional<MemRefPtr>,
+                                      std::optional<TensorView>, std::optional<WindowBufferPtr>>(),
+                             nb::arg("shape"), nb::arg("dtype"), nb::arg("memref").none(),
+                             nb::arg("tensor_view").none(), nb::arg("window_buffer").none(),
+                             "Create a distributed tensor type preserving all optional metadata.");
+  BindFields<DistributedTensorType>(dist_tensor_type_class);
+
+  // TileType - const shared_ptr
+  auto tile_type_class =
+      nb::class_<TileType, ShapedType>(ir, "TileType", "Tile type representation (multi-dimensional tensor)");
+  tile_type_class.def(
+      nb::init<const std::vector<ExprPtr>&, DataType, std::optional<MemRefPtr>, std::optional<TileView>,
+               std::optional<MemorySpace>>(),
+      nb::arg("shape"), nb::arg("dtype"), nb::arg("memref") = nb::none(), nb::arg("tile_view") = nb::none(),
+      nb::arg("memory_space") = nb::none(),
+      "Create a tile type (supports multi-dimensional tensors; code generation has constraints)");
+  tile_type_class.def(
+      nb::init<const std::vector<int64_t>&, DataType, std::optional<MemRefPtr>, std::optional<TileView>,
+               std::optional<MemorySpace>>(),
+      nb::arg("shape"), nb::arg("dtype"), nb::arg("memref") = nb::none(), nb::arg("tile_view") = nb::none(),
+      nb::arg("memory_space") = nb::none(),
+      "Create a tile type (supports multi-dimensional tensors; code generation has constraints)");
+  tile_type_class.def(
+      "get_effective_tile_view",
+      [](const TileType& self) { return tile_view_semantics::GetEffectiveTileView(self); },
+      "Return an effective TileView copy. A stored view keeps its metadata while an empty "
+      "valid_shape expands to shape; an absent view uses the implicit fields derived from "
+      "(shape, memory_space). Callers needing semantic fields should use this method.");
+  BindFields<TileType>(tile_type_class);
+
+  // ArrayType - on-core fixed-size 1-D homogeneous array (C-stack local)
+  auto array_type_class = nb::class_<ArrayType, ShapedType>(
+      ir, "ArrayType",
+      "On-core array type (lives on scalar register file / C stack). "
+      "Homogeneous, 1-D, fixed extent, integer dtype. Cannot cross function boundaries.");
+  array_type_class.def(nb::init<DataType, ExprPtr>(), nb::arg("dtype"), nb::arg("extent"),
+                       "Create an ArrayType from a dtype and a ConstInt extent");
+  array_type_class.def(nb::init<DataType, int64_t>(), nb::arg("dtype"), nb::arg("extent"),
+                       "Create an ArrayType from a dtype and an int extent");
+  array_type_class.def_prop_ro(
+      "extent", [](const ArrayType& self) { return self.extent(); },
+      "Number of elements (always a ConstInt)");
+  BindFields<ArrayType>(array_type_class);
+
+  // TupleType - const shared_ptr
+  auto tuple_type_class =
+      nb::class_<TupleType, Type>(ir, "TupleType", "Tuple type representation (contains multiple types)");
+  tuple_type_class.def(nb::init<const std::vector<TypePtr>&>(), nb::arg("types"),
+                       "Create a tuple type from a list of types");
+  BindFields<TupleType>(tuple_type_class);
+
+  // PtrType - allocation identity token type
+  auto ptr_type_class =
+      nb::class_<PtrType, Type>(ir, "PtrType", "Pointer type for allocation identity tokens");
+  ptr_type_class.def(nb::init<>(), "Create a Ptr type");
+  ptr_type_class.def_static("get", &GetPtrType, "Get the singleton PtrType instance");
+  BindFields<PtrType>(ptr_type_class);
+
+  // WindowBufferType - singleton marker type for pld.alloc_window_buffer outputs.
+  // Mirrors MemRefType: no per-instance fields. The WindowBuffer Var subclass
+  // (bindings below) carries the allocation metadata.
+  auto window_buffer_type_class = nb::class_<WindowBufferType, Type>(
+      ir, "WindowBufferType",
+      "Singleton marker type for pld.alloc_window_buffer outputs. The companion WindowBuffer "
+      "Var subclass carries the allocation metadata (name, size, dtype, host flags).");
+  window_buffer_type_class.def(nb::init<>(), "Create the singleton WindowBufferType instance.");
+  window_buffer_type_class.def_static("get", &GetWindowBufferType,
+                                      "Get the shared singleton WindowBufferType instance.");
+  BindFields<WindowBufferType>(window_buffer_type_class);
+
+  // CommCtxType - singleton marker type for pld.get_comm_ctx outputs. The
+  // back-reference to the enclosing CommDomainScopeStmt lives on the producing op's
+  // DistributedTensor argument (via its WindowBuffer back-reference), so the
+  // type itself carries no per-instance fields.
+  auto comm_ctx_type_class =
+      nb::class_<CommCtxType, Type>(ir, "CommCtxType",
+                                    "Singleton marker type for pld.system.get_comm_ctx outputs. "
+                                    "Consumed by pld.system.rank / pld.system.nranks to read "
+                                    "scalar fields of the runtime CommContext struct.");
+  comm_ctx_type_class.def(nb::init<>(), "Create the singleton CommCtxType instance.");
+  comm_ctx_type_class.def_static("get", &GetCommCtxType, "Get the shared singleton CommCtxType instance.");
+  BindFields<CommCtxType>(comm_ctx_type_class);
+
+  // Async-prefetch handle types - singleton markers for the prefetch.* op family.
+  // All three are opaque: the workspace backing a context, the in-flight event and
+  // the session are runtime-side values with no compile-time payload.
+  auto prefetch_async_context_type_class = nb::class_<PrefetchAsyncContextType, Type>(
+      ir, "PrefetchAsyncContextType",
+      "Singleton marker type for prefetch.make_context outputs. Consumed by "
+      "prefetch.async_prefetch and prefetch.session; lowers to PTOAS "
+      "!pto.prefetch_async_context.");
+  prefetch_async_context_type_class.def(nb::init<>(),
+                                        "Create the singleton PrefetchAsyncContextType instance.");
+  prefetch_async_context_type_class.def_static("get", &GetPrefetchAsyncContextType,
+                                               "Get the shared singleton PrefetchAsyncContextType instance.");
+  BindFields<PrefetchAsyncContextType>(prefetch_async_context_type_class);
+
+  auto async_event_type_class = nb::class_<AsyncEventType, Type>(
+      ir, "AsyncEventType",
+      "Singleton marker type for prefetch.async_prefetch outputs. Paired with an "
+      "AsyncSession in prefetch.wait; lowers to PTOAS !pto.async_event.");
+  async_event_type_class.def(nb::init<>(), "Create the singleton AsyncEventType instance.");
+  async_event_type_class.def_static("get", &GetAsyncEventType,
+                                    "Get the shared singleton AsyncEventType instance.");
+  BindFields<AsyncEventType>(async_event_type_class);
+
+  auto async_session_type_class = nb::class_<AsyncSessionType, Type>(
+      ir, "AsyncSessionType",
+      "Singleton marker type for prefetch.session outputs. Paired with an AsyncEvent in "
+      "prefetch.wait; lowers to PTOAS !pto.async_session.");
+  async_session_type_class.def(nb::init<>(), "Create the singleton AsyncSessionType instance.");
+  async_session_type_class.def_static("get", &GetAsyncSessionType,
+                                      "Get the shared singleton AsyncSessionType instance.");
+  BindFields<AsyncSessionType>(async_session_type_class);
+
+  // MemorySpace enum
+  nb::enum_<MemorySpace>(ir, "MemorySpace", "Memory space enumeration")
+      .value("DDR", MemorySpace::DDR, "DDR memory (off-chip)")
+      .value("Vec", MemorySpace::Vec, "Vector/unified buffer (on-chip)")
+      .value("Mat", MemorySpace::Mat, "Matrix/L1 buffer")
+      .value("Left", MemorySpace::Left, "Left matrix operand buffer")
+      .value("Right", MemorySpace::Right, "Right matrix operand buffer")
+      .value("Acc", MemorySpace::Acc, "Accumulator buffer")
+      .value("Bias", MemorySpace::Bias, "Bias buffer")
+      .value("LeftScale", MemorySpace::LeftScale, "L0A-side MX block-scale buffer (A5)")
+      .value("RightScale", MemorySpace::RightScale, "L0B-side MX block-scale buffer (A5)")
+      .value("ScalarLocal", MemorySpace::ScalarLocal, "On-core scalar register file / C stack (ArrayType)")
+      .export_values();
+
+  // Short alias: ir.Mem = ir.MemorySpace
+  ir.attr("Mem") = ir.attr("MemorySpace");
+
+  // PipeType enum
+  nb::enum_<PipeType>(ir, "PipeType", nb::is_arithmetic(), "Pipeline type enumeration")
+      .value("MTE1", PipeType::MTE1, "Memory Transfer Engine 1")
+      .value("MTE2", PipeType::MTE2, "Memory Transfer Engine 2")
+      .value("MTE3", PipeType::MTE3, "Memory Transfer Engine 3")
+      .value("M", PipeType::M, "Matrix Unit")
+      .value("V", PipeType::V, "Vector Unit")
+      .value("S", PipeType::S, "Scalar Unit")
+      .value("FIX", PipeType::FIX, "Fix Pipe")
+      .value("ALL", PipeType::ALL, "All Pipes")
+      .export_values();
+
+  // CoreType enum
+  nb::enum_<CoreType>(ir, "CoreType", nb::is_arithmetic(), "Core type enumeration")
+      .value("VECTOR", CoreType::VECTOR, "Vector Core")
+      .value("CUBE", CoreType::CUBE, "Cube Core")
+      .export_values();
+
+  // TileLayout enum - must be before TileView
+  nb::enum_<TileLayout>(ir, "TileLayout", "Tile layout enumeration")
+      .value("none_box", TileLayout::none_box, "No layout constraint")
+      .value("row_major", TileLayout::row_major, "Row-major layout")
+      .value("col_major", TileLayout::col_major, "Column-major layout")
+      .export_values();
+
+  // CompactMode enum - must be before TileView.
+  nb::enum_<CompactMode>(ir, "CompactMode", "Partial-tile compact mode enumeration")
+      .value("null", CompactMode::null, "Ordinary non-compact layout")
+      .value("normal", CompactMode::normal, "Compact valid-region layout");
+
+  // Final device buffer descriptors carry no MemRef or runtime expressions.
+  auto buffer_type_class = nb::class_<BufferType, Type>(
+      ir, "BufferType", "Physical descriptor for a mutable on-chip buffer handle");
+  buffer_type_class.def(
+      nb::init<std::vector<int64_t>, DataType, MemorySpace, std::vector<int64_t>, TileLayout, TileLayout,
+               uint64_t, PadValue, CompactMode>(),
+      nb::arg("shape"), nb::arg("dtype"), nb::arg("memory_space"),
+      nb::arg("valid_shape") = std::vector<int64_t>{}, nb::arg("blayout") = TileLayout::row_major,
+      nb::arg("slayout") = TileLayout::none_box, nb::arg("fractal") = 512, nb::arg("pad") = PadValue::null,
+      nb::arg("compact") = CompactMode::null,
+      "Create a static physical descriptor; -1 in valid_shape denotes a runtime valid extent");
+  BindFields<BufferType>(buffer_type_class);
+
+  auto multi_buffer_type_class = nb::class_<MultiBufferType, Type>(
+      ir, "MultiBufferType", "Descriptor for an explicit multi-slot buffer allocation");
+  multi_buffer_type_class.def(nb::init<BufferTypePtr, int64_t>(), nb::arg("element_type"),
+                              nb::arg("slot_count"),
+                              "Create a multi-buffer descriptor with positive slot count");
+  BindFields<MultiBufferType>(multi_buffer_type_class);
+
+  // TileView - immutable struct for tile view information.
+  //
+  // Fields are read-only from Python so that hash and equality remain stable
+  // across an instance's lifetime (Python's hash contract). Construct via the
+  // constructor, not by mutating fields.
+  nb::class_<TileView>(
+      ir, "TileView",
+      "Tile view representation with valid shape, stride, start offset, layouts, fractal, pad, and "
+      "compact mode. "
+      "Immutable from Python — set all fields at construction time.")
+      .def(nb::init<const std::vector<ExprPtr>&, const std::vector<ExprPtr>&, ExprPtr, TileLayout, TileLayout,
+                    uint64_t, PadValue, CompactMode>(),
+           nb::arg("valid_shape") = std::vector<ExprPtr>{}, nb::arg("stride") = std::vector<ExprPtr>{},
+           nb::arg("start_offset") = ExprPtr{}, nb::arg("blayout") = TileLayout::row_major,
+           nb::arg("slayout") = TileLayout::none_box, nb::arg("fractal") = static_cast<uint64_t>(512),
+           nb::arg("pad") = PadValue::null, nb::arg("compact") = CompactMode::null,
+           "Create a tile view; fields default to empty/null/row_major/none_box/512/null/null. "
+           "fractal is a size in bytes, not elements.")
+      .def(nb::init<const std::vector<int64_t>&, const std::vector<int64_t>&, ExprPtr, TileLayout, TileLayout,
+                    uint64_t, PadValue, CompactMode>(),
+           nb::arg("valid_shape"), nb::arg("stride"), nb::arg("start_offset"),
+           nb::arg("blayout") = TileLayout::row_major, nb::arg("slayout") = TileLayout::none_box,
+           nb::arg("fractal") = static_cast<uint64_t>(512), nb::arg("pad") = PadValue::null,
+           nb::arg("compact") = CompactMode::null,
+           "Create a tile view with integer valid_shape and stride, auto-converted to ConstInt. "
+           "fractal is a size in bytes, not elements.")
+      .def_ro("valid_shape", &TileView::valid_shape, "Valid shape dimensions")
+      .def_ro("stride", &TileView::stride, "Stride for each dimension")
+      .def_ro("start_offset", &TileView::start_offset, "Starting offset")
+      .def_ro("blayout", &TileView::blayout, "Block layout")
+      .def_ro("slayout", &TileView::slayout, "Scatter layout")
+      .def_ro("fractal", &TileView::fractal,
+              "Fractal size in bytes (not elements). In a boxed (NZ/ZN) layout the inner box is "
+              "M0 = 16 rows by fractal / dtype_bytes / M0 cols; the two matmul-path values are "
+              "16x16 boxes: 512 (Mat/Left/Right operand, FP16) and 1024 (Acc accumulator, "
+              "FP32/INT32). MX scale tiles carry 32, the MX block size (1-byte scale dtype, so "
+              "bytes and elements coincide).")
+      .def_ro("pad", &TileView::pad, "Pad mode")
+      .def_ro("compact", &TileView::compact, "Partial-tile compact mode")
+      .def(
+          "__eq__", [](const TileView& self, const TileView& other) { return self == other; },
+          nb::arg("other"), "Structural equality comparison")
+      .def(
+          "__ne__", [](const TileView& self, const TileView& other) { return self != other; },
+          nb::arg("other"), "Structural inequality comparison")
+      .def(
+          "__hash__", [](const TileView& self) { return Hash(self); },
+          "Hash consistent with __eq__ (ConstInt by value, other ExprPtrs by pointer identity)");
+
+  // Dynamic dimension constant
+  ir.attr("DYNAMIC_DIM") = kDynamicDim;
+
+  // Compile-time locked CommContext field offsets consumed by distributed
+  // codegen. Values come from offsetof(::CommContext, ...) and are pinned by
+  // static_assert in include/pypto/codegen/distributed/comm_layout.h. Exposed
+  // to Python so unit tests can assert no drift between bindings and the
+  // literal numbers that codegen embeds into the inline peer-offset arithmetic
+  // of emitted distributed kernels.
+  nb::module_ comm_layout_mod = ir.def_submodule(
+      "comm_layout", "Compile-time locked CommContext field offsets consumed by distributed codegen.");
+  comm_layout_mod.attr("RANK_ID_OFFSET") = pypto::codegen::distributed::comm_layout::kRankIdOffset;
+  comm_layout_mod.attr("RANK_NUM_OFFSET") = pypto::codegen::distributed::comm_layout::kRankNumOffset;
+  comm_layout_mod.attr("WINDOWS_IN_OFFSET") = pypto::codegen::distributed::comm_layout::kWindowsInOffset;
+  comm_layout_mod.attr("WINDOWS_OUT_OFFSET") = pypto::codegen::distributed::comm_layout::kWindowsOutOffset;
+  comm_layout_mod.attr("WINDOW_SLOT_STRIDE") = pypto::codegen::distributed::comm_layout::kWindowSlotStride;
+  comm_layout_mod.attr("COMM_CTX_SIZE") = pypto::codegen::distributed::comm_layout::kCommCtxSize;
+
+  // OpRegistry
+  nb::enum_<OpIRStage>(ir, "OpIRStage", "Representation consumed and produced by an operator")
+      .value("Functional", OpIRStage::Functional)
+      .value("Buffer", OpIRStage::Buffer);
+  nb::enum_<BufferAccess>(ir, "BufferAccess", "Access to buffer data or descriptor metadata")
+      .value("None_", BufferAccess::None)
+      .value("Read", BufferAccess::Read)
+      .value("Write", BufferAccess::Write)
+      .value("ReadWrite", BufferAccess::ReadWrite);
+  nb::enum_<BufferResultBehavior>(ir, "BufferResultBehavior", "Storage ownership of an actual SSA result")
+      .value("None_", BufferResultBehavior::None)
+      .value("Allocate", BufferResultBehavior::Allocate)
+      .value("Alias", BufferResultBehavior::Alias)
+      .value("Borrow", BufferResultBehavior::Borrow)
+      .value("Value", BufferResultBehavior::Value);
+  nb::class_<BufferArgEffect>(ir, "BufferArgEffect", "Explicit data and metadata effects of one operand")
+      .def_ro("data", &BufferArgEffect::data)
+      .def_ro("metadata", &BufferArgEffect::metadata)
+      .def_ro("non_memory", &BufferArgEffect::non_memory);
+  nb::class_<BufferResultSpec>(ir, "BufferResultSpec", "Ownership and alias source of one SSA result")
+      .def_ro("behavior", &BufferResultSpec::behavior)
+      .def_ro("alias_arg", &BufferResultSpec::alias_arg);
+  ir.def(
+      "get_op_ir_stage",
+      [](const std::string& op_name) { return OpRegistry::GetInstance().GetEntry(op_name).GetIRStage(); },
+      nb::arg("op_name"), "Get the operator's explicitly declared IR stage");
+  ir.def(
+      "get_op_buffer_arg_effect",
+      [](const std::string& op_name, size_t arg_index) {
+        return OpRegistry::GetInstance().GetEntry(op_name).GetBufferArgEffect(arg_index);
+      },
+      nb::arg("op_name"), nb::arg("arg_index"), "Get explicit data and metadata effects of a buffer operand");
+  ir.def(
+      "get_op_buffer_result_spec",
+      [](const std::string& op_name, size_t result_index) {
+        return OpRegistry::GetInstance().GetEntry(op_name).GetBufferResultSpec(result_index);
+      },
+      nb::arg("op_name"), nb::arg("result_index") = 0, "Get ownership and alias source of one buffer result");
+  ir.def(
+      "create_op_call",
+      [](const std::string& op_name, const std::vector<ExprPtr>& args, const Span& span) {
+        return OpRegistry::GetInstance().CreateUserFacing(op_name, args, span);
+      },
+      nb::arg("op_name"), nb::arg("args"), nb::arg("span"),
+      "Create a Call expression (backward compatibility)");
+
+  ir.def(
+      "create_op_call",
+      [](const std::string& op_name, const std::vector<ExprPtr>& args, const nb::dict& kwargs_dict,
+         const Span& span) {
+        // Convert Python dict to C++ vector<pair<string, any>> to preserve order
+        auto kwargs = ConvertKwargsDict(kwargs_dict);
+        return OpRegistry::GetInstance().CreateUserFacing(op_name, args, kwargs, span);
+      },
+      nb::arg("op_name"), nb::arg("args"), nb::arg("kwargs"), nb::arg("span"),
+      "Create a Call expression with args and kwargs");
+
+  // Underscore-prefixed: NOT a public API. Compiler-internal counterpart of
+  // `create_op_call`, it reaches operators marked `internal_only`, which
+  // `CreateUserFacing` rejects by design. Its only caller is the round-trip
+  // parser, rebuilding a printer-emitted internal dispatch
+  // (`pl.builtin.<ns>.<op>(...)`) that no DSL wrapper can spell; that caller
+  // re-checks the invariants the printer stamps before calling in, so the
+  // guard `internal_only` provides is enforced at the user-facing surface
+  // rather than dropped. `create_op_call` still routes through
+  // `CreateUserFacing` and is unaffected. Buffer lowering additionally supplies
+  // an explicit result descriptor for allocation and view operators.
+  ir.def(
+      "_create_internal_op_call",
+      [](const std::string& op_name, const std::vector<ExprPtr>& args, const nb::dict& kwargs_dict,
+         const Span& span) {
+        auto kwargs = ConvertKwargsDict(kwargs_dict);
+        return OpRegistry::GetInstance().CreateInternal(op_name, args, kwargs, span);
+      },
+      nb::arg("op_name"), nb::arg("args"), nb::arg("kwargs"), nb::arg("span"),
+      "Create a Call expression for a compiler-internal operator (round-trip parser only)");
+
+  ir.def(
+      "_create_internal_op_call",
+      [](const std::string& op_name, const std::vector<ExprPtr>& args, const nb::dict& kwargs_dict,
+         const TypePtr& result_type, const Span& span) {
+        auto kwargs = ConvertKwargsDict(kwargs_dict);
+        return OpRegistry::GetInstance().CreateInternal(op_name, args, kwargs, result_type, span);
+      },
+      nb::arg("op_name"), nb::arg("args"), nb::arg("kwargs"), nb::arg("type"), nb::arg("span"),
+      "Create an internal Buffer call with a validated explicit result descriptor");
+
+  ir.def(
+      "set_call_attrs",
+      [](const CallPtr& call, const nb::dict& attrs_dict) -> CallPtr {
+        // Return a copy of `call` with compiler-internal `attrs_` set from a
+        // Python dict. Used by the round-trip parser to re-attach generic
+        // op-call attrs (e.g. `pipeline_membership`) that the printer surfaced
+        // as `attrs={...}`; op DSL wrappers / IR builders take no attrs param,
+        // so the parser builds the call first, then layers attrs on here.
+        if (!call) throw pypto::ValueError("set_call_attrs: call must not be None");
+        auto attrs = ConvertAttrsFromPython(attrs_dict);
+        return std::make_shared<Call>(call->op_, call->args_, call->kwargs_, attrs, call->GetType(),
+                                      call->span_);
+      },
+      nb::arg("call"), nb::arg("attrs"), "Return a copy of a Call with compiler-internal attrs set");
+
+  ir.def(
+      "is_op_registered",
+      [](const std::string& op_name) { return OpRegistry::GetInstance().IsRegistered(op_name); },
+      nb::arg("op_name"), "Check if an operator is registered");
+
+  ir.def(
+      "get_op", [](const std::string& op_name) { return OpRegistry::GetInstance().GetOp(op_name); },
+      nb::arg("op_name"), "Get an operator instance by name");
+
+  ir.def(
+      "get_op_output_arity",
+      [](const std::string& op_name) { return OpRegistry::GetInstance().GetEntry(op_name).GetOutputArity(); },
+      nb::arg("op_name"), "Number of SSA results (0 means VoidType, >1 means TupleType)");
+
+  ir.def(
+      "op_arg_is_workspace",
+      [](const std::string& op_name, size_t arg_index) {
+        return OpRegistry::GetInstance().GetEntry(op_name).IsWorkspaceArg(arg_index);
+      },
+      nb::arg("op_name"), nb::arg("arg_index"),
+      "Whether an argument was declared compiler-supplied scratch rather than a result");
+
+  ir.def(
+      "get_op_argument_count",
+      [](const std::string& op_name) {
+        return OpRegistry::GetInstance().GetEntry(op_name).GetArgumentCount();
+      },
+      nb::arg("op_name"), "Number of arguments an operator's registration documents");
+
+  ir.def(
+      "get_op_memory_spec",
+      [](const std::string& op_name) -> nb::object {
+        auto& registry = OpRegistry::GetInstance();
+        if (!registry.IsRegistered(op_name)) return nb::none();
+        const auto& entry = registry.GetEntry(op_name);
+        const auto& spec = entry.GetMemorySpec();
+        if (!spec.has_value()) return nb::none();
+        // Empty spec (from no_memory_spec()) — no constraints and no resolver
+        if (spec->input_constraints.empty() && !spec->deduce_output_memory) return nb::none();
+
+        nb::dict result;
+        // Input constraints
+        nb::list inputs;
+        for (const auto& c : spec->input_constraints) {
+          nb::list allowed;
+          for (auto ms : c) allowed.append(ms);
+          inputs.append(nb::cast(allowed));
+        }
+        result["input_constraints"] = inputs;
+        // Output (resolve with empty kwargs for display). Distinguishes:
+        //   - Fixed/default-seeded: resolver returns a concrete MemorySpace.
+        //   - Inherit-input (slice/reshape/...): marker string "inherit_from_input".
+        //   - Retargetable with no kwarg default (tile.load/tile.create without
+        //     target_memory): deferred — InferTileMemorySpace resolves from
+        //     consumer demand. Reported as the string "deferred".
+        if (entry.OutputMemoryInheritsInput()) {
+          result["output_memory"] = "inherit_from_input";
+        } else if (spec->deduce_output_memory) {
+          auto out = spec->deduce_output_memory({});
+          if (out.has_value()) {
+            result["output_memory"] = *out;
+          } else {
+            result["output_memory"] = "deferred";
+          }
+        } else {
+          result["output_memory"] = nb::none();
+        }
+        return result;
+      },
+      nb::arg("op_name"), "Get memory space specification for a registered operator");
+
+  nb::enum_<ArgEffect>(ir, "ArgEffect", "What executing an operator does to the buffer one argument names")
+      .value("Read", ArgEffect::Read, "Read, never written")
+      .value("Write", ArgEffect::Write, "Overwritten without being read first")
+      .value("ReadWrite", ArgEffect::ReadWrite, "Read and written (accumulate, atomic, in-place update)");
+
+  nb::enum_<WriteChannel>(ir, "WriteChannel", "The hardware path an operator's writes travel")
+      .value("Dma", WriteChannel::Dma, "MTE3 / DMA store path")
+      .value("Scalar", WriteChannel::Scalar, "Scalar D-cache write path");
+
+  ir.def(
+      "get_op_arg_effect",
+      [](const std::string& op_name, size_t arg_index, nb::kwargs kwargs) -> ArgEffect {
+        const auto& entry = OpRegistry::GetInstance().GetEntry(op_name);
+        // The same conversion every other kwarg-taking binding uses. Rolling a
+        // local int/str pair here rejected the enum-valued kwargs an operator
+        // legitimately carries — `tile.mgather`'s `target_memory` is a
+        // `MemorySpace`, and it is exactly what that operator's effect resolver
+        // reads.
+        nb::dict kwargs_dict;
+        for (auto [key, value] : kwargs) {
+          kwargs_dict[key] = value;
+        }
+        return entry.GetArgEffect(arg_index, ConvertKwargsDict(kwargs_dict));
+      },
+      nb::arg("op_name"), nb::arg("arg_index"), nb::arg("kwargs"),
+      "Effect an operator has on one positional argument, for a call carrying the given kwargs");
+
+  ir.def(
+      "op_has_declared_arg_effects",
+      [](const std::string& op_name) {
+        return OpRegistry::GetInstance().GetEntry(op_name).HasDeclaredArgEffects();
+      },
+      nb::arg("op_name"), "Whether an operator declared its per-argument effects (False = never classified)");
+
+  ir.def(
+      "op_has_declared_arg_effect",
+      [](const std::string& op_name, size_t arg_index) {
+        return OpRegistry::GetInstance().GetEntry(op_name).HasDeclaredArgEffect(arg_index);
+      },
+      nb::arg("op_name"), nb::arg("arg_index"),
+      "Whether the registration reached a verdict about this argument in particular");
+
+  ir.def(
+      "get_op_write_channel",
+      [](const std::string& op_name) -> nb::object {
+        auto channel = OpRegistry::GetInstance().GetEntry(op_name).GetWriteChannel();
+        return channel.has_value() ? nb::cast(*channel) : nb::none();
+      },
+      nb::arg("op_name"), "The hardware path an operator's writes travel, or None when it declared none");
+
+  nb::enum_<LaneInvariantArg>(ir, "LaneInvariantArg",
+                              "Why an argument carries no lane-indexed data under automatic AIV splitting")
+      .value("Scratch", LaneInvariantArg::Scratch,
+             "Hardware workspace; full width and halved are both correct")
+      .value("IndexAddressedSource", LaneInvariantArg::IndexAddressedSource,
+             "Lookup table read at absolute indices; only full width is correct")
+      .value("AbsoluteIndexedDestination", LaneInvariantArg::AbsoluteIndexedDestination,
+             "Destination written at absolute indices; only full width is correct");
+
+  ir.def(
+      "get_op_lane_invariant_arg",
+      [](const std::string& op_name, size_t arg_index) -> nb::object {
+        auto kind = OpRegistry::GetInstance().GetEntry(op_name).GetLaneInvariantArgKind(arg_index);
+        return kind.has_value() ? nb::cast(*kind) : nb::none();
+      },
+      nb::arg("op_name"), nb::arg("arg_index"),
+      "Why one positional argument carries no lane-indexed data, or None when the operator declared none");
+
+  // Var - const shared_ptr
+  auto var_class = nb::class_<Var, Expr>(ir, "Var", "Variable reference expression");
+
+  var_class.def(
+      nb::init<const std::string&, const TypePtr&, const Span&>(), nb::arg("name_hint"), nb::arg("type"),
+      nb::arg("span"),
+      "Create a variable reference (memory reference is stored in ShapedType for Tensor/Tile types)");
+  var_class.def_prop_ro(
+      "unique_id", &Var::UniqueId,
+      "Process-unique identifier for this Var instance. Stable for the lifetime of the process; "
+      "use as a dictionary key to deduplicate Var wrappers that refer to the same underlying object.");
+  BindFields<Var>(var_class);
+
+  // IterArg - const shared_ptr
+  auto iterarg_class = nb::class_<IterArg, Var>(ir, "IterArg", "Iteration argument variable");
+  iterarg_class.def(nb::init<const std::string&, const TypePtr&, const ExprPtr&, const Span&>(),
+                    nb::arg("name_hint"), nb::arg("type"), nb::arg("initValue"), nb::arg("span"),
+                    "Create an iteration argument with initial value");
+  BindFields<IterArg>(iterarg_class);
+
+  // MemRef - now inherits from Var (first-class expression)
+  auto memref_class =
+      nb::class_<MemRef, Var>(ir, "MemRef", "Memory reference variable for shaped types (inherits from Var)");
+  memref_class
+      .def(
+          "__init__",
+          [](MemRef* self, const VarPtr& base, int64_t byte_offset, uint64_t size, const Span& span,
+             bool is_pinned, uint64_t slots, const std::optional<ExprPtr>& slot) {
+            CheckSlotCount(slots);
+            new (self) MemRef(base, byte_offset, size, span, is_pinned, slots, slot);
+          },
+          nb::arg("base"), nb::arg("byte_offset"), nb::arg("size"), nb::arg("span") = Span::unknown(),
+          nb::arg("is_pinned") = false, nb::arg("slots") = 1, nb::arg("slot") = nb::none(),
+          "Create a memory reference with base Ptr, integer byte_offset, and size. Set is_pinned for an "
+          "author-declared allocation whose size the parser leaves for InitMemRef to derive; slots/slot "
+          "select one slot of a multi-slot declaration")
+      .def(
+          "__init__",
+          [](MemRef* self, const VarPtr& base, const ExprPtr& byte_offset, uint64_t size, const Span& span,
+             uint64_t slots, const std::optional<ExprPtr>& slot) {
+            CheckSlotCount(slots);
+            new (self) MemRef(base, byte_offset, size, span, /*is_pinned=*/false, slots, slot);
+          },
+          nb::arg("base"), nb::arg("byte_offset"), nb::arg("size"), nb::arg("span") = Span::unknown(),
+          nb::arg("slots") = 1, nb::arg("slot") = nb::none(),
+          "Create a memory reference with base Ptr, byte_offset expression, and size. slots/slot record "
+          "which slot of a multi-slot allocation this is, which outlives InitMemRef resolving the index "
+          "into the offset")
+      .def_ro("is_pinned_", &MemRef::is_pinned_,
+              "True for an author-declared allocation, false for a compiler allocation")
+      .def_ro("slot_count_", &MemRef::slot_count_,
+              "How many equally-sized slots the declared allocation holds (1 when unsubscripted)")
+      .def_ro("slot_index_", &MemRef::slot_index_,
+              "Which slot of the declared allocation this MemRef denotes, as an Expr (None when "
+              "unsubscripted); may be a runtime value")
+      // Declaration forms. Both leave size and address for InitMemRef to derive
+      // and are distinguished from the three-argument form purely by arity.
+      //
+      // `MemRef()` leaves the base Ptr unnamed: the parser then takes the name
+      // from the variable the declaration is bound to, so it is written once. An
+      // empty base name means exactly "no name given" — it is not a value the
+      // named forms can produce, since the parser rejects an empty literal.
+      .def(
+          "__init__",
+          [](MemRef* self, const Span& span, uint64_t slots) {
+            CheckSlotCount(slots);
+            auto base = std::make_shared<Var>("", GetPtrType(), Span::unknown());
+            new (self) MemRef(base, static_cast<int64_t>(0), static_cast<uint64_t>(0), span,
+                              /*is_pinned=*/true, slots);
+          },
+          // `slots` goes AFTER `span`: `span` was the first positional parameter
+          // before slots existed, so putting slots first would break
+          // `pl.MemRef(span)`. `slots` is written as a keyword either way.
+          nb::arg("span") = Span::unknown(), nb::arg("slots") = 1,
+          "Declare an allocation of your own, named after the variable it is bound to. Size and "
+          "address are left for InitMemRef to derive, and nothing else is ever packed into it. Pass "
+          "slots=N for N equally-sized slots, selected by subscript in the tile annotation")
+      .def(
+          "__init__",
+          [](MemRef* self, const std::string& name, const Span& span, uint64_t slots) {
+            CheckSlotCount(slots);
+            auto base = std::make_shared<Var>(name, GetPtrType(), Span::unknown());
+            new (self) MemRef(base, static_cast<int64_t>(0), static_cast<uint64_t>(0), span,
+                              /*is_pinned=*/true, slots);
+          },
+          nb::arg("name"), nb::arg("span") = Span::unknown(), nb::arg("slots") = 1,
+          "Declare an allocation of your own under an explicit name, overriding the variable name")
+      // `decl[k]` selects one slot. The result is the same declaration — same base
+      // Ptr, so the slots share one allocation — differing only in slot_index_.
+      .def(
+          "__getitem__",
+          [](const MemRef& self, uint64_t slot) {
+            CHECK(self.is_pinned_) << "Only a declared allocation can be subscripted; a MemRef that "
+                                      "already describes an existing allocation has no slots";
+            CHECK(slot < self.slot_count_)
+                << "Slot index " << slot << " is out of range for a declaration with " << self.slot_count_
+                << " slot(s); declare it with pl.MemRef(slots=" << (slot + 1) << ") or higher";
+            auto index =
+                std::make_shared<ConstInt>(static_cast<int64_t>(slot), DataType::INDEX, Span::unknown());
+            return std::make_shared<MemRef>(self.base_, self.byte_offset_, self.size_, self.span_,
+                                            self.is_pinned_, self.slot_count_, std::move(index));
+          },
+          nb::arg("slot"), "Select one slot of a multi-slot declared allocation by constant index")
+      // String base constructor: MemRef("base_name", byte_offset, size) — for forward references
+      // in printed IR where the base Ptr variable appears in annotations before its alloc statement
+      .def(
+          "__init__",
+          [](MemRef* self, const std::string& base_name, int64_t byte_offset, uint64_t size,
+             const Span& span) {
+            auto base = std::make_shared<Var>(base_name, GetPtrType(), Span::unknown());
+            new (self) MemRef(base, byte_offset, size, span);
+          },
+          nb::arg("base"), nb::arg("byte_offset"), nb::arg("size"), nb::arg("span") = Span::unknown(),
+          "Create a memory reference from base name string, integer byte_offset, and size")
+      // Legacy constructor: MemRef(MemorySpace, addr_expr, size, id) → auto-creates base Ptr
+      .def(
+          "__init__",
+          [](MemRef* self, MemorySpace memory_space, const ExprPtr& addr_expr, uint64_t size, uint64_t id,
+             const Span& span) {
+            // Build a name like "mem_vec_0" from memory_space and id
+            std::string space_str = MemorySpaceToString(memory_space);
+            std::transform(space_str.begin(), space_str.end(), space_str.begin(),
+                           [](unsigned char c) { return std::tolower(c); });
+            std::string base_name = "mem_" + space_str + "_" + std::to_string(id);
+            auto base = std::make_shared<Var>(base_name, GetPtrType(), Span::unknown());
+            // Use addr_expr as byte_offset for backward compatibility
+            new (self) MemRef(base, addr_expr, size, span);
+          },
+          nb::arg("memory_space"), nb::arg("addr"), nb::arg("size"), nb::arg("id"),
+          nb::arg("span") = Span::unknown(),
+          "Legacy constructor: create MemRef from memory_space, addr, size, id")
+      // Legacy constructor: MemRef(addr_int, size, id) → auto-creates base Ptr
+      .def(
+          "__init__",
+          [](MemRef* self, int64_t addr, uint64_t size, uint64_t id, const Span& span) {
+            std::string base_name = "mem_" + std::to_string(id);
+            auto base = std::make_shared<Var>(base_name, GetPtrType(), Span::unknown());
+            auto addr_expr = std::make_shared<ConstInt>(addr, DataType::INDEX, Span::unknown());
+            new (self) MemRef(base, addr_expr, size, span);
+          },
+          nb::arg("addr"), nb::arg("size"), nb::arg("id"), nb::arg("span") = Span::unknown(),
+          "Legacy constructor: create MemRef from integer addr, size, id")
+      .def_rw("base_", &MemRef::base_, "Base Ptr variable (allocation identity)")
+      .def_rw("byte_offset_", &MemRef::byte_offset_, "Byte offset from base")
+      .def_rw("size_", &MemRef::size_, "Size in bytes (64-bit unsigned)")
+      .def_static("same_allocation", &MemRef::SameAllocation, nb::arg("a"), nb::arg("b"),
+                  "Check if two MemRefs share the same allocation (same base_ Ptr)")
+      .def_static("may_alias", &MemRef::MayAlias, nb::arg("a"), nb::arg("b"),
+                  "Check if two MemRefs may alias (same base + overlapping byte ranges)");
+
+  // ConstInt - const shared_ptr
+  auto constint_class = nb::class_<ConstInt, Expr>(ir, "ConstInt", "Constant integer expression");
+  constint_class.def(nb::init<int64_t, DataType, const Span&>(), nb::arg("value"), nb::arg("dtype"),
+                     nb::arg("span"), "Create a constant integer expression");
+  BindFields<ConstInt>(constint_class);
+  constint_class.def_prop_ro("dtype", &ConstInt::dtype, "Data type of the expression");
+
+  // ConstFloat - const shared_ptr
+  auto constfloat_class = nb::class_<ConstFloat, Expr>(ir, "ConstFloat", "Constant float expression");
+  constfloat_class.def(nb::init<double, DataType, const Span&>(), nb::arg("value"), nb::arg("dtype"),
+                       nb::arg("span"), "Create a constant float expression");
+  BindFields<ConstFloat>(constfloat_class);
+  constfloat_class.def_prop_ro("dtype", &ConstFloat::dtype, "Data type of the expression");
+
+  // ConstBool - const shared_ptr
+  auto constbool_class = nb::class_<ConstBool, Expr>(ir, "ConstBool", "Constant boolean expression");
+  constbool_class.def(nb::init<bool, const Span&>(), nb::arg("value"), nb::arg("span"),
+                      "Create a constant boolean expression");
+  BindFields<ConstBool>(constbool_class);
+  constbool_class.def_prop_ro("dtype", &ConstBool::dtype, "Data type of the expression (always BOOL)");
+
+  // Call - const shared_ptr
+  auto call_class = nb::class_<Call, Expr>(ir, "Call", "Function call expression");
+
+  // Constructors without kwargs (backward compatibility)
+  call_class.def(nb::init<const OpPtr&, const std::vector<ExprPtr>&, const Span&>(), nb::arg("op"),
+                 nb::arg("args"), nb::arg("span"), "Create a function call expression");
+  call_class.def(nb::init<const OpPtr&, const std::vector<ExprPtr>&, const TypePtr&, const Span&>(),
+                 nb::arg("op"), nb::arg("args"), nb::arg("type"), nb::arg("span"),
+                 "Create a function call expression with explicit type");
+
+  // Constructors with kwargs (using nb::dict) - use factory functions
+  call_class.def(
+      "__init__",
+      [](Call* self, const OpPtr& op, const std::vector<ExprPtr>& args, const nb::dict& kwargs_dict,
+         const Span& span) {
+        auto kwargs = ConvertKwargsDict(kwargs_dict);
+        new (self) Call(op, args, kwargs, span);
+      },
+      nb::arg("op"), nb::arg("args"), nb::arg("kwargs"), nb::arg("span"),
+      "Create a function call expression with kwargs");
+
+  call_class.def(
+      "__init__",
+      [](Call* self, const OpPtr& op, const std::vector<ExprPtr>& args, const nb::dict& kwargs_dict,
+         const TypePtr& type, const Span& span) {
+        auto kwargs = ConvertKwargsDict(kwargs_dict);
+        new (self) Call(op, args, kwargs, type, span);
+      },
+      nb::arg("op"), nb::arg("args"), nb::arg("kwargs"), nb::arg("type"), nb::arg("span"),
+      "Create a function call expression with kwargs and explicit type");
+
+  // Constructor with kwargs and explicit attrs (e.g. {"arg_directions": [...]}) and type
+  call_class.def(
+      "__init__",
+      [](Call* self, const OpPtr& op, const std::vector<ExprPtr>& args, const nb::dict& kwargs_dict,
+         const nb::object& attrs_or_none, const TypePtr& type, const Span& span) {
+        auto kwargs = ConvertKwargsDict(kwargs_dict);
+        // Builtin kernel metadata stores core_num as an integer, whereas
+        // outlined user dispatches store the SPMD launch expression.
+        auto attrs = ConvertAttrsFromPython(attrs_or_none, !op || op->name_.rfind("builtin.", 0) != 0);
+        new (self) Call(op, args, std::move(kwargs), std::move(attrs), type, span);
+      },
+      nb::arg("op"), nb::arg("args"), nb::arg("kwargs"), nb::arg("attrs").none(), nb::arg("type"),
+      nb::arg("span"),
+      "Create a function call expression with kwargs and explicit attrs map and type. "
+      "Reserved attrs keys: 'arg_directions' -> list[ArgDirection].");
+
+  BindFields<Call>(call_class);
+
+  // Submit - task-launch expression (see include/pypto/ir/expr.h Submit class)
+  auto submit_class = nb::class_<Submit, Expr>(ir, "Submit", "Task-launch expression (pl.submit)");
+
+  submit_class.def(nb::init<const OpPtr&, const std::vector<ExprPtr>&, const std::vector<ExprPtr>&,
+                            const TypePtr&, const Span&>(),
+                   nb::arg("op"), nb::arg("args"), nb::arg("deps"), nb::arg("type"), nb::arg("span"),
+                   "Create a Submit expression");
+
+  submit_class.def(
+      "__init__",
+      [](Submit* self, const OpPtr& op, const std::vector<ExprPtr>& args, const std::vector<ExprPtr>& deps,
+         const nb::dict& kwargs_dict, const nb::object& attrs_or_none, const TypePtr& type, const Span& span,
+         const std::optional<ExprPtr>& core_num, bool sync_start, bool allow_early_resolve,
+         const std::optional<ExprPtr>& predicate) {
+        auto kwargs = ConvertKwargsDict(kwargs_dict);
+        auto attrs = ConvertAttrsFromPython(attrs_or_none);
+        new (self) Submit(op, args, deps, std::move(kwargs), std::move(attrs), type, span, core_num,
+                          sync_start, allow_early_resolve, predicate);
+      },
+      nb::arg("op"), nb::arg("args"), nb::arg("deps"), nb::arg("kwargs"), nb::arg("attrs").none(),
+      nb::arg("type"), nb::arg("span"), nb::arg("core_num") = nb::none(), nb::arg("sync_start") = false,
+      nb::arg("allow_early_resolve") = false, nb::arg("predicate") = nb::none(),
+      "Create a Submit expression with kwargs and explicit attrs map and type. "
+      "The optional core_num (an INDEX/INT Expr) and sync_start carry the SPMD launch spec "
+      "for pl.spmd_submit; omit them for a plain pl.submit. "
+      "allow_early_resolve opts this task in as a speculative early-dispatch producer. "
+      "predicate is an optional comparison Expr (e.g. Gt(tensor.read(t, [i]), 0)) the scheduler "
+      "evaluates at the dispatch point; omit it for an unconditional dispatch. "
+      "Reserved attrs keys: 'arg_directions' -> list[ArgDirection].");
+
+  BindFields<Submit>(submit_class);
+
+  // Convert a vector<pair<string, any>> kwargs/attrs container to a Python dict.
+  auto kwargs_to_pydict = [](const std::vector<std::pair<std::string, std::any>>& items) {
+    nb::dict result;
+    for (const auto& [key, value] : items) {
+      if (value.type() == typeid(int)) {
+        result[key.c_str()] = AnyCast<int>(value, "converting to Python: " + key);
+      } else if (value.type() == typeid(bool)) {
+        result[key.c_str()] = AnyCast<bool>(value, "converting to Python: " + key);
+      } else if (value.type() == typeid(std::string)) {
+        result[key.c_str()] = AnyCast<std::string>(value, "converting to Python: " + key);
+      } else if (value.type() == typeid(double)) {
+        result[key.c_str()] = AnyCast<double>(value, "converting to Python: " + key);
+      } else if (value.type() == typeid(float)) {
+        result[key.c_str()] = AnyCast<float>(value, "converting to Python: " + key);
+      } else if (value.type() == typeid(DataType)) {
+        result[key.c_str()] = AnyCast<DataType>(value, "converting to Python: " + key);
+      } else if (value.type() == typeid(MemorySpace)) {
+        result[key.c_str()] = AnyCast<MemorySpace>(value, "converting to Python: " + key);
+      } else if (value.type() == typeid(TensorLayout)) {
+        result[key.c_str()] = AnyCast<TensorLayout>(value, "converting to Python: " + key);
+      } else if (value.type() == typeid(TileLayout)) {
+        result[key.c_str()] = AnyCast<TileLayout>(value, "converting to Python: " + key);
+      } else if (value.type() == typeid(PadValue)) {
+        result[key.c_str()] = AnyCast<PadValue>(value, "converting to Python: " + key);
+      } else if (value.type() == typeid(ArgDirection)) {
+        result[key.c_str()] = AnyCast<ArgDirection>(value, "converting to Python: " + key);
+      } else if (value.type() == typeid(std::vector<ArgDirection>)) {
+        const auto& dirs = AnyCast<std::vector<ArgDirection>>(value, "converting to Python: " + key);
+        nb::list lst;
+        for (auto d : dirs) {
+          lst.append(nb::cast(d));
+        }
+        result[key.c_str()] = lst;
+      } else if (value.type() == typeid(std::vector<int32_t>)) {
+        // Used by attrs["arg_direction_overrides"] (per-arg NoDep override
+        // indices). Surface as a Python list[int] so attribute readback
+        // round-trips through the binding.
+        const auto& idxs = AnyCast<std::vector<int32_t>>(value, "converting to Python: " + key);
+        nb::list lst;
+        for (auto i : idxs) {
+          lst.append(nb::cast(i));
+        }
+        result[key.c_str()] = lst;
+      } else if (value.type() == typeid(std::vector<VarPtr>)) {
+        // Used by attrs["manual_dep_edges"], attrs["arg_direction_overrides_vars"],
+        // and attrs["dump_vars"].
+        const auto& vars = AnyCast<std::vector<VarPtr>>(value, "converting to Python: " + key);
+        nb::list lst;
+        for (const auto& v : vars) {
+          lst.append(nb::cast(v));
+        }
+        result[key.c_str()] = lst;
+      } else if (value.type() == typeid(std::vector<std::pair<VarPtr, int>>)) {
+        // Used by ScopeStmt attrs["cache_policy_vars"] — the parse-time
+        // ``pl.set_cache_policy`` declarations, as ``list[tuple[Var, int]]``.
+        const auto& decls =
+            AnyCast<std::vector<std::pair<VarPtr, int>>>(value, "converting to Python: " + key);
+        nb::list lst;
+        for (const auto& [v, policy] : decls) {
+          lst.append(nb::make_tuple(nb::cast(v), nb::cast(policy)));
+        }
+        result[key.c_str()] = lst;
+      } else if (value.type() == typeid(std::vector<std::pair<int32_t, int>>)) {
+        // Used by Function attrs["cache_policy"] — the same declarations after
+        // the scope outliner resolved them to param indices, as
+        // ``list[tuple[int, int]]``.
+        const auto& decls =
+            AnyCast<std::vector<std::pair<int32_t, int>>>(value, "converting to Python: " + key);
+        nb::list lst;
+        for (const auto& [idx, policy] : decls) {
+          lst.append(nb::make_tuple(nb::cast(idx), nb::cast(policy)));
+        }
+        result[key.c_str()] = lst;
+      } else if (value.type() == typeid(VarPtr)) {
+        // Used by ScopeStmt attrs["task_id_var"] (single producer TaskId Var).
+        result[key.c_str()] = nb::cast(AnyCast<VarPtr>(value, "converting to Python: " + key));
+      } else if (value.type() == typeid(ExprPtr)) {
+        // IR expressions stored in attrs (e.g. attrs["device"] and
+        // attrs["core_num"] on Orchestration dispatch calls).
+        result[key.c_str()] = nb::cast(AnyCast<ExprPtr>(value, "converting to Python: " + key));
+      }
+    }
+    return result;
+  };
+
+  call_class.def_prop_ro(
+      "kwargs", [kwargs_to_pydict](const CallPtr& self) { return kwargs_to_pydict(self->kwargs_); },
+      "Keyword arguments (metadata) for this call");
+
+  call_class.def_prop_ro(
+      "attrs", [kwargs_to_pydict](const CallPtr& self) { return kwargs_to_pydict(self->attrs_); },
+      "Compiler-internal node metadata. Reserved keys include 'arg_directions', "
+      "'manual_dep_edges', and 'dummy_task'.");
+
+  call_class.def_prop_ro(
+      "arg_directions",
+      [](const CallPtr& self) {
+        nb::list result;
+        for (auto d : self->GetArgDirections()) {
+          result.append(nb::cast(d));
+        }
+        return result;
+      },
+      "Resolved per-argument call-site directions (empty list when not yet derived). "
+      "Stored under attrs['arg_directions'].");
+
+  submit_class.def_prop_ro(
+      "kwargs", [kwargs_to_pydict](const SubmitPtr& self) { return kwargs_to_pydict(self->kwargs_); },
+      "Keyword arguments (metadata) for this submit");
+
+  submit_class.def_prop_ro(
+      "attrs", [kwargs_to_pydict](const SubmitPtr& self) { return kwargs_to_pydict(self->attrs_); },
+      "Compiler-internal node metadata. Reserved keys: 'arg_directions' -> list[ArgDirection]. "
+      "Note: 'manual_dep_edges' is intentionally NOT used on Submit — see Submit.deps.");
+
+  submit_class.def_prop_ro(
+      "arg_directions",
+      [](const SubmitPtr& self) {
+        nb::list result;
+        for (auto d : self->GetArgDirections()) {
+          result.append(nb::cast(d));
+        }
+        return result;
+      },
+      "Resolved per-argument call-site directions (empty list when not yet derived). "
+      "Stored under attrs['arg_directions'].");
+
+  // MakeTuple - const shared_ptr
+  auto make_tuple_class = nb::class_<MakeTuple, Expr>(ir, "MakeTuple", "Tuple construction expression");
+  make_tuple_class.def(nb::init<const std::vector<ExprPtr>&, const Span&>(), nb::arg("elements"),
+                       nb::arg("span"), "Create a tuple construction expression");
+  BindFields<MakeTuple>(make_tuple_class);
+
+  // TupleGetItemExpr - const shared_ptr
+  auto tuple_get_item_class =
+      nb::class_<TupleGetItemExpr, Expr>(ir, "TupleGetItemExpr", "Tuple element access expression");
+  tuple_get_item_class.def(nb::init<const ExprPtr&, int, const Span&>(), nb::arg("tuple"), nb::arg("index"),
+                           nb::arg("span"), "Create a tuple element access expression");
+  BindFields<TupleGetItemExpr>(tuple_get_item_class);
+
+  // BinaryExpr - abstract, const shared_ptr
+  auto binaryexpr_class = nb::class_<BinaryExpr, Expr>(ir, "BinaryExpr", "Base class for binary operations");
+  BindFields<BinaryExpr>(binaryexpr_class);
+
+  // UnaryExpr - abstract, const shared_ptr
+  auto unaryexpr_class = nb::class_<UnaryExpr, Expr>(ir, "UnaryExpr", "Base class for unary operations");
+  BindFields<UnaryExpr>(unaryexpr_class);
+
+// Macro to bind binary expression nodes
+#define BIND_BINARY_EXPR(OpName, Description)                                                  \
+  nb::class_<OpName, BinaryExpr>(ir, #OpName, Description)                                     \
+      .def(nb::init<const ExprPtr&, const ExprPtr&, DataType, const Span&>(), nb::arg("left"), \
+           nb::arg("right"), nb::arg("dtype"), nb::arg("span"), "Create " Description);
+
+  // Bind all binary expression nodes
+  BIND_BINARY_EXPR(Add, "Addition expression (left + right)")
+  BIND_BINARY_EXPR(Sub, "Subtraction expression (left - right)")
+  BIND_BINARY_EXPR(Mul, "Multiplication expression (left * right)")
+  BIND_BINARY_EXPR(FloorDiv, "Floor division expression (left // right)")
+  BIND_BINARY_EXPR(FloorMod, "Floor modulo expression (left % right)")
+  BIND_BINARY_EXPR(FloatDiv, "Float division expression (left / right)")
+  BIND_BINARY_EXPR(Min, "Minimum expression (min(left, right))")
+  BIND_BINARY_EXPR(Max, "Maximum expression (max(left, right))")
+  BIND_BINARY_EXPR(Pow, "Power expression (left ** right)")
+  BIND_BINARY_EXPR(Eq, "Equality expression (left == right)")
+  BIND_BINARY_EXPR(Ne, "Inequality expression (left != right)")
+  BIND_BINARY_EXPR(Lt, "Less than expression (left < right)")
+  BIND_BINARY_EXPR(Le, "Less than or equal to expression (left <= right)")
+  BIND_BINARY_EXPR(Gt, "Greater than expression (left > right)")
+  BIND_BINARY_EXPR(Ge, "Greater than or equal to expression (left >= right)")
+  BIND_BINARY_EXPR(And, "Logical and expression (left and right)")
+  BIND_BINARY_EXPR(Or, "Logical or expression (left or right)")
+  BIND_BINARY_EXPR(Xor, "Logical xor expression (left xor right)")
+  BIND_BINARY_EXPR(BitAnd, "Bitwise and expression (left & right)")
+  BIND_BINARY_EXPR(BitOr, "Bitwise or expression (left | right)")
+  BIND_BINARY_EXPR(BitXor, "Bitwise xor expression (left ^ right)")
+  BIND_BINARY_EXPR(BitShiftLeft, "Bitwise left shift expression (left << right)")
+  BIND_BINARY_EXPR(BitShiftRight, "Bitwise right shift expression (left >> right)")
+
+#undef BIND_BINARY_EXPR
+
+// Macro to bind unary expression nodes
+#define BIND_UNARY_EXPR(OpName, Description)                                                        \
+  nb::class_<OpName, UnaryExpr>(ir, #OpName, Description)                                           \
+      .def(nb::init<const ExprPtr&, DataType, const Span&>(), nb::arg("operand"), nb::arg("dtype"), \
+           nb::arg("span"), "Create " Description);
+
+  // Bind all unary expression nodes
+  BIND_UNARY_EXPR(Abs, "Absolute value expression (abs(operand))")
+  BIND_UNARY_EXPR(Neg, "Negation expression (-operand)")
+  BIND_UNARY_EXPR(Not, "Logical not expression (not operand)")
+  BIND_UNARY_EXPR(BitNot, "Bitwise not expression (~operand)")
+  BIND_UNARY_EXPR(Cast, "Cast expression (cast operand to dtype)")
+
+#undef BIND_UNARY_EXPR
+
+  static nb::exception<StructuralComparisonUnsupported> unsupported(ir, "StructuralComparisonUnsupported",
+                                                                    PyExc_TypeError);
+  nb::register_exception_translator([](const std::exception_ptr& error, void*) {
+    try {
+      if (error) std::rethrow_exception(error);
+    } catch (const StructuralComparisonUnsupported& e) {
+      nb::object instance = nb::borrow<nb::object>(unsupported.ptr())(e.what());
+      instance.attr("reason") = nb::str(e.reason().c_str());
+      instance.attr("field_path") = nb::str(e.field_path().c_str());
+      PyErr_SetObject(unsupported.ptr(), instance.ptr());
+    }
+  });
+
+  auto bind_comparison = [&](auto pointer) {
+    using Ptr = decltype(pointer);
+    ir.def(
+        "structural_hash",
+        [](const Ptr& node, bool auto_mapping) { return structural_hash(node, auto_mapping); },
+        nb::arg("node"), nb::arg("enable_auto_mapping") = false,
+        "Hash IR structure with the same variable policy as structural_equal. "
+        "Definitions are alpha-renamed; free variables preserve identity unless auto-mapping is enabled. "
+        "Compares exact dtype and float bits, including attached storage.");
+    ir.def(
+        "structural_equal",
+        [](const Ptr& lhs, const Ptr& rhs, bool auto_mapping) {
+          return structural_equal(lhs, rhs, auto_mapping);
+        },
+        nb::arg("lhs"), nb::arg("rhs"), nb::arg("enable_auto_mapping") = false,
+        "Compare IR structure, ignoring source locations and bound names. "
+        "Free variables preserve identity unless auto-mapping is enabled. "
+        "Compares exact dtype, float bits, operator kind and semantic fields.");
+    ir.def(
+        "assert_structural_equal",
+        [](const Ptr& lhs, const Ptr& rhs, bool auto_mapping) {
+          assert_structural_equal(lhs, rhs, auto_mapping);
+        },
+        nb::arg("lhs"), nb::arg("rhs"), nb::arg("enable_auto_mapping") = false,
+        "Assert structural equality under the same policy as structural_equal. "
+        "Raises ValueError with a mismatch path, or StructuralComparisonUnsupported.");
+  };
+  bind_comparison(IRNodePtr{});
+  bind_comparison(TypePtr{});
+  // Preserve the original Type overload's keyword spelling as well as node=.
+  ir.def(
+      "structural_hash",
+      [](const TypePtr& type, bool auto_mapping) { return structural_hash(type, auto_mapping); },
+      nb::arg("type"), nb::arg("enable_auto_mapping") = false);
+
+  ir.def("_without_type_memref", &CloneTypeWithoutMemRef, nb::arg("type"),
+         "Remove binding-owned allocation annotations for explicit value-type compatibility checks.");
+  ir.def("verify_structural_bindings", &verify_structural_bindings, nb::arg("node"),
+         "Verify binding visibility and unique definitions; comparison itself does not validate IR.");
+
+  // Serialization functions
+  ir.def(
+      "serialize",
+      [](const IRNodePtr& node) {
+        auto data = serialization::Serialize(node);
+        return nb::bytes(reinterpret_cast<const char*>(data.data()), data.size());
+      },
+      nb::arg("node"), "Serialize an IR node to MessagePack bytes");
+
+  ir.def(
+      "deserialize",
+      [](const nb::bytes& data) {
+        std::vector<uint8_t> vec(static_cast<const uint8_t*>(data.data()),
+                                 static_cast<const uint8_t*>(data.data()) + data.size());
+        return serialization::Deserialize(vec);
+      },
+      nb::arg("data"), "Deserialize an IR node from MessagePack bytes");
+
+  ir.def("serialize_to_file", &serialization::SerializeToFile, nb::arg("node"), nb::arg("path"),
+         "Serialize an IR node to a file");
+
+  ir.def("deserialize_from_file", &serialization::DeserializeFromFile, nb::arg("path"),
+         "Deserialize an IR node from a file");
+
+  // ========== Statements ==========
+
+  // Stmt - abstract base, const shared_ptr
+  auto stmt_class = nb::class_<Stmt, IRNode>(ir, "Stmt", "Base class for all statements");
+  BindFields<Stmt>(stmt_class);
+  // Manually expose leading_comments as read-only (intentionally outside
+  // GetFieldDescriptors — see stmt.h).
+  stmt_class.def_ro("leading_comments", &Stmt::leading_comments_,
+                    "Source-level comments printed above this statement (read-only; "
+                    "use ir.attach_leading_comments to modify).");
+
+  // Free function: attach leading comments to an existing statement.
+  // Python-side `Stmt.leading_comments` is read-only; this helper is the one
+  // sanctioned mutation channel (e.g., for the Python parser after building a
+  // stmt). See stmt.h:AttachLeadingComments for the const-safety rationale.
+  ir.def("attach_leading_comments", &AttachLeadingComments, nb::arg("stmt"), nb::arg("comments"),
+         "Attach leading comments to an existing statement (mutates IgnoreField metadata only). "
+         "Returns the same statement for convenient chaining.");
+
+  // AssignStmt - const shared_ptr
+  auto assign_stmt_class =
+      nb::class_<AssignStmt, Stmt>(ir, "AssignStmt", "Assignment statement: var = value");
+  assign_stmt_class.def(nb::init<const VarPtr&, const ExprPtr&, const Span&>(), nb::arg("var"),
+                        nb::arg("value"), nb::arg("span"), "Create an assignment statement");
+  BindFields<AssignStmt>(assign_stmt_class);
+
+  // IfStmt - const shared_ptr
+  auto if_stmt_class = nb::class_<IfStmt, Stmt>(
+      ir, "IfStmt", "Conditional statement: if condition then then_body else else_body");
+  if_stmt_class.def(nb::init<const ExprPtr&, const StmtPtr&, const std::optional<StmtPtr>&,
+                             const std::vector<VarPtr>&, const Span&>(),
+                    nb::arg("condition"), nb::arg("then_body"), nb::arg("else_body") = nb::none(),
+                    nb::arg("return_vars"), nb::arg("span"),
+                    "Create a conditional statement with then and else branches (else_body can be None)");
+  BindFields<IfStmt>(if_stmt_class);
+
+  // YieldStmt - const shared_ptr
+  auto yield_stmt_class = nb::class_<YieldStmt, Stmt>(ir, "YieldStmt", "Yield statement: yield value");
+  yield_stmt_class.def(nb::init<const std::vector<ExprPtr>&, const Span&>(), nb::arg("value"),
+                       nb::arg("span"), "Create a yield statement with a list of expressions");
+  yield_stmt_class.def(nb::init<const Span&>(), nb::arg("span"), "Create a yield statement without values");
+  BindFields<YieldStmt>(yield_stmt_class);
+
+  // ReturnStmt - const shared_ptr
+  auto return_stmt_class = nb::class_<ReturnStmt, Stmt>(ir, "ReturnStmt", "Return statement: return value");
+  return_stmt_class.def(nb::init<const std::vector<ExprPtr>&, const Span&>(), nb::arg("value"),
+                        nb::arg("span"), "Create a return statement with a list of expressions");
+  return_stmt_class.def(nb::init<const Span&>(), nb::arg("span"), "Create a return statement without values");
+  BindFields<ReturnStmt>(return_stmt_class);
+
+  // ForKind enum (must be before ForStmt which uses it)
+  nb::enum_<ForKind>(ir, "ForKind", "For loop kind classification")
+      .value("Sequential", ForKind::Sequential, "Standard sequential for loop (default)")
+      .value("Parallel", ForKind::Parallel, "Parallel for loop")
+      .value("Unroll", ForKind::Unroll, "Compile-time unrolled for loop")
+      .value("Pipeline", ForKind::Pipeline,
+             "Software-pipelined loop (pre-lowering user marker + transient post-lowering marker)")
+      .export_values();
+
+  nb::enum_<HardwareLoopPolicy>(ir, "HardwareLoopPolicy", "Hardware loop intent")
+      .value("Auto", HardwareLoopPolicy::Auto, "Use the default hardware-loop lowering policy")
+      .value("Require", HardwareLoopPolicy::Require, "Require hardware-loop lowering");
+
+  // ForStmt - const shared_ptr
+  auto for_stmt_class = nb::class_<ForStmt, Stmt>(
+      ir, "ForStmt", "For loop statement: for loop_var in range(start, stop, step): body");
+  for_stmt_class.def(
+      "__init__",
+      [](ForStmt* self, const VarPtr& loop_var, const ExprPtr& start, const ExprPtr& stop,
+         const ExprPtr& step, const std::vector<IterArgPtr>& iter_args, const StmtPtr& body,
+         const std::vector<VarPtr>& return_vars, const Span& span, ForKind kind,
+         const nb::object& attrs_or_none, HardwareLoopPolicy hardware_loop_policy) {
+        auto attrs = ConvertAttrsFromPython(attrs_or_none);
+        new (self) ForStmt(loop_var, start, stop, step, iter_args, body, return_vars, span, kind,
+                           std::move(attrs), {}, hardware_loop_policy);
+      },
+      nb::arg("loop_var"), nb::arg("start"), nb::arg("stop"), nb::arg("step"), nb::arg("iter_args"),
+      nb::arg("body"), nb::arg("return_vars"), nb::arg("span"), nb::arg("kind") = ForKind::Sequential,
+      nb::arg("attrs") = nb::none(), nb::arg("hardware_loop_policy") = HardwareLoopPolicy::Auto,
+      "Create a for loop statement");
+  BindFields<ForStmt>(for_stmt_class);
+  // Custom attrs property: convert vector<pair<string, any>> to Python dict
+  for_stmt_class.def_prop_ro(
+      "attrs",
+      [](const ForStmtPtr& self) {
+        nb::dict result;
+        for (const auto& [key, value] : self->attrs_) {
+          result[key.c_str()] = AnyToPyObject<int, bool, std::string, double, float, DataType, MemorySpace,
+                                              TensorLayout, TileLayout, PadValue>(value, key);
+        }
+        return result;
+      },
+      "Loop-level attributes as a dictionary");
+
+  // WhileStmt - const shared_ptr
+  auto while_stmt_class =
+      nb::class_<WhileStmt, Stmt>(ir, "WhileStmt", "While loop statement: while condition: body");
+  while_stmt_class.def(nb::init<const ExprPtr&, const std::vector<IterArgPtr>&, const StmtPtr&,
+                                const std::vector<VarPtr>&, const Span&>(),
+                       nb::arg("condition"), nb::arg("iter_args"), nb::arg("body"), nb::arg("return_vars"),
+                       nb::arg("span"), "Create a while loop statement");
+  BindFields<WhileStmt>(while_stmt_class);
+
+  // ScopeKind enum
+  nb::enum_<ScopeKind>(ir, "ScopeKind", "Scope kind classification")
+      .value("InCore", ScopeKind::InCore, "InCore scope for AICore sub-graphs")
+      .value("Cluster", ScopeKind::Cluster, "Cluster scope for co-scheduled AIC + AIV groups")
+      .value("Hierarchy", ScopeKind::Hierarchy, "Distributed hierarchy scope (uses level/role)")
+      .value("Spmd", ScopeKind::Spmd, "SPMD dispatch scope (core_num/sync_start)")
+      .value("Runtime", ScopeKind::Runtime, "Runtime orchestration scope (SIMPLER_SCOPE wrapper)")
+      .value("CommDomain", ScopeKind::CommDomain,
+             "Comm-domain scope (with orch.allocate_domain(...) wrapper for host_orch window buffers)")
+      .value("SplitAiv", ScopeKind::SplitAiv, "Explicit AIV-split region (pl.split_aiv)")
+      .value("Graph", ScopeKind::Graph, "Recordable orchestration region (pl.graph)")
+      .value("Reg", ScopeKind::Reg, "Register lexical region")
+      .export_values();
+
+  // SplitMode enum
+  nb::enum_<SplitMode>(ir, "SplitMode", "Split mode for cross-core data transfer")
+      .value("NONE", SplitMode::None, "No split")
+      .value("UP_DOWN", SplitMode::UpDown, "Split vertically (height halved)")
+      .value("LEFT_RIGHT", SplitMode::LeftRight, "Split horizontally (width halved)")
+      .export_values();
+
+  // NotifyOp / WaitCmp enums — payload of the pld.system.notify / pld.system.wait
+  // ops. Stored as `int` in kwargs (see CreateKwargsFromPyDict dispatch); the C++
+  // op deducer validates the int against the enum range. Defined nb::is_arithmetic
+  // so user code can mix the enum with int literals where needed (e.g. masks).
+  // No `.export_values()`: members like `Eq` / `Ge` / `Set` would shadow the IR
+  // operator classes (ir.Eq, ir.Ge) and the built-in Python `Set` exposed at the
+  // ir module level. Users access them as `ir.NotifyOp.AtomicAdd` etc.
+  nb::enum_<NotifyOp>(ir, "NotifyOp", nb::is_arithmetic(),
+                      "Cross-rank notify semantics for pld.system.notify (TNOTIFY)")
+      .value("AtomicAdd", NotifyOp::kAtomicAdd, "Atomically add value to peer's signal slot")
+      .value("Set", NotifyOp::kSet, "Non-atomic store of value to peer's signal slot");
+
+  nb::enum_<WaitCmp>(ir, "WaitCmp", nb::is_arithmetic(),
+                     "Cross-rank wait predicate for pld.system.wait (TWAIT)")
+      .value("Eq", WaitCmp::kEq, "Block until *signal_slot == expected")
+      .value("Ge", WaitCmp::kGe, "Block until *signal_slot >= expected");
+
+  nb::enum_<AtomicType>(
+      ir, "AtomicType", nb::is_arithmetic(),
+      "Combine mode for global-memory writes — pld.tensor.put (TPUT) and tile.store (TSTORE)")
+      .value("None_", AtomicType::kNone, "Plain store — overwrite the destination")
+      .value("Add", AtomicType::kAdd, "Atomically add the source data into the destination");
+
+  nb::enum_<AccPhase>(ir, "AccPhase", nb::is_arithmetic(),
+                      "Producer-side unit-flag phase for GEMV accumulator operations")
+      .value("Unspecified", AccPhase::kUnspecified, "Do not use the unit-flag protocol")
+      .value("Partial", AccPhase::kPartial, "Check the unit flag without setting it")
+      .value("Final", AccPhase::kFinal, "Check and set the unit flag");
+
+  nb::enum_<STPhase>(ir, "STPhase", nb::is_arithmetic(), "Consumer-side unit-flag phase for tile.store")
+      .value("Unspecified", STPhase::kUnspecified, "Do not use the unit-flag protocol")
+      .value("Final", STPhase::kFinal, "Check and clear the unit flag");
+
+  nb::enum_<ReduceOp>(ir, "ReduceOp", nb::is_arithmetic(),
+                      "Reduction operator for collective reductions (pld.tensor.allreduce, ...)")
+      .value("Sum", ReduceOp::kSum, "Element-wise sum across ranks")
+      .value("Max", ReduceOp::kMax, "Element-wise maximum across ranks")
+      .value("Min", ReduceOp::kMin, "Element-wise minimum across ranks")
+      .value("Prod", ReduceOp::kProd, "Element-wise product across ranks");
+
+  // ScopeStmt - abstract base class for all scope statements (issue #1047).
+  auto scope_stmt_class = nb::class_<ScopeStmt, Stmt>(
+      ir, "ScopeStmt", "Scope statement: marks a region with specific execution context (abstract base)");
+  scope_stmt_class.def_prop_ro("scope_kind", &ScopeStmt::GetScopeKind, "Discriminator for the scope kind");
+  BindFields<ScopeStmt>(scope_stmt_class);  // exposes name_hint, body
+  // Custom ``attrs`` property: reflection's auto-bind would expose
+  // ``vector<pair<string, any>>`` raw (nanobind can't convert), so we shadow
+  // it with a dict-returning lambda. Each concrete subclass below re-registers
+  // the parent's reflection fields under itself, so we must shadow on every
+  // subclass too (see ``shadow_scope_attrs`` calls after each ``BindFields``).
+  const auto scope_attrs_doc =
+      "Scope-level attributes (e.g. 'task_id_var' for "
+      "``pl.at(...) as tid``, 'manual_dep_edges' for "
+      "``pl.at(..., deps=)``).";
+  scope_stmt_class.def_prop_ro(
+      "attrs", [kwargs_to_pydict](const ScopeStmtPtr& self) { return kwargs_to_pydict(self->attrs_); },
+      scope_attrs_doc);
+
+  // InCoreScopeStmt
+  auto in_core_scope_stmt_class = nb::class_<InCoreScopeStmt, ScopeStmt>(
+      ir, "InCoreScopeStmt",
+      "InCore scope: AICore sub-graph region. split=SplitMode.NONE (the default) is "
+      "the single encoding of 'no split'.");
+  in_core_scope_stmt_class.def(nb::init<SplitMode, std::string, const StmtPtr&, const Span&>(),
+                               nb::arg("split") = SplitMode::None, nb::arg("name_hint") = "", nb::arg("body"),
+                               nb::arg("span"), "Create an InCore scope statement");
+  BindFields<InCoreScopeStmt>(in_core_scope_stmt_class);
+  in_core_scope_stmt_class.def_prop_ro(
+      "attrs",
+      [kwargs_to_pydict](const std::shared_ptr<const InCoreScopeStmt>& self) {
+        return kwargs_to_pydict(self->attrs_);
+      },
+      scope_attrs_doc);
+
+  // ClusterScopeStmt
+  auto cluster_scope_stmt_class = nb::class_<ClusterScopeStmt, ScopeStmt>(
+      ir, "ClusterScopeStmt", "Cluster scope: co-scheduled AIC + AIV group");
+  cluster_scope_stmt_class.def(nb::init<std::string, const StmtPtr&, const Span&>(),
+                               nb::arg("name_hint") = "", nb::arg("body"), nb::arg("span"),
+                               "Create a Cluster scope statement");
+  BindFields<ClusterScopeStmt>(cluster_scope_stmt_class);
+  cluster_scope_stmt_class.def_prop_ro(
+      "attrs",
+      [kwargs_to_pydict](const std::shared_ptr<const ClusterScopeStmt>& self) {
+        return kwargs_to_pydict(self->attrs_);
+      },
+      scope_attrs_doc);
+
+  auto reg_scope_stmt_class =
+      nb::class_<RegScopeStmt, ScopeStmt>(ir, "RegScopeStmt", "Register lexical scope");
+  reg_scope_stmt_class.def(
+      "__init__",
+      [](RegScopeStmt* self, std::string name_hint, const StmtPtr& body, const Span& span,
+         std::vector<std::string> leading_comments, const nb::object& attrs) {
+        new (self) RegScopeStmt(std::move(name_hint), body, span, std::move(leading_comments),
+                                ConvertAttrsFromPython(attrs));
+      },
+      nb::arg("name_hint"), nb::arg("body"), nb::arg("span"),
+      nb::arg("leading_comments") = std::vector<std::string>{}, nb::arg("attrs") = nb::none(),
+      "Create a register lexical scope statement");
+  BindFields<RegScopeStmt>(reg_scope_stmt_class);
+  reg_scope_stmt_class.def_prop_ro(
+      "attrs", [kwargs_to_pydict](const RegScopeStmtPtr& self) { return kwargs_to_pydict(self->attrs_); },
+      scope_attrs_doc);
+
+  // GraphScopeStmt
+  auto graph_scope_stmt_class = nb::class_<GraphScopeStmt, ScopeStmt>(
+      ir, "GraphScopeStmt", "Graph scope: a recordable orchestration region");
+  graph_scope_stmt_class.def(nb::init<std::string, const StmtPtr&, const Span&>(), nb::arg("name_hint"),
+                             nb::arg("body"), nb::arg("span"),
+                             "Create a Graph scope statement (name_hint is the region name)");
+  BindFields<GraphScopeStmt>(graph_scope_stmt_class);
+  graph_scope_stmt_class.def_prop_ro(
+      "attrs",
+      [kwargs_to_pydict](const std::shared_ptr<const GraphScopeStmt>& self) {
+        return kwargs_to_pydict(self->attrs_);
+      },
+      scope_attrs_doc);
+
+  // HierarchyScopeStmt
+  auto hierarchy_scope_stmt_class = nb::class_<HierarchyScopeStmt, ScopeStmt>(
+      ir, "HierarchyScopeStmt", "Hierarchy scope: distributed-hierarchy region");
+  hierarchy_scope_stmt_class.def(
+      nb::init<Level, std::optional<Role>, std::string, const StmtPtr&, const Span&>(), nb::arg("level"),
+      nb::arg("role") = nb::none(), nb::arg("name_hint") = "", nb::arg("body"), nb::arg("span"),
+      "Create a Hierarchy scope statement");
+  BindFields<HierarchyScopeStmt>(hierarchy_scope_stmt_class);
+  hierarchy_scope_stmt_class.def_prop_ro(
+      "attrs",
+      [kwargs_to_pydict](const std::shared_ptr<const HierarchyScopeStmt>& self) {
+        return kwargs_to_pydict(self->attrs_);
+      },
+      scope_attrs_doc);
+
+  // SpmdScopeStmt
+  auto spmd_scope_stmt_class =
+      nb::class_<SpmdScopeStmt, ScopeStmt>(ir, "SpmdScopeStmt", "SPMD dispatch scope");
+  spmd_scope_stmt_class.def(nb::init<ExprPtr, bool, std::string, const StmtPtr&, const Span&>(),
+                            nb::arg("core_num"), nb::arg("sync_start") = false, nb::arg("name_hint") = "",
+                            nb::arg("body"), nb::arg("span"), "Create an SPMD scope statement");
+  // Convenience overload: accept a plain Python int for core_num and wrap it as
+  // ConstInt(DataType::INDEX) automatically, mirroring the surface of pl.spmd()
+  // and IRBuilder.scope() so callers can write ir.SpmdScopeStmt(core_num=4, ...).
+  spmd_scope_stmt_class.def(
+      "__init__",
+      [](SpmdScopeStmt* self, int64_t core_num, bool sync_start, std::string name_hint, const StmtPtr& body,
+         const Span& span) {
+        auto core_num_expr = std::make_shared<const ConstInt>(core_num, DataType::INDEX, span);
+        new (self) SpmdScopeStmt(core_num_expr, sync_start, std::move(name_hint), body, span);
+      },
+      nb::arg("core_num"), nb::arg("sync_start") = false, nb::arg("name_hint") = "", nb::arg("body"),
+      nb::arg("span"), "Create an SPMD scope statement (int core_num is wrapped as ConstInt)");
+  BindFields<SpmdScopeStmt>(spmd_scope_stmt_class);
+  spmd_scope_stmt_class.def_prop_ro(
+      "attrs",
+      [kwargs_to_pydict](const std::shared_ptr<const SpmdScopeStmt>& self) {
+        return kwargs_to_pydict(self->attrs_);
+      },
+      scope_attrs_doc);
+
+  // SplitAivScopeStmt
+  auto split_aiv_scope_stmt_class = nb::class_<SplitAivScopeStmt, ScopeStmt>(
+      ir, "SplitAivScopeStmt",
+      "Explicit AIV-split region across 2 subblocks. mode=NONE is task-parallel "
+      "(no halving; both lanes run the full body via aiv_id); UP_DOWN/LEFT_RIGHT "
+      "halve vector compute on the split axis. Erased by LowerAutoVectorSplit "
+      "(pass 23); never reaches codegen.");
+  split_aiv_scope_stmt_class.def(nb::init<SplitMode, int, std::string, const StmtPtr&, const Span&>(),
+                                 nb::arg("split"), nb::arg("count") = 2, nb::arg("name_hint") = "",
+                                 nb::arg("body"), nb::arg("span"), "Create an AIV-split scope statement");
+  BindFields<SplitAivScopeStmt>(split_aiv_scope_stmt_class);
+  split_aiv_scope_stmt_class.def_prop_ro(
+      "attrs",
+      [kwargs_to_pydict](const std::shared_ptr<const SplitAivScopeStmt>& self) {
+        return kwargs_to_pydict(self->attrs_);
+      },
+      scope_attrs_doc);
+
+  // RuntimeScopeStmt
+  auto runtime_scope_stmt_class = nb::class_<RuntimeScopeStmt, ScopeStmt>(
+      ir, "RuntimeScopeStmt",
+      "Runtime orchestration scope: emits SIMPLER_SCOPE() (manual=False) or "
+      "SIMPLER_SCOPE(ScopeMode::MANUAL) (manual=True) wrappers in codegen");
+  runtime_scope_stmt_class.def(nb::init<bool, std::string, const StmtPtr&, const Span&>(),
+                               nb::arg("manual") = false, nb::arg("name_hint") = "", nb::arg("body"),
+                               nb::arg("span"), "Create a Runtime scope statement");
+  BindFields<RuntimeScopeStmt>(runtime_scope_stmt_class);
+  runtime_scope_stmt_class.def_prop_ro(
+      "attrs",
+      [kwargs_to_pydict](const std::shared_ptr<const RuntimeScopeStmt>& self) {
+        return kwargs_to_pydict(self->attrs_);
+      },
+      scope_attrs_doc);
+
+  // CommDomainScopeStmt
+  auto comm_domain_scope_stmt_class = nb::class_<CommDomainScopeStmt, ScopeStmt>(
+      ir, "CommDomainScopeStmt",
+      "CommDomain scope: wraps host_orch use sites of a comm-domain's WindowBuffers. "
+      "Codegen lowers to `with orch.allocate_domain(name=..., workers=..., window_size=..., "
+      "buffers=[...]) as __comm_d<n>:`. Synthesized by MaterializeCommDomainScopes pass; no user DSL "
+      "surface.");
+  comm_domain_scope_stmt_class.def(
+      nb::init<std::vector<int64_t>, std::vector<WindowBufferPtr>, std::string, const StmtPtr&,
+               const Span&>(),
+      nb::arg("devices"), nb::arg("slots"), nb::arg("name_hint") = "", nb::arg("body"), nb::arg("span"),
+      "Create a CommDomain scope statement. ``devices`` empty = all devices (resolved to "
+      "*range(world_size) at codegen).");
+  BindFields<CommDomainScopeStmt>(comm_domain_scope_stmt_class);
+  comm_domain_scope_stmt_class.def_prop_ro(
+      "attrs",
+      [kwargs_to_pydict](const std::shared_ptr<const CommDomainScopeStmt>& self) {
+        return kwargs_to_pydict(self->attrs_);
+      },
+      scope_attrs_doc);
+
+  // SeqStmts - const shared_ptr
+  auto seq_stmts_class =
+      nb::class_<SeqStmts, Stmt>(ir, "SeqStmts", "Sequence of statements: a sequence of statements");
+  seq_stmts_class.def(nb::init<const std::vector<StmtPtr>&, const Span&>(), nb::arg("stmts"), nb::arg("span"),
+                      "Create a sequence of statements");
+  seq_stmts_class.def(
+      "__getitem__",
+      [](const std::shared_ptr<const SeqStmts>& self, int index) -> StmtPtr {
+        int size = static_cast<int>(self->stmts_.size());
+        if (index < -size || index >= size) {
+          throw pypto::IndexError("SeqStmts index " + std::to_string(index) + " out of range [" +
+                                  std::to_string(-size) + ", " + std::to_string(size - 1) + "]");
+        }
+        if (index < 0) index += size;
+        return self->stmts_[index];
+      },
+      nb::arg("index"), "Get statement by index, supports negative indexing");
+  BindFields<SeqStmts>(seq_stmts_class);
+
+  // EvalStmt - const shared_ptr
+  auto eval_stmt_class = nb::class_<EvalStmt, Stmt>(ir, "EvalStmt", "Evaluation statement: expr");
+  eval_stmt_class.def(nb::init<const ExprPtr&, const Span&>(), nb::arg("expr"), nb::arg("span"),
+                      "Create an evaluation statement");
+  BindFields<EvalStmt>(eval_stmt_class);
+
+  // BreakStmt - const shared_ptr
+  auto break_stmt_class = nb::class_<BreakStmt, Stmt>(ir, "BreakStmt", "Break statement: break");
+  break_stmt_class.def(nb::init<const Span&>(), nb::arg("span"), "Create a break statement");
+  BindFields<BreakStmt>(break_stmt_class);
+
+  // ContinueStmt - const shared_ptr
+  auto continue_stmt_class =
+      nb::class_<ContinueStmt, Stmt>(ir, "ContinueStmt", "Continue statement: continue");
+  continue_stmt_class.def(nb::init<const Span&>(), nb::arg("span"), "Create a continue statement");
+  BindFields<ContinueStmt>(continue_stmt_class);
+
+  // InlineLanguage enum — language tag for InlineStmt bodies.
+  nb::enum_<InlineLanguage>(ir, "InlineLanguage", "Source language carried by an InlineStmt body")
+      .value("Python", InlineLanguage::Python, "Python source")
+      .export_values();
+
+  // InlineStmt - const shared_ptr
+  auto inline_stmt_class = nb::class_<InlineStmt, Stmt>(
+      ir, "InlineStmt", "Inline statement: opaque source body in a target language");
+  inline_stmt_class.def(nb::init<std::string, InlineLanguage, const Span&>(), nb::arg("body"),
+                        nb::arg("language"), nb::arg("span"), "Create an inline statement");
+  BindFields<InlineStmt>(inline_stmt_class);
+
+  nb::enum_<FunctionIRStage>(ir, "FunctionIRStage", "Function body representation")
+      .value("Functional", FunctionIRStage::Functional, "Tensor/Tile value semantics (default)")
+      .value("Buffer", FunctionIRStage::Buffer, "Explicit storage handles and destination writes");
+
+  // FunctionType enum
+  nb::enum_<FunctionType>(ir, "FunctionType", "Function type classification")
+      .value("Opaque", FunctionType::Opaque, "Unspecified function type (default)")
+      .value("Orchestration", FunctionType::Orchestration, "Host/AICPU control and coordination")
+      .value("InCore", FunctionType::InCore, "AICore sub-graph execution (unspecialized)")
+      .value("AIC", FunctionType::AIC, "Cube core kernel (specialized InCore)")
+      .value("AIV", FunctionType::AIV, "Vector core kernel (specialized InCore)")
+      .value("Group", FunctionType::Group, "Co-scheduled group of AIC + AIV kernels")
+      .value("Spmd", FunctionType::Spmd, "SPMD data-parallel dispatch")
+      .value("Inline", FunctionType::Inline, "Whole-body substitution at every call site")
+      .value("Graph", FunctionType::Graph, "Recordable/replayable orchestration fragment")
+      .export_values();
+
+  // Level enum — hierarchy level in the Linqu machine model
+  nb::enum_<Level>(ir, "Level", "Hierarchy level in the Linqu machine model")
+      .value("AIV", Level::AIV, "Single AIV (Vector) core")
+      .value("AIC", Level::AIC, "Single AIC (Cube) core")
+      .value("CORE_GROUP", Level::CORE_GROUP, "Core-group (e.g. 1 AIC + 2 AIV)")
+      .value("CHIP_DIE", Level::CHIP_DIE, "Chip die")
+      .value("CHIP", Level::CHIP, "Chip (UMA)")
+      .value("HOST", Level::HOST, "Host (single OS instance)")
+      .value("CLUSTER_0", Level::CLUSTER_0, "Cluster-level-0 (pod)")
+      .value("CLUSTER_1", Level::CLUSTER_1, "Cluster-level-1 (supernode)")
+      .value("CLUSTER_2", Level::CLUSTER_2, "Cluster-level-2 (cross-rack)")
+      .value("GLOBAL", Level::GLOBAL, "Global coordinator")
+      // Readability aliases
+      .value("L2CACHE", Level::L2CACHE, "Alias for CHIP_DIE")
+      .value("PROCESSOR", Level::PROCESSOR, "Alias for CHIP")
+      .value("UMA", Level::UMA, "Alias for CHIP")
+      .value("NODE", Level::NODE, "Alias for HOST")
+      .value("POD", Level::POD, "Alias for CLUSTER_0")
+      .value("CLOS1", Level::CLOS1, "Alias for CLUSTER_1")
+      .value("CLOS2", Level::CLOS2, "Alias for CLUSTER_2")
+      .export_values();
+
+  // Role enum — function role at L3-L7 hierarchy levels
+  nb::enum_<Role>(ir, "Role", "Function role at L3-L7 hierarchy levels")
+      .value("Orchestrator", Role::Orchestrator, "Builds DAG, submits tasks")
+      .value("SubWorker", Role::SubWorker,
+             "Executes compute/data tasks dispatched by the orchestrator at the same level")
+      .export_values();
+
+  // ParamDirection enum
+  nb::enum_<ParamDirection>(ir, "ParamDirection", "Parameter direction classification")
+      .value("In", ParamDirection::In, "Read-only input (default)")
+      .value("Out", ParamDirection::Out, "Write-only output")
+      .value("InOut", ParamDirection::InOut, "Read-write input/output")
+      .export_values();
+
+  // ArgDirection enum (call-site task-submission semantics)
+  nb::enum_<ArgDirection>(ir, "ArgDirection", "Call-site argument direction (mirrors runtime TensorArgType)")
+      .value("Input", ArgDirection::Input, "Read-only input (add_input / TensorArgType::INPUT)")
+      .value("Output", ArgDirection::Output,
+             "Runtime-allocated output buffer (add_output(create_info) / TensorArgType::OUTPUT)")
+      .value("InOut", ArgDirection::InOut, "Read-then-write (add_inout / TensorArgType::INOUT)")
+      .value("OutputExisting", ArgDirection::OutputExisting,
+             "Write-only into an existing tensor "
+             "(add_output(tensor) / TensorArgType::OUTPUT_EXISTING)")
+      .value("NoDep", ArgDirection::NoDep,
+             "No-dependency existing tensor (add_no_dep / TensorArgType::NO_DEP)")
+      .value("Scalar", ArgDirection::Scalar, "Scalar (non-tensor) argument (add_scalar)");
+  // Intentionally do NOT call .export_values(): ArgDirection::InOut would shadow
+  // ParamDirection::InOut at module scope. Users access values via the enum class
+  // (ir.ArgDirection.InOut) to keep the two direction models cleanly separated.
+
+  // IsInCoreType helper
+  ir.def("is_incore_type", &IsInCoreType, nb::arg("func_type"),
+         "Check if a FunctionType is an InCore variant (InCore, AIC, or AIV)");
+
+  // IsOrchestrationLike helper
+  ir.def("is_orchestration_like", nb::overload_cast<FunctionType>(&IsOrchestrationLike), nb::arg("func_type"),
+         "Check if a FunctionType has an orchestration body (Orchestration or Graph)");
+
+  // LevelToLinquLevel helper
+  ir.def("level_to_linqu_level", &LevelToLinquLevel, nb::arg("level"),
+         "Map Level enum value to Linqu hierarchy level number (0-7)");
+
+  // Function - const shared_ptr
+  auto function_class = nb::class_<Function, IRNode>(
+      ir, "Function", "Function definition with name, parameters, return types, and body");
+  function_class.def(
+      "__init__",
+      [](Function* self, const std::string& name, const nb::list& params,
+         const std::vector<TypePtr>& return_types, const StmtPtr& body, const Span& span, FunctionType type,
+         std::optional<Level> level, std::optional<Role> role, const nb::object& attrs_or_none,
+         bool requires_runtime_binding, FunctionIRStage ir_stage) {
+        std::vector<VarPtr> param_vars;
+        std::vector<ParamDirection> param_dirs;
+        param_vars.reserve(nb::len(params));
+        param_dirs.reserve(nb::len(params));
+        for (auto item : params) {
+          // Accept either a Var (default In) or a tuple (Var, ParamDirection)
+          if (nb::isinstance<nb::tuple>(item)) {
+            auto tup = nb::cast<nb::tuple>(item);
+            if (nb::len(tup) != 2) {
+              throw pypto::TypeError("Each tuple in 'params' must be (Var, ParamDirection)");
+            }
+            param_vars.push_back(nb::cast<VarPtr>(tup[0]));
+            param_dirs.push_back(nb::cast<ParamDirection>(tup[1]));
+          } else {
+            param_vars.push_back(nb::cast<VarPtr>(item));
+            param_dirs.push_back(ParamDirection::In);
+          }
+        }
+        auto attrs = ConvertAttrsFromPython(attrs_or_none);
+        new (self) Function(name, std::move(param_vars), std::move(param_dirs), return_types, body, span,
+                            type, level, role, std::move(attrs), requires_runtime_binding, ir_stage);
+      },
+      nb::arg("name"), nb::arg("params"), nb::arg("return_types"), nb::arg("body"), nb::arg("span"),
+      nb::arg("type") = FunctionType::Opaque, nb::arg("level") = nb::none(), nb::arg("role") = nb::none(),
+      nb::arg("attrs") = nb::none(), nb::arg("requires_runtime_binding") = false,
+      nb::arg("ir_stage") = FunctionIRStage::Functional, "Create a function definition");
+  BindFields<Function>(function_class);
+  // Use the shared attr converter so Function readback covers every value type
+  // accepted by ConvertKwargsDict, including enum, list, Var, and Expr attrs.
+  function_class.def_prop_ro(
+      "attrs", [kwargs_to_pydict](const FunctionPtr& self) { return kwargs_to_pydict(self->attrs_); },
+      "Function-level attributes as a dictionary");
+  // Backward-compat split property: extract SplitMode from attrs
+  function_class.def_prop_ro(
+      "split",
+      [](const FunctionPtr& self) -> nb::object {
+        auto mode = self->GetSplitMode();
+        if (!mode.has_value()) return nb::none();
+        return nb::cast(*mode);
+      },
+      "Split mode for cross-core transfer (convenience accessor into attrs)");
+
+  // Program - const shared_ptr
+  auto program_class =
+      nb::class_<Program, IRNode>(ir, "Program",
+                                  "Program definition with functions mapped by GlobalVar references. "
+                                  "Functions are automatically sorted by name for deterministic ordering.");
+  program_class.def(nb::init<const std::vector<FunctionPtr>&, const std::string&, const Span&>(),
+                    nb::arg("functions"), nb::arg("name"), nb::arg("span"),
+                    "Create a program from a list of functions. "
+                    "GlobalVar references are created automatically from function names.");
+  program_class.def("get_function", &Program::GetFunction, nb::arg("name"),
+                    "Get a function by name, returns None if not found");
+  program_class.def("get_global_var", &Program::GetGlobalVar, nb::arg("name"),
+                    "Get a GlobalVar by name, returns None if not found");
+  program_class.def(
+      "__getitem__",
+      [](const std::shared_ptr<const Program>& self, const std::string& name) {
+        return self->GetFunction(name);
+      },
+      nb::arg("name"), "Get function by name, returns None if not found");
+  // Custom property for functions_ map that converts to Python dict
+  program_class.def_prop_ro(
+      "functions",
+      [](const std::shared_ptr<const Program>& self) {
+        nb::dict result;
+        for (const auto& [gvar, func] : self->functions_) {
+          result[nb::cast(gvar)] = nb::cast(func);
+        }
+        return result;
+      },
+      "Map of GlobalVar references to their corresponding functions, sorted by GlobalVar name");
+  program_class.def_ro("name", &Program::name_, "Program name");
+  program_class.def_ro("span", &Program::span_, "Source location");
+
+  // WindowBuffer — a specialised Var subclass that carries window-buffer
+  // allocation metadata. Mirrors MemRef's Var-subclass shape; the inherited
+  // ``name_hint`` is mirrored from ``name_`` (UsualField, unique-id role).
+  auto window_buffer_class = nb::class_<WindowBuffer, Var>(
+      ir, "WindowBuffer",
+      "Per-rank window-buffer allocation, modelled as a specialised Var. "
+      "Its SSA-edge type is the singleton WindowBufferType; the allocation metadata "
+      "(name, size, dtype, host-staging flags) lives on the Var subclass directly — "
+      "the exact mirror of how MemRef carries (base, byte_offset, size) under MemRefType. "
+      "Constructed by the comm-collection pass; the alloc op's LHS at parse time is a "
+      "plain Var(PtrType).");
+  window_buffer_class.def(nb::init<VarPtr, ExprPtr, bool, bool, Span>(), nb::arg("base"), nb::arg("size"),
+                          nb::arg("load_from_host") = false, nb::arg("store_to_host") = false,
+                          nb::arg("span") = Span::unknown(),
+                          "Create a WindowBuffer wrapping the given Ptr Var. The buffer's "
+                          "runtime-unique identifier flows through the inherited "
+                          "Var.name_hint (taken from base.name_hint).");
+  BindFields<WindowBuffer>(window_buffer_class);
+
+  // Python-style printer function - unified API for IRNode
+  ir.def(
+      "python_print",
+      [](const IRNodePtr& node, const std::string& prefix, bool concise, bool format, bool explicit_layout) {
+        return MaybeFormat(PythonPrint(node, prefix, concise, explicit_layout), format);
+      },
+      nb::arg("node"), nb::arg("prefix") = "pl", nb::arg("concise") = false, nb::arg("format") = true,
+      nb::arg("explicit_layout") = false,
+      "Print IR node (Expr, Stmt, Function, or Program) in Python IR syntax.\n\n"
+      "Args:\n"
+      "    node: IR node to print\n"
+      "    prefix: Module prefix (default 'pl'). 'pld' is reserved for\n"
+      "        pypto.language.distributed when printing a Program\n"
+      "    concise: If true, omit intermediate type annotations (default false)\n"
+      "    format: If true, apply registered format callback (default true)\n"
+      "    explicit_layout: If true, print every tile's fully-resolved\n"
+      "        blayout/slayout/fractal (including tiles whose canonical view is\n"
+      "        absent) so the output is self-describing for layouts (default false)");
+
+  // Python-style printer function for Type objects - use separate name to avoid overload ambiguity
+  ir.def(
+      "python_print_type",
+      [](const TypePtr& type, const std::string& prefix, bool format, bool explicit_layout) {
+        return MaybeFormat(PythonPrint(type, prefix, explicit_layout), format);
+      },
+      nb::arg("type"), nb::arg("prefix") = "pl", nb::arg("format") = true, nb::arg("explicit_layout") = false,
+      "Print Type object in Python IR syntax.\n\n"
+      "Args:\n"
+      "    type: Type to print\n"
+      "    prefix: Module prefix (default 'pl' for 'import pypto.language as pl')\n"
+      "    format: If true, apply registered format callback (default true)\n"
+      "    explicit_layout: If true, print fully-resolved tile layouts (default false)");
+
+  // Register a Python callable to format printed IR output (e.g., ruff).
+  // Pass None to unregister. The callback receives a code string and returns formatted code.
+  ir.def(
+      "register_format_callback",
+      [](nb::object cb) {
+        if (cb.is_none()) {
+          RegisterFormatCallback(nullptr);
+        } else {
+          // Store as nb::object to prevent garbage collection of the Python callback
+          nb::object stored_cb = nb::borrow(cb);
+          RegisterFormatCallback([stored_cb](const std::string& code) -> std::string {
+            try {
+              nb::gil_scoped_acquire guard;
+              return nb::cast<std::string>(stored_cb(code));
+            } catch (...) {
+              // Best-effort: return raw output on any failure
+              return code;
+            }
+          });
+        }
+      },
+      nb::arg("callback"),
+      "Register a Python callable to post-process printed IR output.\n\n"
+      "The callback receives a code string and returns the formatted code.\n"
+      "Pass None to unregister and revert to raw output.\n\n"
+      "Note: Must be called during module initialization (single-threaded).\n"
+      "The GIL is acquired automatically when the callback is invoked from C++.");
+
+  // operator functions for Var (wrapped in Python for span capture and normalization)
+  // Using standalone C++ API functions from scalar_expr.h
+  // Note: first parameter (self) is implicit when binding as method
+  ir.def("add", &MakeAdd, nb::arg("lhs"), nb::arg("rhs"), nb::arg("span") = Span::unknown(),
+         "Addition operator");
+  ir.def("sub", &MakeSub, nb::arg("lhs"), nb::arg("rhs"), nb::arg("span") = Span::unknown(),
+         "Subtraction operator");
+  ir.def("mul", &MakeMul, nb::arg("lhs"), nb::arg("rhs"), nb::arg("span") = Span::unknown(),
+         "Multiplication operator");
+  ir.def("truediv", &MakeFloatDiv, nb::arg("lhs"), nb::arg("rhs"), nb::arg("span") = Span::unknown(),
+         "True division operator");
+  ir.def("floordiv", &MakeFloorDiv, nb::arg("lhs"), nb::arg("rhs"), nb::arg("span") = Span::unknown(),
+         "Floor division operator");
+  ir.def("mod", &MakeFloorMod, nb::arg("lhs"), nb::arg("rhs"), nb::arg("span") = Span::unknown(),
+         "Modulo operator");
+  ir.def("pow", &MakePow, nb::arg("lhs"), nb::arg("rhs"), nb::arg("span") = Span::unknown(),
+         "Power operator");
+  ir.def("eq", &MakeEq, nb::arg("lhs"), nb::arg("rhs"), nb::arg("span") = Span::unknown(),
+         "Equality operator");
+  ir.def("ne", &MakeNe, nb::arg("lhs"), nb::arg("rhs"), nb::arg("span") = Span::unknown(),
+         "Inequality operator");
+  ir.def("lt", &MakeLt, nb::arg("lhs"), nb::arg("rhs"), nb::arg("span") = Span::unknown(),
+         "Less than operator");
+  ir.def("le", &MakeLe, nb::arg("lhs"), nb::arg("rhs"), nb::arg("span") = Span::unknown(),
+         "Less than or equal operator");
+  ir.def("gt", &MakeGt, nb::arg("lhs"), nb::arg("rhs"), nb::arg("span") = Span::unknown(),
+         "Greater than operator");
+  ir.def("ge", &MakeGe, nb::arg("lhs"), nb::arg("rhs"), nb::arg("span") = Span::unknown(),
+         "Greater than or equal operator");
+  ir.def("neg", &MakeNeg, nb::arg("operand"), nb::arg("span") = Span::unknown(), "Negation operator");
+  ir.def("cast", &MakeCast, nb::arg("operand"), nb::arg("dtype"), nb::arg("span") = Span::unknown(),
+         "Cast operator");
+  ir.def("bit_and", &MakeBitAnd, nb::arg("lhs"), nb::arg("rhs"), nb::arg("span") = Span::unknown(),
+         "Bitwise and operator");
+  ir.def("bit_or", &MakeBitOr, nb::arg("lhs"), nb::arg("rhs"), nb::arg("span") = Span::unknown(),
+         "Bitwise or operator");
+  ir.def("bit_xor", &MakeBitXor, nb::arg("lhs"), nb::arg("rhs"), nb::arg("span") = Span::unknown(),
+         "Bitwise xor operator");
+  ir.def("bit_shift_left", &MakeBitShiftLeft, nb::arg("lhs"), nb::arg("rhs"),
+         nb::arg("span") = Span::unknown(), "Bitwise left shift operator");
+  ir.def("bit_shift_right", &MakeBitShiftRight, nb::arg("lhs"), nb::arg("rhs"),
+         nb::arg("span") = Span::unknown(), "Bitwise right shift operator");
+  ir.def("bit_not", &MakeBitNot, nb::arg("operand"), nb::arg("span") = Span::unknown(),
+         "Bitwise not operator");
+  ir.def("not_", &MakeNot, nb::arg("operand"), nb::arg("span") = Span::unknown(), "Logical not operator");
+  ir.def("and_", &MakeAnd, nb::arg("lhs"), nb::arg("rhs"), nb::arg("span") = Span::unknown(),
+         "Logical and operator (lhs and rhs)");
+  ir.def("or_", &MakeOr, nb::arg("lhs"), nb::arg("rhs"), nb::arg("span") = Span::unknown(),
+         "Logical or operator (lhs or rhs)");
+  ir.def("min_", &MakeMin, nb::arg("lhs"), nb::arg("rhs"), nb::arg("span") = Span::unknown(),
+         "Minimum operator");
+  ir.def("max_", &MakeMax, nb::arg("lhs"), nb::arg("rhs"), nb::arg("span") = Span::unknown(),
+         "Maximum operator");
+
+  // ParentStmtAnalysis - utility class for analyzing statement parent relationships
+  auto parent_stmt_analysis_class = nb::class_<ParentStmtAnalysis>(
+      ir, "ParentStmtAnalysis",
+      "Utility class for analyzing parent-child relationships in statement trees.\n\n"
+      "This class builds a mapping from each statement to its parent statement within\n"
+      "a function's body. It is useful for passes that need to traverse upward in the\n"
+      "IR tree or understand the context of a statement.\n\n"
+      "Example usage:\n"
+      "    analysis = ir.ParentStmtAnalysis()\n"
+      "    analysis.build_map(function)\n"
+      "    parent = analysis.get_parent(some_stmt)\n"
+      "    if parent:\n"
+      "        # Use parent statement\n\n"
+      "Note: The analysis becomes invalid after IR transformations. Call build_map again\n"
+      "if the IR tree is modified.");
+
+  parent_stmt_analysis_class.def(nb::init<>(), "Create a ParentStmtAnalysis instance");
+
+  parent_stmt_analysis_class.def(
+      "build_map", &ParentStmtAnalysis::BuildMap, nb::arg("func"),
+      "Build the parent mapping from a function's body.\n\n"
+      "Traverses the function's statement tree and records parent-child relationships.\n"
+      "This method clears any existing mapping before building the new one.\n\n"
+      "Args:\n"
+      "    func: The function to analyze (can be None, resulting in empty map)\n\n"
+      "Parent relationships established:\n"
+      "- For SeqStmts: Each child statement's parent is the SeqStmts\n"
+      "- For IfStmt: then_body and else_body (if present) have IfStmt as parent\n"
+      "- For ForStmt: body has ForStmt as parent\n"
+      "- Root statement (function.body) has no parent");
+
+  parent_stmt_analysis_class.def("get_parent", &ParentStmtAnalysis::GetParent, nb::arg("stmt"),
+                                 "Get the parent statement of a given statement.\n\n"
+                                 "Args:\n"
+                                 "    stmt: The statement to query\n\n"
+                                 "Returns:\n"
+                                 "    Parent statement, or None if:\n"
+                                 "    - stmt is the root statement (function body)\n"
+                                 "    - stmt is not found in the analyzed tree\n"
+                                 "    - stmt is None");
+
+  parent_stmt_analysis_class.def("has_parent", &ParentStmtAnalysis::HasParent, nb::arg("stmt"),
+                                 "Check if a statement has a recorded parent.\n\n"
+                                 "Args:\n"
+                                 "    stmt: The statement to check\n\n"
+                                 "Returns:\n"
+                                 "    True if stmt has a parent in the map, False otherwise");
+
+  parent_stmt_analysis_class.def("clear", &ParentStmtAnalysis::Clear,
+                                 "Clear the parent mapping.\n\n"
+                                 "Removes all recorded parent-child relationships. Useful for reusing\n"
+                                 "the same ParentStmtAnalysis instance with different functions.");
+
+  // Op conversion registry bindings
+  ir.def(
+      "register_op_conversion",
+      [](const std::string& from_op, const std::string& to_op) {
+        OpConversionRegistry::GetInstance().RegisterSimple(from_op, to_op);
+      },
+      nb::arg("from_op"), nb::arg("to_op"),
+      "Register a simple tensor-to-tile op name mapping.\n\n"
+      "Args:\n"
+      "    from_op: Source op name (e.g., 'tensor.add')\n"
+      "    to_op: Target op name (e.g., 'tile.add')");
+
+  ir.def(
+      "register_op_conversion_custom",
+      [](const std::string& from_op, const nb::object& func) {
+        // Capture Python callable in a C++ ConversionFunc
+        nb::object py_func = nb::borrow(func);
+        OpConversionRegistry::GetInstance().RegisterCustom(
+            from_op,
+            [py_func](const std::vector<ExprPtr>& args,
+                      const std::vector<std::pair<std::string, std::any>>& kwargs,
+                      const Span& span) -> ConversionResult {
+              nb::gil_scoped_acquire guard;
+              // Convert kwargs to Python list of (key, value) tuples
+              nb::list py_kwargs_list;
+              for (const auto& [key, val] : kwargs) {
+                nb::object py_val = AnyToPyObject<DataType, MemorySpace, TensorLayout, PadValue, bool, int,
+                                                  std::string, double>(val, key);
+                nb::tuple pair = nb::make_tuple(nb::cast(key), py_val);
+                py_kwargs_list.append(pair);
+              }
+              nb::object result = py_func(nb::cast(args), py_kwargs_list, nb::cast(span));
+              // Result can be:
+              // 1. An ExprPtr (simple conversion)
+              // 2. A tuple of (list[StmtPtr], ExprPtr) (complex conversion)
+              if (nb::isinstance<nb::tuple>(result)) {
+                nb::tuple result_tuple = nb::cast<nb::tuple>(result);
+                auto prologue = nb::cast<std::vector<StmtPtr>>(result_tuple[0]);
+                auto expr = nb::cast<ExprPtr>(result_tuple[1]);
+                return ConversionResult{std::move(prologue), std::move(expr)};
+              }
+              return ConversionResult{nb::cast<ExprPtr>(result)};
+            });
+      },
+      nb::arg("from_op"), nb::arg("func"),
+      "Register a custom conversion function for a tensor op.\n\n"
+      "The function receives (args, kwargs, span) and should return either:\n"
+      "- An Expr (simple conversion)\n"
+      "- A tuple (list[Stmt], Expr) for complex conversions with prologue statements");
+
+  ir.def(
+      "has_op_conversion",
+      [](const std::string& op_name) { return OpConversionRegistry::GetInstance().HasConversion(op_name); },
+      nb::arg("op_name"), "Check if a conversion rule exists for an operator.");
+
+  // ---------------------------------------------------------------------------
+  // transform_utils bindings
+  // ---------------------------------------------------------------------------
+
+  ir.def(
+      "flatten_to_stmts", [](const StmtPtr& stmt) { return transform_utils::FlattenToStmts(stmt); },
+      nb::arg("stmt"),
+      "Unwrap a statement into a flat list. Returns children of SeqStmts, or a single-element list.");
+
+  ir.def(
+      "collect_def_vars", [](const StmtPtr& stmt) { return transform_utils::CollectDefVars(stmt); },
+      nb::arg("stmt"), "Collect all AssignStmt LHS variables (definition sites) from a statement tree.");
+
+  ir.def(
+      "find_yield_stmt",
+      [](const StmtPtr& body) -> nb::object {
+        auto result = transform_utils::FindYieldStmt(body);
+        if (!result) return nb::none();
+        return nb::cast(result);
+      },
+      nb::arg("body"), "Find the first YieldStmt inside a statement body (searches through SeqStmts).");
+
+  ir.def(
+      "get_last_yield_stmt",
+      [](const StmtPtr& body) -> nb::object {
+        auto result = transform_utils::GetLastYieldStmt(body);
+        if (!result) return nb::none();
+        return nb::cast(result);
+      },
+      nb::arg("body"), "Find the trailing YieldStmt in a statement body (checks only the last element).");
+
+  ir.def(
+      "substitute_expr",
+      [](const ExprPtr& expr, const std::vector<std::pair<VarPtr, VarPtr>>& var_map_pairs) {
+        std::unordered_map<const Var*, VarPtr> var_map;
+        for (const auto& [orig, replacement] : var_map_pairs) {
+          var_map[orig.get()] = replacement;
+        }
+        return transform_utils::Substitute(expr, var_map);
+      },
+      nb::arg("expr"), nb::arg("var_map"),
+      "Substitute variables in an expression using a list of (original_var, replacement_var) pairs.");
+
+  ir.def(
+      "substitute_stmt",
+      [](const StmtPtr& body, const std::vector<std::pair<VarPtr, VarPtr>>& var_map_pairs) {
+        std::unordered_map<const Var*, VarPtr> var_map;
+        for (const auto& [orig, replacement] : var_map_pairs) {
+          var_map[orig.get()] = replacement;
+        }
+        return transform_utils::Substitute(body, var_map);
+      },
+      nb::arg("body"), nb::arg("var_map"),
+      "Substitute variable references in a statement subtree using a list of (original_var, replacement_var) "
+      "pairs.");
+
+  ir.def(
+      "deep_clone",
+      [](const StmtPtr& body, const std::vector<std::pair<VarPtr, ExprPtr>>& var_map_pairs) -> nb::tuple {
+        std::unordered_map<const Var*, ExprPtr> seed_map;
+        for (const auto& [orig, replacement] : var_map_pairs) {
+          seed_map[orig.get()] = replacement;
+        }
+        auto result = DeepClone(body, seed_map);
+        // Convert raw-pointer-keyed map to shared_ptr-keyed map for Python
+        std::vector<std::pair<VarPtr, VarPtr>> out_pairs;
+        out_pairs.reserve(result.var_map.size());
+        for (const auto& [raw_ptr, new_var] : result.var_map) {
+          // Find the original VarPtr from the raw pointer — wrap as non-owning shared_ptr
+          // Since Python holds the original IR tree alive, the raw pointer is valid
+          out_pairs.emplace_back(std::shared_ptr<const Var>(std::shared_ptr<const Var>{}, raw_ptr), new_var);
+        }
+        return nb::make_tuple(result.cloned_body, out_pairs);
+      },
+      nb::arg("body"), nb::arg("var_map") = std::vector<std::pair<VarPtr, ExprPtr>>{},
+      "Deep-clone a statement subtree, creating fresh Var objects at definition sites.\n\n"
+      "var_map seeds the substitution: each (original_var, replacement_expr) pair\n"
+      "replaces references to original_var with replacement_expr inside the clone.\n\n"
+      "Returns a tuple of (cloned_body, def_var_map) where def_var_map is a list of\n"
+      "(original_var, cloned_var) pairs for the definition sites freshly cloned by\n"
+      "the traversal. Seeded entries from var_map are NOT included — use the\n"
+      "caller's own substitution map for those.");
+
+  ir.def("returned_param_indices", &return_lineage::ReturnedParamIndices, nb::arg("func"), nb::arg("program"),
+         "Trace each return to its external parameter.");
+
+  // Cross-function call return type deduction
+  ir.def("deduce_call_return_type", &DeduceCallReturnType, nb::arg("callee_params"), nb::arg("args"),
+         nb::arg("return_types"),
+         "Deduce return types for a cross-function call by substituting "
+         "dynamic shape variables from callee params with actual arg shapes.");
+}
+
+}  // namespace python
+}  // namespace pypto

@@ -1,0 +1,154 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
+
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "pypto/core/error.h"
+#include "pypto/ir/expr.h"
+#include "pypto/ir/function.h"
+#include "pypto/ir/kind_traits.h"
+#include "pypto/ir/op_registry.h"
+#include "pypto/ir/program.h"
+#include "pypto/ir/span.h"
+#include "pypto/ir/stmt.h"
+#include "pypto/ir/transforms/base/visitor.h"
+#include "pypto/ir/type.h"
+#include "pypto/ir/verifier/verifier.h"
+
+namespace pypto {
+namespace ir {
+namespace {
+
+class TileOps2DVerifier : public IRVisitor {
+ public:
+  explicit TileOps2DVerifier(std::vector<Diagnostic>& diagnostics, std::string func_name)
+      : diagnostics_(diagnostics), func_name_(std::move(func_name)) {}
+
+  void VisitStmt_(const AssignStmtPtr& op) override {
+    if (!op) return;
+    if (auto call = As<Call>(op->value_)) {
+      CheckCall(call, op->span_);
+    }
+    IRVisitor::VisitStmt_(op);
+  }
+
+  void VisitStmt_(const EvalStmtPtr& op) override {
+    if (!op) return;
+    if (auto call = As<Call>(op->expr_)) {
+      CheckCall(call, op->span_);
+    }
+    IRVisitor::VisitStmt_(op);
+  }
+
+ private:
+  void CheckCall(const CallPtr& call, const Span& stmt_span) {
+    if (!call || !call->op_ || As<GlobalVar>(call->op_)) return;
+
+    const auto& name = call->op_->name_;
+    if (name.substr(0, 5) != "tile.") return;
+
+    // `tile.load` / `tile.store` bridge the tensor and tile worlds: the rewrite
+    // gives them a 2D tile while their tensor-side window operands legitimately
+    // keep the source's ND rank, so neither the result nor the argument scan
+    // below applies to them.
+    //
+    // `tile.reshape` / `tile.reinterpret_view` are NOT exempt. Their rank comes
+    // from a literal shape operand rather than from an operand's type, so they
+    // are the one place the rewrite has to rewrite the shape itself -- and the
+    // one place a >2D tile used to survive the pass unnoticed, only to be typed
+    // from its first two dimensions by `ExtractTileTypeInfo` in PTO codegen.
+    if (IsOp(call, "tile.load") || IsOp(call, "tile.store")) {
+      return;
+    }
+
+    auto result_tile = As<TileType>(call->GetType());
+    if (result_tile && result_tile->shape_.size() > 2) {
+      diagnostics_.emplace_back(DiagnosticSeverity::Error, "TileOps2D", 0,
+                                "Tile op '" + name + "' in InCore function '" + func_name_ +
+                                    "' produces >2D tile (should have been flattened to 2D)",
+                                stmt_span);
+    }
+
+    if (IsOp(call, "tile.transpose") && call->args_.size() != 4) {
+      diagnostics_.emplace_back(DiagnosticSeverity::Error, "TileOps2D", 0,
+                                "tile.transpose in InCore function '" + func_name_ + "' has " +
+                                    std::to_string(call->args_.size()) +
+                                    " arguments (expected 4: input, axis1, axis2, scratch after "
+                                    "FlattenTileNdTo2D)",
+                                stmt_span);
+    }
+
+    // A flattened tile.assemble indexes a 2D tile, so its offset must be exactly
+    // (row, col). Codegen reads it positionally and ignores anything past index 1
+    // (pto_ops_datamove.cpp), so a leftover ND offset is a silent misplacement
+    // rather than a hard failure — and the TileType scan below cannot see it,
+    // because the offset is a TupleType.
+    if (IsOp(call, "tile.assemble") && call->args_.size() == 3) {
+      auto offset_tuple = As<MakeTuple>(call->args_[2]);
+      if (!offset_tuple) {
+        // A non-literal offset (e.g. a bare Var in hand-built or re-parsed IR)
+        // leaves the (row, col) form unestablished, so it cannot be accepted
+        // either: the verifier has no way to confirm the postcondition.
+        diagnostics_.emplace_back(DiagnosticSeverity::Error, "TileOps2D", 0,
+                                  "tile.assemble in InCore function '" + func_name_ +
+                                      "' has a non-literal offset (expected a 2-element (row, col) "
+                                      "tuple after FlattenTileNdTo2D)",
+                                  stmt_span);
+      } else if (offset_tuple->elements_.size() != 2) {
+        diagnostics_.emplace_back(DiagnosticSeverity::Error, "TileOps2D", 0,
+                                  "tile.assemble in InCore function '" + func_name_ + "' has a rank-" +
+                                      std::to_string(offset_tuple->elements_.size()) +
+                                      " offset (expected 2: row, col after FlattenTileNdTo2D)",
+                                  stmt_span);
+      }
+    }
+
+    for (const auto& arg : call->args_) {
+      auto arg_tile = As<TileType>(arg->GetType());
+      if (arg_tile && arg_tile->shape_.size() > 2) {
+        diagnostics_.emplace_back(DiagnosticSeverity::Error, "TileOps2D", 0,
+                                  "Tile op '" + name + "' in InCore function '" + func_name_ +
+                                      "' has >2D tile argument (should have been flattened to 2D)",
+                                  stmt_span);
+        break;
+      }
+    }
+  }
+
+  std::vector<Diagnostic>& diagnostics_;
+  std::string func_name_;
+};
+
+class TileOps2DPropertyVerifierImpl : public PropertyVerifier {
+ public:
+  [[nodiscard]] std::string GetName() const override { return "TileOps2D"; }
+
+  void Verify(const ProgramPtr& program, std::vector<Diagnostic>& diagnostics) override {
+    if (!program) return;
+    for (const auto& [gv, func] : program->functions_) {
+      if (!func || !func->body_ || !IsInCoreType(func->func_type_)) continue;
+      TileOps2DVerifier verifier(diagnostics, func->name_);
+      verifier.VisitStmt(func->body_);
+    }
+  }
+};
+
+}  // namespace
+
+PropertyVerifierPtr CreateTileOps2DPropertyVerifier() {
+  return std::make_shared<TileOps2DPropertyVerifierImpl>();
+}
+
+}  // namespace ir
+}  // namespace pypto

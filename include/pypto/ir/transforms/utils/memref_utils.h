@@ -1,0 +1,736 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
+
+#ifndef PYPTO_IR_TRANSFORMS_UTILS_MEMREF_UTILS_H_
+#define PYPTO_IR_TRANSFORMS_UTILS_MEMREF_UTILS_H_
+
+#include <algorithm>
+#include <any>
+#include <array>
+#include <cctype>
+#include <cstddef>
+#include <cstdint>
+#include <limits>
+#include <map>
+#include <memory>
+#include <optional>
+#include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+#include "pypto/core/dtype.h"
+#include "pypto/core/logging.h"
+#include "pypto/ir/expr.h"
+#include "pypto/ir/kind_traits.h"
+#include "pypto/ir/memory_space.h"
+#include "pypto/ir/memref.h"
+#include "pypto/ir/op_registry.h"
+#include "pypto/ir/scalar_expr.h"
+#include "pypto/ir/span.h"
+#include "pypto/ir/stmt.h"
+#include "pypto/ir/storage_size.h"
+#include "pypto/ir/tile_view_semantics.h"
+#include "pypto/ir/transforms/utils/transform_utils.h"
+#include "pypto/ir/type.h"
+
+namespace pypto::ir {
+
+// Re-export FindYieldStmt from transform_utils so existing consumers compile unchanged.
+using transform_utils::FindYieldStmt;
+
+inline std::optional<MemRefPtr> GetTypeMemRef(const TypePtr& type) {
+  if (auto shaped_type = std::dynamic_pointer_cast<const ShapedType>(type)) {
+    return shaped_type->memref_;
+  }
+  return std::nullopt;
+}
+
+inline TypePtr CloneTypeWithMemRef(const TypePtr& type, const std::optional<MemRefPtr>& memref,
+                                   std::optional<MemorySpace> tile_memory_space_override = std::nullopt) {
+  // DistributedTensorType inherits TensorType: dispatch on it first so the
+  // returned clone preserves the subclass identity (including the
+  // window_buffer_ back-reference). Without this guard the more generic
+  // ``TensorType`` branch below would silently downgrade DistributedTensor
+  // params during memref/SSA rebuilds — by codegen time the var's type would
+  // become plain TensorType and the cross-rank op codegen would lose the
+  // ``DistributedTensorType`` kind discriminator (see N6 plan §codegen).
+  if (auto dist_type = std::dynamic_pointer_cast<const DistributedTensorType>(type)) {
+    return std::make_shared<DistributedTensorType>(dist_type->shape_, dist_type->dtype_, memref,
+                                                   dist_type->tensor_view_, dist_type->window_buffer_);
+  }
+
+  if (auto tensor_type = std::dynamic_pointer_cast<const TensorType>(type)) {
+    return std::make_shared<TensorType>(tensor_type->shape_, tensor_type->dtype_, memref,
+                                        tensor_type->tensor_view_);
+  }
+
+  if (auto tile_type = std::dynamic_pointer_cast<const TileType>(type)) {
+    auto memory_space =
+        tile_memory_space_override.has_value() ? tile_memory_space_override : tile_type->memory_space_;
+    return std::make_shared<TileType>(tile_type->shape_, tile_type->dtype_, memref, tile_type->tile_view_,
+                                      memory_space);
+  }
+
+  return type;
+}
+
+/// Remove allocation annotations before comparing value descriptors. Keep
+/// window identity, layouts, and every other type field. Memoize tuple DAGs.
+inline TypePtr CloneTypeWithoutMemRef(const TypePtr& root) {
+  std::unordered_map<const Type*, TypePtr> cache;
+  auto strip = [&](auto&& self, const TypePtr& type) -> TypePtr {
+    if (!type) return type;
+    if (auto found = cache.find(type.get()); found != cache.end()) {
+      return found->second;
+    }
+    TypePtr result = type;
+    if (auto tuple = As<TupleType>(type)) {
+      std::vector<TypePtr> elements;
+      bool changed = false;
+      for (const auto& element : tuple->types_) {
+        auto next = self(self, element);
+        changed |= next != element;
+        elements.push_back(std::move(next));
+      }
+      if (changed) result = std::make_shared<TupleType>(std::move(elements));
+    } else if (auto shaped = As<ShapedType>(type); shaped && shaped->memref_) {
+      result = CloneTypeWithMemRef(type, std::nullopt);
+    }
+    cache.emplace(type.get(), result);
+    return result;
+  };
+  return strip(strip, root);
+}
+
+/// Keep newly inferred shape / dtype / view metadata, filling only missing storage metadata.
+/// Op type deduction may omit a declared MemRef or tile memory space. For a
+/// re-deduced assignment, carry them from the assigned Var's type: ConvertToSSA
+/// records allocation metadata there, not on the RHS Call.
+inline TypePtr WithCarriedMemRef(const TypePtr& deduced, const TypePtr& original) {
+  auto memref = GetTypeMemRef(deduced);
+  bool changed = false;
+  if (!memref && GetTypeMemRef(original)) {
+    memref = GetTypeMemRef(original);
+    changed = true;
+  }
+  std::optional<MemorySpace> memory_space;
+  auto tile = As<TileType>(deduced);
+  auto original_tile = As<TileType>(original);
+  if (tile && original_tile && !tile->memory_space_ && original_tile->memory_space_) {
+    memory_space = original_tile->memory_space_;
+    changed = true;
+  }
+  return changed ? CloneTypeWithMemRef(deduced, memref, memory_space) : deduced;
+}
+
+/// Select assignment metadata consistently in inlining and SSA conversion.
+inline TypePtr GetAuthoritativeAssignmentType(const TypePtr& lhs_type, const ExprPtr& value) {
+  auto value_type = value ? value->GetType() : nullptr;
+  const bool rhs_carries_authoritative_metadata = AsVarLike(value) ||
+                                                  std::dynamic_pointer_cast<const ShapedType>(value_type) ||
+                                                  As<TupleType>(value_type);
+  auto chosen = value_type && !As<UnknownType>(value_type) && rhs_carries_authoritative_metadata ? value_type
+                                                                                                 : lhs_type;
+  // The RHS wins on shape / dtype / view metadata. Op type deduction does not
+  // produce a MemRef, so an LHS MemRef supplies additional allocation metadata
+  // (an author-declared allocation or a re-parsed post-allocation dump).
+  if (!GetTypeMemRef(chosen).has_value() && GetTypeMemRef(lhs_type).has_value()) {
+    chosen = CloneTypeWithMemRef(chosen, GetTypeMemRef(lhs_type));
+  }
+  return chosen;
+}
+
+template <typename RemapExprFn>
+inline std::vector<ExprPtr> RemapTypeExprVector(const std::vector<ExprPtr>& exprs,
+                                                const RemapExprFn& remap_expr, bool& changed) {
+  std::vector<ExprPtr> new_exprs;
+  new_exprs.reserve(exprs.size());
+  for (const auto& expr : exprs) {
+    auto new_expr = remap_expr(expr);
+    if (new_expr.get() != expr.get()) {
+      changed = true;
+    }
+    new_exprs.push_back(std::move(new_expr));
+  }
+  return new_exprs;
+}
+
+template <typename RemapExprFn>
+inline std::optional<TensorView> RemapTensorViewExprs(const std::optional<TensorView>& tensor_view,
+                                                      const RemapExprFn& remap_expr, bool& changed) {
+  if (!tensor_view.has_value()) {
+    return tensor_view;
+  }
+  bool view_changed = false;
+  auto new_stride = RemapTypeExprVector(tensor_view->stride, remap_expr, view_changed);
+  auto new_valid_shape = RemapTypeExprVector(tensor_view->valid_shape, remap_expr, view_changed);
+  if (!view_changed) {
+    return tensor_view;
+  }
+  changed = true;
+  return TensorView(std::move(new_stride), tensor_view->layout, std::move(new_valid_shape), tensor_view->pad);
+}
+
+template <typename RemapExprFn>
+inline std::optional<TileView> RemapTileViewExprs(const std::optional<TileView>& tile_view,
+                                                  const RemapExprFn& remap_expr, bool& changed) {
+  if (!tile_view.has_value()) {
+    return tile_view;
+  }
+  bool view_changed = false;
+  auto new_valid_shape = RemapTypeExprVector(tile_view->valid_shape, remap_expr, view_changed);
+  auto new_stride = RemapTypeExprVector(tile_view->stride, remap_expr, view_changed);
+  ExprPtr new_start_offset = tile_view->start_offset;
+  if (tile_view->start_offset) {
+    new_start_offset = remap_expr(tile_view->start_offset);
+    if (new_start_offset.get() != tile_view->start_offset.get()) {
+      view_changed = true;
+    }
+  }
+  if (!view_changed) {
+    return tile_view;
+  }
+  changed = true;
+  return TileView(std::move(new_valid_shape), std::move(new_stride), std::move(new_start_offset),
+                  tile_view->blayout, tile_view->slayout, tile_view->fractal, tile_view->pad,
+                  tile_view->compact);
+}
+
+/// Rewrite the SSA values a *pinned* MemRef's slot index names.
+///
+/// A declared allocation's slot index may be a runtime expression (`l0c[i & 1]`),
+/// which makes it the only MemRef field that substitution has to follow: rename
+/// `i` and the index must follow, or it dangles on a stale Var.
+///
+/// Restricted to pinned MemRefs on purpose. `byte_offset_` needs no remap — it is
+/// `ConstInt(0)` until InitMemRef and a concrete address after — and confining
+/// rebuilds to the pinned window keeps them strictly before every pass that keys
+/// on MemRef *pointer* identity (`AllocateMemoryAddr` matches old→new by raw
+/// pointer). Rebuilding one of those later would silently split a shared MemRef.
+template <typename RemapExprFn>
+inline std::optional<MemRefPtr> RemapPinnedMemRefExprs(const std::optional<MemRefPtr>& memref,
+                                                       const RemapExprFn& remap_expr, bool& changed) {
+  if (!memref.has_value() || !(*memref)->is_pinned_) return memref;
+  const auto& slot_index = (*memref)->slot_index_;
+  if (!slot_index.has_value() || !*slot_index) return memref;
+  auto new_index = remap_expr(*slot_index);
+  if (new_index == *slot_index) return memref;
+  changed = true;
+  const auto& old = *memref;
+  return std::make_optional<MemRefPtr>(
+      std::make_shared<MemRef>(old->name_hint_, old->base_, old->byte_offset_, old->size_, old->span_,
+                               old->is_pinned_, old->slot_count_, std::make_optional(std::move(new_index))));
+}
+
+template <typename RemapExprFn>
+inline TypePtr CloneTypeWithMemRefAndRemapExprs(
+    const TypePtr& type, const std::optional<MemRefPtr>& memref_in, const RemapExprFn& remap_expr,
+    std::optional<MemorySpace> tile_memory_space_override = std::nullopt) {
+  const bool memref_changed = GetTypeMemRef(type) != memref_in;
+  bool changed = memref_changed;
+  const auto memref = RemapPinnedMemRefExprs(memref_in, remap_expr, changed);
+
+  // DistributedTensorType clone path: matches the comment on
+  // CloneTypeWithMemRef above. Distinct from the TensorType branch so the
+  // window_buffer_ back-reference and the kind discriminator survive an
+  // InitMemRef / SSA rebuild.
+  if (auto dist_type = std::dynamic_pointer_cast<const DistributedTensorType>(type)) {
+    auto new_shape = RemapTypeExprVector(dist_type->shape_, remap_expr, changed);
+    auto new_tensor_view = RemapTensorViewExprs(dist_type->tensor_view_, remap_expr, changed);
+    if (!changed) {
+      return type;
+    }
+    return std::make_shared<DistributedTensorType>(std::move(new_shape), dist_type->dtype_, memref,
+                                                   std::move(new_tensor_view), dist_type->window_buffer_);
+  }
+
+  if (auto tensor_type = std::dynamic_pointer_cast<const TensorType>(type)) {
+    auto new_shape = RemapTypeExprVector(tensor_type->shape_, remap_expr, changed);
+    auto new_tensor_view = RemapTensorViewExprs(tensor_type->tensor_view_, remap_expr, changed);
+    if (!changed) {
+      return type;
+    }
+    return std::make_shared<TensorType>(std::move(new_shape), tensor_type->dtype_, memref,
+                                        std::move(new_tensor_view));
+  }
+
+  if (auto tile_type = std::dynamic_pointer_cast<const TileType>(type)) {
+    auto memory_space =
+        tile_memory_space_override.has_value() ? tile_memory_space_override : tile_type->memory_space_;
+    auto new_shape = RemapTypeExprVector(tile_type->shape_, remap_expr, changed);
+    auto new_tile_view = RemapTileViewExprs(tile_type->tile_view_, remap_expr, changed);
+    if (!changed) {
+      return type;
+    }
+    return std::make_shared<TileType>(std::move(new_shape), tile_type->dtype_, memref,
+                                      std::move(new_tile_view), memory_space);
+  }
+
+  return type;
+}
+
+inline std::shared_ptr<const TileType> GetTileTypeWithMemRef(const TypePtr& type) {
+  auto tile_type = std::dynamic_pointer_cast<const TileType>(type);
+  if (!tile_type || !tile_type->memref_.has_value()) {
+    return nullptr;
+  }
+  return tile_type;
+}
+
+inline MemRefPtr GetDefinedMemRef(const std::shared_ptr<const TileType>& tile_type) {
+  CHECK(tile_type != nullptr) << "TileType must not be null";
+  CHECK(tile_type->memref_.has_value()) << "TileType must carry MemRef";
+  return *tile_type->memref_;
+}
+
+/// Each MemRef's offset relative to its buffer, as address assignment reads it.
+///
+/// Keyed by MemRef pointer. An entry is the MemRef's `byte_offset_`, with scalar
+/// constants folded in where AllocateMemoryAddr can prove them (see
+/// `FoldRelativeMemRefOffsets` there).
+using RelativeMemRefOffsets = std::unordered_map<const MemRef*, ExprPtr>;
+
+/// The absolute address of @p memref once its buffer has been placed at @p buffer_base.
+///
+/// The address is `buffer_base + relative`, where `relative` is @p memref's entry in
+/// @p relative_offsets. A constant folds into one INT64 `ConstInt` — the dtype the
+/// `pto.alloc_tile` addr operand takes. A still-symbolic offset stays an expression,
+/// which codegen lowers into the tile's runtime address assignment: a declared
+/// allocation's runtime slot index (`l0c[i % 2]`), or a slice at a runtime row.
+///
+/// The offset must never be dropped. A `tile.slice` re-derives it through
+/// `pto.subview`, but a view of that view — a `tile.reshape`, which emits no op of its
+/// own — is addressed only by its `pto.alloc_tile addr`, so dropping the offset
+/// silently aliases it onto the buffer's first bytes.
+inline ExprPtr MakeAbsoluteMemRefAddress(uint64_t buffer_base, const MemRefPtr& memref,
+                                         const RelativeMemRefOffsets& relative_offsets) {
+  INTERNAL_CHECK(memref != nullptr) << "Internal error: null MemRef passed to MakeAbsoluteMemRefAddress";
+  INTERNAL_CHECK_SPAN(buffer_base <= static_cast<uint64_t>(std::numeric_limits<int64_t>::max()),
+                      memref->span_)
+      << "Internal error: buffer base " << buffer_base << " of MemRef '" << memref->name_hint_
+      << "' exceeds PyPTO's signed INT64 address representation";
+  const auto entry = relative_offsets.find(memref.get());
+  INTERNAL_CHECK_SPAN(entry != relative_offsets.end() && entry->second != nullptr, memref->span_)
+      << "Internal error: MemRef '" << memref->name_hint_ << "' reached address assignment with no offset";
+  const ExprPtr& relative_offset = entry->second;
+  if (auto relative = As<ConstInt>(relative_offset)) {
+    INTERNAL_CHECK_SPAN(relative->value_ >= 0, memref->span_)
+        << "Internal error: MemRef '" << memref->name_hint_ << "' has a negative relative offset "
+        << relative->value_;
+    INTERNAL_CHECK_SPAN(static_cast<uint64_t>(relative->value_) <=
+                            static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) - buffer_base,
+                        memref->span_)
+        << "Internal error: address of MemRef '" << memref->name_hint_
+        << "' exceeds PyPTO's signed INT64 address representation";
+    return std::make_shared<ConstInt>(static_cast<int64_t>(buffer_base) + relative->value_, DataType::INT64,
+                                      Span::unknown());
+  }
+  auto base = std::make_shared<ConstInt>(static_cast<int64_t>(buffer_base), DataType::INDEX, Span::unknown());
+  return std::make_shared<Add>(base, relative_offset, DataType::INDEX, Span::unknown());
+}
+
+/// How two MemRefs' start addresses relate.
+enum class AddressRelation {
+  kSame,       ///< provably the same address
+  kDifferent,  ///< provably different addresses
+  kUnknown,    ///< same allocation, offsets neither provably equal nor provably apart
+};
+
+/// Compare where two MemRefs start, more precisely than `MemRef::SameAllocation`.
+///
+/// `SameAllocation` compares only the base Ptr, so two slots of one
+/// `pl.MemRef(slots=N)` look like the same storage. Use this wherever the
+/// question is whether a value already sits where it has to end up: between two
+/// slots of one allocation a reconciling copy is still required.
+///
+/// Size is deliberately not compared. A padded loop-carried accumulator carries
+/// its buffer under one valid shape and yields it under another, so the two
+/// MemRefs describe the same storage at differing extents; requiring equal sizes
+/// would ask for a copy from a buffer onto itself, which for `Acc` has no legal
+/// lowering at all.
+///
+/// Offsets compare through `AreExprsEqual`, so a runtime slot subscript written
+/// twice (`buf[i % 2]` at two sites builds two structurally identical trees)
+/// still reports `kSame`. What it cannot prove either way is `kUnknown` — two
+/// *different* symbolic offsets into one allocation may or may not land on the
+/// same bytes. Callers that would move data must reject that case rather than
+/// guess: copying is unsafe when the addresses turn out equal, and skipping is
+/// unsafe when they do not.
+inline AddressRelation CompareBaseAddress(const MemRefPtr& a, const MemRefPtr& b) {
+  CHECK(a != nullptr && b != nullptr) << "MemRef must not be null";
+  if (a->base_.get() != b->base_.get()) return AddressRelation::kDifferent;
+  if (AreExprsEqual(a->byte_offset_, b->byte_offset_)) return AddressRelation::kSame;
+  // AreExprsEqual folds ConstInt by value, so two constants that compare unequal
+  // really are different addresses; anything else is symbolic and unprovable.
+  if (As<ConstInt>(a->byte_offset_) && As<ConstInt>(b->byte_offset_)) return AddressRelation::kDifferent;
+  return AddressRelation::kUnknown;
+}
+
+inline bool TryRegisterUniqueMemRef(const MemRefPtr& memref, MemorySpace memory_space,
+                                    std::map<const MemRef*, MemorySpace>& seen_ptrs) {
+  CHECK(memref != nullptr) << "MemRef must not be null";
+  auto [it, inserted] = seen_ptrs.emplace(memref.get(), memory_space);
+  CHECK(inserted || it->second == memory_space)
+      << "Conflicting TileType.memory_space values found for the same MemRef";
+  return inserted;
+}
+
+// ============================================================================
+// Base Ptr name construction and parsing
+// ============================================================================
+
+/// Build a base Ptr variable name from memory space and counter: "mem_vec_7"
+inline std::string BuildBasePtrName(MemorySpace space, uint64_t id) {
+  std::string space_str = MemorySpaceToString(space);
+  std::transform(space_str.begin(), space_str.end(), space_str.begin(),
+                 [](unsigned char c) { return std::tolower(c); });
+  return "mem_" + space_str + "_" + std::to_string(id);
+}
+
+/// Build a base Ptr variable name from counter only: "mem_7"
+inline std::string BuildBasePtrName(uint64_t id) { return "mem_" + std::to_string(id); }
+
+/// Extract the trailing numeric counter from a base Ptr name (e.g., "mem_vec_7" → 7).
+/// Returns std::nullopt if the name has no trailing numeric suffix.
+inline std::optional<uint64_t> ExtractNameCounter(const std::string& name) {
+  auto pos = name.find_last_of('_');
+  if (pos == std::string::npos || pos + 1 >= name.size()) return std::nullopt;
+  const std::string suffix = name.substr(pos + 1);
+  if (suffix.empty() ||
+      !std::all_of(suffix.begin(), suffix.end(), [](unsigned char c) { return std::isdigit(c); })) {
+    return std::nullopt;
+  }
+  return std::stoull(suffix);
+}
+
+// ============================================================================
+// Alloc statement creation
+// ============================================================================
+
+/// Create an alloc AssignStmt for a MemRef's base Ptr variable.
+/// DDR → tensor.alloc, on-chip → tile.alloc.
+/// Emits: base_ptr: Ptr = {tile,tensor}.alloc(memory_space, size)
+/// `alloc_size` overrides the reserved bytes when the allocation is larger than
+/// the MemRef that names it. That happens for a multi-slot declared allocation:
+/// each slot MemRef is sized to its own slot (so its byte range stays inside the
+/// slot), while the allocation has to cover every slot.
+inline StmtPtr CreateAllocStatement(const MemRefPtr& memref, MemorySpace memory_space, bool pinned = false,
+                                    std::optional<uint64_t> alloc_size = std::nullopt) {
+  std::string op_name = (memory_space == MemorySpace::DDR) ? "tensor.alloc" : "tile.alloc";
+  auto alloc_op = std::make_shared<Op>(op_name);
+
+  auto memspace_expr =
+      std::make_shared<ConstInt>(static_cast<int64_t>(memory_space), DataType::INDEX, Span::unknown());
+  auto size_expr = std::make_shared<ConstInt>(static_cast<int64_t>(alloc_size.value_or(memref->size_)),
+                                              DataType::INDEX, Span::unknown());
+
+  std::vector<ExprPtr> alloc_args = {memspace_expr, size_expr};
+  // Only emit the kwarg when set, so ordinary compiler allocations print and
+  // compare exactly as before.
+  std::vector<std::pair<std::string, std::any>> alloc_kwargs;
+  if (pinned) alloc_kwargs.emplace_back("pinned", true);
+  auto alloc_call =
+      std::make_shared<Call>(alloc_op, alloc_args, std::move(alloc_kwargs), GetPtrType(), Span::unknown());
+
+  return std::make_shared<AssignStmt>(memref->base_, alloc_call, Span::unknown());
+}
+
+/// Prepend alloc statements to a function body's top-level statement list.
+///
+/// Every consumer of the allocation list scans the body's top-level `SeqStmts`
+/// (see `CollectPinnedAllocSizes`), so an allocation created after `InitMemRef`
+/// has to land there too rather than beside its first use.
+inline StmtPtr InsertAllocsIntoBody(const StmtPtr& body, const std::vector<StmtPtr>& alloc_stmts) {
+  if (alloc_stmts.empty()) return body;
+
+  std::vector<StmtPtr> new_seq_stmts;
+  new_seq_stmts.insert(new_seq_stmts.end(), alloc_stmts.begin(), alloc_stmts.end());
+
+  const Span& span = body ? body->span_ : alloc_stmts.front()->span_;
+  if (body) {
+    if (auto seq = As<SeqStmts>(body)) {
+      new_seq_stmts.insert(new_seq_stmts.end(), seq->stmts_.begin(), seq->stmts_.end());
+    } else {
+      new_seq_stmts.push_back(body);
+    }
+  }
+
+  return SeqStmts::Flatten(std::move(new_seq_stmts), span);
+}
+
+/// The base Ptr an alloc statement declares when it is a user-owned (pinned)
+/// buffer, else null. Null for every compiler-created allocation.
+inline VarPtr GetPinnedAllocBase(const StmtPtr& stmt) {
+  auto assign = As<AssignStmt>(stmt);
+  if (!assign) return nullptr;
+  auto call = As<Call>(assign->value_);
+  if (!call || !call->op_) return nullptr;
+  if (!IsOp(call, "tile.alloc") && !IsOp(call, "tensor.alloc")) return nullptr;
+  return call->GetKwarg<bool>("pinned", false) ? assign->var_ : nullptr;
+}
+
+// ============================================================================
+// Byte offset computation helpers
+// ============================================================================
+
+/// Create a ConstInt(0) expression for byte offset initialization.
+inline ExprPtr MakeZeroByteOffset() {
+  return std::make_shared<ConstInt>(0, DataType::INDEX, Span::unknown());
+}
+
+/// Create an addition expression: lhs + rhs.
+/// Folds ConstInt + ConstInt into a single ConstInt.
+inline ExprPtr AddByteOffsets(const ExprPtr& lhs, const ExprPtr& rhs) {
+  auto const_lhs = As<ConstInt>(lhs);
+  auto const_rhs = As<ConstInt>(rhs);
+  if (const_lhs && const_rhs) {
+    return std::make_shared<ConstInt>(const_lhs->value_ + const_rhs->value_, DataType::INDEX,
+                                      Span::unknown());
+  }
+  if (const_rhs && const_rhs->value_ == 0) return lhs;
+  if (const_lhs && const_lhs->value_ == 0) return rhs;
+  return std::make_shared<Add>(lhs, rhs, DataType::INDEX, Span::unknown());
+}
+
+/// Derive an alias window from its current source, preserving allocation-slot identity.
+/// The offset is relative to the source, never the alias's previous absolute offset.
+inline MemRefPtr MakeAliasingMemRef(const MemRefPtr& source, const ExprPtr& relative_offset, uint64_t size,
+                                    const Span& span = Span::unknown()) {
+  INTERNAL_CHECK(source) << "Internal error: alias source must carry a MemRef";
+  auto zero = As<ConstInt>(relative_offset);
+  if (zero && zero->value_ == 0 && size == source->size_) return source;
+  return std::make_shared<MemRef>(source->base_, AddByteOffsets(source->byte_offset_, relative_offset), size,
+                                  span, source->is_pinned_, source->slot_count_, source->slot_index_);
+}
+
+/// Create a multiply expression: lhs * rhs.
+/// Folds ConstInt * ConstInt into a single ConstInt.
+inline ExprPtr MulByteOffsets(const ExprPtr& lhs, const ExprPtr& rhs) {
+  auto const_lhs = As<ConstInt>(lhs);
+  auto const_rhs = As<ConstInt>(rhs);
+  if (const_lhs && const_rhs) {
+    return std::make_shared<ConstInt>(const_lhs->value_ * const_rhs->value_, DataType::INDEX,
+                                      Span::unknown());
+  }
+  if (const_rhs && const_rhs->value_ == 1) return lhs;
+  if (const_lhs && const_lhs->value_ == 1) return rhs;
+  return std::make_shared<Mul>(lhs, rhs, DataType::INDEX, Span::unknown());
+}
+
+/// Compute the byte offset of a slice of an NZ-boxed accumulator (L0C) tile.
+///
+/// L0C is not row-major dense: it is a grid of 16x16 boxes stored column of
+/// boxes first, so the physical element index of logical ``(r, c)`` is
+/// ``r * row_stride + c * col_stride`` with the strides from
+/// ``GetAccumulatorTileGeometry``. Applying the row-major formula here yields an
+/// address that is not merely misaligned but points at the wrong data whenever a
+/// consumer reads it (a ``tile.reshape`` stacked on the slice does exactly that,
+/// because it inherits this offset without going through ``pto.subview``).
+///
+/// Only ever reached through ``GetSliceAccumulatorGeometry``, which is what
+/// establishes that this linear form is a faithful standalone address: the
+/// window keeps the parent's full row extent, its row origin is 0, and its
+/// column origin is either a box multiple or a run-time value PTO scales by the
+/// very same stride. Read that function before widening this one.
+inline ExprPtr ComputeAccumulatorSliceByteOffset(const std::vector<ExprPtr>& offsets,
+                                                 const tile_view_semantics::AccumulatorTileGeometry& geometry,
+                                                 const DataType& dtype, const Span& span) {
+  INTERNAL_CHECK_SPAN(offsets.size() == 2, span)
+      << "Internal error: accumulator slice offset rank (" << offsets.size()
+      << ") must be 2; GetAccumulatorTileGeometry only accepts 2-D accumulators";
+
+  const std::array<int64_t, 2> strides = {geometry.row_stride, geometry.col_stride};
+
+  ExprPtr elements = MakeZeroByteOffset();
+  for (size_t i = 0; i < offsets.size(); ++i) {
+    elements = AddByteOffsets(
+        elements,
+        MulByteOffsets(offsets[i], std::make_shared<ConstInt>(strides[i], DataType::INDEX, Span::unknown())));
+  }
+
+  // GetAccumulatorTileGeometry only reports a geometry when one 16x16 box is
+  // exactly `kAccFractal` bytes, which pins the element width to 4 bytes, so the
+  // packed sub-byte handling in ComputeSliceByteOffset is genuinely unreachable
+  // from here. That makes this an internal invariant, not a user-facing one.
+  const uint64_t storage_bits = storage_size::GetStorageBitWidth(dtype);
+  INTERNAL_CHECK_SPAN(storage_bits > 0 && storage_bits % 8 == 0, span)
+      << "Internal error: accumulator dtype must have a whole-byte storage width, got " << dtype.ToString();
+  return MulByteOffsets(elements, std::make_shared<ConstInt>(static_cast<int64_t>(storage_bits / 8),
+                                                             DataType::INDEX, Span::unknown()));
+}
+
+/// Resolve the NZ box geometry a `tile.slice`'s byte offset and view span must
+/// use, or nullopt when the pre-existing row-major-dense arithmetic is kept.
+///
+/// The NZ form `(r * 16 + c * rows) * elem_bytes` is a *standalone* address, and
+/// that is the whole difficulty. A `tile.slice` usually lowers to `pto.subview`,
+/// which carries the logical window indices and re-derives the address itself —
+/// but a `tile.reshape` stacked on the slice inherits this byte offset and turns
+/// it into its own `pto.alloc_tile addr`, carrying the *slice's* `rows`. PTO
+/// derives the box-column stride from that `rows`, so the offset is a faithful
+/// re-description of the parent only when the window keeps the parent's full row
+/// extent; then `rows` is unchanged and every box lands where the parent put it.
+///
+/// Guards, each falling back to row-major-dense:
+///  * not a `tile.slice`, or a parent that is not an NZ-boxed accumulator;
+///  * a non-2-D window, or one whose row extent is dynamic or narrower than the
+///    parent's. A row-narrowing window has NO correct standalone base address —
+///    its box columns are strided by the parent's `rows`, its descriptor's by its
+///    own — so it is left on the arithmetic it has always had rather than swapped
+///    for a differently wrong number. See docs/en/dev/passes/35-init_memref.md.
+///  * a non-zero row origin, which is only reachable together with a narrowed row
+///    extent and is unrepresentable for the same reason;
+///  * a static column origin that is not a multiple of the 16-wide box. Such a
+///    window lies inside one box column and `CanonicalizeTileSlice` explicitly
+///    whitelists it as a legal MAD destination, where this offset is dead; it
+///    must therefore not be rejected here.
+///
+/// A *dynamic* column origin is accepted: PTO lowers the very same linear form at
+/// run time, so the two agree exactly, and neither side can check box alignment
+/// statically.
+///
+/// Deliberately a pure function of `(call, parent_type)`: InitMemRef and
+/// MemoryReuse both derive a view's offset from exactly these two inputs and
+/// must not disagree.
+inline std::optional<tile_view_semantics::AccumulatorTileGeometry> GetSliceAccumulatorGeometry(
+    const CallPtr& call, const TypePtr& parent_type) {
+  if (!call || !IsOp(call, "tile.slice")) return std::nullopt;
+
+  auto parent_tile = As<TileType>(parent_type);
+  if (!parent_tile) return std::nullopt;
+  auto geometry = tile_view_semantics::GetAccumulatorTileGeometry(*parent_tile);
+  if (!geometry) return std::nullopt;
+
+  // tile.slice(input, shape, offset[, valid_shape]); `shape` is the pre-drop
+  // window, so it is the one that lines up with the parent's rank.
+  if (call->args_.size() < 3) return std::nullopt;
+  auto window = As<MakeTuple>(call->args_[1]);
+  auto offsets = As<MakeTuple>(call->args_[2]);
+  if (!window || !offsets) return std::nullopt;
+  if (window->elements_.size() != 2 || offsets->elements_.size() != 2) return std::nullopt;
+
+  // GetAccumulatorTileGeometry already established a static 2-D parent shape.
+  auto parent_rows = As<ConstInt>(parent_tile->shape_[0]);
+  auto window_rows = As<ConstInt>(window->elements_[0]);
+  if (!parent_rows || !window_rows || parent_rows->value_ != window_rows->value_) return std::nullopt;
+
+  auto row_offset = As<ConstInt>(offsets->elements_[0]);
+  if (!row_offset || row_offset->value_ != 0) return std::nullopt;
+
+  if (auto col_offset = As<ConstInt>(offsets->elements_[1])) {
+    if (col_offset->value_ < 0 || col_offset->value_ % geometry->box.cols != 0) return std::nullopt;
+  }
+  return geometry;
+}
+
+/// Compute byte offset for a slice operation.
+/// byte_offset = (o0 * s1 * ... * sN + o1 * s2 * ... * sN + ... + oN) * storage_bits / 8
+///
+/// MemRef carries a byte offset rather than a nibble offset. INT4/UINT4/HF4
+/// slices therefore require a static, byte-aligned origin. FP4 x2 carrier
+/// offsets are already byte offsets and need no sub-byte alignment conversion.
+///
+/// @param acc_geometry NZ box geometry, supplied by ``GetSliceAccumulatorGeometry``
+///        for the accumulator (L0C) windows it can address exactly. Every other
+///        slice passes nullopt and keeps the arithmetic below bit-for-bit — both
+///        the genuinely row-major-dense parents (Vec / DDR / tensor) and the ones
+///        this pass does not yet model (the fractal-512 Mat / Left / Right duals,
+///        and accumulator windows that narrow the row extent).
+inline ExprPtr ComputeSliceByteOffset(
+    const std::vector<ExprPtr>& offsets, const std::vector<ExprPtr>& parent_shape, const DataType& dtype,
+    const Span& span,
+    const std::optional<tile_view_semantics::AccumulatorTileGeometry>& acc_geometry = std::nullopt) {
+  INTERNAL_CHECK(offsets.size() == parent_shape.size())
+      << "Internal error: slice offset rank (" << offsets.size() << ") must match parent shape rank ("
+      << parent_shape.size() << ")";
+
+  if (acc_geometry.has_value()) {
+    return ComputeAccumulatorSliceByteOffset(offsets, *acc_geometry, dtype, span);
+  }
+
+  ExprPtr result = MakeZeroByteOffset();
+
+  for (size_t i = 0; i < offsets.size(); ++i) {
+    ExprPtr stride = std::make_shared<ConstInt>(1, DataType::INDEX, Span::unknown());
+    for (size_t j = i + 1; j < parent_shape.size(); ++j) {
+      stride = MulByteOffsets(stride, parent_shape[j]);
+    }
+    result = AddByteOffsets(result, MulByteOffsets(offsets[i], stride));
+  }
+
+  const uint64_t storage_bits = storage_size::GetStorageBitWidth(dtype);
+  INTERNAL_CHECK_SPAN(storage_bits > 0, span)
+      << "Internal error: slice dtype has no storage width: " << dtype.ToString();
+  if (storage_bits % 8 == 0) {
+    auto elem_size_expr =
+        std::make_shared<ConstInt>(static_cast<int64_t>(storage_bits / 8), DataType::INDEX, Span::unknown());
+    return MulByteOffsets(result, elem_size_expr);
+  }
+
+  auto logical_offset = As<ConstInt>(result);
+  CHECK_SPAN(logical_offset, span)
+      << "Packed 4-bit slice offsets must be compile-time constants because MemRef cannot represent "
+         "a dynamic nibble offset";
+  CHECK_SPAN(logical_offset->value_ >= 0, span)
+      << "Packed 4-bit slice offsets must be non-negative, but got logical offset " << logical_offset->value_;
+  const auto byte_offset =
+      storage_size::StaticLogicalOffsetToByte(static_cast<uint64_t>(logical_offset->value_), dtype);
+  CHECK_SPAN(byte_offset.has_value(), span)
+      << "Packed 4-bit slice origins must be byte-aligned; logical linear offset " << logical_offset->value_
+      << " selects the second nibble of a byte";
+  CHECK_SPAN(*byte_offset <= static_cast<uint64_t>(std::numeric_limits<int64_t>::max()), span)
+      << "Packed 4-bit slice byte offset overflows int64";
+  return std::make_shared<ConstInt>(static_cast<int64_t>(*byte_offset), DataType::INDEX, Span::unknown());
+}
+
+/// Compute additional byte offset for a view operation.
+/// Dispatches: slice ops → stride-based offset, others → zero offset.
+inline ExprPtr ComputeViewByteOffset(const CallPtr& call, const TypePtr& parent_type) {
+  const std::string& op_name = call->op_->name_;
+
+  if (IsOp(call, "tensor.slice") || IsOp(call, "tile.slice")) {
+    auto shaped = std::dynamic_pointer_cast<const ShapedType>(parent_type);
+    INTERNAL_CHECK_SPAN(shaped, call->span_) << "Internal error: slice parent must be ShapedType";
+
+    // tensor.slice(input, shape, offset) → offset is args[2]
+    // tile.slice(input, shape, offset[, valid_shape]) → offset is args[2]
+    size_t offset_arg_idx = 2;
+    INTERNAL_CHECK_SPAN(offset_arg_idx < call->args_.size(), call->span_)
+        << "Internal error: " << op_name << " missing offset argument";
+
+    // Extract individual offset elements from the MakeTuple expression
+    std::vector<ExprPtr> offsets;
+    if (auto make_tuple = As<MakeTuple>(call->args_[offset_arg_idx])) {
+      offsets = make_tuple->elements_;
+    } else {
+      offsets.push_back(call->args_[offset_arg_idx]);
+    }
+
+    // An accumulator (L0C) parent is NZ-boxed, not row-major dense. Ask for the
+    // box strides; every other parent — including tensor.slice, which has no
+    // TileType at all — yields nullopt and keeps the row-major arithmetic
+    // bit-for-bit. This must stay a pure function of (call, parent_type):
+    // MemoryReuse re-derives the same offset from the same two inputs when it
+    // re-anchors a view onto a retargeted buffer, and the two must agree.
+    auto acc_geometry = GetSliceAccumulatorGeometry(call, parent_type);
+
+    return ComputeSliceByteOffset(offsets, shaped->shape_, shaped->dtype_, call->span_, acc_geometry);
+  }
+
+  // Non-slice view ops (reshape, transpose, extract):
+  // No additional byte offset — same memory region, different interpretation
+  return MakeZeroByteOffset();
+}
+
+}  // namespace pypto::ir
+
+#endif  // PYPTO_IR_TRANSFORMS_UTILS_MEMREF_UTILS_H_

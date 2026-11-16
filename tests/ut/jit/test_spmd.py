@@ -1,0 +1,429 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+
+"""Regression tests: @pl.jit / @pl.jit.inline support pl.spmd().
+
+Guards issue #1432. There is no separate "JIT parser" — the JIT specializer
+rewrites @pl.jit functions into ordinary @pl.program source, which the shared
+parser consumes. Both pl.spmd() forms therefore flow through unchanged:
+
+  - the ``for i in pl.spmd(N):`` loop form, and
+  - the ``with pl.spmd(N): kernel(...)`` scope form.
+
+The sibling-loop test additionally guards PR #1414's specializer alpha-renamer
+fix in the SPMD context: two sibling loops inside a pl.spmd block may reuse the
+same loop-local names without the renamer emitting an out-of-scope bridge.
+"""
+
+import re
+
+import pypto.language as pl
+import pytest
+from pypto import backend, passes
+from pypto.backend import BackendType
+from pypto.ir import compile as compile_ir
+from pypto.jit.decorator import jit
+from pypto.pypto_core import ir
+from pypto.runtime import ExecutionMode, RunConfig
+
+# Module-level constants — the JIT specializer inlines module-level ints at
+# their use sites, but does NOT capture function-local closure variables.
+_BATCH = 16
+_HIDDEN = 512
+_K_CHUNK = 128
+_HALF = _HIDDEN // 2  # columns of `hidden` handled by each SPMD block
+_CHUNKS = _HALF // _K_CHUNK  # pl.pipeline iterations per block
+
+
+def test_spmd_scatter_different_output_shapes(tmp_path):
+    """Branch-local stores must preserve the two output tensor identities."""
+    torch = pytest.importorskip("torch")
+
+    @jit
+    def scatter(source: pl.Tensor, local_kv: pl.Out[pl.Tensor], predecessor_kv: pl.Out[pl.Tensor]):
+        with pl.spmd(20, name_hint="cp_swa_augmented_kv_scatter"):
+            block = pl.tile.get_block_idx()
+            if block < 4:
+                for row in pl.range(block * 64, block * 64 + 64, 16):
+                    predecessor_kv[row : row + 16, :] = source[row : row + 16, :]
+            else:
+                for row in pl.range((block - 4) * 64, (block - 4) * 64 + 64, 16):
+                    local_kv[row : row + 16, :] = source[row + 256 : row + 272, :]
+        return local_kv, predecessor_kv
+
+    program = scatter.specialize(
+        torch.empty(1280, 128, dtype=torch.bfloat16),
+        torch.empty(1024, 128, dtype=torch.bfloat16),
+        torch.empty(256, 128, dtype=torch.bfloat16),
+    )
+    compile_ir(program, output_dir=str(tmp_path), skip_ptoas=True)
+
+
+def test_jit_spmd_for_loop():
+    """``for i in pl.spmd(N)`` inside a plain @pl.jit entry compiles end-to-end."""
+    torch = pytest.importorskip("torch")
+
+    @jit
+    def spmd_add(a: pl.Tensor, b: pl.Tensor, c: pl.Out[pl.Tensor]):
+        for i in pl.spmd(2):
+            offset = i * 64
+            tile_a = pl.load(a, [offset, 0], [64, 128])
+            tile_b = pl.load(b, [offset, 0], [64, 128])
+            c = pl.store(pl.add(tile_a, tile_b), [offset, 0], c)
+        return c
+
+    post = spmd_add.lower(torch.randn(128, 128), torch.randn(128, 128), torch.empty(128, 128))
+    func_types = {f.func_type for f in post.functions.values()}
+    assert ir.FunctionType.Spmd in func_types, (
+        f"expected an Spmd function from `for i in pl.spmd()`, got {func_types}"
+    )
+    assert any(
+        f.name == "spmd_add" and f.func_type == ir.FunctionType.Orchestration for f in post.functions.values()
+    )
+
+
+def test_jit_spmd_with_form():
+    """``with pl.spmd(N): kernel(...)`` dispatching a @pl.jit.incore dep."""
+    torch = pytest.importorskip("torch")
+
+    @jit.incore
+    def add_kernel(a: pl.Tensor, b: pl.Tensor, c: pl.Out[pl.Tensor]):
+        # @jit.incore already establishes the InCore context — no pl.at needed.
+        tile_a = pl.load(a, [0, 0], [64, 128])
+        tile_b = pl.load(b, [0, 0], [64, 128])
+        c = pl.store(pl.add(tile_a, tile_b), [0, 0], c)
+        return c
+
+    @jit
+    def entry(a: pl.Tensor, b: pl.Tensor, c: pl.Out[pl.Tensor]):
+        with pl.spmd(2):
+            c = add_kernel(a, b, c)
+        return c
+
+    post = entry.lower(torch.randn(128, 128), torch.randn(128, 128), torch.empty(128, 128))
+    func_types = {f.func_type for f in post.functions.values()}
+    assert ir.FunctionType.Spmd in func_types, (
+        f"expected an Spmd function from `with pl.spmd()`, got {func_types}"
+    )
+
+
+def test_jit_spmd_inline_with_form_no_tid():
+    """``with pl.spmd(N):`` with an INLINE body (no ``as tid``) compiles end-to-end.
+
+    Exercises the decoupling of inline-body support from TaskId capture: the plain
+    with-form auto-outlines the inline body into a synthetic InCore kernel — like the
+    for-form / as-tid form — without capturing a producer TaskId. The dispatch stays
+    a plain Call (no task_id_var → not lowered to a Submit), unlike the as-tid form.
+    """
+    torch = pytest.importorskip("torch")
+
+    @jit
+    def entry(a: pl.Tensor, b: pl.Tensor, c: pl.Out[pl.Tensor]):
+        with pl.spmd(2):
+            i = pl.tile.get_block_idx()
+            offset = i * 64
+            tile_a = pl.load(a, [offset, 0], [64, 128])
+            tile_b = pl.load(b, [offset, 0], [64, 128])
+            c = pl.store(pl.add(tile_a, tile_b), [offset, 0], c)
+        return c
+
+    post = entry.lower(torch.randn(128, 128), torch.randn(128, 128), torch.empty(128, 128))
+    func_types = {f.func_type for f in post.functions.values()}
+    assert ir.FunctionType.Spmd in func_types, (
+        f"expected an Spmd function from the inline `with pl.spmd()` body, got {func_types}"
+    )
+    # No `as tid`, so the dispatch keeps the plain-Call shape (never a Submit).
+    orch = next(f for f in post.functions.values() if f.func_type == ir.FunctionType.Orchestration)
+    spmd_names = {f.name for f in post.functions.values() if f.func_type == ir.FunctionType.Spmd}
+    submits = []
+
+    def _walk(node):
+        if isinstance(node, ir.SeqStmts):
+            for s in node.stmts:
+                _walk(s)
+        elif isinstance(node, ir.AssignStmt):
+            if isinstance(node.value, ir.Submit) and node.value.op.name in spmd_names:
+                submits.append(node.value)
+        elif hasattr(node, "body") and node.body is not None:
+            _walk(node.body)
+
+    _walk(orch.body)
+    assert not submits, "plain inline with-form (no as tid) must not lower to a Submit"
+
+
+def test_jit_inline_helper_spmd_for_loop():
+    """A @pl.jit.inline helper using ``for i in pl.spmd(N)`` is spliced + dispatched."""
+    torch = pytest.importorskip("torch")
+
+    @jit.inline
+    def spmd_helper(a: pl.Tensor, b: pl.Tensor, c: pl.Tensor):
+        for i in pl.spmd(2):
+            offset = i * 64
+            tile_a = pl.load(a, [offset, 0], [64, 128])
+            tile_b = pl.load(b, [offset, 0], [64, 128])
+            c = pl.store(pl.add(tile_a, tile_b), [offset, 0], c)
+        return c
+
+    @jit
+    def entry(a: pl.Tensor, b: pl.Tensor, c: pl.Out[pl.Tensor]):
+        c = spmd_helper(a, b, c)
+        return c
+
+    post = entry.lower(torch.randn(128, 128), torch.randn(128, 128), torch.empty(128, 128))
+    func_types = {f.func_type for f in post.functions.values()}
+    # InlineFunctions splices away every Inline helper.
+    assert ir.FunctionType.Inline not in func_types, (
+        "FunctionType.Inline helper should have been spliced by InlineFunctions"
+    )
+    assert ir.FunctionType.Spmd in func_types, (
+        f"expected an Spmd function from the inline helper, got {func_types}"
+    )
+
+
+def test_jit_spmd_sibling_pipeline_loops_reuse_names():
+    """Two sibling pl.pipeline loops inside a pl.spmd block may reuse loop-local names.
+
+    Regression for issue #1432 / PR #1414: before #1414 the JIT specializer's
+    alpha-renamer treated the second loop's ``k0`` / ``chunk`` as loop-carried
+    rebinds of the first loop's locals, emitting a bridge that reads them
+    outside their defining scope — which ConvertToSSA rejects. ``lower``
+    raises if the specializer regresses.
+    """
+    torch = pytest.importorskip("torch")
+
+    @jit.inline
+    def rmsnorm_like(a: pl.Tensor, out: pl.Tensor):
+        # Each SPMD block owns a column-half of `hidden`; `k0` and `chunk` are
+        # reused across the two sibling pl.pipeline loops on purpose.
+        for blk in pl.spmd(2):
+            base = blk * _HALF
+            acc = pl.full([1, _BATCH], dtype=pl.FP32, value=0.0)
+            for kb in pl.pipeline(_CHUNKS, stage=2):
+                k0 = base + kb * _K_CHUNK
+                chunk = pl.cast(a[:, k0 : k0 + _K_CHUNK], target_type=pl.FP32)
+                acc = pl.add(acc, pl.reshape(pl.row_sum(pl.mul(chunk, chunk)), [1, _BATCH]))
+            for kb in pl.pipeline(_CHUNKS, stage=2):  # sibling: reuses kb/k0/chunk
+                k0 = base + kb * _K_CHUNK
+                chunk = pl.cast(a[:, k0 : k0 + _K_CHUNK], target_type=pl.FP32)
+                out = pl.assemble(out, pl.cast(chunk, target_type=pl.BF16), [0, k0])
+        return out
+
+    @jit
+    def entry(a: pl.Tensor, out: pl.Out[pl.Tensor]):
+        out = rmsnorm_like(a, out)
+        return out
+
+    post = entry.lower(
+        # Input is BF16 so the `pl.cast(..., FP32)` in `rmsnorm_like` is a
+        # real cross-dtype promotion. Same-dtype casts are rejected at IR
+        # construction time, so this fixture must not feed FP32 in.
+        torch.empty([_BATCH, _HIDDEN], dtype=torch.bfloat16).normal_(),
+        torch.empty([_BATCH, _HIDDEN], dtype=torch.bfloat16),
+    )
+    func_types = {f.func_type for f in post.functions.values()}
+    assert ir.FunctionType.Spmd in func_types, (
+        f"expected an Spmd function from sibling pl.pipeline loops, got {func_types}"
+    )
+
+
+def test_jit_spmd_with_form_as_tid_captures_and_wires_deps():
+    """``with pl.spmd(N) as tid:`` (capture form) compiles end-to-end through @pl.jit.
+
+    Exercises the full pipeline on the SPMD producer-TaskId capture: an inline
+    ``as tid`` body (auto-outlined like the for-form) plus a downstream dispatch
+    wired via ``deps=[tid0]``. Two separate Out buffers keep the dependency on the
+    explicit ``deps=`` edge (not on a chained tuple-return). Asserts not just that
+    two Spmd wrappers exist, but that the ``deps=[tid0]`` edge actually survives JIT
+    specialization + lowering — otherwise the specializer could drop/rebind it and
+    this test would still pass.
+    """
+    torch = pytest.importorskip("torch")
+
+    @jit
+    def entry(a: pl.Tensor, out1: pl.Out[pl.Tensor], out2: pl.Out[pl.Tensor]):
+        with pl.spmd(2, name_hint="stage1") as tid0:
+            i = pl.tile.get_block_idx()
+            t = pl.load(a, [i * 64, 0], [64, 128])
+            out1 = pl.store(pl.add(t, t), [i * 64, 0], out1)
+        with pl.spmd(2, name_hint="stage2", deps=[tid0]) as tid1:  # noqa: F841
+            j = pl.tile.get_block_idx()
+            u = pl.load(a, [j * 64, 0], [64, 128])
+            out2 = pl.store(pl.add(u, u), [j * 64, 0], out2)
+        return out2
+
+    post = entry.lower(torch.randn(128, 128), torch.empty(128, 128), torch.empty(128, 128))
+    spmd_fns = [f for f in post.functions.values() if f.func_type == ir.FunctionType.Spmd]
+    assert len(spmd_fns) == 2, (
+        f"expected two Spmd functions from the two captured pl.spmd() dispatches, got {len(spmd_fns)}"
+    )
+    spmd_fn_names = {f.name for f in spmd_fns}
+
+    # Inspect the lowered orchestration IR: the full pipeline now KEEPS the
+    # captured dispatches as Submits of the outlined Spmd functions
+    # (DeriveCallDirections preserves Submit-ness), and the surviving deps=[tid0]
+    # edge rides as the consumer Submit's typed ``deps_`` field. Exactly one of
+    # the two dispatches must carry a single dep edge — proving the specializer
+    # neither dropped nor duplicated the JIT-specific dependency wiring.
+    orch = next(f for f in post.functions.values() if f.func_type == ir.FunctionType.Orchestration)
+    assert orch.name == "entry"
+    spmd_dispatches = []
+
+    def _walk(node):
+        if isinstance(node, ir.SeqStmts):
+            for s in node.stmts:
+                _walk(s)
+        elif isinstance(node, ir.AssignStmt):
+            if isinstance(node.value, (ir.Call, ir.Submit)) and node.value.op.name in spmd_fn_names:
+                spmd_dispatches.append(node.value)
+        elif hasattr(node, "body") and node.body is not None:
+            _walk(node.body)
+
+    _walk(orch.body)
+    assert len(spmd_dispatches) == 2, (
+        f"expected two spmd dispatches, got {[c.op.name for c in spmd_dispatches]}"
+    )
+
+    def _dep_count(disp):
+        # Deps live only on Submit::deps_ (ManualDepsOnSubmitOnly invariant);
+        # a plain Call dispatch never carries dep edges.
+        assert isinstance(disp, ir.Submit), f"spmd dispatch must be a Submit, got {type(disp).__name__}"
+        return len(disp.deps)
+
+    dep_counts = sorted(_dep_count(c) for c in spmd_dispatches)
+    assert dep_counts == [0, 1], (
+        f"expected the deps=[tid0] edge to survive as exactly one dep on the consumer "
+        f"dispatch, got per-dispatch dep counts {dep_counts}"
+    )
+
+
+def test_inline_spmd_reads_loop_carried_tensor(tmp_path):
+    """Issue #2955: both single-trip RMSNorm loops read the current layer input."""
+    backend.reset_for_testing()
+    # Static rows isolate carry cloning from dynamic-dimension roundtrip handling.
+    T = 16
+
+    @pl.jit.inline(auto_scope=False)
+    def norm(x: pl.Tensor[[T, 64], pl.BF16], out: pl.Tensor[[T, 64], pl.BF16]):
+        for b in pl.spmd((T + 7) // 8):
+            r = b * 8
+            n = pl.min(8, T - r)
+            acc = pl.full([1, 8], dtype=pl.FP32, value=0.0)
+            for c in pl.range(0, 64, 128):
+                v = pl.cast(pl.slice(x, [8, 128], [r, c], valid_shape=[n, pl.min(128, 64 - c)]), pl.FP32)
+                v = pl.set_validshape(pl.fillpad(v, pad_value=pl.PadValue.zero), 8, 128)
+                acc = pl.add(acc, pl.reshape(pl.row_sum(pl.mul(v, v)), [1, 8]))
+            inv = pl.reshape(pl.rsqrt(pl.add(pl.mul(acc, 1.0 / 64), 1e-6), high_precision=True), [8, 1])
+            for d in pl.range(0, 64, 128):
+                normalized_input = pl.cast(
+                    pl.slice(x, [8, 128], [r, d], valid_shape=[n, pl.min(128, 64 - d)]), pl.FP32
+                )
+                y = pl.row_expand_mul(normalized_input, inv)
+                out = pl.assemble(
+                    out, pl.set_validshape(pl.cast(y, pl.BF16, mode="rint"), n, pl.min(128, 64 - d)), [r, d]
+                )
+        return out
+
+    @pl.jit
+    def repro(source: pl.Tensor[[T, 64], pl.BF16], output: pl.Out[pl.Tensor[[T, 64], pl.BF16]]):
+        x = pl.create_tensor([T, 64], dtype=pl.BF16)
+        norm(source, x)
+        tmp = pl.create_tensor([T, 64], dtype=pl.BF16)
+        for layer in pl.range(2):
+            norm(x, tmp)
+            x = tmp
+        norm(x, output)
+        return output
+
+    compiled = repro.compile(config=RunConfig(platform="a5", save_kernels_dir=str(tmp_path / "compiled")))
+    assert (compiled.output_dir / "orchestration" / "repro.cpp").is_file()
+    assert list((tmp_path / "compiled").rglob("*.pto"))
+
+
+def test_constexpr_manual_parallel_tensor_and_taskid_merge_compiles(tmp_path, monkeypatch):
+    """Issue #3115: the first Simplify must preserve a wrapped branch yield.
+
+    Compile the actual inline/SPMD authoring surface through source codegen.
+    The dependency assertion below also checks that the TaskId array reaches
+    the consumer; merely accepting the early SSA shape would miss that loss.
+    """
+    monkeypatch.setenv("PTOAS_ROOT", str(tmp_path / "no_optional_ptoas"))
+    tokens_dim = pl.dynamic("T")
+
+    @pl.jit.inline(auto_scope=False)
+    def producer(
+        x: pl.Tensor[[tokens_dim, 32], pl.FP32],
+        tmp: pl.Tensor[[tokens_dim, 32], pl.FP32],
+        group: pl.Scalar[pl.INDEX],
+    ):
+        with pl.spmd(1) as ready:
+            row = group * 32 + pl.tile.get_block_idx() * 32
+            count = pl.min(32, pl.tensor.dim(x, 0) - row)
+            value = pl.load(x, [row, 0], [32, 32], valid_shape=[count, 32])
+            pl.store(pl.add(value, 1.0), [row, 0], tmp)
+        return tmp, ready
+
+    @pl.jit.inline(auto_scope=False)
+    def branch(
+        x: pl.Tensor[[tokens_dim, 32], pl.FP32],
+        out: pl.Tensor[[tokens_dim, 32], pl.FP32],
+        count: pl.constexpr,
+    ):
+        tokens = pl.tensor.dim(x, 0)
+        tmp = pl.create_tensor([tokens, 32], dtype=pl.FP32)
+        deps = pl.array.create(count, pl.TASK_ID)
+        if count == 1:
+            tmp, ready = producer(x, tmp, 0)
+            deps[0] = ready
+        else:
+            with pl.manual_scope():
+                for group in pl.parallel(count):
+                    tmp, ready = producer(x, tmp, group)
+                    deps[group] = ready
+        with pl.spmd(count, deps=[deps]):
+            row = pl.tile.get_block_idx() * 32
+            valid_rows = pl.min(32, tokens - row)
+            value = pl.load(tmp, [row, 0], [32, 32], valid_shape=[valid_rows, 32])
+            pl.store(value, [row, 0], out)
+        return out
+
+    @pl.jit(auto_scope=False)
+    def entry(
+        x: pl.Tensor[[tokens_dim, 32], pl.FP32],
+        out: pl.Out[pl.Tensor[[tokens_dim, 32], pl.FP32]],
+    ):
+        if pl.tensor.dim(x, 0) <= 32:
+            out = branch(x, out, 1)
+        else:
+            out = branch(x, out, 2)
+        return out
+
+    compiled = entry.compile(
+        config=RunConfig(
+            backend_type=BackendType.Ascend910B,
+            execution_mode=ExecutionMode.ONBOARD,
+            memory_planner=passes.MemoryPlanner.PYPTO,
+            save_kernels=True,
+            save_kernels_dir=str(tmp_path / "compiled"),
+        )
+    )
+    source = (compiled.output_dir / "orchestration" / "entry.cpp").read_text()
+    dep_arrays = re.findall(r"TaskId (params_t\d+_deps)\[(\d+)\];", source)
+    assert [int(size) for _, size in dep_arrays] == [1, 2]
+    assert source.count(".set_dependencies(") == 2
+    for target, size in dep_arrays:
+        # Both branches must gather every producer handle from the same array,
+        # including slot 1 in the parallel producer branch.
+        reads = re.findall(rf"if \((\w+)\[(\d+)\]\.is_valid\(\)\) {target}\[", source)
+        assert len({array for array, _ in reads}) == 1
+        assert [int(index) for _, index in reads] == list(range(int(size)))
+    assert list(compiled.output_dir.rglob("*.pto"))
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

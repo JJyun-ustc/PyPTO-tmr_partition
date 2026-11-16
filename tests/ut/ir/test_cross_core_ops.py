@@ -1,0 +1,773 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+
+"""Tests for cross-core communication ops and MixedKernelExpanded IRProperty."""
+
+import pytest
+from pypto import DataType, ir, passes
+from pypto import language as pl
+from pypto.ir.op import system_ops
+from pypto.pypto_core.ir import ConstInt
+
+
+def test_tpush_ops_return_unknown_type():
+    """Test tpush ops return UnknownType."""
+    span = ir.Span.unknown()
+    tile_type = ir.TileType([64], DataType.FP32)
+    tile_var = ir.Var("t", tile_type, span)
+
+    for op_name in ["tile.tpush_to_aiv", "tile.tpush_to_aic"]:
+        call = ir.create_op_call(op_name, [tile_var], {"split": 0}, span)
+        assert isinstance(call.type, ir.UnknownType)
+
+
+def test_frontend_pipe_id_kwarg_is_accepted():
+    """Cross-core frontend ops accept an optional PTOAS pipe id."""
+    span = ir.Span.unknown()
+    tile_type = ir.TileType([64], DataType.FP32)
+    tile_var = ir.Var("t", tile_type, span)
+    z = ConstInt(0, DataType.INT32, span)
+
+    tpush = ir.create_op_call("tile.tpush_to_aiv", [tile_var], {"split": 0, "id": 7}, span)
+    assert tpush.kwargs["id"] == 7
+
+    tpop_op = ir.get_op("tile.tpop_from_aic")
+    tpop = ir.Call(tpop_op, [], {"split": 0, "id": 7}, tile_type, span)
+    assert tpop.kwargs["id"] == 7
+
+    tfree = ir.create_op_call("system.tfree_to_aic", [tile_var], {"id": 7}, span)
+    assert tfree.kwargs["id"] == 7
+
+    init = ir.create_op_call(
+        "system.aiv_initialize_pipe",
+        [z, z],
+        {"dir_mask": 1, "slot_size": 256, "id": 7},
+        span,
+    )
+    assert init.kwargs["id"] == 7
+
+
+def test_tpop_ops_return_tile_type():
+    """Test tpop ops return TileType when constructed with explicit type."""
+    span = ir.Span.unknown()
+    tile_type = ir.TileType([64], DataType.FP32)
+
+    for op_name in ["tile.tpop_from_aic", "tile.tpop_from_aiv"]:
+        op = ir.get_op(op_name)
+        call = ir.Call(op, [], {"split": 0}, tile_type, span)
+        assert isinstance(call.type, ir.TileType)
+        assert call.type.shape == [64]
+        assert call.type.dtype == DataType.FP32
+
+
+def test_initialize_pipe_ops():
+    """Test initialize_pipe ops take two i32 buffer operands and return UnknownType.
+
+    dir_mask=1: only C2V is active; c2v_consumer_buf must be concrete, v2c uses placeholder zero.
+    """
+    span = ir.Span.unknown()
+    z = ConstInt(0, DataType.INT32, span)
+    c2v_base = ir.Var("c2v_base", ir.ScalarType(DataType.INT32), span)
+
+    for op_name in ["system.aic_initialize_pipe", "system.aiv_initialize_pipe"]:
+        call = ir.create_op_call(op_name, [c2v_base, z], {"dir_mask": 1, "slot_size": 256}, span)
+        assert isinstance(call.type, ir.UnknownType)
+
+
+def test_reserve_buffer_op():
+    """Test reserve_buffer op accepts no args and returns ScalarType(INT32)."""
+    span = ir.Span.unknown()
+    call = ir.create_op_call("system.reserve_buffer", [], {"name": "shared_buf", "size": 1024}, span)
+    assert isinstance(call.type, ir.ScalarType)
+    assert call.type.dtype == DataType.INT32
+
+
+def test_import_peer_buffer_op():
+    """Test import_peer_buffer op accepts no args and returns ScalarType(INT32)."""
+    span = ir.Span.unknown()
+    call = ir.create_op_call(
+        "system.import_peer_buffer", [], {"name": "shared_buf", "peer_func": "aic_kernel"}, span
+    )
+    assert isinstance(call.type, ir.ScalarType)
+    assert call.type.dtype == DataType.INT32
+
+
+def test_cross_core_ops_registered():
+    """Test all cross-core ops are registered."""
+    op_names = [
+        "tile.tpush_to_aiv",
+        "tile.tpush_to_aic",
+        "tile.tpop_from_aic",
+        "tile.tpop_from_aiv",
+        "system.aic_initialize_pipe",
+        "system.aiv_initialize_pipe",
+        "system.reserve_buffer",
+        "system.import_peer_buffer",
+        "system.set_ffts",
+        "system.sync_set",
+        "system.sync_wait",
+    ]
+    for name in op_names:
+        assert ir.is_op_registered(name), f"{name} should be registered"
+
+
+def test_set_ffts_accepts_a3_workspace_tensor():
+    """The FFTS setup op accepts a practical one-dimensional INT64 workspace."""
+    span = ir.Span.unknown()
+    workspace = ir.Var("ffts_workspace", ir.TensorType([256], DataType.INT64), span)
+
+    call = system_ops.set_ffts(workspace, span=span)
+
+    assert isinstance(call.type, ir.UnknownType)
+    assert call.args == [workspace]
+
+
+@pytest.mark.parametrize(
+    ("shape", "dtype", "message"),
+    [
+        ([255], DataType.INT64, "at least 256"),
+        ([256], DataType.INT32, "INT64"),
+        ([16, 16], DataType.INT64, "1-D"),
+    ],
+)
+def test_set_ffts_rejects_invalid_workspace(shape, dtype, message):
+    """Reject workspaces that PTOAS cannot use as its A3 FFTS backing store."""
+    workspace = ir.Var("ffts_workspace", ir.TensorType(shape, dtype), ir.Span.unknown())
+    with pytest.raises((TypeError, ValueError), match=message):
+        system_ops.set_ffts(workspace)
+
+
+def test_cross_core_sync_static_and_dynamic_event_ids():
+    """Cross-core sync accepts either a user event id or a dynamic index operand."""
+    span = ir.Span.unknown()
+
+    static_set = system_ops.sync_set(
+        3, pipe=ir.PipeType.FIX, ffts_mode=1, core_type=system_ops.KernelType.AIV, span=span
+    )
+    assert isinstance(static_set.type, ir.UnknownType)
+    assert static_set.args == []
+    assert static_set.kwargs == {
+        "pipe": int(ir.PipeType.FIX),
+        "event_id": 3,
+        "ffts_mode": 1,
+        "core_type": "aiv",
+    }
+
+    event_id = ir.Var("event_id", ir.ScalarType(DataType.INDEX), span)
+    dynamic_wait = system_ops.sync_wait(
+        event_id, pipe=ir.PipeType.MTE3, core_type=system_ops.KernelType.AIC, span=span
+    )
+    assert isinstance(dynamic_wait.type, ir.UnknownType)
+    assert dynamic_wait.args == [event_id]
+    assert "event_id" not in dynamic_wait.kwargs
+    assert dynamic_wait.kwargs["core_type"] == "aic"
+
+
+def test_pipeline_flags_static_and_dynamic_ir():
+    span = ir.Span.unknown()
+    set_call = system_ops.set_flag(ir.PipeType.MTE2, ir.PipeType.V, 7, span=span)
+    event = ir.Var("event", ir.ScalarType(DataType.INDEX), span)
+    wait_call = system_ops.wait_flag(
+        ir.PipeType.MTE2, ir.PipeType.V, event, core_type=system_ops.KernelType.AIV, span=span
+    )
+    assert isinstance(set_call.type, ir.UnknownType)
+    assert set_call.args == []
+    assert set_call.kwargs["event_id"] == 7
+    assert wait_call.args == [event]
+    assert "event_id" not in wait_call.kwargs
+    assert wait_call.kwargs["core_type"] == "aiv"
+
+
+@pytest.mark.parametrize("event_id", [-1, 8, True])
+def test_pipeline_flag_rejects_invalid_static_event(event_id):
+    with pytest.raises((TypeError, ValueError)):
+        system_ops.set_flag(ir.PipeType.MTE2, ir.PipeType.V, event_id)
+
+
+def test_pipeline_flag_rejects_invalid_ir():
+    span = ir.Span.unknown()
+    with pytest.raises((TypeError, ValueError), match="different"):
+        system_ops.set_flag(ir.PipeType.V, ir.PipeType.V)
+    with pytest.raises((TypeError, ValueError), match="concrete"):
+        ir.create_op_call(
+            "system.wait_flag",
+            [],
+            {"src_pipe": ir.PipeType.ALL, "dst_pipe": ir.PipeType.V, "event_id": 0},
+            span,
+        )
+    bad_event = ir.Var("event", ir.ScalarType(DataType.INT32), span)
+    with pytest.raises((TypeError, ValueError), match="INDEX"):
+        system_ops.wait_flag(ir.PipeType.MTE2, ir.PipeType.V, bad_event)
+
+
+@pytest.mark.parametrize("core_type", ["aic", "aiv", "aic_only", "mix", 0])
+def test_cross_core_sync_rejects_non_enum_core_type(core_type):
+    """``core_type`` is enum-only: the lowered attr spelling is not an input."""
+    with pytest.raises(TypeError, match="core_type must be a KernelType member"):
+        system_ops.sync_set(0, pipe=ir.PipeType.FIX, core_type=core_type)
+
+
+def test_cross_core_sync_rejects_mix_kernel():
+    """An event pins one kernel; landing in both is spelled by omitting core_type."""
+    with pytest.raises(ValueError, match="Omit core_type"):
+        system_ops.sync_set(0, pipe=ir.PipeType.FIX, core_type=system_ops.KernelType.MIX)
+
+
+@pytest.mark.parametrize("event_id", [-1, 14])
+def test_cross_core_sync_rejects_reserved_or_out_of_range_event_ids(event_id):
+    """Only event ids 0..13 are available to user-authored cross-core sync."""
+    with pytest.raises(ValueError, match="event_id"):
+        system_ops.sync_set(event_id, pipe=ir.PipeType.FIX)
+
+
+def test_cross_core_sync_rejects_non_index_dynamic_event_id():
+    """PTO's dynamic event operand is index-typed."""
+    event_id = ir.Var("event_id", ir.ScalarType(DataType.INT32), ir.Span.unknown())
+    with pytest.raises(ValueError, match=r"ScalarType\(INDEX\)"):
+        system_ops.sync_wait(event_id, pipe=ir.PipeType.MTE3)
+
+
+@pytest.mark.parametrize("ffts_mode", [-1, 3])
+def test_cross_core_sync_rejects_invalid_ffts_mode(ffts_mode):
+    """PTO sync.set accepts FFTS modes 0, 1, and 2 only."""
+    with pytest.raises(ValueError, match="ffts_mode"):
+        system_ops.sync_set(0, pipe=ir.PipeType.FIX, ffts_mode=ffts_mode)
+
+
+def test_aiv_shard_halves_split_axis():
+    """tile.aiv_shard halves the split axis: UP_DOWN -> axis0, LEFT_RIGHT -> axis1."""
+    span = ir.Span.unknown()
+    tile_var = ir.Var("t", ir.TileType([16, 128], DataType.FP32), span)
+
+    up_down = ir.create_op_call("tile.aiv_shard", [tile_var], {"split": 1}, span)
+    assert isinstance(up_down.type, ir.TileType)
+    assert up_down.type.shape == [8, 128]
+    assert up_down.type.dtype == DataType.FP32
+
+    left_right = ir.create_op_call("tile.aiv_shard", [tile_var], {"split": 2}, span)
+    assert isinstance(left_right.type, ir.TileType)
+    assert left_right.type.shape == [16, 64]
+    assert left_right.type.dtype == DataType.FP32
+
+
+def test_aic_gather_doubles_split_axis():
+    """tile.aic_gather is the inverse of aiv_shard: it doubles the split axis."""
+    span = ir.Span.unknown()
+
+    up_down = ir.create_op_call(
+        "tile.aic_gather", [ir.Var("t", ir.TileType([8, 128], DataType.FP32), span)], {"split": 1}, span
+    )
+    assert isinstance(up_down.type, ir.TileType)
+    assert up_down.type.shape == [16, 128]
+
+    left_right = ir.create_op_call(
+        "tile.aic_gather", [ir.Var("t", ir.TileType([16, 64], DataType.FP32), span)], {"split": 2}, span
+    )
+    assert isinstance(left_right.type, ir.TileType)
+    assert left_right.type.shape == [16, 128]
+
+
+def _tile(shape, valid=None, dtype=DataType.FP32):
+    """A 2D tile type, optionally with a partial valid_shape."""
+    view = ir.TileView(valid_shape=valid) if valid is not None else None
+    return ir.TileType(shape, dtype, None, view)
+
+
+def test_shard_allows_ragged_split_axis_when_columns_are_full():
+    """A per-lane ROW extent is carried by the boundary, so UP_DOWN raggedness is legal.
+
+    The deducer still reports the lane-agnostic ceil-div here; the true per-lane
+    extent is materialized later by LowerAutoVectorSplit, which is the only place
+    the subblock index is in scope.
+    """
+    span = ir.Span.unknown()
+    tile_var = ir.Var("t", _tile([16, 128], [5, 128]), span)
+
+    shard = ir.create_op_call("tile.aiv_shard", [tile_var], {"split": 1}, span)
+    assert isinstance(shard.type, ir.TileType)
+    assert shard.type.shape == [8, 128]
+
+
+def test_shard_rejects_ragged_split_axis_on_left_right():
+    """LEFT_RIGHT makes the COLUMN extent per-lane, and the FIFO pins that field."""
+    span = ir.Span.unknown()
+    tile_var = ir.Var("t", _tile([16, 128], [16, 32]), span)
+
+    with pytest.raises(ValueError, match="LEFT_RIGHT splits the column axis"):
+        ir.create_op_call("tile.aiv_shard", [tile_var], {"split": 2}, span)
+
+
+def test_shard_rejects_ragged_row_with_narrowed_columns():
+    """A per-lane row extent and a narrowed column extent cannot both be carried.
+
+    The row rides on the TPOP valid_row operand; the narrowed column can only be
+    restored by the static pto.treshape, which rebuilds both axes at once.
+    """
+    span = ir.Span.unknown()
+    tile_var = ir.Var("t", _tile([16, 128], [5, 32]), span)
+
+    with pytest.raises(ValueError, match="per-lane row extent"):
+        ir.create_op_call("tile.aiv_shard", [tile_var], {"split": 1}, span)
+
+
+def test_shard_rejects_runtime_valued_narrow_columns():
+    """pto.treshape carries no operands, so a runtime column extent has no carrier."""
+    span = ir.Span.unknown()
+    valid_col = ir.Var("valid_col", ir.ScalarType(DataType.INDEX), span)
+    tile_var = ir.Var("t", _tile([16, 128], [16, valid_col]), span)
+
+    with pytest.raises(ValueError, match="is a runtime value narrower than the physical box"):
+        ir.create_op_call("tile.aiv_shard", [tile_var], {"split": 1}, span)
+
+
+def test_shard_allows_static_narrow_columns():
+    """A static column narrowing is restorable by treshape after a full-box transport."""
+    span = ir.Span.unknown()
+    tile_var = ir.Var("t", _tile([16, 128], [16, 32]), span)
+
+    shard = ir.create_op_call("tile.aiv_shard", [tile_var], {"split": 1}, span)
+    assert isinstance(shard.type, ir.TileType)
+    assert shard.type.shape == [8, 128]
+
+
+@pytest.mark.parametrize("split", [0, 1, 2])
+@pytest.mark.parametrize(
+    ("layout", "shape", "target"),
+    [
+        (ir.TileLayout.row_major, [32, 4], ir.MemorySpace.LeftScale),
+        (ir.TileLayout.col_major, [4, 32], ir.MemorySpace.RightScale),
+    ],
+)
+def test_gather_preserves_mx_scale_layout(split, layout, shape, target):
+    """A gathered public MX scale remains usable by its cube scale operand."""
+    span = ir.Span.unknown()
+    source = ir.Var(
+        "scale",
+        ir.TileType(
+            shape,
+            DataType.FP8E8M0,
+            tile_view=ir.TileView(blayout=layout, slayout=layout, fractal=32),
+            memory_space=ir.MemorySpace.Vec,
+        ),
+        span,
+    )
+    gathered = ir.create_op_call("tile.aic_gather", [source], {"split": split}, span)
+    # Exercise the actual consumer before checking metadata: this used to raise
+    # "requires the source Mat tile to use the matching row/row/32 layout".
+    moved = ir.create_op_call("tile.move", [gathered], {"target_memory": target}, span)
+    expected_shape = shape.copy()
+    if split:
+        expected_shape[split - 1] *= 2
+    assert isinstance(moved.type, ir.TileType)
+    assert isinstance(gathered.type, ir.TileType)
+    assert moved.type.shape == expected_shape
+    view = gathered.type.get_effective_tile_view()
+    assert (view.blayout, view.slayout, view.fractal) == (layout, layout, 32)
+
+
+@pytest.mark.parametrize("split", [0, 1, 2])
+@pytest.mark.parametrize("layout", [ir.TensorLayout.MX_A_ZZ, ir.TensorLayout.MX_B_NN])
+def test_tensor_gather_preserves_mx_scale_layout(split, layout):
+    span = ir.Span.unknown()
+    source = ir.Var(
+        "scale",
+        ir.TensorType([32, 32], DataType.FP8E8M0, tensor_view=ir.TensorView([], layout)),
+        span,
+    )
+    gathered = ir.create_op_call("tensor.aic_gather", [source], {"split": split}, span)
+    assert isinstance(gathered.type, ir.TensorType)
+    assert gathered.type.tensor_view is not None
+    assert gathered.type.tensor_view.layout == layout
+
+
+def test_gather_defers_the_band_rule_to_lowering():
+    """The deducer does NOT judge whether the two lanes' bands abut.
+
+    It runs before the per-lane extents exist, so the only extent it can see is
+    its own lane-agnostic ceil-div guess. Judging the join on that both
+    misreports the numbers and rejects shapes that are representable once the
+    lanes are localized, so LowerAutoVectorSplit owns the rule (and types the
+    join exactly) instead. Guarded here so the check does not drift back.
+    """
+    span = ir.Span.unknown()
+    tile_var = ir.Var("t", _tile([8, 128], [5, 128]), span)
+
+    gathered = ir.create_op_call("tile.aic_gather", [tile_var], {"split": 1}, span)
+    assert isinstance(gathered.type, ir.TileType)
+    assert gathered.type.shape == [16, 128]
+
+
+def test_gather_allows_a_lane_dependent_split_axis():
+    """A lane-dependent extent is the compiler's own clamp: lane 0 saturates, so the
+    bands abut and the re-joined region is a rectangle. It must not be rejected."""
+    span = ir.Span.unknown()
+    lane_rows = ir.Var("lane_rows", ir.ScalarType(DataType.INDEX), span)
+    tile_var = ir.Var("t", _tile([8, 128], [lane_rows, 128]), span)
+
+    gathered = ir.create_op_call("tile.aic_gather", [tile_var], {"split": 1}, span)
+    assert isinstance(gathered.type, ir.TileType)
+    assert gathered.type.shape == [16, 128]
+
+
+def test_split_reshape_rejects_non_2d_tile():
+    """aiv_shard / aic_gather require a 2D tile."""
+    span = ir.Span.unknown()
+    tile_var = ir.Var("t", ir.TileType([2, 16, 128], DataType.FP32), span)
+
+    with pytest.raises(ValueError, match="2D tile"):
+        ir.create_op_call("tile.aiv_shard", [tile_var], {"split": 1}, span)
+    with pytest.raises(ValueError, match="2D tile"):
+        ir.create_op_call("tile.aic_gather", [tile_var], {"split": 1}, span)
+
+
+def test_split_reshape_rejects_bad_split_attr():
+    """split names the authored MODE — 0, 1 or 2; the pto-isa codes live on tpush/tpop."""
+    span = ir.Span.unknown()
+    tile_var = ir.Var("t", ir.TileType([16, 128], DataType.FP32), span)
+
+    for bad in (-1, 3):
+        with pytest.raises(ValueError, match="split must be"):
+            ir.create_op_call("tile.aiv_shard", [tile_var], {"split": bad}, span)
+
+
+def test_split_reshape_preserves_shape_at_split_zero():
+    """split=0 (a ``mode=NONE`` region) is a crossing, not a split: shape preserved.
+
+    Both ops mean "this value crosses the AIC/AIV boundary". A task-parallel
+    region has no split axis, so there is nothing to halve (shard) or re-join
+    (gather) — the type comes out identical to the operand's.
+    """
+    span = ir.Span.unknown()
+    tile_view = ir.TileView(
+        valid_shape=[ir.ConstInt(13, DataType.INDEX, span), ir.ConstInt(100, DataType.INDEX, span)]
+    )
+    tile_var = ir.Var("t", ir.TileType([16, 128], DataType.FP32, None, tile_view), span)
+
+    for op_name in ("tile.aiv_shard", "tile.aic_gather"):
+        call = ir.create_op_call(op_name, [tile_var], {"split": 0}, span)
+        result = call.type
+        assert isinstance(result, ir.TileType), op_name
+        assert result.shape == [16, 128], op_name
+        assert result.tile_view is not None, op_name
+        valid_0, valid_1 = result.tile_view.valid_shape
+        assert isinstance(valid_0, ir.ConstInt) and isinstance(valid_1, ir.ConstInt), op_name
+        assert [valid_0.value, valid_1.value] == [13, 100], op_name
+
+
+def test_split_reshape_at_split_zero_allows_non_2d():
+    """The rank-2 requirement exists only to disambiguate UP_DOWN / LEFT_RIGHT.
+
+    Neither applies at split=0, so a crossing of a rank-3 tile is accepted and
+    passes the shape through untouched.
+    """
+    span = ir.Span.unknown()
+    tile_var = ir.Var("t", ir.TileType([2, 16, 128], DataType.FP32), span)
+
+    call = ir.create_op_call("tile.aic_gather", [tile_var], {"split": 0}, span)
+    result = call.type
+    assert isinstance(result, ir.TileType)
+    assert result.shape == [2, 16, 128]
+
+
+def test_split_reshape_at_split_zero_skips_even_extent_guard():
+    """An odd split-axis extent is only a problem when the axis is halved."""
+    span = ir.Span.unknown()
+    tile_var = ir.Var("t", ir.TileType([15, 128], DataType.FP32), span)
+
+    call = ir.create_op_call("tile.aiv_shard", [tile_var], {"split": 0}, span)
+    result = call.type
+    assert isinstance(result, ir.TileType)
+    assert result.shape == [15, 128]
+
+
+def test_aiv_shard_shards_an_odd_split_axis_to_the_ceil_half():
+    """An odd split axis shards to the CEIL half — both lanes get the same box.
+
+    pto-isa's TILE_UP_DOWN_ODD gives lane 0 ``rows / 2 + 1`` and lane 1
+    ``rows / 2``. A type function does not know the lane, so the deduced box is
+    the ceil half for both and the raggedness is carried by the per-lane valid
+    extent that LowerAutoVectorSplit materializes.
+    """
+    span = ir.Span.unknown()
+    tile_var = ir.Var("t", ir.TileType([15, 128], DataType.FP32), span)
+
+    sharded = ir.create_op_call("tile.aiv_shard", [tile_var], {"split": 1}, span)
+    assert isinstance(sharded.type, ir.TileType)
+    assert sharded.type.shape == [8, 128]  # ceil(15 / 2)
+
+
+def test_aiv_shard_allows_even_physical_with_odd_valid_shape():
+    """The even-extent guard applies to the physical split axis, not a partial valid_shape.
+
+    A tile whose physical split extent is even (16) but whose valid_shape is an odd
+    partial (15) must be accepted; the result valid_shape is ceil-halved (8) and stays
+    consistent with the halved physical extent (8). Per-lane valid localization happens
+    later at lowering time, which knows the subblock index.
+    """
+    span = ir.Span.unknown()
+    tile_view = ir.TileView(
+        valid_shape=[ir.ConstInt(13, DataType.INDEX, span), ir.ConstInt(128, DataType.INDEX, span)]
+    )
+    tile_type = ir.TileType([16, 128], DataType.FP32, memref=None, tile_view=tile_view, memory_space=None)
+    tile_var = ir.Var("t", tile_type, span)
+
+    # Physical extent 16 is even, so the shard is accepted even though valid (13) is odd.
+    sharded = ir.create_op_call("tile.aiv_shard", [tile_var], {"split": 1}, span)
+    sharded_type = sharded.type
+    assert isinstance(sharded_type, ir.TileType)
+    assert sharded_type.shape == [8, 128]
+    # Result valid (7 = ceil(13/2)) differs from the halved physical (8), so the view is observable.
+    assert sharded_type.tile_view is not None
+    valid_0 = sharded_type.tile_view.valid_shape[0]
+    valid_1 = sharded_type.tile_view.valid_shape[1]
+    assert isinstance(valid_0, ir.ConstInt)
+    assert isinstance(valid_1, ir.ConstInt)
+    assert valid_0.value == 7  # ceil(13 / 2)
+    assert valid_1.value == 128
+
+
+def test_split_reshape_halves_dynamic_physical_extent_symbolically():
+    """A dynamic (non-ConstInt) split-axis physical extent is reshaped to a
+    symbolic floordiv (shard) / mul (gather), not left as an identity reshape."""
+    span = ir.Span.unknown()
+    n = ir.Var("n", ir.ScalarType(DataType.INDEX), span)
+    tile_type = ir.TileType([n, ir.ConstInt(128, DataType.INDEX, span)], DataType.FP32)
+    tile_var = ir.Var("t", tile_type, span)
+
+    sharded = ir.create_op_call("tile.aiv_shard", [tile_var], {"split": 1}, span)
+    assert isinstance(sharded.type, ir.TileType)
+    half0 = sharded.type.shape[0]
+    assert not isinstance(half0, ir.ConstInt)  # symbolic floordiv(n, 2)
+    assert half0 is not n  # transformed, not an identity passthrough
+
+    gathered = ir.create_op_call("tile.aic_gather", [tile_var], {"split": 1}, span)
+    assert isinstance(gathered.type, ir.TileType)
+    assert gathered.type.shape[0] is not n  # symbolic n * 2
+
+
+def test_split_reshape_halves_dynamic_valid_shape_symbolically():
+    """A dynamic split-axis valid_shape is reshaped symbolically instead of
+    passing through unchanged (the static physical extent is still halved)."""
+    span = ir.Span.unknown()
+    valid_n = ir.Var("valid_n", ir.ScalarType(DataType.INDEX), span)
+    tile_view = ir.TileView(valid_shape=[valid_n, ir.ConstInt(128, DataType.INDEX, span)])
+    tile_type = ir.TileType([16, 128], DataType.FP32, memref=None, tile_view=tile_view, memory_space=None)
+    tile_var = ir.Var("t", tile_type, span)
+
+    sharded = ir.create_op_call("tile.aiv_shard", [tile_var], {"split": 1}, span)
+    assert isinstance(sharded.type, ir.TileType)
+    assert sharded.type.shape == [8, 128]  # static physical still halved
+    assert sharded.type.tile_view is not None
+    valid_0 = sharded.type.tile_view.valid_shape[0]
+    assert not isinstance(valid_0, ir.ConstInt)  # symbolic ceil-div
+    assert valid_0 is not valid_n  # transformed, not an identity passthrough
+
+
+def test_aic_gather_allows_odd_split_axis():
+    """aic_gather doubles the axis, so an odd extent is fine (no even constraint)."""
+    span = ir.Span.unknown()
+    tile_var = ir.Var("t", ir.TileType([15, 128], DataType.FP32), span)
+
+    call = ir.create_op_call("tile.aic_gather", [tile_var], {"split": 1}, span)
+    assert isinstance(call.type, ir.TileType)
+    assert call.type.shape == [30, 128]
+
+
+def test_tensor_cross_core_ops_registered():
+    """The tensor-level split-axis ops are registered alongside the tile ops."""
+    for name in ("tensor.aiv_shard", "tensor.aic_gather"):
+        assert ir.is_op_registered(name), f"{name} should be registered"
+
+
+def test_tensor_aiv_shard_halves_split_axis():
+    """tensor.aiv_shard halves the split axis: UP_DOWN -> axis0, LEFT_RIGHT -> axis1."""
+    span = ir.Span.unknown()
+    tensor_var = ir.Var("t", ir.TensorType([16, 128], DataType.FP32), span)
+
+    up_down = ir.create_op_call("tensor.aiv_shard", [tensor_var], {"split": 1}, span)
+    assert isinstance(up_down.type, ir.TensorType)
+    assert up_down.type.shape == [8, 128]
+    assert up_down.type.dtype == DataType.FP32
+
+    left_right = ir.create_op_call("tensor.aiv_shard", [tensor_var], {"split": 2}, span)
+    assert isinstance(left_right.type, ir.TensorType)
+    assert left_right.type.shape == [16, 64]
+    assert left_right.type.dtype == DataType.FP32
+
+
+def test_tensor_aic_gather_doubles_split_axis():
+    """tensor.aic_gather is the inverse of tensor.aiv_shard: it doubles the split axis."""
+    span = ir.Span.unknown()
+
+    up_down = ir.create_op_call(
+        "tensor.aic_gather", [ir.Var("t", ir.TensorType([8, 128], DataType.FP32), span)], {"split": 1}, span
+    )
+    assert isinstance(up_down.type, ir.TensorType)
+    assert up_down.type.shape == [16, 128]
+
+    left_right = ir.create_op_call(
+        "tensor.aic_gather", [ir.Var("t", ir.TensorType([16, 64], DataType.FP32), span)], {"split": 2}, span
+    )
+    assert isinstance(left_right.type, ir.TensorType)
+    assert left_right.type.shape == [16, 128]
+
+
+def test_tensor_split_reshape_rejects_non_2d_tensor():
+    """tensor.aiv_shard / aic_gather require a 2D tensor (rank-2 gate, with reshape hint)."""
+    span = ir.Span.unknown()
+    tensor_var = ir.Var("t", ir.TensorType([2, 16, 128], DataType.FP32), span)
+
+    with pytest.raises(ValueError, match="2D tensor"):
+        ir.create_op_call("tensor.aiv_shard", [tensor_var], {"split": 1}, span)
+    with pytest.raises(ValueError, match="Reshape the operand to 2D"):
+        ir.create_op_call("tensor.aic_gather", [tensor_var], {"split": 1}, span)
+
+
+def test_tensor_split_reshape_rejects_tile_type():
+    """tensor.aiv_shard rejects a TileType operand — that is the tile op's domain."""
+    span = ir.Span.unknown()
+    tile_var = ir.Var("t", ir.TileType([16, 128], DataType.FP32), span)
+
+    with pytest.raises(ValueError, match="TensorType"):
+        ir.create_op_call("tensor.aiv_shard", [tile_var], {"split": 1}, span)
+
+
+def test_tensor_split_reshape_rejects_distributed_tensor():
+    """tensor.aiv_shard rejects a DistributedTensorType — distributed is out of scope."""
+    span = ir.Span.unknown()
+    dist_var = ir.Var("t", ir.DistributedTensorType([16, 128], DataType.FP32), span)
+
+    with pytest.raises(ValueError, match="non-distributed"):
+        ir.create_op_call("tensor.aiv_shard", [dist_var], {"split": 1}, span)
+
+
+def test_tensor_split_reshape_rejects_bad_split_attr():
+    """split names the authored MODE — 0, 1 or 2; the pto-isa codes live on tpush/tpop."""
+    span = ir.Span.unknown()
+    tensor_var = ir.Var("t", ir.TensorType([16, 128], DataType.FP32), span)
+
+    for bad in (-1, 3):
+        with pytest.raises(ValueError, match="split must be"):
+            ir.create_op_call("tensor.aiv_shard", [tensor_var], {"split": bad}, span)
+
+
+def test_tensor_split_reshape_preserves_shape_at_split_zero():
+    """Tensor mirror of the tile deducer: split=0 crosses without splitting."""
+    span = ir.Span.unknown()
+    tensor_view = ir.TensorView(
+        [],
+        ir.TensorLayout.ND,
+        [ir.ConstInt(13, DataType.INDEX, span), ir.ConstInt(100, DataType.INDEX, span)],
+    )
+    tensor_var = ir.Var("t", ir.TensorType([16, 128], DataType.FP32, None, tensor_view), span)
+
+    for op_name in ("tensor.aiv_shard", "tensor.aic_gather"):
+        call = ir.create_op_call(op_name, [tensor_var], {"split": 0}, span)
+        result = call.type
+        assert isinstance(result, ir.TensorType), op_name
+        assert result.shape == [16, 128], op_name
+        assert result.tensor_view is not None, op_name
+        valid_0, valid_1 = result.tensor_view.valid_shape
+        assert isinstance(valid_0, ir.ConstInt) and isinstance(valid_1, ir.ConstInt), op_name
+        assert [valid_0.value, valid_1.value] == [13, 100], op_name
+
+
+def test_tensor_split_reshape_at_split_zero_allows_non_2d():
+    """No split axis at split=0, so the 2D-reshape requirement does not apply."""
+    span = ir.Span.unknown()
+    tensor_var = ir.Var("t", ir.TensorType([2, 16, 128], DataType.FP32), span)
+
+    call = ir.create_op_call("tensor.aic_gather", [tensor_var], {"split": 0}, span)
+    result = call.type
+    assert isinstance(result, ir.TensorType)
+    assert result.shape == [2, 16, 128]
+
+
+def test_tensor_aiv_shard_shards_an_odd_split_axis_to_the_ceil_half():
+    """Tensor mirror of the tile deducer: an odd axis shards to the ceil half."""
+    span = ir.Span.unknown()
+    tensor_var = ir.Var("t", ir.TensorType([15, 128], DataType.FP32), span)
+
+    sharded = ir.create_op_call("tensor.aiv_shard", [tensor_var], {"split": 1}, span)
+    assert isinstance(sharded.type, ir.TensorType)
+    assert sharded.type.shape == [8, 128]  # ceil(15 / 2)
+
+
+def test_tensor_aiv_shard_allows_even_physical_with_odd_valid_shape():
+    """The even-extent guard applies to the physical split axis, not a partial valid_shape.
+
+    Mirrors the tile behavior: physical extent 16 (even) is accepted even though the
+    valid_shape (13) is odd; the result valid is ceil-halved (7)."""
+    span = ir.Span.unknown()
+    tensor_view = ir.TensorView(
+        [],
+        ir.TensorLayout.ND,
+        [ir.ConstInt(13, DataType.INDEX, span), ir.ConstInt(128, DataType.INDEX, span)],
+    )
+    tensor_type = ir.TensorType([16, 128], DataType.FP32, None, tensor_view)
+    tensor_var = ir.Var("t", tensor_type, span)
+
+    sharded = ir.create_op_call("tensor.aiv_shard", [tensor_var], {"split": 1}, span)
+    assert isinstance(sharded.type, ir.TensorType)
+    assert sharded.type.shape == [8, 128]
+    assert sharded.type.tensor_view is not None
+    valid_0 = sharded.type.tensor_view.valid_shape[0]
+    valid_1 = sharded.type.tensor_view.valid_shape[1]
+    assert isinstance(valid_0, ir.ConstInt)
+    assert isinstance(valid_1, ir.ConstInt)
+    assert valid_0.value == 7  # ceil(13 / 2)
+    assert valid_1.value == 128
+
+
+def test_tensor_split_reshape_halves_dynamic_extent_symbolically():
+    """A dynamic split-axis physical extent is reshaped to a symbolic floordiv (shard)
+    / mul (gather), matching the tile deducer."""
+    span = ir.Span.unknown()
+    n = ir.Var("n", ir.ScalarType(DataType.INDEX), span)
+    tensor_type = ir.TensorType([n, ir.ConstInt(128, DataType.INDEX, span)], DataType.FP32)
+    tensor_var = ir.Var("t", tensor_type, span)
+
+    sharded = ir.create_op_call("tensor.aiv_shard", [tensor_var], {"split": 1}, span)
+    assert isinstance(sharded.type, ir.TensorType)
+    half0 = sharded.type.shape[0]
+    assert not isinstance(half0, ir.ConstInt)  # symbolic floordiv(n, 2)
+    assert half0 is not n  # transformed, not an identity passthrough
+
+    gathered = ir.create_op_call("tensor.aic_gather", [tensor_var], {"split": 1}, span)
+    assert isinstance(gathered.type, ir.TensorType)
+    assert gathered.type.shape[0] is not n  # symbolic n * 2
+
+
+def test_dsl_aiv_shard_aic_gather_require_split_aiv_scope():
+    """The eager pl.aiv_shard / pl.aic_gather DSL wrappers raise: the split mode is
+    inherited from the enclosing pl.split_aiv scope, which only exists during a
+    @pl.program parse, so they cannot be constructed eagerly."""
+    span = ir.Span.unknown()
+    tile = pl.Tile(expr=ir.Var("t", ir.TileType([16, 128], DataType.FP32), span))
+
+    with pytest.raises(RuntimeError, match="pl.split_aiv"):
+        pl.aiv_shard(tile)
+
+    with pytest.raises(RuntimeError, match="pl.split_aiv"):
+        pl.aic_gather(tile)
+
+
+def test_mixed_kernel_expanded_property():
+    """Test IRProperty.MixedKernelExpanded works with IRPropertySet."""
+    prop_set = passes.IRPropertySet()
+    prop_set.insert(passes.IRProperty.MixedKernelExpanded)
+    assert prop_set.contains(passes.IRProperty.MixedKernelExpanded)
+    assert not prop_set.contains(passes.IRProperty.SSAForm)
+
+    prop_set.remove(passes.IRProperty.MixedKernelExpanded)
+    assert not prop_set.contains(passes.IRProperty.MixedKernelExpanded)
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

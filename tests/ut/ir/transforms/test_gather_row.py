@@ -1,0 +1,426 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+
+"""Unit tests for tensor.create_l1 + tensor.gather_row (kernel-driven paged gather into L1).
+
+These two tensor-level ops are the flexible counterpart to tensor.paged_gather: the
+kernel itself computes the physical source row per slot (block-table lookups,
+multi-source selection, invalid clamping) and fills an on-chip (L1/Mat) accumulator
+row by row. They are deduced as TensorType so the gathered result composes with
+tensor-level matmul / softmax, and lower (in ConvertTensorToTileOps) to:
+
+    tensor.create_l1  -> tile.create(target_memory=Mat)   (transpose -> ZN Mat layout)
+    tensor.gather_row -> tile.gather_row                   (per-row pto.subview + GM->Mat tload)
+
+``transpose=True`` builds a matmul ``b_trans`` B-operand: create_l1 allocates the
+transposed Mat (ZN) fractal and gather_row places each GM row [r, c] as an L1
+column [c, r].
+"""
+
+import inspect
+
+import pypto.language as pl
+import pytest
+from pypto import ir, passes
+from pypto.backend import BackendType, is_backend_configured, set_backend_type
+from pypto.ir.op import tensor_ops as _ir_tensor_ops
+from pypto.ir.op import tile_ops as _ir_tile_ops
+from pypto.ir.pass_manager import OptimizationStrategy, PassManager
+from pypto.language.op import tensor_ops as _dsl_tensor_ops
+from pypto.language.op import tile_ops as _dsl_tile_ops
+from pypto.language.parser.diagnostics import InvalidOperationError
+
+
+def _build_program(
+    *,
+    transpose: bool = False,
+    rows: int = 16,
+    head_dim: int = 128,
+    nsrc: int = 256,
+):
+    """A kernel that fills an L1 accumulator row by row via create_l1 + gather_row.
+
+    The caller computes each physical source row itself (here a trivial ``r``);
+    the gathered tile is returned so the lowering is observable.
+    """
+    acc_shape = [head_dim, rows] if transpose else [rows, head_dim]
+
+    @pl.program
+    class Program:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(self, src: pl.Tensor[[nsrc, head_dim], pl.BF16]) -> pl.Tensor[acc_shape, pl.BF16]:
+            kv = pl.create_l1(acc_shape, pl.BF16, transpose=transpose)
+            for r in pl.range(rows):
+                if transpose:
+                    # GM row [r, :] lands as the L1 column [:, r].
+                    kv = pl.gather_row(kv, src, [0, r], [r, 0], [1, head_dim], transpose=True)
+                else:
+                    kv = pl.gather_row(kv, src, [r, 0], [r, 0], [1, head_dim])
+            return kv
+
+        @pl.function
+        def main(self, src: pl.Tensor[[nsrc, head_dim], pl.BF16]) -> pl.Tensor[acc_shape, pl.BF16]:
+            r = self.kernel(src)
+            return r
+
+    return Program
+
+
+def _build_straightline(*, transpose: bool):
+    """Already-SSA straight-line kernel: two literal-offset gathers into an L1 tile.
+
+    Mirrors test_paged_gather's convert-only setup so ConvertTensorToTileOps runs
+    standalone (no ConvertToSSA needed) and the literal offsets survive printing,
+    making the row-vs-column write distinction assertable. The caller uses the
+    ``r = self.kernel(...); return r`` form so the convert pass injects the
+    DPS ``Out`` argument at the call site (a bare ``return self.kernel(...)`` is
+    not rewritten, leaving an inconsistent call the roundtrip check would reject).
+    """
+    acc_shape = [128, 16] if transpose else [16, 128]
+    # Branch in Python (not in the traced kernel source — an in-body `if` would
+    # emit a both-branch IfStmt that violates SSA before ConvertToSSA runs). A
+    # transposing gather writes the GM row as the L1 column [0, slot]; a plain
+    # gather writes it as the L1 row [slot, 0].
+    dst0 = [0, 0]
+    dst1 = [0, 1] if transpose else [1, 0]
+
+    @pl.program
+    class Program:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(self, src: pl.Tensor[[256, 128], pl.BF16]) -> pl.Tensor[acc_shape, pl.BF16]:
+            kv0 = pl.create_l1(acc_shape, pl.BF16, transpose=transpose)
+            kv1 = pl.gather_row(kv0, src, dst0, [0, 0], [1, 128], transpose=transpose)
+            kv2 = pl.gather_row(kv1, src, dst1, [1, 0], [1, 128], transpose=transpose)
+            return kv2
+
+        @pl.function
+        def main(self, src: pl.Tensor[[256, 128], pl.BF16]) -> pl.Tensor[acc_shape, pl.BF16]:
+            r = self.kernel(src)
+            return r
+
+    return Program
+
+
+def _print_after_convert(program) -> str:
+    after = passes.convert_tensor_to_tile_ops()(program)
+    # format=False keeps each statement on one line, so substring assertions are
+    # not split by the formatter's line-wrapping (the long ZN TileView annotation
+    # would otherwise wrap the transpose-case create/gather_row calls).
+    return ir.python_print(after, format=False)
+
+
+def test_create_l1_lowers_to_mat_tile():
+    """tensor.create_l1 lowers to a static L1 (Mat) tile.create."""
+    text = _print_after_convert(_build_straightline(transpose=False))
+    assert "pl.tile.create([16, 128]" in text
+    assert "target_memory=pl.Mem.Mat" in text
+    # Default (non-transpose) allocation requests no transposed layout.
+    assert "transpose=False" in text
+
+
+def test_gather_row_lowers_to_tile_gather_row():
+    """tensor.gather_row lowers to the per-row tile.gather_row, no Vec round-trip."""
+    text = _print_after_convert(_build_straightline(transpose=False))
+    # GM row written straight into the accumulator row slot [0, 0] / [1, 0].
+    assert "pl.tile.gather_row(" in text
+    assert "[0, 0], [0, 0], [1, 128], transpose=False)" in text
+    assert "[1, 0], [1, 0], [1, 128], transpose=False)" in text
+    # No tile.assemble (an unsupported MAT->MAT tmov) and src is not preloaded into Vec.
+    assert "pl.tile.assemble(" not in text
+    assert "target_memory=pl.Mem.Vec" not in text
+
+
+def test_create_l1_transpose_allocates_zn_layout():
+    """transpose=True allocates the transposed Mat (ZN) fractal: blayout row / slayout col."""
+    text = _print_after_convert(_build_straightline(transpose=True))
+    # Accumulator shape is the transposed [head_dim, rows].
+    assert "pl.tile.create([128, 16]" in text
+    assert "transpose=True" in text
+    assert "blayout=pl.TileLayout.row_major" in text
+    assert "slayout=pl.TileLayout.col_major" in text
+
+
+def test_gather_row_transpose_writes_column():
+    """transpose=True forwards to tile.gather_row and writes the GM row as a column."""
+    text = _print_after_convert(_build_straightline(transpose=True))
+    assert "pl.tile.gather_row(" in text
+    # Destination offset [0, slot]: the GM row lands as the L1 column at that slot.
+    assert "[0, 0], [0, 0], [1, 128], transpose=True)" in text
+    assert "[0, 1], [1, 0], [1, 128], transpose=True)" in text
+
+
+def test_tile_gather_row_dsl_interface_roundtrips():
+    """The exposed ``pl.tile.gather_row`` DSL wrapper round-trips through the parser.
+
+    A hand-authored tile-level kernel writes GM rows straight into a Mat tile via
+    ``pl.tile.gather_row`` (no tensor-level ``create_l1`` / lowering involved).
+    Printing and re-parsing must reproduce the same IR, which exercises the
+    language wrapper dispatch path (``_dsl_tile.gather_row``) rather than the raw
+    IR-builder fallback the printer previously round-tripped through.
+    """
+
+    @pl.program
+    class Program:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(self, src: pl.Tensor[[256, 128], pl.BF16]) -> pl.Tile[[16, 128], pl.BF16, pl.Mem.Mat]:
+            kv0 = pl.tile.create([16, 128], dtype=pl.BF16, target_memory=pl.Mem.Mat)
+            kv1 = pl.tile.gather_row(kv0, src, [0, 0], [0, 0], [1, 128])
+            kv2 = pl.tile.gather_row(kv1, src, [1, 0], [1, 0], [1, 128], transpose=False)
+            return kv2
+
+        @pl.function
+        def main(self, src: pl.Tensor[[256, 128], pl.BF16]) -> pl.Tile[[16, 128], pl.BF16, pl.Mem.Mat]:
+            return self.kernel(src)
+
+    text = ir.python_print(Program, format=False)
+    assert "pl.tile.gather_row(" in text
+    reparsed = pl.parse(text)
+    ir.assert_structural_equal(Program, reparsed)
+
+
+def test_gather_row_rejects_dtype_mismatch():
+    """acc and src must share dtype (matmul operand integrity)."""
+    with pytest.raises(InvalidOperationError, match="share dtype"):
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(self, src: pl.Tensor[[256, 128], pl.FP16]) -> pl.Tensor[[16, 128], pl.BF16]:
+                kv = pl.create_l1([16, 128], pl.BF16)
+                kv = pl.gather_row(kv, src, [0, 0], [0, 0], [1, 128])
+                return kv
+
+
+def test_gather_row_forwards_valid_shape_to_tile_op():
+    """The optional valid_shape rides through ConvertTensorToTileOps verbatim.
+
+    ``shapes`` sizes the pto.subview (a static attribute in the PTO dialect), so a
+    dynamic transfer length has to travel as a separate operand. Here both are
+    static, which makes the forwarded 6th operand assertable in printed IR.
+    """
+
+    @pl.program
+    class Program:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(self, src: pl.Tensor[[256, 128], pl.BF16]) -> pl.Tensor[[16, 128], pl.BF16]:
+            kv0 = pl.create_l1([16, 128], pl.BF16)
+            # Window is 4 rows; only 3 of them are actually transferred.
+            kv1 = pl.gather_row(kv0, src, [0, 0], [0, 0], [4, 128], valid_shape=[3, 128])
+            return kv1
+
+        @pl.function
+        def main(self, src: pl.Tensor[[256, 128], pl.BF16]) -> pl.Tensor[[16, 128], pl.BF16]:
+            r = self.kernel(src)
+            return r
+
+    text = _print_after_convert(Program)
+    assert "pl.tile.gather_row(" in text
+    # valid_shape prints as a kwarg: `transpose` owns the 6th positional slot in
+    # the DSL, so the operand cannot be emitted positionally without changing what
+    # an existing `gather_row(..., shapes, True)` call means.
+    assert "[0, 0], [0, 0], [4, 128], valid_shape=[3, 128], transpose=False)" in text
+
+
+def test_gather_row_valid_shape_roundtrips():
+    """A dynamic valid_shape survives print -> parse.
+
+    The runtime extent is a genuine SSA operand (not an attr) precisely so it can
+    be a runtime value; this pins that the printer emits it positionally and the
+    parser threads it back to the same IR.
+    """
+
+    @pl.program
+    class Program:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self, src: pl.Tensor[[256, 128], pl.BF16], n: pl.Tensor[[1], pl.INT32]
+        ) -> pl.Tile[[16, 128], pl.BF16, pl.Mem.Mat]:
+            rows = pl.cast(pl.read(n, [0]), pl.INDEX)
+            kv0 = pl.tile.create([16, 128], dtype=pl.BF16, target_memory=pl.Mem.Mat)
+            kv1 = pl.tile.gather_row(kv0, src, [0, 0], [0, 0], [16, 128], valid_shape=[rows, 128])
+            return kv1
+
+        @pl.function
+        def main(
+            self, src: pl.Tensor[[256, 128], pl.BF16], n: pl.Tensor[[1], pl.INT32]
+        ) -> pl.Tile[[16, 128], pl.BF16, pl.Mem.Mat]:
+            return self.kernel(src, n)
+
+    text = ir.python_print(Program, format=False)
+    assert "pl.tile.gather_row(" in text
+    reparsed = pl.parse(text)
+    ir.assert_structural_equal(Program, reparsed)
+
+
+def test_gather_row_rejects_valid_shape_exceeding_shapes():
+    """A provable valid_shape > shapes is rejected at type deduction."""
+    with pytest.raises(InvalidOperationError, match="provably exceeds physical shape extent"):
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(self, src: pl.Tensor[[256, 128], pl.BF16]) -> pl.Tensor[[16, 128], pl.BF16]:
+                kv = pl.create_l1([16, 128], pl.BF16)
+                kv = pl.gather_row(kv, src, [0, 0], [0, 0], [4, 128], valid_shape=[5, 128])
+                return kv
+
+
+@pytest.mark.parametrize("valid_shape", [[4], []])
+def test_gather_row_rejects_valid_shape_rank_mismatch(valid_shape):
+    """valid_shape must match the rank of shapes.
+
+    The empty case matters on its own: ValidateValidShapeBounds reads an empty
+    valid shape as "implicitly fully valid" and accepts it, which is right for a
+    type but wrong for an explicit operand — without the rank check it would reach
+    the backend and trip an INTERNAL_CHECK instead of telling the user.
+    """
+    with pytest.raises(InvalidOperationError, match="valid_shape to have the same rank as shapes"):
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(self, src: pl.Tensor[[256, 128], pl.BF16]) -> pl.Tensor[[16, 128], pl.BF16]:
+                kv = pl.create_l1([16, 128], pl.BF16)
+                kv = pl.gather_row(kv, src, [0, 0], [0, 0], [4, 128], valid_shape=valid_shape)
+                return kv
+
+
+def test_gather_row_valid_shape_is_keyword_only():
+    """Adding valid_shape must not re-bind an existing positional `transpose`.
+
+    `gather_row(..., shapes, True)` was a valid call before valid_shape existed.
+    Had valid_shape taken the 6th slot, that call would silently pass `True` as a
+    shape and fail with an opaque "'Scalar' object is not iterable", so it is
+    keyword-only in all four wrappers. Asserted on the signatures because that is
+    the contract an external caller binds against.
+    """
+    wrappers = [
+        (_dsl_tensor_ops.gather_row, "pl.gather_row"),
+        (_dsl_tile_ops.gather_row, "pl.tile.gather_row"),
+        (_ir_tensor_ops.gather_row, "ir.op.tensor_ops.gather_row"),
+        (_ir_tile_ops.gather_row, "ir.op.tile_ops.gather_row"),
+    ]
+    for fn, name in wrappers:
+        params = list(inspect.signature(fn).parameters.values())
+        positional = [p.name for p in params if p.kind is p.POSITIONAL_OR_KEYWORD]
+        keyword_only = [p.name for p in params if p.kind is p.KEYWORD_ONLY]
+        assert positional[5] == "transpose", f"{name}: 6th positional is {positional[5]!r}, not 'transpose'"
+        assert "valid_shape" in keyword_only, f"{name}: valid_shape must be keyword-only"
+
+
+def test_gather_row_rejects_non_integer_valid_shape():
+    """A fractional extent is rejected rather than reaching lowering.
+
+    The bounds proofs answer "unknown" for a non-integer scalar instead of
+    rejecting it, so without an explicit dtype check `valid_shape=[1.5, 128]`
+    would pass deduction.
+    """
+    with pytest.raises(InvalidOperationError, match="valid_shape\\[0\\] to be an integer extent"):
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(self, src: pl.Tensor[[256, 128], pl.BF16]) -> pl.Tensor[[16, 128], pl.BF16]:
+                kv = pl.create_l1([16, 128], pl.BF16)
+                # Deliberately ill-typed: this asserts the *runtime* rejection.
+                kv = pl.gather_row(kv, src, [0, 0], [0, 0], [4, 128], valid_shape=[1.5, 128])  # type: ignore[list-item]
+                return kv
+
+
+def test_gather_row_rejects_dynamic_shapes_at_trace_time():
+    """A runtime `shapes` fails where the user wrote it, and names valid_shape as the fix.
+
+    `shapes` sizes the pto.subview, whose `sizes` the PTO dialect types as a static
+    attribute, so a dynamic window is unrepresentable. Catching it in the deducer
+    (rather than in the backend) is what makes the error land on the pl.gather_row
+    line.
+    """
+    with pytest.raises(InvalidOperationError, match="Pass a dynamic row count through valid_shape instead"):
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self, src: pl.Tensor[[256, 128], pl.BF16], n: pl.Tensor[[1], pl.INT32]
+            ) -> pl.Tensor[[16, 128], pl.BF16]:
+                rows = pl.cast(pl.read(n, [0]), pl.INDEX)
+                kv = pl.create_l1([16, 128], pl.BF16)
+                kv = pl.gather_row(kv, src, [0, 0], [0, 0], [rows, 128])
+                return kv
+
+
+def test_gather_row_rejects_dynamic_valid_shape_with_transpose():
+    """Dynamic valid_shape + transpose=True is refused, at trace time.
+
+    The transposing gather lowers through a DN2NZ tload, which would need a runtime
+    *column* extent on a boxed NZ tile — unverified on device, so it is rejected
+    rather than silently emitted.
+    """
+    with pytest.raises(
+        InvalidOperationError, match="does not support a dynamic valid_shape together with transpose"
+    ):
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self, src: pl.Tensor[[256, 128], pl.BF16], n: pl.Tensor[[1], pl.INT32]
+            ) -> pl.Tensor[[128, 16], pl.BF16]:
+                rows = pl.cast(pl.read(n, [0]), pl.INDEX)
+                kv = pl.create_l1([128, 16], pl.BF16, transpose=True)
+                kv = pl.gather_row(
+                    kv, src, [0, 0], [0, 0], [16, 128], valid_shape=[rows, 128], transpose=True
+                )
+                return kv
+
+
+def test_create_l1_rejects_non_positive_shape():
+    """create_l1 shape dims must be positive compile-time ConstInt."""
+    with pytest.raises(InvalidOperationError, match="positive compile-time ConstInt"):
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(self, src: pl.Tensor[[256, 128], pl.BF16]) -> pl.Tensor[[16, 128], pl.BF16]:
+                kv = pl.create_l1([16, 0], pl.BF16)
+                kv = pl.gather_row(kv, src, [0, 0], [0, 0], [1, 128])
+                return kv
+
+
+def test_tile_create_transpose_rejects_non_mat():
+    """tile.create transpose=True is a Mat-only (L1) layout; a non-Mat space is rejected."""
+    with pytest.raises(
+        InvalidOperationError, match="transpose=true only for a 2D tile with target_memory=Mat"
+    ):
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(self, src: pl.Tensor[[256, 128], pl.BF16]) -> pl.Tensor[[256, 128], pl.BF16]:
+                # transpose on a Vec tile produces invalid Mat-ZN metadata — the CHECK
+                # fires here at tile.create during tracing, before the return.
+                pl.tile.create([16, 128], dtype=pl.BF16, target_memory=pl.Mem.Vec, transpose=True)
+                return src
+
+
+@pytest.mark.parametrize("transpose", [False, True])
+def test_gather_row_survives_full_pipeline(transpose):
+    """The create_l1 + per-row gather_row loop survives the full Default pipeline."""
+    # A backend may already be configured by an earlier test in the session;
+    # only set it when unconfigured so real set_backend_type failures still surface.
+    if not is_backend_configured():
+        set_backend_type(BackendType.Ascend910)
+    program = _build_program(transpose=transpose)
+    pm = PassManager.get_strategy(OptimizationStrategy.Default)
+    result = pm.run_passes(program)
+    assert result is not None
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

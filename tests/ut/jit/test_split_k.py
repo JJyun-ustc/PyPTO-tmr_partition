@@ -1,0 +1,662 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+
+"""End-to-end split-K matmul: a large-K reduction parallelised across cores.
+
+Each core multiplies an [M, KS] x [KS, N] K-slice and atomically adds its
+partial product into one global-memory output via
+``pl.assemble(..., atomic=pl.AtomicType.Add)``. The output is zero-initialised
+in-kernel before the parallel loop. This test compiles the pattern through the
+full pass pipeline and verifies the per-core kernel emits an atomic-add store.
+
+Mirrors ``examples/advanced/01_split_k.py``.
+"""
+
+import re
+
+import pypto
+import pypto.language as pl
+import pytest
+from pypto import backend, codegen, ir
+from pypto.backend import BackendType
+from pypto.debug import torch_codegen
+from pypto.jit.decorator import jit
+from pypto.runtime import RunConfig
+
+# Module-level constants — the JIT specializer inlines module-level ints.
+_M = 64
+_N = 64
+_K = 512
+_SPLIT = 4  # K reduction spread across 4 cores
+_KS = _K // _SPLIT  # per-core K-slice width
+
+# Down-projection-pattern constants (mirrors qwen3_decode's down_projection
+# kernel: split-K matmul into an fp32 accumulator, then residual + bf16 cast).
+_DM = 16
+_DN = 64
+_DK = 512
+_DSPLIT = 4
+_DKS = _DK // _DSPLIT
+
+
+@pytest.fixture(autouse=True)
+def _setup_backend():
+    backend.reset_for_testing()
+    backend.set_backend_type(BackendType.Ascend910)
+    yield
+    backend.reset_for_testing()
+
+
+def _split_k_program():
+    @jit
+    def matmul_split_k(a: pl.Tensor, b: pl.Tensor, c: pl.Out[pl.Tensor]):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="zero_init"):
+            c = pl.assemble(c, pl.full([_M, _N], dtype=pl.FP32, value=0.0), [0, 0])
+        for ks in pl.parallel(0, _SPLIT):
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="split_k"):
+                k0 = ks * _KS
+                a_k = a[:, k0 : k0 + _KS]
+                b_k = b[k0 : k0 + _KS, :]
+                partial = pl.matmul(a_k, b_k, out_dtype=pl.FP32)
+                c = pl.assemble(c, partial, [0, 0], atomic=pl.AtomicType.Add)
+        return c
+
+    return matmul_split_k
+
+
+def test_split_k_matmul_compiles():
+    """The split-K matmul compiles through the full pipeline into an entry + per-core kernel."""
+    torch = pytest.importorskip("torch")
+    post = _split_k_program().lower(torch.randn(_M, _K), torch.randn(_K, _N), torch.empty(_M, _N))
+    func_types = {f.func_type for f in post.functions.values()}
+    assert ir.FunctionType.Orchestration in func_types, f"expected an Orchestration entry, got {func_types}"
+    assert any(ir.is_incore_type(f.func_type) for f in post.functions.values()), (
+        f"expected an InCore-variant per-core kernel, got {func_types}"
+    )
+
+
+def test_split_k_matmul_emits_atomic_add_store():
+    """The per-core kernel accumulates its partial product with an atomic-add store."""
+    torch = pytest.importorskip("torch")
+    post = _split_k_program().lower(torch.randn(_M, _K), torch.randn(_K, _N), torch.empty(_M, _N))
+    incore = next(f for f in post.functions.values() if ir.is_incore_type(f.func_type))
+    mlir = codegen.PTOCodegen().generate(ir.Program([incore], incore.name, post.span))
+
+    tstore_lines = [line.strip() for line in mlir.splitlines() if "pto.tstore" in line]
+    assert tstore_lines, f"no pto.tstore emitted by the split-K kernel:\n{mlir}"
+    atomic_lines = [line for line in tstore_lines if "{atomicType = #pto<atomic_type atomic_add>}" in line]
+    assert atomic_lines, f"split-K partial product must be stored with atomic-add, got:\n{tstore_lines}"
+    # The partial is a fp32 matmul accumulator stored straight to GM — the cube
+    # (loc=acc) fix-pipe atomic-add store on the AIC kernel.
+    assert all("loc=acc" in line for line in atomic_lines), (
+        f"split-K atomic store must be a cube accumulator (loc=acc) store, got:\n{atomic_lines}"
+    )
+    assert "pto.tmatmul" in mlir, f"expected a matmul in the per-core kernel:\n{mlir}"
+
+
+def _orch_level_atomic_program():
+    """Split-K with the atomic assemble dedented OUT of the CORE_GROUP scope.
+
+    Identical to ``_split_k_program`` except the ``pl.assemble`` sits at the
+    orchestration level. There is no orchestration instruction that can perform
+    an atomic combine, and the atomic kwarg also blocks the create+assemble fold
+    that would otherwise point the kernel's output at a view of ``c`` — so the
+    partial products would land in a discarded per-iteration scratch buffer.
+    """
+
+    @jit
+    def orch_level_atomic(a: pl.Tensor, b: pl.Tensor, c: pl.Out[pl.Tensor]):
+        for ks in pl.parallel(0, _SPLIT):
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="split_k"):
+                k0 = ks * _KS
+                a_k = a[:, k0 : k0 + _KS]
+                b_k = b[k0 : k0 + _KS, :]
+                partial = pl.matmul(a_k, b_k, out_dtype=pl.FP32)
+            c = pl.assemble(c, partial, [0, 0], atomic=pl.AtomicType.Add)
+        return c
+
+    return orch_level_atomic
+
+
+def test_orchestration_level_atomic_assemble_rejected():
+    """An atomic assemble outside the CORE_GROUP scope is a compile error, not a silent drop."""
+    torch = pytest.importorskip("torch")
+    post = _orch_level_atomic_program().lower(torch.randn(_M, _K), torch.randn(_K, _N), torch.empty(_M, _N))
+    orch = next(f for f in post.functions.values() if f.func_type == ir.FunctionType.Orchestration)
+    with pytest.raises(ValueError, match=r"pl\.at\(level=pl\.Level\.CORE_GROUP"):
+        codegen.generate_orchestration(post, orch)
+
+
+def test_orchestration_level_plain_assemble_still_folds():
+    """The guard is atomic-only: a non-atomic orchestration assemble keeps folding to an alias.
+
+    Byte-identical to ``_orch_level_atomic_program`` minus the ``atomic`` kwarg.
+    Without it ``FuseCreateAssembleToSlice`` folds the assemble away and the
+    kernel's output tensor becomes a view of ``c``, so codegen must still
+    succeed and emit ``ext_c.view(...)`` rather than a discarded scratch alloc.
+    """
+    torch = pytest.importorskip("torch")
+
+    @jit
+    def orch_level_plain(a: pl.Tensor, b: pl.Tensor, c: pl.Out[pl.Tensor]):
+        for ks in pl.parallel(0, _SPLIT):
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="split_k"):
+                k0 = ks * _KS
+                a_k = a[:, k0 : k0 + _KS]
+                b_k = b[k0 : k0 + _KS, :]
+                partial = pl.matmul(a_k, b_k, out_dtype=pl.FP32)
+            c = pl.assemble(c, partial, [0, 0])
+        return c
+
+    post = orch_level_plain.lower(torch.randn(_M, _K), torch.randn(_K, _N), torch.empty(_M, _N))
+    orch = next(f for f in post.functions.values() if f.func_type == ir.FunctionType.Orchestration)
+    code = codegen.generate_orchestration(post, orch).code
+
+    assert "ext_c.view(" in code, (
+        f"non-atomic orchestration assemble must fold into a view of the target:\n{code}"
+    )
+    assert "alloc_tensors(" not in code, (
+        f"the kernel output must alias ext_c, not a discarded scratch buffer:\n{code}"
+    )
+
+
+def test_atomic_assemble_without_tile_source_rejected():
+    """An in-scope tensor-into-tensor atomic assemble has no store to carry the combine.
+
+    (The sibling tile-target case is covered by
+    ``tests/ut/codegen/test_pto_codegen_ops.py::test_atomic_add_tile_target_rejected``.)
+    """
+    torch = pytest.importorskip("torch")
+
+    @jit
+    def atomic_tensor_to_tensor(a: pl.Tensor, c: pl.Out[pl.Tensor]):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="copy"):
+            c = pl.assemble(c, a, [0, 0], atomic=pl.AtomicType.Add)
+        return c
+
+    with pytest.raises(ValueError, match=r"requires a tile source"):
+        atomic_tensor_to_tensor.lower(torch.randn(_M, _N), torch.empty(_M, _N))
+
+
+def _split_k_bf16_program():
+    """Split-K matmul accumulating directly into a bf16 output (no fp32 scratch).
+
+    Written exactly like the fp32 ``_split_k_program`` but with a bf16 output ``c``:
+    each core's fp32 matmul accumulator is atomic-added straight into the bf16 GM
+    target, letting the fix-pipe down-convert (fp32 Acc -> bf16 GM). This is the
+    direct bf16 atomic-add form enabled on A2/A3, replacing the
+    ``down_proj_split_k`` fp32-accumulator-then-cast workaround.
+    """
+
+    @jit
+    def matmul_split_k_bf16(a: pl.Tensor, b: pl.Tensor, c: pl.Out[pl.Tensor]):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="zero_init"):
+            c = pl.assemble(c, pl.full([_M, _N], dtype=pl.BF16, value=0.0), [0, 0])
+        for ks in pl.parallel(0, _SPLIT):
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="split_k"):
+                k0 = ks * _KS
+                a_k = a[:, k0 : k0 + _KS]
+                b_k = b[k0 : k0 + _KS, :]
+                partial = pl.matmul(a_k, b_k, out_dtype=pl.FP32)
+                c = pl.assemble(c, partial, [0, 0], atomic=pl.AtomicType.Add)
+        return c
+
+    return matmul_split_k_bf16
+
+
+def test_split_k_bf16_direct_emits_atomic_add_store():
+    """Direct-bf16 split-K emits a CUBE-unit bf16 atomic-add store (fix-pipe down-convert).
+
+    The fp32 matmul accumulator is atomic-added straight into the bf16 GM output.
+    The atomic-add ``pto.tstore`` lands on the cube (AIC) kernel with a
+    ``loc=acc, dtype=f32`` source tile and a bf16 destination view — the fix-pipe
+    Acc->GM path lowered via set_atomic_bf16. This is the true cube-unit bf16
+    atomic-add, and it lets bf16 split-K be written exactly like the fp32 form
+    (previously this required an fp32 scratch + explicit cast).
+    """
+    torch = pytest.importorskip("torch")
+    post = _split_k_bf16_program().lower(
+        torch.randn(_M, _K, dtype=torch.bfloat16),
+        torch.randn(_K, _N, dtype=torch.bfloat16),
+        torch.empty(_M, _N, dtype=torch.bfloat16),
+    )
+    incore = [f for f in post.functions.values() if ir.is_incore_type(f.func_type)]
+    assert incore, "expected at least one InCore kernel"
+    mlir = "\n".join(codegen.PTOCodegen().generate(ir.Program([f], f.name, post.span)) for f in incore)
+
+    tstore_lines = [line.strip() for line in mlir.splitlines() if "pto.tstore" in line]
+    assert tstore_lines, f"no pto.tstore emitted by the bf16 split-K kernels:\n{mlir}"
+    # The split-K partial is an accumulator (loc=acc) atomic-added into the bf16 GM
+    # target — the cube fix-pipe path. Its destination partition view is bf16.
+    atomic_acc_stores = [
+        line
+        for line in tstore_lines
+        if "{atomicType = #pto<atomic_type atomic_add>}" in line and "loc=acc" in line
+    ]
+    assert atomic_acc_stores, (
+        f"bf16 split-K must lower to a cube (loc=acc) atomic-add store, got:\n{tstore_lines}"
+    )
+    assert all(re.search(r"partition_tensor_view<[0-9x]+xbf16>", line) for line in atomic_acc_stores), (
+        f"the cube atomic-add store must target a bf16 GM partition view, got:\n{atomic_acc_stores}"
+    )
+    assert "pto.tmatmul" in mlir, f"expected a cube matmul across the InCore kernels:\n{mlir}"
+
+
+def _split_k_fp16_program():
+    """Split-K matmul accumulating directly into a fp16 output (fp32 Acc -> fp16 GM).
+
+    Like the bf16 variant but with a fp16 output: each core's fp32 matmul
+    accumulator is atomic-added straight into the fp16 GM target via the fix-pipe
+    (half is in the Acc->GM whitelist), lowered through set_atomic_f16.
+    """
+
+    @jit
+    def matmul_split_k_fp16(a: pl.Tensor, b: pl.Tensor, c: pl.Out[pl.Tensor]):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="zero_init"):
+            c = pl.assemble(c, pl.full([_M, _N], dtype=pl.FP16, value=0.0), [0, 0])
+        for ks in pl.parallel(0, _SPLIT):
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="split_k"):
+                k0 = ks * _KS
+                a_k = a[:, k0 : k0 + _KS]
+                b_k = b[k0 : k0 + _KS, :]
+                partial = pl.matmul(a_k, b_k, out_dtype=pl.FP32)
+                c = pl.assemble(c, partial, [0, 0], atomic=pl.AtomicType.Add)
+        return c
+
+    return matmul_split_k_fp16
+
+
+def test_split_k_fp16_direct_emits_atomic_add_store():
+    """Direct-fp16 split-K emits a CUBE-unit fp16 atomic-add store (set_atomic_f16).
+
+    An fp32 matmul accumulator atomic-added straight into a fp16 GM output — the
+    cube fix-pipe path (half is a legal Acc->GM destination dtype).
+    """
+    torch = pytest.importorskip("torch")
+    post = _split_k_fp16_program().lower(
+        torch.randn(_M, _K, dtype=torch.float16),
+        torch.randn(_K, _N, dtype=torch.float16),
+        torch.empty(_M, _N, dtype=torch.float16),
+    )
+    incore = [f for f in post.functions.values() if ir.is_incore_type(f.func_type)]
+    assert incore, "expected at least one InCore kernel"
+    mlir = "\n".join(codegen.PTOCodegen().generate(ir.Program([f], f.name, post.span)) for f in incore)
+
+    tstore_lines = [line.strip() for line in mlir.splitlines() if "pto.tstore" in line]
+    atomic_acc = [
+        line
+        for line in tstore_lines
+        if "{atomicType = #pto<atomic_type atomic_add>}" in line and "loc=acc" in line
+    ]
+    assert atomic_acc, f"fp16 split-K must lower to a cube (loc=acc) atomic-add store, got:\n{tstore_lines}"
+    assert all(re.search(r"partition_tensor_view<[0-9x]+xf16>", line) for line in atomic_acc), (
+        f"the cube atomic-add store must target a fp16 GM partition view, got:\n{atomic_acc}"
+    )
+    assert "pto.tmatmul" in mlir, f"expected a cube matmul across the InCore kernels:\n{mlir}"
+
+
+def _split_k_int32_program():
+    """Split-K matmul accumulating int32 partials (int8 x int8 -> int32 Acc).
+
+    Each core's int8 matmul produces an int32 accumulator that is atomic-added
+    directly into the int32 GM output — the cube (loc=acc) int32 atomic-add
+    (pto-isa set_atomic_s32) path.
+    """
+
+    @jit
+    def matmul_split_k_int32(a: pl.Tensor, b: pl.Tensor, c: pl.Out[pl.Tensor]):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="zero_init"):
+            c = pl.assemble(c, pl.full([_M, _N], dtype=pl.INT32, value=0), [0, 0])
+        for ks in pl.parallel(0, _SPLIT):
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="split_k"):
+                k0 = ks * _KS
+                a_k = a[:, k0 : k0 + _KS]
+                b_k = b[k0 : k0 + _KS, :]
+                partial = pl.matmul(a_k, b_k, out_dtype=pl.INT32)
+                c = pl.assemble(c, partial, [0, 0], atomic=pl.AtomicType.Add)
+        return c
+
+    return matmul_split_k_int32
+
+
+def test_split_k_int32_emits_atomic_add_store():
+    """int8-matmul split-K emits a CUBE-unit int32 atomic-add store (set_atomic_s32).
+
+    An int8 x int8 matmul yields an int32 accumulator (matmul.cpp defaults
+    non-float inputs to int32), atomic-added straight into the int32 GM output.
+    The atomic-add ``pto.tstore`` lands on the cube (AIC) kernel with a
+    ``loc=acc, dtype=i32`` source tile.
+    """
+    torch = pytest.importorskip("torch")
+    post = _split_k_int32_program().lower(
+        torch.randint(-4, 4, (_M, _K), dtype=torch.int8),
+        torch.randint(-4, 4, (_K, _N), dtype=torch.int8),
+        torch.zeros(_M, _N, dtype=torch.int32),
+    )
+    incore = [f for f in post.functions.values() if ir.is_incore_type(f.func_type)]
+    assert incore, "expected at least one InCore kernel"
+    mlir = "\n".join(codegen.PTOCodegen().generate(ir.Program([f], f.name, post.span)) for f in incore)
+
+    tstore_lines = [line.strip() for line in mlir.splitlines() if "pto.tstore" in line]
+    atomic_acc = [
+        line
+        for line in tstore_lines
+        if "{atomicType = #pto<atomic_type atomic_add>}" in line and "loc=acc" in line
+    ]
+    assert atomic_acc, f"int32 split-K must lower to a cube (loc=acc) atomic-add store, got:\n{tstore_lines}"
+    assert all("dtype=i32" in line for line in atomic_acc), (
+        f"the cube atomic-add store must be int32, got:\n{atomic_acc}"
+    )
+    assert "pto.tmatmul" in mlir, f"expected a cube matmul across the InCore kernels:\n{mlir}"
+
+
+def test_split_k_matmul_numerically_correct():
+    """Executing the split-K matmul (via torch_codegen) matches torch.matmul.
+
+    Drives the lowered IR through torch_codegen — which honours the atomic-add
+    store as an accumulate — so the per-core partial products sum to the full
+    product. This validates split-K end to end without the device toolchain.
+    """
+    torch = pytest.importorskip("torch")
+
+    torch.manual_seed(0)
+    a = torch.randn(_M, _K, dtype=torch.float32)
+    b = torch.randn(_K, _N, dtype=torch.float32)
+    c = torch.zeros(_M, _N, dtype=torch.float32)
+
+    post = _split_k_program().lower(a, b, c)
+    code = torch_codegen(post)
+    ns: dict = {}
+    exec(code, ns)  # noqa: S102 — executing generated reference code is the point
+
+    out = c.clone()
+    ns["matmul_split_k"](a, b, out)
+    expected = torch.matmul(a, b)
+    assert torch.allclose(out, expected, rtol=1e-3, atol=1e-3), (
+        f"split-K result mismatch: max abs diff {(expected - out).abs().max().item():.3e}"
+    )
+
+
+def _down_proj_split_k_program():
+    @jit
+    def down_proj_split_k(mlp: pl.Tensor, w_down: pl.Tensor, resid: pl.Tensor, out: pl.Out[pl.Tensor]):
+        # fp32 GM accumulator for the split-K partials — atomic-add needs an
+        # fp32 target, and `out` is bf16. Zero-initialised before the loop.
+        acc = pl.create_tensor([_DM, _DN], dtype=pl.FP32)
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="dp_zero_init"):
+            acc = pl.assemble(acc, pl.full([_DM, _DN], dtype=pl.FP32, value=0.0), [0, 0])
+        for ks in pl.parallel(0, _DSPLIT):
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="dp_split_k"):
+                k0 = ks * _DKS
+                mlp_k = mlp[:, k0 : k0 + _DKS]
+                w_k = w_down[k0 : k0 + _DKS, :]
+                part = pl.matmul(mlp_k, w_k, out_dtype=pl.FP32)
+                acc = pl.assemble(acc, part, [0, 0], atomic=pl.AtomicType.Add)
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="dp_residual"):
+            out = pl.assemble(out, pl.cast(pl.add(acc, resid), target_type=pl.BF16), [0, 0])
+        return out
+
+    return down_proj_split_k
+
+
+def test_split_k_down_projection_pattern_numerically_correct():
+    """A qwen3-style down projection (split-K matmul + residual + bf16 cast) is correct.
+
+    This is the kernel shape rewritten in ``qwen3_decode_split_k.py``: a split-K
+    reduction accumulating into an fp32 global-memory tensor, finalised by adding
+    the residual and casting to bf16.
+    """
+    torch = pytest.importorskip("torch")
+
+    torch.manual_seed(0)
+    mlp = torch.randn(_DM, _DK, dtype=torch.float32)
+    w_down = torch.randn(_DK, _DN, dtype=torch.float32)
+    resid = torch.randn(_DM, _DN, dtype=torch.float32)
+    out = torch.zeros(_DM, _DN, dtype=torch.bfloat16)
+
+    post = _down_proj_split_k_program().lower(mlp, w_down, resid, out)
+    code = torch_codegen(post)
+    ns: dict = {}
+    exec(code, ns)  # noqa: S102 — executing generated reference code is the point
+
+    actual = out.clone()
+    ns["down_proj_split_k"](mlp, w_down, resid, actual)
+    expected = (torch.matmul(mlp, w_down) + resid).bfloat16()
+    assert torch.allclose(actual.float(), expected.float(), rtol=2e-2, atol=2e-2), (
+        f"down-proj split-K mismatch: max abs diff "
+        f"{(actual.float() - expected.float()).abs().max().item():.3e}"
+    )
+
+
+# The DSL parser resolves dtype arguments syntactically, so each narrow-int
+# variant needs its dtype spelled as a literal rather than passed in.
+@jit
+def _split_k_i8_atomic(a: pl.Tensor, b: pl.Tensor, c: pl.Out[pl.Tensor]):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="zero_init"):
+        c = pl.assemble(c, pl.full([_M, _N], dtype=pl.INT8, value=0), [0, 0])
+    for ks in pl.parallel(0, _SPLIT):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="split_k"):
+            k0 = ks * _KS
+            partial = pl.matmul(a[:, k0 : k0 + _KS], b[k0 : k0 + _KS, :], out_dtype=pl.INT32)
+            c = pl.assemble(c, partial, [0, 0], atomic=pl.AtomicType.Add)
+    return c
+
+
+@jit
+def _split_k_i16_atomic(a: pl.Tensor, b: pl.Tensor, c: pl.Out[pl.Tensor]):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="zero_init"):
+        c = pl.assemble(c, pl.full([_M, _N], dtype=pl.INT16, value=0), [0, 0])
+    for ks in pl.parallel(0, _SPLIT):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="split_k"):
+            k0 = ks * _KS
+            partial = pl.matmul(a[:, k0 : k0 + _KS], b[k0 : k0 + _KS, :], out_dtype=pl.INT32)
+            c = pl.assemble(c, partial, [0, 0], atomic=pl.AtomicType.Add)
+    return c
+
+
+@jit
+def _split_k_i8_plain(a: pl.Tensor, b: pl.Tensor, c: pl.Out[pl.Tensor]):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="zero_init"):
+        c = pl.assemble(c, pl.full([_M, _N], dtype=pl.INT8, value=0), [0, 0])
+    for ks in pl.parallel(0, 1):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="mm"):
+            partial = pl.matmul(a, b, out_dtype=pl.INT32)
+            c = pl.assemble(c, partial, [0, 0])
+    return c
+
+
+@pytest.mark.parametrize(
+    "prog_name,out_dtype_name",
+    [("_split_k_i8_atomic", "int8"), ("_split_k_i16_atomic", "int16"), ("_split_k_i8_plain", "int8")],
+)
+def test_acc_to_gm_narrow_int_dest_rejected(prog_name, out_dtype_name):
+    """An Acc->GM store into an int8/int16 tensor fails AccToGmStoreValid.
+
+    ptoas would reject the resulting ``pto.tstore`` ("expects A2/A3 acc tstore
+    dst element type to be i32/f32/f16/bf16"), but only against a line in a
+    generated ``.pto``. The verifier catches it right after InferTileMemorySpace
+    — the first point where the tile's Acc residency is known — so the error
+    carries the user's own source span. The last case is non-atomic: the
+    whitelist is independent of the atomic kwarg.
+    """
+    torch = pytest.importorskip("torch")
+    prog = globals()[prog_name]
+    with pytest.raises(pypto.Error, match="AccToGmStoreValid"):
+        prog.lower(
+            torch.randint(-4, 4, (_M, _K), dtype=torch.int8),
+            torch.randint(-4, 4, (_K, _N), dtype=torch.int8),
+            torch.zeros(_M, _N, dtype=getattr(torch, out_dtype_name)),
+        )
+
+
+def _mm_int_acc_to_float_program():
+    """An int32 accumulator stored straight into an fp32 GM tensor.
+
+    The destination passes the backend whitelist (``fp32`` is in it), so only
+    the source-aware half of ``AccToGmStoreValid`` rejects this: the unscaled
+    fix-pipe writeback narrows ``f32 -> f16/bf16`` and has no ``int32 -> f32``
+    mode at all — that is a dequantization, and its scale has nowhere to live.
+    """
+
+    @jit
+    def mm_int_acc_to_f32(a: pl.Tensor, b: pl.Tensor, c: pl.Out[pl.Tensor]):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="mm_i32_f32"):
+            partial = pl.matmul(a, b, out_dtype=pl.INT32)
+            c = pl.assemble(c, partial, [0, 0])
+        return c
+
+    return mm_int_acc_to_f32
+
+
+def _mm_int_acc_to_float_no_out_dtype_program():
+    """The same store, reached without naming ``out_dtype`` at all.
+
+    ``pl.matmul``'s own guard only sees a request the caller spells out, so this
+    spelling reaches the store untouched — the accumulator is int32 either way,
+    because the operands decide it. It is what makes the verifier the load-bearing
+    half of the check rather than a second opinion.
+    """
+
+    @jit
+    def mm_int_acc_to_f32_default(a: pl.Tensor, b: pl.Tensor, c: pl.Out[pl.Tensor]):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="mm_i32_f32_def"):
+            partial = pl.matmul(a, b)
+            c = pl.assemble(c, partial, [0, 0])
+        return c
+
+    return mm_int_acc_to_f32_default
+
+
+@pytest.mark.parametrize(
+    "program_factory",
+    [_mm_int_acc_to_float_program, _mm_int_acc_to_float_no_out_dtype_program],
+    ids=["explicit_out_dtype", "default_out_dtype"],
+)
+def test_acc_to_gm_int_source_float_dest_rejected(program_factory):
+    """A whitelisted destination is still illegal from an integer accumulator.
+
+    ptoas accepts the resulting ``pto.tstore`` — ``f32`` is in its dst set — and
+    the failure lands in ccec inside pto-isa's ``TStoreAcc`` ("the 2nd parameter
+    maybe need a type '__cc__ float *'"), or, where the shape lets it compile,
+    in the numbers: the kernel writes raw int32 accumulator bits reinterpreted
+    as float.
+
+    Both spellings are covered because ``out_dtype`` is not the trigger, only
+    what makes the assignment *look* type-correct: omitting it produces the same
+    illegal store, so rejecting the bad ``out_dtype`` alone would leave the hole
+    open.
+    """
+    torch = pytest.importorskip("torch")
+    with pytest.raises(pypto.Error, match="AccToGmStoreValid"):
+        program_factory().lower(
+            torch.randint(-4, 4, (_M, _K), dtype=torch.int8),
+            torch.randint(-4, 4, (_K, _N), dtype=torch.int8),
+            torch.zeros(_M, _N, dtype=torch.float32),
+        )
+
+
+def _mm_via_vec_to_int8_program():
+    """The same narrow-int GM destination, reached legally through Vec.
+
+    An explicit ``pl.cast`` narrows the int32 accumulator in the vector unit, so
+    the store sources a Vec tile — a legal int8 store, not an Acc->GM one.
+    """
+
+    @jit
+    def mm_via_vec_to_i8(a: pl.Tensor, b: pl.Tensor, c: pl.Out[pl.Tensor]):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="mm_vec"):
+            partial = pl.matmul(a, b, out_dtype=pl.INT32)
+            narrowed = pl.cast(partial, pl.INT8)
+            c = pl.assemble(c, narrowed, [0, 0])
+        return c
+
+    return mm_via_vec_to_i8
+
+
+def _mm_acc_to_bf16_program():
+    """Cube matmul whose fp32 accumulator is stored straight into a bf16 output.
+
+    Deliberately non-atomic: this isolates the Acc->GM destination whitelist
+    (``AccToGmStoreValid``) from the separate bf16 atomic-add gate
+    (``AtomicAddDtypeValid``), which is A2/A3-only. The store keeps a
+    ``loc=acc, dtype=f32`` source and a bf16 destination, so it exercises the
+    fix-pipe down-convert.
+    """
+
+    @jit
+    def mm_acc_to_bf16(a: pl.Tensor, b: pl.Tensor, c: pl.Out[pl.Tensor]):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="mm_bf16"):
+            partial = pl.matmul(a, b, out_dtype=pl.FP32)
+            c = pl.assemble(c, partial, [0, 0])
+        return c
+
+    return mm_acc_to_bf16
+
+
+@pytest.mark.parametrize("platform", ["a2a3", "a5"])
+def test_acc_to_bf16_gm_store_compiles_on_both_backends(platform):
+    """The fix-pipe narrows an Acc tile into a bf16 GM tensor on A2/A3 *and* A5.
+
+    Both pinned layers accept the same non-quant Acc->GM destination set: ptoas
+    v0.57 verifies ``pto.tstore`` against ``i32/f32/f16/bf16`` for A2/A3 and A5
+    alike, and pto-isa 83d01313's ``CheckStaticAcc`` static_asserts the identical
+    four on both arches (its a5 ST suite covers a bf16 destination directly).
+    PyPTO's A5 entry used to omit BF16, so this program was rejected on A5 only
+    and users had to insert a needless ``pl.cast`` through the vector unit.
+    """
+    torch = pytest.importorskip("torch")
+    # The jit path selects its own backend from the RunConfig platform, so the
+    # arch is chosen here rather than by overriding the module fixture.
+    backend.reset_for_testing()
+    post = _mm_acc_to_bf16_program().lower(
+        torch.randn(_M, _K, dtype=torch.bfloat16),
+        torch.randn(_K, _N, dtype=torch.bfloat16),
+        torch.empty(_M, _N, dtype=torch.bfloat16),
+        config=RunConfig(platform=platform),
+    )
+    incore = [f for f in post.functions.values() if ir.is_incore_type(f.func_type)]
+    assert incore, "expected at least one InCore kernel"
+    mlir = "\n".join(codegen.PTOCodegen().generate(ir.Program([f], f.name, post.span)) for f in incore)
+
+    acc_stores = [line.strip() for line in mlir.splitlines() if "pto.tstore" in line and "loc=acc" in line]
+    assert acc_stores, f"expected a cube (loc=acc) store into the bf16 target:\n{mlir}"
+    assert all(re.search(r"partition_tensor_view<[0-9x]+xbf16>", line) for line in acc_stores), (
+        f"the Acc->GM store must target a bf16 GM partition view, got:\n{acc_stores}"
+    )
+    # Non-atomic: the bf16 atomic-add gate is a separate, still-A2/A3-only rule.
+    assert all("atomicType" not in line for line in acc_stores), (
+        f"this program must not emit an atomic combine, got:\n{acc_stores}"
+    )
+
+
+def test_int8_dest_via_vec_still_compiles():
+    """Regression guard against an over-strict AccToGmStoreValid.
+
+    Legality is a property of the tile's memory space, not of the user-visible
+    dtypes: this program has the identical INT32-matmul-into-INT8-tensor shape
+    as the rejected cases above, but routes through Vec and is legal. A check
+    phrased on dtypes alone (e.g. at the DSL level) would wrongly reject it.
+    """
+    torch = pytest.importorskip("torch")
+    post = _mm_via_vec_to_int8_program().lower(
+        torch.randint(-4, 4, (_M, _K), dtype=torch.int8),
+        torch.randint(-4, 4, (_K, _N), dtype=torch.int8),
+        torch.zeros(_M, _N, dtype=torch.int8),
+    )
+    incore = [f for f in post.functions.values() if ir.is_incore_type(f.func_type)]
+    mlir = "\n".join(codegen.PTOCodegen().generate(ir.Program([f], f.name, post.span)) for f in incore)
+    int8_stores = [line.strip() for line in mlir.splitlines() if "pto.tstore" in line and "xi8>" in line]
+    assert int8_stores, f"expected an int8 store in the vector kernel:\n{mlir}"
+    assert all("loc=vec" in line for line in int8_stores), (
+        f"the int8 store must source a Vec tile, not an Acc one:\n{int8_stores}"
+    )
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

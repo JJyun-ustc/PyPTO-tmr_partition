@@ -1,0 +1,1524 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+
+"""Unit tests for OutlineClusterScopes pass."""
+
+import pypto
+import pypto.language as pl
+import pytest
+from pypto import ir, passes
+
+
+def _funcs_by_type(prog, ftype):
+    """All functions in ``prog`` of the given FunctionType, in program order."""
+    return [f for f in prog.functions.values() if f.func_type == ftype]
+
+
+def _launch_calls(func):
+    """Dispatch Calls in ``func``'s top-level body that carry a launch spec."""
+    body = func.body
+    assert isinstance(body, ir.SeqStmts)
+    return [
+        s.value
+        for s in body.stmts
+        if isinstance(s, ir.AssignStmt) and isinstance(s.value, ir.Call) and "core_num" in s.value.attrs
+    ]
+
+
+class TestOutlineClusterScopes:
+    """Test OutlineClusterScopes pass."""
+
+    def test_outline_simple_cluster_scope(self):
+        """Test outlining a simple Cluster scope into a Group function."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                with pl.cluster():
+                    y: pl.Tensor[[64], pl.FP32] = pl.add(x, x)
+                return y
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.Group)
+            def main_cluster_0(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                y: pl.Tensor[[64], pl.FP32] = pl.add(x, x)
+                return y
+
+            @pl.function
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                y: pl.Tensor[[64], pl.FP32] = self.main_cluster_0(x)
+                return y
+
+        Before = passes.convert_to_ssa()(Before)
+        Expected = passes.convert_to_ssa()(Expected)
+        After = passes.outline_cluster_scopes()(Before)
+        ir.assert_structural_equal(After, Expected)
+
+    def test_outline_cluster_with_incore(self):
+        """Test outlining a Cluster scope containing an InCore scope."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                with pl.cluster():
+                    with pl.at(level=pl.Level.CORE_GROUP):
+                        y: pl.Tensor[[64], pl.FP32] = pl.add(x, x)
+                return y
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.Group)
+            def main_cluster_0(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                with pl.at(level=pl.Level.CORE_GROUP):
+                    y: pl.Tensor[[64], pl.FP32] = pl.add(x, x)
+                return y
+
+            @pl.function
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                y: pl.Tensor[[64], pl.FP32] = self.main_cluster_0(x)
+                return y
+
+        Before = passes.convert_to_ssa()(Before)
+        Expected = passes.convert_to_ssa()(Expected)
+        After = passes.outline_cluster_scopes()(Before)
+        ir.assert_structural_equal(After, Expected)
+
+    def test_outline_multiple_cluster_scopes(self):
+        """Test outlining multiple Cluster scopes in one function."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                with pl.cluster():
+                    y: pl.Tensor[[64], pl.FP32] = pl.add(x, x)
+                with pl.cluster():
+                    z: pl.Tensor[[64], pl.FP32] = pl.mul(y, y)
+                return z
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.Group)
+            def main_cluster_0(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                y: pl.Tensor[[64], pl.FP32] = pl.add(x, x)
+                return y
+
+            @pl.function(type=pl.FunctionType.Group)
+            def main_cluster_1(self, y: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                z: pl.Tensor[[64], pl.FP32] = pl.mul(y, y)
+                return z
+
+            @pl.function
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                y: pl.Tensor[[64], pl.FP32] = self.main_cluster_0(x)
+                z: pl.Tensor[[64], pl.FP32] = self.main_cluster_1(y)
+                return z
+
+        Before = passes.convert_to_ssa()(Before)
+        Expected = passes.convert_to_ssa()(Expected)
+        After = passes.outline_cluster_scopes()(Before)
+        ir.assert_structural_equal(After, Expected)
+
+    def test_no_cluster_scopes_passthrough(self):
+        """Test that functions without Cluster scopes are passed through unchanged."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                y: pl.Tensor[[64], pl.FP32] = pl.add(x, x)
+                return y
+
+        Before = passes.convert_to_ssa()(Before)
+        After = passes.outline_cluster_scopes()(Before)
+        ir.assert_structural_equal(After, Before)
+
+    def test_cluster_does_not_affect_incore_scopes(self):
+        """Test that OutlineClusterScopes does not outline InCore scopes."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                with pl.at(level=pl.Level.CORE_GROUP):
+                    y: pl.Tensor[[64], pl.FP32] = pl.add(x, x)
+                return y
+
+        Before = passes.convert_to_ssa()(Before)
+        After = passes.outline_cluster_scopes()(Before)
+        # InCore scopes should remain untouched by the cluster pass
+        ir.assert_structural_equal(After, Before)
+
+    def test_outline_standalone_spmd_scope(self):
+        """Standalone pl.spmd() should outline to a Spmd wrapper, not a Group."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                out: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                x_tile: pl.Tile[[64], pl.FP32] = pl.load(x, [0], [64])
+                y_tile: pl.Tile[[64], pl.FP32] = pl.add(x_tile, x_tile)
+                out: pl.Tensor[[64], pl.FP32] = pl.store(y_tile, [0], out)
+                return out
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                out: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                with pl.spmd(4, sync_start=True):
+                    out = self.kernel(x, out)
+                return out
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                out: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                x_tile: pl.Tile[[64], pl.FP32] = pl.load(x, [0], [64])
+                y_tile: pl.Tile[[64], pl.FP32] = pl.add(x_tile, x_tile)
+                out: pl.Tensor[[64], pl.FP32] = pl.store(y_tile, [0], out)
+                return out
+
+            # The launch spec rides on the DISPATCH, not the wrapper: core_num is
+            # evaluated in the caller's scope, so the callee must not carry it.
+            @pl.function(type=pl.FunctionType.Spmd)
+            def main_spmd_0(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                out: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                # Wrapper returns its own `out` param (the kernel writes through
+                # the Out arg), not the post-call SSA result var.
+                out_call = self.kernel(x, out)
+                return out
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                out: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                out = self.main_spmd_0(x, out, attrs={"core_num": 4, "sync_start": True})
+                return out
+
+        Before = passes.convert_to_ssa()(Before)
+        Expected = passes.convert_to_ssa()(Expected)
+        After = passes.outline_cluster_scopes()(Before)
+        ir.assert_structural_equal(After, Expected)
+
+    def test_outline_cluster_in_orchestration_function(self):
+        """Test that Cluster scopes in Orchestration functions are also outlined."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def compute(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                y: pl.Tensor[[64], pl.FP32] = pl.add(x, x)
+                return y
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                with pl.cluster():
+                    y: pl.Tensor[[64], pl.FP32] = self.compute(x)
+                return y
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def compute(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                y: pl.Tensor[[64], pl.FP32] = pl.add(x, x)
+                return y
+
+            @pl.function(type=pl.FunctionType.Group)
+            def main_cluster_0(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                y: pl.Tensor[[64], pl.FP32] = self.compute(x)
+                return y
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                y: pl.Tensor[[64], pl.FP32] = self.main_cluster_0(x)
+                return y
+
+        Before = passes.convert_to_ssa()(Before)
+        Expected = passes.convert_to_ssa()(Expected)
+        After = passes.outline_cluster_scopes()(Before)
+        ir.assert_structural_equal(After, Expected)
+
+    def test_cluster_scope_no_outputs(self):
+        """Test outlining a Cluster scope with no variables used after."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                with pl.cluster():
+                    _y: pl.Tensor[[64], pl.FP32] = pl.add(x, x)
+                return x
+
+        @pl.program
+        class Expected:
+            # _y is not used after the cluster scope, so the outlined Group
+            # function has no return types.
+            @pl.function(type=pl.FunctionType.Group)
+            def main_cluster_0(self, x: pl.Tensor[[64], pl.FP32]):
+                _y: pl.Tensor[[64], pl.FP32] = pl.add(x, x)
+
+            @pl.function
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                self.main_cluster_0(x)
+                return x
+
+        Before = passes.convert_to_ssa()(Before)
+        Expected = passes.convert_to_ssa()(Expected)
+        After = passes.outline_cluster_scopes()(Before)
+        ir.assert_structural_equal(After, Expected)
+
+    def test_cluster_round_trip(self):
+        """Test that cluster scope survives print -> parse round-trip."""
+
+        @pl.program
+        class Original:
+            @pl.function
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                with pl.cluster():
+                    y: pl.Tensor[[64], pl.FP32] = pl.add(x, x)
+                return y
+
+        printed = Original.as_python()
+        Reparsed = pl.parse_program(printed)
+        ir.assert_structural_equal(Original, Reparsed)
+
+    def test_cluster_multiple_outputs(self):
+        """Test outlining a Cluster scope with multiple output variables."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                with pl.cluster():
+                    y: pl.Tensor[[64], pl.FP32] = pl.add(x, x)
+                    z: pl.Tensor[[64], pl.FP32] = pl.mul(x, x)
+                w: pl.Tensor[[64], pl.FP32] = pl.add(y, z)
+                return w
+
+        @pl.program
+        class Expected:
+            # y and z are both used after the cluster scope, so the outlined
+            # Group function returns a 2-tuple.
+            @pl.function(type=pl.FunctionType.Group)
+            def main_cluster_0(
+                self, x: pl.Tensor[[64], pl.FP32]
+            ) -> tuple[pl.Tensor[[64], pl.FP32], pl.Tensor[[64], pl.FP32]]:
+                y: pl.Tensor[[64], pl.FP32] = pl.add(x, x)
+                z: pl.Tensor[[64], pl.FP32] = pl.mul(x, x)
+                return y, z
+
+            @pl.function
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                y, z = self.main_cluster_0(x)
+                w: pl.Tensor[[64], pl.FP32] = pl.add(y, z)
+                return w
+
+        Before = passes.convert_to_ssa()(Before)
+        Expected = passes.convert_to_ssa()(Expected)
+        After = passes.outline_cluster_scopes()(Before)
+        ir.assert_structural_equal(After, Expected)
+
+    def test_outline_spmd_for_loop_auto_outlines_incore(self):
+        """`for i in pl.spmd(N)` auto-outlines into Spmd + InCore.
+
+        The new loop form binds the iteration variable to
+        ``pl.tile.get_block_idx()`` inside an implicit InCoreScopeStmt,
+        giving inline tile ops direct access to the block index without a
+        separate ``@pl.function(type=InCore)`` declaration.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                a: pl.Tensor[[512, 128], pl.FP32],
+                out: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
+            ) -> pl.Tensor[[512, 128], pl.FP32]:
+                for i in pl.spmd(4):
+                    offset = i * 128
+                    tile_a: pl.Tile[[128, 128], pl.FP32] = pl.load(a, [offset, 0], [128, 128])
+                    out = pl.store(tile_a, [offset, 0], out)
+                return out
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                a: pl.Tensor[[512, 128], pl.FP32],
+                out: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
+            ) -> pl.Tensor[[512, 128], pl.FP32]:
+                i = pl.tile.get_block_idx()
+                offset = i * 128
+                tile_a: pl.Tile[[128, 128], pl.FP32] = pl.load(a, [offset, 0], [128, 128])
+                out_store = pl.store(tile_a, [offset, 0], out)
+                # The outline pass keeps the post-store SSA alias but returns
+                # the write param itself (param-identity returns, #1702).
+                out_final: pl.Tensor[[512, 128], pl.FP32] = out_store
+                return out
+
+            @pl.function(type=pl.FunctionType.Spmd)
+            def main_spmd_0(
+                self,
+                a: pl.Tensor[[512, 128], pl.FP32],
+                out: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
+            ) -> pl.Tensor[[512, 128], pl.FP32]:
+                out_call = self.main_incore_0(a, out)
+                return out
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                a: pl.Tensor[[512, 128], pl.FP32],
+                out: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
+            ) -> pl.Tensor[[512, 128], pl.FP32]:
+                out = self.main_spmd_0(a, out, attrs={"core_num": 4})
+                return out
+
+        Before = passes.convert_to_ssa()(Before)
+        Expected = passes.convert_to_ssa()(Expected)
+        After = passes.outline_incore_scopes()(Before)
+        After = passes.outline_cluster_scopes()(After)
+        ir.assert_structural_equal(After, Expected)
+
+    def test_outline_spmd_for_loop_uses_name_hint_on_incore(self):
+        """``for ... in pl.spmd(..., name_hint=...)`` names the outlined InCore kernel."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                a: pl.Tensor[[512, 128], pl.FP32],
+                out: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
+            ) -> pl.Tensor[[512, 128], pl.FP32]:
+                for i in pl.spmd(4, name_hint="q_proj_spmd"):
+                    offset = i * 128
+                    tile_a: pl.Tile[[128, 128], pl.FP32] = pl.load(a, [offset, 0], [128, 128])
+                    out = pl.store(tile_a, [offset, 0], out)
+                return out
+
+        @pl.program
+        class Expected:
+            # name_hint="q_proj_spmd" names the outlined Spmd wrapper, and the
+            # InCore kernel drops the "_spmd" suffix -> "q_proj" (instead of the
+            # default "main_incore_0" / "main_spmd_0").
+            @pl.function(type=pl.FunctionType.InCore)
+            def q_proj(
+                self,
+                a: pl.Tensor[[512, 128], pl.FP32],
+                out: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
+            ) -> pl.Tensor[[512, 128], pl.FP32]:
+                i = pl.tile.get_block_idx()
+                offset = i * 128
+                tile_a: pl.Tile[[128, 128], pl.FP32] = pl.load(a, [offset, 0], [128, 128])
+                out_store = pl.store(tile_a, [offset, 0], out)
+                # The outline pass keeps the post-store SSA alias but returns
+                # the write param itself (param-identity returns, #1702).
+                out_final: pl.Tensor[[512, 128], pl.FP32] = out_store
+                return out
+
+            @pl.function(type=pl.FunctionType.Spmd)
+            def q_proj_spmd(
+                self,
+                a: pl.Tensor[[512, 128], pl.FP32],
+                out: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
+            ) -> pl.Tensor[[512, 128], pl.FP32]:
+                out_call = self.q_proj(a, out)
+                return out
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                a: pl.Tensor[[512, 128], pl.FP32],
+                out: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
+            ) -> pl.Tensor[[512, 128], pl.FP32]:
+                out = self.q_proj_spmd(a, out, attrs={"core_num": 4})
+                return out
+
+        Before = passes.convert_to_ssa()(Before)
+        Expected = passes.convert_to_ssa()(Expected)
+        After = passes.outline_incore_scopes()(Before)
+        After = passes.outline_cluster_scopes()(After)
+        ir.assert_structural_equal(After, Expected)
+
+    def test_outline_spmd_for_loop_marks_assemble_dest_as_written(self):
+        """`for n0 in pl.spmd(N): out = pl.assemble(out, slice, [n0, ...])`
+        must lift `out` off ``In`` on both the outlined InCore and Spmd
+        wrapper. Without this, the orchestration codegen later drops the
+        SSA-result alias for the call and emits a use of an undeclared
+        ``out__ssa_vN`` C++ identifier. The body only writes ``out`` — the
+        assemble destination slot is its sole use — so the direction is ``Out``
+        rather than ``InOut`` (issue #2415).
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                a: pl.Tensor[[512, 128], pl.FP32],
+                out: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
+            ) -> pl.Tensor[[512, 128], pl.FP32]:
+                for n0 in pl.spmd(4):
+                    offset = n0 * 128
+                    chunk: pl.Tensor[[128, 128], pl.FP32] = pl.slice(a, [128, 128], [offset, 0])
+                    out = pl.assemble(out, chunk, [offset, 0])
+                return out
+
+        @pl.program
+        class Expected:
+            # `out` is the assemble destination and the body never reads it, so
+            # it becomes Out on both the outlined InCore kernel and the Spmd
+            # wrapper; `a` stays In.
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                a: pl.Tensor[[512, 128], pl.FP32],
+                out: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
+            ) -> pl.Tensor[[512, 128], pl.FP32]:
+                n0 = pl.tile.get_block_idx()
+                offset = n0 * 128
+                chunk: pl.Tensor[[128, 128], pl.FP32] = pl.slice(a, [128, 128], [offset, 0])
+                out_asm = pl.assemble(out, chunk, [offset, 0])
+                return out
+
+            @pl.function(type=pl.FunctionType.Spmd)
+            def main_spmd_0(
+                self,
+                a: pl.Tensor[[512, 128], pl.FP32],
+                out: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
+            ) -> pl.Tensor[[512, 128], pl.FP32]:
+                out_call = self.main_incore_0(a, out)
+                return out
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                a: pl.Tensor[[512, 128], pl.FP32],
+                out: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
+            ) -> pl.Tensor[[512, 128], pl.FP32]:
+                out = self.main_spmd_0(a, out, attrs={"core_num": 4})
+                return out
+
+        Before = passes.convert_to_ssa()(Before)
+        Expected = passes.convert_to_ssa()(Expected)
+        After = passes.outline_incore_scopes()(Before)
+        After = passes.outline_cluster_scopes()(After)
+        ir.assert_structural_equal(After, Expected)
+
+    def test_nested_spmd_in_cluster_propagates_sync_start(self):
+        """`with pl.cluster(): with pl.spmd(N, sync_start=True): ...` keeps a
+        single Group function and moves ``core_num``/``sync_start`` onto its
+        DISPATCH.
+
+        Semantics (outline_cluster_scopes_pass.cpp, UnwrapNestedSpmd): the
+        Cluster scope is outlined into a Group function whose body still
+        contains the nested ``SpmdScopeStmt``. UnwrapNestedSpmd then (a) replaces
+        the ``ScopeStmt(Spmd)`` with its body (the single kernel call), (b) hands
+        the launch spec to the call site — translated back through the dispatch's
+        args, since the spec was lifted from inside the callee — and (c) leaves
+        the self-contained ``spmd_unwrapped`` marker on the Group. No separate
+        Spmd wrapper is emitted — the doc's "Unwrap Nested Spmd in Group" step.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                out: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                x_tile: pl.Tile[[64], pl.FP32] = pl.load(x, [0], [64])
+                y_tile: pl.Tile[[64], pl.FP32] = pl.add(x_tile, x_tile)
+                out: pl.Tensor[[64], pl.FP32] = pl.store(y_tile, [0], out)
+                return out
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                out: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                with pl.cluster():
+                    with pl.spmd(4, sync_start=True):
+                        out = self.kernel(x, out)
+                return out
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                out: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                x_tile: pl.Tile[[64], pl.FP32] = pl.load(x, [0], [64])
+                y_tile: pl.Tile[[64], pl.FP32] = pl.add(x_tile, x_tile)
+                out: pl.Tensor[[64], pl.FP32] = pl.store(y_tile, [0], out)
+                return out
+
+            # Single Group function (NOT a Spmd wrapper): the nested Spmd scope
+            # was unwrapped, so only the self-contained marker stays here —
+            # core_num/sync_start ride the dispatch below.
+            @pl.function(type=pl.FunctionType.Group, attrs={"spmd_unwrapped": True})
+            def main_cluster_0(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                out: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                # Group wrapper returns its own `out` param (the kernel writes
+                # through the Out arg), not the post-call SSA result var.
+                out_call = self.kernel(x, out)
+                return out
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                out: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                out = self.main_cluster_0(x, out, attrs={"core_num": 4, "sync_start": True})
+                return out
+
+        Before = passes.convert_to_ssa()(Before)
+        Expected = passes.convert_to_ssa()(Expected)
+        After = passes.outline_cluster_scopes()(Before)
+        ir.assert_structural_equal(After, Expected)
+
+    def test_nested_spmd_in_cluster_omits_sync_start_when_false(self):
+        """Without ``sync_start=True`` the dispatch carries only ``core_num`` —
+        the ``sync_start`` attr is not added.
+
+        Pins the conditional in LaunchSpecStamper: ``sync_start`` is appended to
+        the dispatch attrs only when present AND true. With the default
+        ``sync_start=False`` the attr must be absent, not ``False``.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                out: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                x_tile: pl.Tile[[64], pl.FP32] = pl.load(x, [0], [64])
+                y_tile: pl.Tile[[64], pl.FP32] = pl.add(x_tile, x_tile)
+                out: pl.Tensor[[64], pl.FP32] = pl.store(y_tile, [0], out)
+                return out
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                out: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                with pl.cluster():
+                    with pl.spmd(8):
+                        out = self.kernel(x, out)
+                return out
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                out: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                x_tile: pl.Tile[[64], pl.FP32] = pl.load(x, [0], [64])
+                y_tile: pl.Tile[[64], pl.FP32] = pl.add(x_tile, x_tile)
+                out: pl.Tensor[[64], pl.FP32] = pl.store(y_tile, [0], out)
+                return out
+
+            # Only the marker stays on the Group; the dispatch below carries
+            # core_num alone — no sync_start attr (default False is dropped).
+            @pl.function(type=pl.FunctionType.Group, attrs={"spmd_unwrapped": True})
+            def main_cluster_0(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                out: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                # Group wrapper returns its own `out` param (the kernel writes
+                # through the Out arg), not the post-call SSA result var.
+                out_call = self.kernel(x, out)
+                return out
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                out: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                out = self.main_cluster_0(x, out, attrs={"core_num": 8})
+                return out
+
+        Before = passes.convert_to_ssa()(Before)
+        Expected = passes.convert_to_ssa()(Expected)
+        After = passes.outline_cluster_scopes()(Before)
+        ir.assert_structural_equal(After, Expected)
+
+    def test_nested_spmd_in_cluster_lifts_dumps_onto_dispatch(self):
+        """A cluster-nested ``pl.spmd(..., dumps=[...])`` moves its dump marks
+        onto the Group's DISPATCH alongside ``core_num``.
+
+        Unwrapping deletes the Spmd scope, which is the only carrier of an
+        explicit ``dumps=`` there, so LaunchSpecStamper translates the marks back
+        through the dispatch's args like the launch spec. They merge after the
+        Cluster scope's own marks: ``x`` (on both) appears once, ``out`` (only
+        on the Spmd scope) is appended.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                out: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                x_tile: pl.Tile[[64], pl.FP32] = pl.load(x, [0], [64])
+                out: pl.Tensor[[64], pl.FP32] = pl.store(x_tile, [0], out)
+                return out
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                out: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                with pl.cluster(dumps=[x]):
+                    with pl.spmd(8, dumps=[x, out]):
+                        out = self.kernel(x, out)
+                return out
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                out: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                x_tile: pl.Tile[[64], pl.FP32] = pl.load(x, [0], [64])
+                out: pl.Tensor[[64], pl.FP32] = pl.store(x_tile, [0], out)
+                return out
+
+            @pl.function(type=pl.FunctionType.Group)
+            def main_cluster_0(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                out: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                pl.func_attr({"spmd_unwrapped": True})
+                out_call = self.kernel(x, out)
+                return out
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                out: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                out = self.main_cluster_0(x, out, attrs={"dump_vars": [x, out], "core_num": 8})
+                return out
+
+        Before = passes.convert_to_ssa()(Before)
+        Expected = passes.convert_to_ssa()(Expected)
+        After = passes.outline_cluster_scopes()(Before)
+        ir.assert_structural_equal(After, Expected)
+
+    def test_cluster_callee_out_slot_does_not_demote_inout(self):
+        """Step 3 merges an inner callee's direction; it never overwrites.
+
+        The cluster pass is the only outline pass constructed with a ``program``,
+        so it is the only one that runs ``InferParamDirections`` Step 3 — merging
+        directions from ``GlobalVar`` calls in the scope body. Each source of
+        evidence is a lower bound, so the merge must follow ``In < Out < InOut``.
+        A plain assignment would let a callee that declares its slot ``Out``
+        erase the read this body really performs, dropping a genuine RAW
+        dependency on ``buf``'s incoming contents.
+
+        Here the body loads ``buf`` (a read), stores into it (a write), and then
+        hands the same capture to ``helper``, whose slot is ``Out``.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def helper(
+                self,
+                src: pl.Tensor[[16, 128], pl.FP32],
+                dst: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+            ) -> pl.Tensor[[16, 128], pl.FP32]:
+                t: pl.Tile[[16, 128], pl.FP32] = pl.load(src, [0, 0], [16, 128])
+                dst = pl.store(t, [0, 0], dst)
+                return dst
+
+            @pl.function
+            def main(
+                self,
+                x: pl.Tensor[[16, 128], pl.FP32],
+                buf: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+            ) -> pl.Tensor[[16, 128], pl.FP32]:
+                with pl.cluster():
+                    back: pl.Tile[[16, 128], pl.FP32] = pl.load(buf, [0, 0], [16, 128])
+                    keep: pl.Tile[[16, 128], pl.FP32] = pl.exp(back)
+                    pl.store(keep, [0, 0], buf)
+                    res = self.helper(x, buf)
+                return res
+
+        After = passes.outline_cluster_scopes()(passes.convert_to_ssa()(Before))
+
+        outlined = After.get_function("main_cluster_0")
+        assert outlined is not None, f"main_cluster_0 missing from {list(After.functions)}"
+        buf_idx = next(i for i, p in enumerate(outlined.params) if p.name_hint.startswith("buf"))
+        assert outlined.param_directions[buf_idx] == ir.ParamDirection.InOut, (
+            f"expected InOut at outlined callee param {buf_idx}, got {list(outlined.param_directions)}"
+        )
+
+    def test_cluster_capture_read_by_one_callee_written_by_another(self):
+        """One callee reads the capture, another overwrites it: ``InOut``.
+
+        ``ParamDirection`` is not a lattice this evidence can be folded along.
+        ``In`` is the analysis's *no evidence yet* floor, so merging the callee
+        directions one call at a time turned ``In`` (from ``reads``) and ``Out``
+        (from ``writes``) into ``Out`` and dropped a read that genuinely
+        happens — the wrapper would be told it need not stage ``shared``'s
+        incoming contents, which is exactly the RAW edge ``reads`` depends on.
+
+        The body itself neither loads nor stores ``shared``; the only evidence
+        is the two callee slots, so this pins the accumulation rather than any
+        Step 0/1 path.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def reads(
+                self,
+                src: pl.Tensor[[16, 128], pl.FP32],
+                dst: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+            ) -> pl.Tensor[[16, 128], pl.FP32]:
+                t: pl.Tile[[16, 128], pl.FP32] = pl.load(src, [0, 0], [16, 128])
+                dst = pl.store(t, [0, 0], dst)
+                return dst
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def writes(self, dst: pl.Out[pl.Tensor[[16, 128], pl.FP32]]) -> pl.Tensor[[16, 128], pl.FP32]:
+                dst = pl.assemble(dst, pl.full([16, 128], dtype=pl.FP32, value=0.0), [0, 0])
+                return dst
+
+            @pl.function
+            def main(
+                self,
+                shared: pl.Tensor[[16, 128], pl.FP32],
+                out: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+            ) -> pl.Tensor[[16, 128], pl.FP32]:
+                with pl.cluster():
+                    res = self.reads(shared, out)
+                    self.writes(shared)
+                return res
+
+        After = passes.outline_cluster_scopes()(passes.convert_to_ssa()(Before))
+
+        outlined = After.get_function("main_cluster_0")
+        assert outlined is not None, f"main_cluster_0 missing from {list(After.functions)}"
+        directions = {
+            p.name_hint.split("__ssa_v")[0]: d for p, d in zip(outlined.params, outlined.param_directions)
+        }
+        assert directions["shared"] == ir.ParamDirection.InOut, (
+            f"a capture one callee reads and another overwrites is InOut, got {directions}"
+        )
+        # The write-only capture still comes out ``Out``: keeping the two
+        # observations apart must not manufacture a read (issue #2415).
+        assert directions["out"] == ir.ParamDirection.Out, (
+            f"expected Out for the write-only capture, got {directions}"
+        )
+
+    def test_cluster_body_read_survives_a_write_only_callee_slot(self):
+        """A read in the body counts even when a callee overwrites the capture.
+
+        The two halves of the verdict come from different places: the body read
+        from Step 0's scan, the write from the callee's declared slot. Deriving
+        the direction from the callee slots alone lost the first, leaving
+        ``shared`` ``Out`` — telling the wrapper it need not stage the contents
+        ``pl.load`` right there consumes.
+
+        Step 0 can be trusted for this only because it now skips arguments a
+        callee declares ``Out``; otherwise handing a capture to ``overwrite``
+        would itself look like a read and every write-only capture would come
+        back ``InOut`` (issue #2415). ``out`` below is that control case.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def overwrite(self, dst: pl.Out[pl.Tensor[[16, 128], pl.FP32]]) -> pl.Tensor[[16, 128], pl.FP32]:
+                dst = pl.assemble(dst, pl.full([16, 128], dtype=pl.FP32, value=0.0), [0, 0])
+                return dst
+
+            @pl.function
+            def main(
+                self,
+                shared: pl.Tensor[[16, 128], pl.FP32],
+                out: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+            ) -> pl.Tensor[[16, 128], pl.FP32]:
+                with pl.cluster():
+                    t: pl.Tile[[16, 128], pl.FP32] = pl.load(shared, [0, 0], [16, 128])
+                    out = pl.store(pl.exp(t), [0, 0], out)
+                    self.overwrite(shared)
+                return out
+
+        After = passes.outline_cluster_scopes()(passes.convert_to_ssa()(Before))
+
+        outlined = After.get_function("main_cluster_0")
+        assert outlined is not None, f"main_cluster_0 missing from {list(After.functions)}"
+        directions = {
+            p.name_hint.split("__ssa_v")[0]: d for p, d in zip(outlined.params, outlined.param_directions)
+        }
+        assert directions["shared"] == ir.ParamDirection.InOut, (
+            f"the body loads `shared` before the callee overwrites it; got {directions}"
+        )
+        assert directions["out"] == ir.ParamDirection.Out, (
+            f"`out` is only ever stored into and must stay Out; got {directions}"
+        )
+
+    def test_cluster_loop_carried_capture_takes_callee_direction(self):
+        """A loop-carried capture is an ``IterArg``, and must still be mapped.
+
+        ``IterArg`` derives from ``Var`` but carries its own ``ObjectKind``, so
+        ``As<Var>`` never matches one (`.claude/rules/ir-kind-traits.md`).
+        Matching the argument that way skipped every loop-carried capture, which
+        left the wrapper parameter at the seeded ``In`` however the callee
+        declared its slot — here the callee overwrites ``acc``.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def writes(self, dst: pl.Out[pl.Tensor[[16, 128], pl.FP32]]) -> pl.Tensor[[16, 128], pl.FP32]:
+                dst = pl.assemble(dst, pl.full([16, 128], dtype=pl.FP32, value=0.0), [0, 0])
+                return dst
+
+            @pl.function
+            def main(self, out: pl.Out[pl.Tensor[[16, 128], pl.FP32]]) -> pl.Tensor[[16, 128], pl.FP32]:
+                for i, (acc,) in pl.range(3, init_values=(out,)):
+                    with pl.cluster():
+                        updated = self.writes(acc)
+                    acc_rv = pl.yield_(updated)
+                return acc_rv
+
+        After = passes.outline_cluster_scopes()(passes.convert_to_ssa()(Before))
+
+        outlined = After.get_function("main_cluster_0")
+        assert outlined is not None, f"main_cluster_0 missing from {list(After.functions)}"
+        acc_idx = next(i for i, p in enumerate(outlined.params) if p.name_hint.startswith("acc"))
+        assert outlined.param_directions[acc_idx] == ir.ParamDirection.Out, (
+            f"the loop-carried capture takes the callee's Out slot, got {list(outlined.param_directions)}"
+        )
+
+    def test_cluster_submit_only_out_capture_stays_out(self):
+        """A capture handed only to a ``pl.submit`` ``Out`` slot is ``Out``.
+
+        The base visitor does not forward ``Submit`` to the ``Call`` handler, so
+        without a dedicated override every launch argument counted as a read and
+        this capture came back ``InOut`` — the false cross-rank dependency of
+        issue #2415, for exactly the programs that launch work asynchronously.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def overwrite(self, dst: pl.Out[pl.Tensor[[16, 128], pl.FP32]]) -> pl.Tensor[[16, 128], pl.FP32]:
+                dst = pl.assemble(dst, pl.full([16, 128], dtype=pl.FP32, value=0.0), [0, 0])
+                return dst
+
+            @pl.function
+            def main(self, out: pl.Out[pl.Tensor[[16, 128], pl.FP32]]) -> pl.Tensor[[16, 128], pl.FP32]:
+                with pl.cluster():
+                    res, tid = pl.submit(self.overwrite, out)
+                return res
+
+        After = passes.outline_cluster_scopes()(passes.convert_to_ssa()(Before))
+
+        outlined = After.get_function("main_cluster_0")
+        assert outlined is not None, f"main_cluster_0 missing from {list(After.functions)}"
+        out_idx = next(i for i, p in enumerate(outlined.params) if p.name_hint.startswith("out"))
+        assert outlined.param_directions[out_idx] == ir.ParamDirection.Out, (
+            f"a submit-only write target must not gain a read, got {list(outlined.param_directions)}"
+        )
+
+    def test_cluster_body_read_survives_a_submit_out_slot(self):
+        """The Submit skip is per-argument, not a blanket "launches read nothing".
+
+        ``shared`` is loaded by the body *and* overwritten through the launch,
+        so it is ``InOut``; ``out`` is only ever stored into and stays ``Out``.
+        Skipping every argument of a ``Submit`` would collapse both to ``Out``.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def overwrite(self, dst: pl.Out[pl.Tensor[[16, 128], pl.FP32]]) -> pl.Tensor[[16, 128], pl.FP32]:
+                dst = pl.assemble(dst, pl.full([16, 128], dtype=pl.FP32, value=0.0), [0, 0])
+                return dst
+
+            @pl.function
+            def main(
+                self,
+                shared: pl.Tensor[[16, 128], pl.FP32],
+                out: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+            ) -> pl.Tensor[[16, 128], pl.FP32]:
+                with pl.cluster():
+                    t: pl.Tile[[16, 128], pl.FP32] = pl.load(shared, [0, 0], [16, 128])
+                    out = pl.store(pl.exp(t), [0, 0], out)
+                    res, tid = pl.submit(self.overwrite, shared)
+                return out
+
+        After = passes.outline_cluster_scopes()(passes.convert_to_ssa()(Before))
+
+        outlined = After.get_function("main_cluster_0")
+        assert outlined is not None, f"main_cluster_0 missing from {list(After.functions)}"
+        directions = {
+            p.name_hint.split("__ssa_v")[0]: d for p, d in zip(outlined.params, outlined.param_directions)
+        }
+        assert directions["shared"] == ir.ParamDirection.InOut, (
+            f"the body loads `shared` before the launch overwrites it; got {directions}"
+        )
+        assert directions["out"] == ir.ParamDirection.Out, (
+            f"`out` is only ever stored into and must stay Out; got {directions}"
+        )
+
+    def test_cluster_store_target_becomes_out(self):
+        """A Cluster scope that writes an external tensor via ``pl.store`` marks
+        that tensor as an ``Out`` parameter on the outlined Group function.
+
+        Semantics: ScopeOutliner treats tile.store targets as side-effect
+        outputs and InferParamDirections Step 1 lifts the corresponding param
+        off ``In``. The body never reads ``buf`` — the store target slot is its
+        sole use — so the direction is ``Out``, not ``InOut`` (issue #2415).
+        The store result is captured into a fresh ``_store`` SSA var, but the
+        Group returns the write param itself (param-identity returns, #1702);
+        the call site re-binds the external tensor to that return value
+        (``buf`` -> ``buf2``). Mirrors the
+        InCore-pass store-only case, but the parent here is NOT promoted — the
+        cluster pass leaves the caller's function type unchanged.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(self, x: pl.Tensor[[16, 128], pl.FP32]) -> pl.Tensor[[16, 128], pl.FP32]:
+                buf: pl.Tensor[[16, 128], pl.FP32] = pl.create_tensor([16, 128], dtype=pl.FP32)
+                with pl.cluster():
+                    tile = pl.tile.full([16, 128], dtype=pl.FP32, value=0.0)
+                    pl.store(tile, [0, 0], buf)
+                result: pl.Tensor[[16, 128], pl.FP32] = pl.add(buf, x)
+                return result
+
+        @pl.program
+        class Expected:
+            # buf is a tile.store target the body never reads, so it becomes Out
+            # on the Group; the store result lands in a fresh buf_store var, but
+            # the Group returns the Out param itself (param-identity returns,
+            # #1702).
+            @pl.function(type=pl.FunctionType.Group)
+            def main_cluster_0(
+                self, buf: pl.Out[pl.Tensor[[16, 128], pl.FP32]]
+            ) -> pl.Tensor[[16, 128], pl.FP32]:
+                tile = pl.tile.full([16, 128], dtype=pl.FP32, value=0.0)
+                buf_store: pl.Tensor[[16, 128], pl.FP32] = pl.store(tile, [0, 0], buf)
+                return buf
+
+            @pl.function
+            def main(self, x: pl.Tensor[[16, 128], pl.FP32]) -> pl.Tensor[[16, 128], pl.FP32]:
+                buf: pl.Tensor[[16, 128], pl.FP32] = pl.create_tensor([16, 128], dtype=pl.FP32)
+                buf2: pl.Tensor[[16, 128], pl.FP32] = self.main_cluster_0(buf)
+                result: pl.Tensor[[16, 128], pl.FP32] = pl.add(buf2, x)
+                return result
+
+        Before = passes.convert_to_ssa()(Before)
+        Expected = passes.convert_to_ssa()(Expected)
+        After = passes.outline_cluster_scopes()(Before)
+        ir.assert_structural_equal(After, Expected)
+
+    def test_cluster_duplicate_name_hint_dedups(self):
+        """Two Cluster scopes sharing a ``name_hint`` deduplicate the second
+        outlined function name with a numeric suffix.
+
+        Semantics (scope_outline_utils.h:464-472): the first scope takes the
+        verbatim hint ``grp`` and inserts it into ``known_names_``; the second
+        scope's identical hint collides, so the outliner appends ``_0`` ->
+        ``grp_0``. This keeps program function names unique even when the user
+        reuses a hint across sibling scopes.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                with pl.cluster(name_hint="grp"):
+                    y: pl.Tensor[[64], pl.FP32] = pl.add(x, x)
+                with pl.cluster(name_hint="grp"):
+                    z: pl.Tensor[[64], pl.FP32] = pl.mul(y, y)
+                return z
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.Group)
+            def grp(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                y: pl.Tensor[[64], pl.FP32] = pl.add(x, x)
+                return y
+
+            # Second "grp" collides -> deduplicated to "grp_0".
+            @pl.function(type=pl.FunctionType.Group)
+            def grp_0(self, y: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                z: pl.Tensor[[64], pl.FP32] = pl.mul(y, y)
+                return z
+
+            @pl.function
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                y: pl.Tensor[[64], pl.FP32] = self.grp(x)
+                z: pl.Tensor[[64], pl.FP32] = self.grp_0(y)
+                return z
+
+        Before = passes.convert_to_ssa()(Before)
+        Expected = passes.convert_to_ssa()(Expected)
+        After = passes.outline_cluster_scopes()(Before)
+        ir.assert_structural_equal(After, Expected)
+
+    def test_cluster_outlined_verifier_rejects_cluster_in_incore(self):
+        """Test that ClusterOutlined verifier flags Cluster scopes in InCore functions."""
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def compute(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                with pl.cluster():
+                    y: pl.Tensor[[64], pl.FP32] = pl.add(x, x)
+                return y
+
+        props = passes.IRPropertySet()
+        props.insert(passes.IRProperty.ClusterOutlined)
+
+        with pytest.raises(pypto.Error, match="Verification failed"):
+            passes.verify_properties(props, Program, "OutlineClusterScopes")
+
+
+class TestOutlineSpmdScopeTaskId:
+    """``with pl.spmd(...) as tid:`` outlines to an ``ir.Submit`` (grid dispatch + producer TaskId).
+
+    The captured-TaskId Spmd scope rides the same ``kAttrTaskIdVar`` rail as
+    ``pl.at(...) as tid:``: ``OutlineIncoreScopes`` outlines the inner InCore body
+    into a kernel (preserving the outer scope's attrs), then
+    ``OutlineClusterScopes``' Spmd outliner — seeing ``kAttrTaskIdVar`` — emits an
+    ``ir.Submit`` whose return type ends in ``Scalar[TASK_ID]`` instead of a plain
+    Call. The launch spec rides the dispatch, so ``core_num`` lands in the
+    Submit's own first-class field — the same shape ``pl.spmd_submit(...,
+    core_num=N)`` produces. Explicit ``deps=[tid]`` fold into the consumer
+    Submit's ``deps``.
+    """
+
+    @staticmethod
+    def _run(prog):
+        prog = passes.convert_to_ssa()(prog)
+        prog = passes.outline_incore_scopes()(prog)
+        prog = passes.outline_cluster_scopes()(prog)
+        return prog
+
+    @staticmethod
+    def _submit_values(func):
+        """All ``ir.Submit`` exprs bound by an AssignStmt in ``func`` (in body order)."""
+        found = []
+
+        def walk(n):
+            if isinstance(n, ir.SeqStmts):
+                for s in n.stmts:
+                    walk(s)
+            elif isinstance(n, ir.AssignStmt):
+                if isinstance(n.value, ir.Submit):
+                    found.append(n.value)
+            elif hasattr(n, "body") and n.body is not None:
+                walk(n.body)
+
+        walk(func.body)
+        return found
+
+    def test_as_tid_outlines_to_submit(self):
+        """A captured Spmd dispatch lowers to a deps-free ``ir.Submit`` (not a plain Call)."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                a: pl.Tensor[[512, 128], pl.FP32],
+                out: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
+            ) -> pl.Tensor[[512, 128], pl.FP32]:
+                with pl.spmd(4, name_hint="stage1") as tid:
+                    i = pl.tile.get_block_idx()
+                    t: pl.Tile[[128, 128], pl.FP32] = pl.load(a, [i * 128, 0], [128, 128])
+                    out = pl.store(pl.add(t, t), [i * 128, 0], out)
+                return out
+
+        After = self._run(Before)
+
+        # A Spmd wrapper function was synthesised. The launch spec is NOT on it:
+        # core_num is evaluated in the caller's scope, so the callee must not
+        # reference it (a Function is a closed scope).
+        spmd_fns = _funcs_by_type(After, ir.FunctionType.Spmd)
+        assert len(spmd_fns) == 1
+        assert "core_num" not in spmd_fns[0].attrs
+
+        # The orchestration entry lowers the dispatch to exactly one Submit.
+        orch = _funcs_by_type(After, ir.FunctionType.Orchestration)[0]
+        submits = self._submit_values(orch)
+        assert len(submits) == 1
+        submit = submits[0]
+        # core_num rides the dispatch, in Submit's first-class field.
+        assert submit.core_num is not None
+        # No explicit deps on a lone captured dispatch.
+        assert len(submit.deps) == 0
+
+    def test_as_tid_deps_fold_into_submit_deps(self):
+        """``deps=[tid0]`` on a second captured Spmd folds into that Submit's ``deps``."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                a: pl.Tensor[[512, 128], pl.FP32],
+                out: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
+            ) -> pl.Tensor[[512, 128], pl.FP32]:
+                with pl.spmd(4, name_hint="stage1") as tid0:
+                    i = pl.tile.get_block_idx()
+                    t: pl.Tile[[128, 128], pl.FP32] = pl.load(a, [i * 128, 0], [128, 128])
+                    out = pl.store(t, [i * 128, 0], out)
+                with pl.spmd(4, name_hint="stage2", deps=[tid0]) as tid1:
+                    j = pl.tile.get_block_idx()
+                    u: pl.Tile[[128, 128], pl.FP32] = pl.load(out, [j * 128, 0], [128, 128])
+                    out = pl.store(pl.add(u, u), [j * 128, 0], out)
+                return out
+
+        After = self._run(Before)
+        orch = _funcs_by_type(After, ir.FunctionType.Orchestration)[0]
+        submits = self._submit_values(orch)
+        assert len(submits) == 2
+        # First dispatch has no explicit deps; second carries the first's producer TaskId.
+        assert len(submits[0].deps) == 0
+        assert len(submits[1].deps) == 1
+        assert isinstance(submits[1].deps[0], ir.Var)
+        # Two distinct Spmd wrapper functions were synthesised.
+        assert len(_funcs_by_type(After, ir.FunctionType.Spmd)) == 2
+
+    def test_allow_early_resolve_threads_onto_submit(self):
+        """``pl.spmd(..., allow_early_resolve=True) as tid`` sets the Submit's flag."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                a: pl.Tensor[[512, 128], pl.FP32],
+                out: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
+            ) -> pl.Tensor[[512, 128], pl.FP32]:
+                with pl.spmd(4, name_hint="stage1", allow_early_resolve=True) as tid:
+                    i = pl.tile.get_block_idx()
+                    t: pl.Tile[[128, 128], pl.FP32] = pl.load(a, [i * 128, 0], [128, 128])
+                    out = pl.store(pl.add(t, t), [i * 128, 0], out)
+                return out
+
+        After = self._run(Before)
+        orch = _funcs_by_type(After, ir.FunctionType.Orchestration)[0]
+        (submit,) = self._submit_values(orch)
+        assert submit.allow_early_resolve is True
+
+    def test_allow_early_resolve_without_as_tid_still_submits(self):
+        """A plain ``with pl.spmd(..., allow_early_resolve=True):`` forces an ``ir.Submit``.
+
+        Without ``as tid`` the dispatch would normally lower to a plain Call; the
+        early-dispatch hint forces the Submit shape (the outliner synthesises an
+        unused producer TaskId) so the flag can ride to codegen.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                a: pl.Tensor[[512, 128], pl.FP32],
+                out: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
+            ) -> pl.Tensor[[512, 128], pl.FP32]:
+                t = pl.load(a, [0, 0], [512, 128])
+                out = pl.store(t, [0, 0], out)
+                return out
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                a: pl.Tensor[[512, 128], pl.FP32],
+                out: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
+            ) -> pl.Tensor[[512, 128], pl.FP32]:
+                with pl.spmd(4, allow_early_resolve=True):
+                    out = self.kernel(a, out)
+                return out
+
+        After = self._run(Before)
+        orch = _funcs_by_type(After, ir.FunctionType.Orchestration)[0]
+        (submit,) = self._submit_values(orch)
+        assert submit.allow_early_resolve is True
+        # core_num rides the dispatch, in Submit's first-class field.
+        assert submit.core_num is not None
+
+
+class TestDynamicSpmdLaunchSpec:
+    """A runtime ``pl.spmd`` block count stays in the caller's scope.
+
+    ``core_num`` may be an expression over caller-local scalars. A Function is a
+    closed scope, so parking that expression on the outlined callee produced a
+    Function referencing a name it does not bind — printed as a decorator, that
+    name is unbound at class-body evaluation time and the program could not be
+    re-parsed. The spec therefore rides the dispatch.
+    """
+
+    M_DYN = pl.dynamic("M_DYN_SPMD_SPEC")
+
+    @staticmethod
+    def _build():
+        M_DYN = TestDynamicSpmdLaunchSpec.M_DYN
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                a: pl.Tensor[[M_DYN, 128], pl.FP32],
+                out: pl.InOut[pl.Tensor[[M_DYN, 128], pl.FP32]],
+            ) -> pl.Tensor[[M_DYN, 128], pl.FP32]:
+                m = pl.tensor.dim(a, 0)
+                with pl.spmd(m // 16):
+                    i = pl.tile.get_block_idx()
+                    t: pl.Tile[[16, 128], pl.FP32] = pl.load(a, [i * 16, 0], [16, 128])
+                    out = pl.store(pl.add(t, t), [i * 16, 0], out)
+                return out
+
+        prog = passes.convert_to_ssa()(Before)
+        prog = passes.outline_incore_scopes()(prog)
+        return passes.outline_cluster_scopes()(prog)
+
+    def test_dynamic_core_num_rides_the_dispatch(self):
+        """The outlined Spmd function must not reference a caller-local scalar."""
+        After = self._build()
+
+        spmd_fns = _funcs_by_type(After, ir.FunctionType.Spmd)
+        assert len(spmd_fns) == 1
+        assert "core_num" not in spmd_fns[0].attrs
+
+        launch = _launch_calls(_funcs_by_type(After, ir.FunctionType.Orchestration)[0])
+        assert len(launch) == 1
+        # An expression over the caller's local scalar, not a folded constant.
+        assert isinstance(launch[0].attrs["core_num"], ir.FloorDiv)
+
+    def test_dynamic_core_num_program_reparses(self):
+        """print -> parse must succeed; a decorator-scoped var raised NameError."""
+        printed = ir.python_print(self._build(), format=False)
+        assert "core_num" in printed
+        # A reparse alone is not proof: a __FREE_VAR-marked name still parses,
+        # it just binds a different Var. The name must be genuinely bound.
+        assert "__FREE_VAR" not in printed
+        reparsed = pl.parse(printed)
+        assert isinstance(reparsed, ir.Program)
+
+    @staticmethod
+    def _build_cluster_nested():
+        M_DYN = TestDynamicSpmdLaunchSpec.M_DYN
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                a: pl.Tensor[[M_DYN, 128], pl.FP32],
+                out: pl.InOut[pl.Tensor[[M_DYN, 128], pl.FP32]],
+                n: pl.Scalar[pl.INDEX],
+            ) -> pl.Tensor[[M_DYN, 128], pl.FP32]:
+                with pl.cluster():
+                    with pl.spmd(n // 16):
+                        i = pl.tile.get_block_idx()
+                        t: pl.Tile[[16, 128], pl.FP32] = pl.load(a, [i * 16, 0], [16, 128])
+                        out = pl.store(pl.add(t, t), [i * 16, 0], out)
+                return out
+
+        prog = passes.convert_to_ssa()(Before)
+        prog = passes.outline_incore_scopes()(prog)
+        return passes.outline_cluster_scopes()(prog)
+
+    def test_cluster_nested_dynamic_core_num_rides_the_dispatch(self):
+        """The unwrapped Group keeps only the self-contained marker.
+
+        The spec is lifted from *inside* the Group, where the count references a
+        Group **param**; it must be translated back through the dispatch's args
+        so the attr names a Var that is live at the call site.
+        """
+        After = self._build_cluster_nested()
+
+        groups = _funcs_by_type(After, ir.FunctionType.Group)
+        assert len(groups) == 1
+        assert "core_num" not in groups[0].attrs
+        assert groups[0].attrs["spmd_unwrapped"] is True
+        group_params = list(groups[0].params)
+
+        launch = _launch_calls(_funcs_by_type(After, ir.FunctionType.Orchestration)[0])
+        assert len(launch) == 1
+        # Translated into the caller's Var space — not left pointing at a param
+        # of the callee it was lifted out of.
+        core_num = launch[0].attrs["core_num"]
+        assert isinstance(core_num, ir.FloorDiv)
+        assert not any(core_num.left is p for p in group_params)
+        assert any(core_num.left is arg for arg in launch[0].args)
+
+    def test_cluster_nested_dynamic_core_num_program_reparses(self):
+        """print -> parse must succeed for the pl.cluster()-nested form too."""
+        printed = ir.python_print(self._build_cluster_nested(), format=False)
+        assert "core_num" in printed
+        assert "__FREE_VAR" not in printed
+        reparsed = pl.parse(printed)
+        assert isinstance(reparsed, ir.Program)
+
+
+class TestOutlinedReturnParamsExplicit:
+    """Outlined wrapper functions return their params by pointer identity.
+
+    Param-identity returns make the return->param mapping a lookup for
+    orchestration codegen, so multi-output wrappers can never alias the
+    returned value to the wrong output (issue #1702).
+    """
+
+    @staticmethod
+    def _first_return(func):
+        ret = func.body.stmts[-1]
+        assert isinstance(ret, ir.ReturnStmt)
+        return ret
+
+    def test_spmd_wrapper_tuple_destructure_returns_param(self):
+        """Spmd wrapper around a multi-out kernel returns the actual out param.
+
+        Mirrors #1702: the kernel writes two InOut + one Out, the scope's only
+        consumed result is the Out (last). The wrapper's return must be its own
+        ``out`` param, not the TupleGetItem SSA alias.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                a: pl.Tensor[[64, 64], pl.FP32],
+                pre: pl.InOut[pl.Tensor[[64, 64], pl.FP32]],
+                post: pl.InOut[pl.Tensor[[64, 64], pl.FP32]],
+                out: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
+            ) -> tuple[
+                pl.Tensor[[64, 64], pl.FP32],
+                pl.Tensor[[64, 64], pl.FP32],
+                pl.Tensor[[64, 64], pl.FP32],
+            ]:
+                tile = pl.load(a, [0, 0], [64, 64])
+                pre = pl.store(tile, [0, 0], pre)
+                post = pl.store(tile, [0, 0], post)
+                t2 = pl.add(tile, tile)
+                out = pl.store(t2, [0, 0], out)
+                return pre, post, out
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                a: pl.Tensor[[64, 64], pl.FP32],
+                pre: pl.InOut[pl.Tensor[[64, 64], pl.FP32]],
+                post: pl.InOut[pl.Tensor[[64, 64], pl.FP32]],
+                out: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
+            ) -> pl.Tensor[[64, 64], pl.FP32]:
+                with pl.spmd(4):
+                    pre, post, out = self.kernel(a, pre, post, out)
+                return out
+
+        after = passes.outline_cluster_scopes()(passes.convert_to_ssa()(Before))
+
+        spmd_fns = [f for f in after.functions.values() if f.func_type == ir.FunctionType.Spmd]
+        assert len(spmd_fns) == 1
+        wrapper = spmd_fns[0]
+        ret = self._first_return(wrapper)
+        # Bind the projected values once: each `ret.value[i]` access creates a
+        # fresh Python wrapper, so `id()` is only stable on a held reference.
+        ret_values = list(ret.value)
+        params = list(wrapper.params)
+        assert len(ret_values) == 1
+        # Pointer identity with the wrapper's own `out` param (params are
+        # [a, pre, post, out] in first-use order).
+        param_ids = {id(p): p.name_hint for p in params}
+        assert id(ret_values[0]) in param_ids, "wrapper must return a param by identity"
+        assert param_ids[id(ret_values[0])].startswith("out")
+
+    def test_store_target_output_returns_inout_param(self):
+        """A store-target output of a cluster scope returns the InOut param itself."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                a: pl.Tensor[[512, 128], pl.FP32],
+                out: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
+            ) -> pl.Tensor[[512, 128], pl.FP32]:
+                with pl.spmd(4) as tid:  # noqa: F841
+                    i = pl.tile.get_block_idx()
+                    t: pl.Tile[[128, 128], pl.FP32] = pl.load(a, [i * 128, 0], [128, 128])
+                    out = pl.store(pl.add(t, t), [i * 128, 0], out)
+                return out
+
+        after = passes.outline_cluster_scopes()(
+            passes.outline_incore_scopes()(passes.convert_to_ssa()(Before))
+        )
+
+        spmd_fns = [f for f in after.functions.values() if f.func_type == ir.FunctionType.Spmd]
+        assert len(spmd_fns) == 1
+        wrapper = spmd_fns[0]
+        ret = self._first_return(wrapper)
+        # Hold references so wrapper identity (`id`) stays stable across checks.
+        ret_values = list(ret.value)
+        params = list(wrapper.params)
+        param_ids = {id(p) for p in params}
+        for value in ret_values:
+            assert id(value) in param_ids, "store-target output must be returned as the param itself"
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

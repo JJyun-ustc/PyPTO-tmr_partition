@@ -1,0 +1,295 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
+
+#include "pypto/backend/common/backend.h"
+
+#include <nanobind/nanobind.h>
+#include <nanobind/stl/map.h>
+#include <nanobind/stl/optional.h>
+#include <nanobind/stl/shared_ptr.h>
+#include <nanobind/stl/string.h>
+#include <nanobind/stl/vector.h>
+
+#include <cstddef>
+#include <cstdint>
+#include <map>
+#include <memory>
+#include <optional>
+#include <string>
+#include <vector>
+
+#include "../module.h"
+#include "pypto/backend/910B/backend_910b.h"
+#include "pypto/backend/950/backend_950.h"
+#include "pypto/backend/common/backend_config.h"
+#include "pypto/backend/common/backend_handler.h"
+#include "pypto/backend/common/buffer_elementwise_recipes.h"
+#include "pypto/backend/common/op_rules.h"
+#include "pypto/backend/common/soc.h"
+#include "pypto/core/dtype.h"
+#include "pypto/ir/memref.h"
+#include "pypto/ir/pipe.h"
+#include "pypto/ir/type.h"
+
+namespace nb = nanobind;
+
+namespace pypto {
+namespace python {
+
+using pypto::backend::Backend;
+using pypto::backend::Backend910B;
+using pypto::backend::Backend950;
+using pypto::backend::BackendHandler;
+using pypto::backend::BackendType;
+using pypto::backend::Cluster;
+using pypto::backend::Core;
+using pypto::backend::Die;
+using pypto::backend::Mem;
+using pypto::backend::SoC;
+using pypto::ir::CoreType;
+using pypto::ir::MemorySpace;
+
+void BindBackend(nb::module_& m) {
+  nb::module_ backend_mod = m.def_submodule("backend", "PyPTO Backend module");
+
+  backend_mod.def("get_buffer_elementwise_recipe_names", &backend::GetBufferElementwiseRecipeNames,
+                  "Return a sorted snapshot of logical names with implemented Buffer elementwise recipes; "
+                  "each recipe still restricts physical forms");
+
+  // ========== BackendType enum ==========
+  auto backend_type =
+      nb::enum_<BackendType>(backend_mod, "BackendType",
+                             "Backend type for passes and codegen (use Instance internally)")
+          .value("Ascend910", BackendType::Ascend910, "910 backend (A2/A3 PTO assembly codegen)")
+          .value("Ascend950", BackendType::Ascend950, "950 PTO backend");
+
+  // Register the old spelling as the same Python object. A second .value()
+  // creates a distinct nanobind enum member and breaks Python identity/equality.
+  backend_type.attr("Ascend910B") = backend_type.attr("Ascend910");
+  backend_type.attr("_member_map_")["Ascend910B"] = backend_type.attr("Ascend910");
+
+  // ========== Mem class ==========
+  nb::class_<Mem>(backend_mod, "Mem", "Memory component")
+      .def(nb::init<MemorySpace, uint64_t, uint64_t>(), nb::arg("mem_type"), nb::arg("mem_size"),
+           nb::arg("alignment"), "Create a memory component")
+      .def_prop_ro("mem_type", &Mem::GetMemType, "Memory space type")
+      .def_prop_ro("mem_size", &Mem::GetMemSize, "Memory size in bytes")
+      .def_prop_ro("alignment", &Mem::GetAlignment, "Memory alignment in bytes")
+      .def("__repr__", [](const Mem& mem) {
+        return "Mem(type=" + ir::MemorySpaceToString(mem.GetMemType()) +
+               ", size=" + std::to_string(mem.GetMemSize()) +
+               ", alignment=" + std::to_string(mem.GetAlignment()) + ")";
+      });
+
+  // ========== Core class ==========
+  nb::class_<Core>(backend_mod, "Core", "Processing core")
+      .def(nb::init<CoreType, std::vector<Mem>>(), nb::arg("core_type"), nb::arg("mems"),
+           "Create a processing core")
+      .def_prop_ro("core_type", &Core::GetCoreType, "Core type (CUBE or VECTOR)")
+      .def_prop_ro("mems", &Core::GetMems, "List of memory components")
+      .def("__repr__", [](const Core& core) {
+        return "Core(type=" + std::to_string(static_cast<int>(core.GetCoreType())) +
+               ", mems=" + std::to_string(core.GetMems().size()) + ")";
+      });
+
+  // ========== Cluster class ==========
+  nb::class_<Cluster>(backend_mod, "Cluster", "Cluster of processing cores")
+      .def(nb::init<std::map<Core, int>>(), nb::arg("core_counts"), "Create cluster from core counts map")
+      .def(nb::init<const Core&, int>(), nb::arg("core"), nb::arg("count"),
+           "Create cluster with single core type")
+      .def_prop_ro("core_counts", &Cluster::GetCoreCounts, "Map of core configurations to counts")
+      .def("total_core_count", &Cluster::TotalCoreCount, "Get total number of cores in cluster")
+      .def("__repr__", [](const Cluster& cluster) {
+        return "Cluster(total_cores=" + std::to_string(cluster.TotalCoreCount()) + ")";
+      });
+
+  // ========== Die class ==========
+  nb::class_<Die>(backend_mod, "Die", "Die containing clusters")
+      .def(nb::init<std::map<Cluster, int>>(), nb::arg("cluster_counts"),
+           "Create die from cluster counts map")
+      .def(nb::init<const Cluster&, int>(), nb::arg("cluster"), nb::arg("count"),
+           "Create die with single cluster type")
+      .def_prop_ro("cluster_counts", &Die::GetClusterCounts, "Map of cluster configurations to counts")
+      .def("total_cluster_count", &Die::TotalClusterCount, "Get total number of clusters in die")
+      .def("total_core_count", &Die::TotalCoreCount, "Get total number of cores in die")
+      .def("__repr__", [](const Die& die) {
+        return "Die(clusters=" + std::to_string(die.TotalClusterCount()) +
+               ", cores=" + std::to_string(die.TotalCoreCount()) + ")";
+      });
+
+  // ========== SoC class ==========
+  nb::class_<SoC>(backend_mod, "SoC", "System on Chip")
+      .def(nb::init<std::map<Die, int>>(), nb::arg("die_counts"), "Create SoC from die counts map")
+      .def(nb::init<const Die&, int>(), nb::arg("die"), nb::arg("count"), "Create SoC with single die type")
+      .def_prop_ro("die_counts", &SoC::GetDieCounts, "Map of die configurations to counts")
+      .def("total_die_count", &SoC::TotalDieCount, "Get total number of dies in SoC")
+      .def("total_cluster_count", &SoC::TotalClusterCount, "Get total number of clusters in SoC")
+      .def("total_core_count", &SoC::TotalCoreCount, "Get total number of cores in SoC")
+      .def("__repr__", [](const SoC& soc) {
+        return "SoC(dies=" + std::to_string(soc.TotalDieCount()) +
+               ", clusters=" + std::to_string(soc.TotalClusterCount()) +
+               ", cores=" + std::to_string(soc.TotalCoreCount()) + ")";
+      });
+
+  // ========== BackendHandler ==========
+  // Per-backend behaviour dispatch. Passes / codegen / Python all consume this
+  // interface rather than branching on BackendType.
+  nb::class_<BackendHandler>(backend_mod, "BackendHandler", "Per-backend behaviour dispatch interface")
+      .def("get_pto_target_arch", &BackendHandler::GetPtoTargetArch,
+           "PTO MLIR target arch attribute string (e.g. 'a2a3', 'a5')")
+      .def("get_launch_spec_core_count_method", &BackendHandler::GetLaunchSpecCoreCountMethod,
+           "Method name on launch_spec for setting the logical block count "
+           "('set_block_num' on both backends and runtimes)")
+      .def("get_default_sim_platform", &BackendHandler::GetDefaultSimPlatform,
+           "Default simulator platform name (e.g. 'a2a3sim', 'a5sim')")
+      .def("get_extra_ptoas_flags", &BackendHandler::GetExtraPtoasFlags,
+           "Extra flags appended to ptoas invocation for this backend")
+      .def("honors_high_precision_algorithm", &BackendHandler::HonorsHighPrecisionAlgorithm,
+           "Whether PTO-ISA selects a distinct algorithm from the precisionType attribute that "
+           "high_precision=True emits (ignored on Ascend910)")
+      .def("requires_gm_pipe_buffer", &BackendHandler::RequiresGMPipeBuffer,
+           "Whether ExpandMixedKernel must inject the GM-backed pipe slot buffer")
+      .def("supports_local_pipe_depth", &BackendHandler::SupportsLocalPipeDepth,
+           "Whether cross-core pipes support a local consumer depth independent of the transport ring")
+      .def("requires_split_load_tpop_workaround", &BackendHandler::RequiresSplitLoadTpopWorkaround,
+           "Whether MemoryReuse must apply the load + tpop_from_aic in-place hazard guard")
+      .def("requires_level3_tmp_scratch", &BackendHandler::RequiresLevel3TmpScratch,
+           "Whether InitMemRef/codegen must materialize PTOAS level-3 explicit tmp scratch")
+      .def("requires_vto_c_fractal_adapt", &BackendHandler::RequiresVtoCFractalAdapt,
+           "Whether AIV-side V-to-C tpush must materialise a fractal-layout adapter move")
+      .def("requires_runtime_subblock_bridge", &BackendHandler::RequiresRuntimeSubblockBridge,
+           "Whether split AIV wrappers must source the subblock id from the runtime context")
+      .def("requires_no_split_dual_aiv_dispatch", &BackendHandler::RequiresNoSplitDualAivDispatch,
+           "Whether mixed kernels with no split mode must still be dispatched on both AIV lanes")
+      .def("splits_cube_to_vector_transport_in_hardware",
+           &BackendHandler::SplitsCubeToVectorTransportInHardware,
+           "Whether a split Cube-to-Vector push divides its transported extent between the AIV lanes itself")
+      .def("get_gm_access_granularity_bytes", &BackendHandler::GetGmAccessGranularityBytes,
+           "GM access granularity in bytes (issue #1180 perf-hint threshold input)")
+      .def("get_l2_cache_line_bytes", &BackendHandler::GetL2CacheLineBytes, "L2 cache line size in bytes")
+      .def("get_recommended_innermost_dim_bytes", &BackendHandler::GetRecommendedInnermostDimBytes,
+           "Recommended minimum innermost-dim size, in bytes, for tile ops touching GM")
+      .def("get_capacity_bytes", &BackendHandler::GetCapacityBytes, nb::arg("memory_space"),
+           "Capacity of one memory component in the owning SoC, in bytes; 0 for an unmodeled space")
+      .def("supports_mat_to_bias_move", &BackendHandler::SupportsMatToBiasMove, nb::arg("source_dtype"),
+           nb::arg("bias_dtype"), "Whether the backend supports this Mat-to-Bias tile.move dtype pair")
+      .def("get_l0_fractal_alignment", &BackendHandler::GetL0FractalAlignment,
+           "Cube fractal alignment in elements for L0 tile dimensions m, n, k")
+      .def("get_l0c_m_alignment", &BackendHandler::GetL0cMAlignment, nb::arg("accumulator_dtype"),
+           "Physical M-row alignment of one L0C accumulator allocation")
+      .def("get_min_l0_tile_dim", &BackendHandler::GetMinL0TileDim,
+           "Minimum legal value for L0 tile dimensions m, n, k");
+
+  nb::enum_<backend::OpScratchStatus>(backend_mod, "OpScratchStatus")
+      .value("Required", backend::OpScratchStatus::Required)
+      .value("NotRequired", backend::OpScratchStatus::NotRequired)
+      .value("Unknown", backend::OpScratchStatus::Unknown)
+      .value("Unsupported", backend::OpScratchStatus::Unsupported);
+  nb::class_<backend::TileScratchSpec>(backend_mod, "TileScratchSpec")
+      .def_ro("dtype", &backend::TileScratchSpec::dtype)
+      .def_ro("rows", &backend::TileScratchSpec::rows)
+      .def_ro("cols", &backend::TileScratchSpec::cols);
+  nb::class_<backend::OpScratchPlan>(backend_mod, "OpScratchPlan")
+      .def_ro("status", &backend::OpScratchPlan::status)
+      .def_ro("spec", &backend::OpScratchPlan::spec)
+      .def_ro("reason", &backend::OpScratchPlan::reason);
+
+  // ========== Backend abstract base class ==========
+  nb::class_<Backend>(backend_mod, "Backend", "Abstract backend base class")
+      .def("get_type_name", &Backend::GetTypeName, "Get backend type name")
+      .def("get_registered_op_names", &Backend::GetRegisteredOpNames,
+           "Get a sorted snapshot of this backend's registered operator names")
+      .def(
+          "plan_op_scratch",
+          [](const Backend& target, const std::string& op_name, std::optional<DataType> source_dtype,
+             std::optional<int64_t> source_cols, std::optional<DataType> target_dtype,
+             std::optional<bool> saturating, const ir::TileTypePtr& source_tile) {
+            return target.PlanOpScratch(op_name,
+                                        {source_dtype, source_cols, target_dtype, saturating, source_tile});
+          },
+          nb::arg("op_name"), nb::arg("source_dtype") = nb::none(), nb::arg("source_cols") = nb::none(),
+          nb::kw_only(), nb::arg("target_dtype") = nb::none(), nb::arg("saturating") = nb::none(),
+          nb::arg("source_tile") = nb::none(),
+          "Plan compiler-created scratch using this backend's registered rule; None means no rule")
+      .def("get_handler", &Backend::GetHandler, nb::rv_policy::reference,
+           "Get the per-backend BackendHandler singleton")
+      .def("export_to_file", &Backend::ExportToFile, nb::arg("path"), "Export backend to msgpack file")
+      .def_static(
+          "import_from_file",
+          [](const std::string& path) -> Backend* {
+            // Return raw pointer that nanobind will manage
+            return Backend::ImportFromFile(path).release();
+          },
+          nb::arg("path"), nb::rv_policy::take_ownership, "Import backend from msgpack file")
+      .def("find_mem_path", &Backend::FindMemPath, nb::arg("from_mem"), nb::arg("to_mem"),
+           "Find memory path from source to destination")
+      .def("get_mem_size", &Backend::GetMemSize, nb::arg("mem_type"),
+           "Get total memory size for given memory type")
+      .def("get_core_count", &Backend::GetCoreCount, nb::arg("core_type"),
+           "Get total physical core count of a given core type across the SoC")
+      .def_prop_ro(
+          "soc", [](const Backend& backend) -> const SoC& { return backend.GetSoC(); }, "Get SoC object");
+
+  // ========== Backend910B concrete implementation ==========
+  nb::class_<Backend910B, Backend>(backend_mod, "Backend910B", "910B backend implementation")
+      .def_static("instance", &Backend910B::Instance, nb::rv_policy::reference,
+                  "Get singleton instance of 910B backend");
+
+  // ========== Backend950 concrete implementation ==========
+  nb::class_<Backend950, Backend>(backend_mod, "Backend950", "950 PTO backend implementation")
+      .def_static("instance", &Backend950::Instance, nb::rv_policy::reference,
+                  "Get singleton instance of 950 backend");
+
+  // ========== Backend configuration functions ==========
+  backend_mod.def("set_backend_type", &backend::BackendConfig::SetBackendType, nb::arg("backend_type"),
+                  "Set the global backend type. Must be called before any backend operations. "
+                  "Can be called multiple times with the same type (idempotent).");
+
+  backend_mod.def("get_backend_type", &backend::BackendConfig::GetBackendType,
+                  "Get the configured backend type. Throws error if not configured.");
+
+  backend_mod.def(
+      "get_backend_instance", [](BackendType type) { return backend::GetBackendInstance(type); },
+      nb::arg("backend_type"), nb::rv_policy::reference,
+      "Get the singleton Backend instance for a specific BackendType. "
+      "Useful when the caller knows the desired backend independently of global config.");
+
+  backend_mod.def(
+      "get_handler", []() { return backend::BackendConfig::GetBackend()->GetHandler(); },
+      nb::rv_policy::reference,
+      "Get the BackendHandler for the currently configured backend. "
+      "Throws if backend type has not been configured.");
+
+  backend_mod.def(
+      "get_input_tile_layout",
+      [](const std::string& op_name, size_t input_index) -> std::optional<ir::TileLayout> {
+        const auto* spec = backend::BackendConfig::GetBackend()->GetTileLayoutSpec(op_name);
+        if (spec == nullptr || input_index >= spec->input_layouts.size()) {
+          return std::nullopt;
+        }
+        return spec->input_layouts[input_index];
+      },
+      nb::arg("op_name"), nb::arg("input_index"),
+      "Tile layout the configured backend requires for one input of `op_name`, or None when that "
+      "input is unconstrained. ResolveBackendOpLayouts repairs an operand that disagrees, so an "
+      "operator whose lowering addresses its operands linearly must constrain every tile input. "
+      "Throws if the backend type has not been configured.");
+
+  backend_mod.def("is_backend_configured", &backend::BackendConfig::IsConfigured,
+                  "Check if backend type has been configured.");
+
+  backend_mod.def("reset_for_testing", &backend::BackendConfig::ResetForTesting,
+                  "Reset backend configuration (for testing only). "
+                  "WARNING: Only use in tests to reset between test cases.");
+}
+
+}  // namespace python
+}  // namespace pypto

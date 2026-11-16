@@ -1,0 +1,1264 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
+
+#include <algorithm>
+#include <any>
+#include <cstddef>
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <optional>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
+#include <vector>
+
+#include "pypto/core/dtype.h"
+#include "pypto/core/logging.h"
+#include "pypto/ir/expr.h"
+#include "pypto/ir/function.h"
+#include "pypto/ir/kind_traits.h"
+#include "pypto/ir/memory_space.h"
+#include "pypto/ir/op_registry.h"
+#include "pypto/ir/scalar_expr.h"
+#include "pypto/ir/span.h"
+#include "pypto/ir/stmt.h"
+#include "pypto/ir/tile_view_semantics.h"
+#include "pypto/ir/transforms/base/visitor.h"
+#include "pypto/ir/transforms/utils/memref_utils.h"
+#include "pypto/ir/transforms/utils/mutable_copy.h"
+#include "pypto/ir/transforms/utils/op_predicates.h"
+#include "pypto/ir/transforms/utils/tile_conversion_utils.h"
+#include "pypto/ir/transforms/utils/transform_utils.h"
+#include "pypto/ir/transforms/utils/var_collectors.h"
+#include "pypto/ir/type.h"
+#include "src/ir/transforms/flatten_tile_nd_to_2d/internal.h"
+#include "src/ir/transforms/flatten_tile_nd_to_2d/rewrite_internal.h"
+
+namespace pypto {
+namespace ir {
+
+using transform_utils::FlattenToStmts;
+using transform_utils::Substitute;
+
+namespace flatten_tile_nd_to_2d {
+namespace rewrite_internal {
+
+CallPtr WithRemappedCallAttrs(const CallPtr& original, const CallPtr& rewritten, const FlattenContext& ctx) {
+  auto attrs = original->attrs_;
+  for (auto& [key, value] : attrs) {
+    auto remapped = MapAttrExprs(value, [&](const ExprPtr& expr) { return Substitute(expr, ctx.var_map); });
+    if (remapped) value = std::move(*remapped);
+  }
+  return transform_utils::PreserveCallAttrs(attrs, rewritten);
+}
+
+// Allocation annotations are live IR: in particular, a pinned runtime slot may
+// name a scalar rebuilt earlier in this block. Reuse the type remapper (including
+// RemapPinnedMemRefExprs) before binding the result, never at its consumers.
+TypePtr RemapTypeReferences(const TypePtr& type, const FlattenContext& ctx) {
+  return CloneTypeWithMemRefAndRemapExprs(type, GetTypeMemRef(type),
+                                          [&](const ExprPtr& expr) { return Substitute(expr, ctx.var_map); });
+}
+
+TypePtr WithRemappedAllocation(const TypePtr& value_type, const TypePtr& original_type,
+                               const FlattenContext& ctx) {
+  return RemapTypeReferences(WithCarriedMemRef(value_type, original_type), ctx);
+}
+
+CallPtr WithRemappedResultAllocation(const CallPtr& value, const AssignStmtPtr& original,
+                                     const FlattenContext& ctx) {
+  INTERNAL_CHECK_SPAN(!op_predicates::OutputInheritsSourceBuffer(value->op_->name_), original->span_)
+      << "An inherited result must obtain its allocation from its input in InitMemRef";
+  auto old_tile = As<TileType>(original->var_->GetType());
+  auto new_tile = As<TileType>(value->GetType());
+  if (old_tile && old_tile->memref_ && old_tile->memory_space_ && new_tile && new_tile->memory_space_) {
+    CHECK_SPAN(old_tile->memory_space_ == new_tile->memory_space_, original->span_)
+        << "FlattenTileNdTo2D cannot move explicitly bound result '" << original->var_->name_hint_
+        << "' from " << MemorySpaceToString(*old_tile->memory_space_) << " to "
+        << MemorySpaceToString(*new_tile->memory_space_);
+  }
+  auto type = WithRemappedAllocation(value->GetType(), original->var_->GetType(), ctx);
+  if (type == value->GetType()) return value;
+  return std::make_shared<Call>(value->op_, value->args_, value->kwargs_, value->attrs_, type, value->span_);
+}
+
+/// Count real uses once, following the IR visitor's attr rules and all type
+/// expression fields. Definitions are excluded; shared types are walked once.
+class VarUseCounter : public IRVisitor {
+ public:
+  std::unordered_map<const Var*, size_t> counts;
+
+  void VisitExpr(const ExprPtr& expr) override {
+    VisitType(expr->GetType());
+    IRVisitor::VisitExpr(expr);
+  }
+
+ protected:
+  void VisitVarLike_(const VarPtr& var) override { ++counts[var.get()]; }
+  void VisitStmt_(const AssignStmtPtr& stmt) override {
+    VisitType(stmt->var_->GetType());
+    VisitExpr(stmt->value_);
+  }
+
+ private:
+  void VisitType(const TypePtr& type) {
+    if (type && visited_types_.insert(type.get()).second) var_collectors::VisitTypeExprFields(*this, type);
+  }
+  std::unordered_set<const Type*> visited_types_;
+};
+
+bool IsNaturalNzMatLoad(const TileTypePtr& result_tile, bool assume_mat = false) {
+  if (!result_tile) return false;
+  if (result_tile->memory_space_ != MemorySpace::Mat && !assume_mat) return false;
+  const auto view = result_tile->tile_view_.has_value()
+                        ? *result_tile->tile_view_
+                        : tile_view_semantics::GetImplicitTileView(
+                              result_tile->shape_,
+                              assume_mat ? std::make_optional(MemorySpace::Mat) : result_tile->memory_space_);
+  return view.blayout == TileLayout::col_major && view.slayout == TileLayout::row_major;
+}
+
+bool HasKwarg(const std::vector<std::pair<std::string, std::any>>& kwargs, const std::string& name) {
+  return std::any_of(kwargs.begin(), kwargs.end(),
+                     [&name](const auto& kwarg) { return kwarg.first == name; });
+}
+
+/// True when a `tile.load`'s source tensor carries the NZ layout.
+///
+/// `BlockNzTensorViews` runs right after this pass and will put such a load
+/// into its final form — a blocked rank-5 GM window feeding a logical 2D tile —
+/// so this pass must leave it alone rather than collapse the window or
+/// re-deduce the tile type.
+bool IsNzSourceLoad(const std::vector<ExprPtr>& args) {
+  if (args.empty()) return false;
+  auto tensor = AsVarLike(args[0]);
+  if (!tensor) return false;
+  auto tensor_type = AsTensorTypeLike(tensor->GetType());
+  return tensor_type && tensor_type->tensor_view_.has_value() &&
+         tensor_type->tensor_view_->layout == TensorLayout::NZ;
+}
+
+/**
+ * @brief Flatten a >2D `tile.create` / `tile.full` allocation to its 2D form.
+ *
+ * A batched Acc accumulator packs its pages along COLUMNS, not rows: `[M, B*N]`
+ * with page `b` at `[0, b*N]`. A row window of a multi-block-column L0C tile is
+ * strided and the MAD has no destination stride, so the generic `[B*M, N]`
+ * collapse would be silently mis-addressed. See `BuildAccPackingMap` for the
+ * chain analysis that decides which allocations are packed this way.
+ *
+ * @return The Var bound to the flattened allocation.
+ */
+VarPtr EmitFlattenedTileAlloc(const CallPtr& call, const AssignStmtPtr& assign,
+                              const TileTypePtr& result_tile, const std::string& op_name,
+                              const FlattenContext& ctx, const OpRegistry& op_registry, const Span& span,
+                              std::vector<StmtPtr>* result) {
+  // A batched Acc accumulator packs its pages along COLUMNS, not rows:
+  // [M, B*N] with page b at [0, b*N]. A row window of a multi-block-column
+  // L0C tile is strided and the MAD has no destination stride, so the
+  // generic [B*M, N] collapse would be silently mis-addressed. See
+  // BuildAccPackingMap for the chain analysis that decides this.
+  const auto* acc_plan = ctx.AccPackingForVar(assign->var_);
+  auto [merged, last] =
+      acc_plan ? std::pair<int64_t, int64_t>{acc_plan->rows, acc_plan->batch_count * acc_plan->cols}
+               : ComputeMergedShape(result_tile->shape_, op_name);
+
+  // Rebuild the call with 2D shape
+  auto new_shape_tuple = MakeShapeTupleFromInts({merged, last}, span);
+  std::vector<ExprPtr> new_args;
+  // First arg is the shape tuple
+  new_args.push_back(new_shape_tuple);
+  // Remaining args (e.g., fill value for tile.full)
+  for (size_t i = 1; i < call->args_.size(); ++i) {
+    new_args.push_back(Substitute(call->args_[i], ctx.var_map));
+  }
+
+  // The accumulator's only legal home is Acc, and stating it here (rather
+  // than leaving it to InferTileMemorySpace, pass 20) is what makes the
+  // per-page windows an Acc parent's windows from pass 13 onward — so
+  // CanonicalizeTileSlice (pass 19) sees them as accumulator windows and
+  // leaves them alone instead of materializing them as Vec extracts.
+  auto create_kwargs = call->kwargs_;
+  if (acc_plan) {
+    create_kwargs.erase(std::remove_if(create_kwargs.begin(), create_kwargs.end(),
+                                       [](const auto& kw) { return kw.first == "target_memory"; }),
+                        create_kwargs.end());
+    create_kwargs.emplace_back("target_memory", MemorySpace::Acc);
+  }
+  auto deduced = op_registry.Create(op_name, new_args, create_kwargs, span);
+  auto new_call = WithRemappedCallAttrs(call, WithRemappedResultAllocation(deduced, assign, ctx), ctx);
+  auto flat_var = std::make_shared<Var>(assign->var_->name_hint_, new_call->GetType(), assign->var_->span_);
+  result->push_back(std::make_shared<AssignStmt>(flat_var, new_call, assign->span_));
+  return flat_var;
+}
+
+/**
+ * @brief Fold a >2D `tile.assemble`'s ND offset into the flattened (row, col) space.
+ *
+ * The target and source tiles are rewritten to 2D by their defining ops, but the
+ * offset is a literal `MakeTuple` that no `Substitute` touches, so leaving it
+ * alone would put an ND offset on a 2D tile — which codegen reads positionally
+ * (row = `elements[0]`, col = `elements[1]`, the rest ignored) and would place
+ * the write at the wrong address. The fold is the same row-major collapse
+ * `tile.load` applies to its tensor-rank offsets.
+ *
+ * @return The Var bound to the folded assemble, or null when `call` is not a
+ *         `tile.assemble` or already targets a 2D tile — both of which the
+ *         caller's generic re-create path handles.
+ */
+VarPtr TryFoldNdAssembleOffset(const CallPtr& call, const AssignStmtPtr& assign, const FlattenContext& ctx,
+                               const OpRegistry& op_registry, const Span& span,
+                               std::vector<StmtPtr>* result) {
+  if (!IsOp(call, "tile.assemble")) return nullptr;
+  // Pre-substitution types are the ND ones the user wrote; the fold is expressed
+  // in that ND coordinate space (cf. the tile.store branch in TransformBody).
+  auto orig_target_type = As<TileType>(call->args_[0]->GetType());
+  if (!IsNdTile(orig_target_type)) return nullptr;
+
+  // Substitute the offset tuple too, not just the tile operands: its elements are
+  // index expressions that may reference Vars this pass remapped, and folding the
+  // pre-substitution elements would carry a stale SSA reference into the rebuilt
+  // call. The tile.store branch substitutes every arg for the same reason.
+  auto offset_tuple = As<MakeTuple>(Substitute(call->args_[2], ctx.var_map));
+  INTERNAL_CHECK_SPAN(offset_tuple, span) << "Internal error: tile.assemble offset must be a literal tuple";
+  INTERNAL_CHECK_SPAN(offset_tuple->elements_.size() == orig_target_type->shape_.size(), span)
+      << "Internal error: ND tile.assemble offset rank must match the target rank "
+         "(guaranteed by PreconditionAnalysis)";
+
+  std::vector<ExprPtr> new_args = {
+      Substitute(call->args_[0], ctx.var_map),
+      Substitute(call->args_[1], ctx.var_map),
+      std::make_shared<MakeTuple>(
+          std::vector<ExprPtr>{
+              CollapseLeadingOffsetsToRow(offset_tuple->elements_, orig_target_type->shape_, span),
+              offset_tuple->elements_.back()},
+          span),
+  };
+
+  auto deduced = op_registry.Create("tile.assemble", new_args, call->kwargs_, span);
+  CallPtr new_call = std::make_shared<Call>(
+      deduced->op_, deduced->args_, deduced->kwargs_, deduced->attrs_,
+      WithRemappedAllocation(deduced->GetType(), assign->var_->GetType(), ctx), deduced->span_);
+  new_call = WithRemappedCallAttrs(call, new_call, ctx);
+  auto flat_var = std::make_shared<Var>(assign->var_->name_hint_, new_call->GetType(), assign->var_->span_);
+  result->push_back(std::make_shared<AssignStmt>(flat_var, new_call, assign->span_));
+  return flat_var;
+}
+
+/**
+ * @brief Flatten a >2D `tile.reshape` / `tile.reinterpret_view` to its 2D form.
+ *
+ * These two are the only tile ops whose result rank comes from a literal shape
+ * operand rather than from an operand's type, so the generic
+ * substitute-and-re-deduce path cannot lower them: it rebuilds the call with the
+ * SAME ND shape tuple and the rank>2 result survives the pass. PTO codegen then
+ * types the tile from `shape_[0]` / `shape_[1]` alone (`ExtractTileTypeInfo`)
+ * and drops every trailing dimension, so a `[2, 8, 128]` tile is emitted as
+ * `rows=2, cols=8` -- 16 elements instead of 2048 -- and ptoas rejects the
+ * resulting `pto.treshape` for a total-byte-size mismatch.
+ *
+ * The collapse is the pass's own `[product(leading), last]` rule, and it is
+ * exactly semantics-preserving for a reshape: a tile is one contiguous
+ * row-major run, so `[2, 8, 128]` and `[16, 128]` name the same elements in the
+ * same order. The 2D-target reshape that results is often the identity, which
+ * `FoldNoOpReshape` (pass 38) then removes.
+ *
+ * A safe batch-only reshape feeding `tile.batch_matmul` is peeled by
+ * `NormalizeBatchMatmulOperand` before this runs and never reaches here.
+ *
+ * @return The Var bound to the flattened view, or null when `call` is neither of
+ *         these two ops, is the rank-deriving 1-arg `tile.reinterpret_view`, or
+ *         already targets 2D -- all of which the caller's generic path handles.
+ */
+VarPtr TryFlattenRankRaisingView(const CallPtr& call, const AssignStmtPtr& assign, const std::string& op_name,
+                                 const FlattenContext& ctx, const OpRegistry& op_registry, const Span& span,
+                                 std::vector<StmtPtr>* result) {
+  if (!IsOp(call, "tile.reshape") && !IsOp(call, "tile.reinterpret_view")) return nullptr;
+  auto result_tile = As<TileType>(call->GetType());
+  // A shape operand is what makes the rank explicit; the 1-arg
+  // `tile.reinterpret_view` form derives its rank from the source and is already
+  // handled by the caller's generic path, as is an already-2D target.
+  if (!IsNdTile(result_tile) || call->args_.size() != 2) return nullptr;
+
+  auto [merged, last] = ComputeMergedShape(result_tile->shape_, op_name + " target shape");
+  std::vector<ExprPtr> new_args = {Substitute(call->args_[0], ctx.var_map),
+                                   MakeShapeTupleFromInts({merged, last}, span)};
+  auto deduced = op_registry.Create(op_name, new_args, call->kwargs_, span);
+  CallPtr new_call = std::make_shared<Call>(
+      deduced->op_, deduced->args_, deduced->kwargs_, deduced->attrs_,
+      WithRemappedAllocation(deduced->GetType(), assign->var_->GetType(), ctx), deduced->span_);
+  new_call = WithRemappedCallAttrs(call, new_call, ctx);
+  auto flat_var = std::make_shared<Var>(assign->var_->name_hint_, new_call->GetType(), assign->var_->span_);
+  result->push_back(std::make_shared<AssignStmt>(flat_var, new_call, assign->span_));
+  return flat_var;
+}
+
+/**
+ * @brief Emit the per-page drain of a column-packed batched accumulator.
+ *
+ * The pages sit side by side in ONE `[M, B*N]` Acc tile, so there is no single
+ * 2D buffer whose row-major collapse is the `[B, M, N]` output window. Each page
+ * is stored as a column window at its own batch offset — the same per-page shape
+ * `LowerBatchMatmul`'s direct-store fusion already emits, straight out of L0C
+ * with no Vec staging (a store whose source is an Acc tile classifies CUBE, so
+ * it needs no cross-core move).
+ *
+ * `BuildAccPackingMap` has already verified the store is the 3-arg form with
+ * tensor-rank offsets, so the checks below guard a pass invariant, not user
+ * input.
+ *
+ * @return The Var bound by the last page's store, which threads the tensor.
+ */
+VarPtr EmitPackedAccumulatorDrain(const AccPackingPlan& plan, const CallPtr& call,
+                                  const AssignStmtPtr& assign, const FlattenContext& ctx,
+                                  const OpRegistry& op_registry, const Span& span,
+                                  std::vector<StmtPtr>* result) {
+  auto packed = Substitute(call->args_[0], ctx.var_map);
+  auto offsets = As<MakeTuple>(Substitute(call->args_[1], ctx.var_map));
+  ExprPtr out_tensor = Substitute(call->args_[2], ctx.var_map);
+  INTERNAL_CHECK_SPAN(offsets && offsets->elements_.size() == plan.nd_shape.size(), span)
+      << "Internal error: column-packed accumulator drain expects rank-" << plan.nd_shape.size()
+      << " tile.store offsets";
+
+  const size_t batch_rank = plan.batch_dims.size();
+  std::vector<ExprPtr> partition_shape;
+  partition_shape.reserve(plan.nd_shape.size());
+  for (size_t i = 0; i < batch_rank; ++i) {
+    partition_shape.push_back(std::make_shared<ConstInt>(1, DataType::INDEX, span));
+  }
+  partition_shape.push_back(std::make_shared<ConstInt>(plan.rows, DataType::INDEX, span));
+  partition_shape.push_back(std::make_shared<ConstInt>(plan.cols, DataType::INDEX, span));
+
+  auto page_shape = MakeShapeTupleFromInts({plan.rows, plan.cols}, span);
+  VarPtr last_store;
+  for (int64_t batch = 0; batch < plan.batch_count; ++batch) {
+    const std::string suffix = std::to_string(batch);
+    auto page_offset = MakeShapeTupleFromInts({0, batch * plan.cols}, span);
+    auto page = op_registry.Create("tile.slice", {packed, page_shape, page_offset}, span);
+    auto page_var = std::make_shared<Var>("acc_drain_" + suffix, page->GetType(), span);
+    result->push_back(std::make_shared<AssignStmt>(page_var, page, assign->span_));
+
+    if (plan.row_windows) {
+      auto row = MakeCanonicalIndexAdd(
+          offsets->elements_[0], std::make_shared<ConstInt>(batch * plan.rows, DataType::INDEX, span), span);
+      auto store_offsets =
+          std::make_shared<MakeTuple>(std::vector<ExprPtr>{row, offsets->elements_[1]}, span);
+      auto page_store =
+          op_registry.Create("tile.store", {page_var, store_offsets, out_tensor}, call->kwargs_, span);
+      page_store = WithRemappedCallAttrs(call, page_store, ctx);
+      last_store = std::make_shared<Var>(assign->var_->name_hint_ + "_" + suffix, page_store->GetType(),
+                                         assign->var_->span_);
+      result->push_back(std::make_shared<AssignStmt>(last_store, page_store, assign->span_));
+      out_tensor = last_store;
+      continue;
+    }
+    auto batch_indices = BuildBatchIndices(batch, plan.batch_dims);
+    auto store_offsets = std::make_shared<MakeTuple>(
+        BuildBatchAdjustedOffsets(offsets->elements_, batch_indices, batch_rank, span), span);
+    auto page_store = op_registry.Create(
+        "tile.store",
+        {page_var, store_offsets, out_tensor, std::make_shared<MakeTuple>(partition_shape, span)},
+        call->kwargs_, span);
+    page_store = WithRemappedCallAttrs(call, page_store, ctx);
+    last_store = std::make_shared<Var>(assign->var_->name_hint_ + "_" + suffix, page_store->GetType(),
+                                       assign->var_->span_);
+    result->push_back(std::make_shared<AssignStmt>(last_store, page_store, assign->span_));
+    out_tensor = last_store;
+  }
+  INTERNAL_CHECK_SPAN(last_store, span)
+      << "Internal error: a column-packed accumulator always has at least one page";
+  return last_store;
+}
+
+/// Map a logical row-window origin into the packed accumulator. Evaluate the
+/// original offset before dividing, preserving fixed-width scalar arithmetic.
+ExprPtr PackedRowWindowOffsets(const AccPackingPlan& plan, const ExprPtr& offsets, const FlattenContext& ctx,
+                               const Span& span) {
+  auto tuple = As<MakeTuple>(Substitute(offsets, ctx.var_map));
+  INTERNAL_CHECK_SPAN(tuple && tuple->elements_.size() == 2, span)
+      << "Internal error: a packed accumulator window must have two offsets";
+  ExprPtr column;
+  if (auto row = As<ConstInt>(tuple->elements_[0])) {
+    column = std::make_shared<ConstInt>((row->value_ / plan.rows) * plan.cols, DataType::INDEX, span);
+  } else {
+    auto rows = std::make_shared<ConstInt>(plan.rows, DataType::INDEX, span);
+    auto cols = std::make_shared<ConstInt>(plan.cols, DataType::INDEX, span);
+    column = MakeMul(MakeFloorDiv(tuple->elements_[0], rows, span), cols, span);
+  }
+  column = MakeCanonicalIndexAdd(column, tuple->elements_[1], span);
+  return std::make_shared<MakeTuple>(
+      std::vector<ExprPtr>{std::make_shared<ConstInt>(0, DataType::INDEX, span), column}, span);
+}
+
+/**
+ * @brief Recursively transform statements, flattening >2D tile ops to 2D.
+ *
+ * Every node this synthesizes is attributed to the statement it was synthesized
+ * for (see `span` in the rewrite loop) — never to the enclosing function — so
+ * post-pass diagnostics, IR traces and `loc()` point at the offending source
+ * line rather than the `def` line.
+ */
+std::vector<StmtPtr> TransformBody(const std::vector<StmtPtr>& stmts, FlattenContext& ctx,
+                                   const OpRegistry& op_registry) {
+  std::vector<StmtPtr> result;
+
+  // Pre-scan: identify operand chains (tile.load -> tile.transpose_view/reshape)
+  // consumed EXCLUSIVELY by tile.batch_matmul. Used for two things: (a) the
+  // tile.transpose / tile.reshape rewrite-loop skips below (peeled by the lowering),
+  // and (b) the !fit capacity drop — when a matmul's whole operands do not fit Mat,
+  // ExtractBatchPage loads them per batch and the dead whole chain is dropped.
+  //
+  // Safety: we count ALL Var references across every statement type (Return, Yield,
+  // If conditions, For/While bounds, etc.), not just Call arguments. A Var used
+  // anywhere outside a tile.batch_matmul Call prevents it from being treated as a
+  // batch_matmul-only chain.
+  std::unordered_set<const Var*> batch_matmul_only_vars;
+  // Operand-chain vars (whole load + transpose_view) feeding EXCLUSIVELY !fit
+  // batch_matmuls — their whole tile would overflow Mat, so ExtractBatchPage loads
+  // them per batch and the dead whole chain is dropped during rewriting below.
+  std::unordered_set<const Var*> not_fit_drop_vars;
+  {
+    std::vector<const Var*> batch_matmul_operands;
+    std::unordered_map<const Var*, size_t> eligible_uses;
+    for (const auto& stmt : stmts) {
+      auto assign = As<AssignStmt>(stmt);
+      auto call = assign ? As<Call>(assign->value_) : nullptr;
+      const bool is_matmul = IsOp(call, "tile.batch_matmul");
+      const bool is_acc = IsOp(call, "tile.batch_matmul_acc");
+      if (!is_matmul && !is_acc) continue;
+      for (size_t i = is_acc ? 1 : 0; i < (is_acc ? 3 : call->args_.size()); ++i) {
+        if (auto operand = AsVarLike(call->args_[i])) {
+          batch_matmul_operands.push_back(operand.get());
+          ++eligible_uses[operand.get()];
+        }
+      }
+    }
+    // Attr/type/nested uses must keep the original definition alive, just like
+    // ordinary arguments. Explicitly bound owners must not be peeled away.
+    for (const auto* var : batch_matmul_operands) {
+      if (eligible_uses[var] == ctx.UseCount(var) && !GetTypeMemRef(var->GetType())) {
+        batch_matmul_only_vars.insert(var);
+      }
+    }
+
+    // Walk back through safe peelable `tile.reshape` chains so the upstream
+    // dead `tile.reshape` (and any further-upstream `tile.load`) are also
+    // skipped during rewriting. Without this, the orphan reshape would emit a
+    // rank>2 tile that violates the post-pass `TileOps2D` property. Require the
+    // input to have exactly one use across the WHOLE function so a
+    // load also consumed inside a nested body is never peeled away.
+    // Also walk back through a single-use tile.transpose_view so its underlying
+    // whole tile.load joins the chain (needed so the !fit path can drop the dead
+    // whole load, not just the view).
+    auto stmt_def_map = BuildAssignDefMap(stmts);
+    std::vector<const Var*> reshape_worklist(batch_matmul_only_vars.begin(), batch_matmul_only_vars.end());
+    while (!reshape_worklist.empty()) {
+      const Var* current = reshape_worklist.back();
+      reshape_worklist.pop_back();
+      auto def_it = stmt_def_map.find(current);
+      if (def_it == stmt_def_map.end()) continue;
+      auto chain_call = As<Call>(def_it->second->value_);
+      const bool is_view = IsOp(chain_call, "tile.transpose_view");
+      if (!is_view && !IsSafePeelableBatchMatmulReshape(chain_call)) continue;
+      auto input_var = As<Var>(chain_call->args_[0]);
+      if (!input_var) continue;
+      if (ctx.UseCount(input_var.get()) != 1 || GetTypeMemRef(input_var->GetType())) continue;
+      if (batch_matmul_only_vars.insert(input_var.get()).second) {
+        reshape_worklist.push_back(input_var.get());
+      }
+    }
+
+    // Per-batch_matmul capacity gate: when the operands' whole tiles do not fit
+    // Mat together, their batch_matmul_only operand chains are loaded per batch
+    // (ExtractBatchPage !fit path) — drop the dead whole chain here. A chain
+    // shared with any FIT matmul stays whole (drop only chains feeding
+    // exclusively !fit matmuls).
+    std::unordered_set<const Var*> any_fit, any_notfit;
+    std::function<void(const Var*, bool)> MarkChain = [&](const Var* v, bool fits) {
+      if (!v) return;
+      (fits ? any_fit : any_notfit).insert(v);
+      auto it = stmt_def_map.find(v);
+      if (it == stmt_def_map.end()) return;
+      auto c = As<Call>(it->second->value_);
+      if (!c || !c->op_ || c->args_.empty()) return;
+      if (IsOp(c, "tile.transpose_view") || IsOp(c, "tile.reshape")) {
+        if (auto in = As<Var>(c->args_[0])) MarkChain(in.get(), fits);
+      }
+    };
+    for (const auto& s : stmts) {
+      auto a = As<AssignStmt>(s);
+      auto c = a ? As<Call>(a->value_) : nullptr;
+      if (!c || !c->op_) continue;
+      const bool is_bmm = IsOp(c, "tile.batch_matmul");
+      const bool is_bmm_acc = IsOp(c, "tile.batch_matmul_acc");
+      if (!is_bmm && !is_bmm_acc) continue;
+      const size_t lhs_i = is_bmm ? 0 : 1;
+      const size_t rhs_i = is_bmm ? 1 : 2;
+      if (rhs_i >= c->args_.size()) continue;
+      // Mirror LowerBatchMatmul's per-operand routing so a non-contiguous whole
+      // load (which goes per-batch) is also recognized as !fit here and its dead
+      // whole chain is dropped (otherwise it would survive to codegen and trip the
+      // ND2NZ contiguity guard).
+      const bool capacity_fits = BatchOperandsWholeFit(As<TileType>(c->args_[lhs_i]->GetType()),
+                                                       As<TileType>(c->args_[rhs_i]->GetType()));
+      const bool lhs_fits =
+          KeepOperandWhole(capacity_fits, TraceOperandBaseLoad(c->args_[lhs_i], stmt_def_map));
+      const bool rhs_fits =
+          KeepOperandWhole(capacity_fits, TraceOperandBaseLoad(c->args_[rhs_i], stmt_def_map));
+      if (auto lv = As<Var>(c->args_[lhs_i])) MarkChain(lv.get(), lhs_fits);
+      if (auto rv = As<Var>(c->args_[rhs_i])) MarkChain(rv.get(), rhs_fits);
+    }
+    // Visit order does not escape: the loop only tests membership and inserts
+    // into a set that is itself consumed by lookup, so the result is identical
+    // for any traversal order.
+    // NOLINTNEXTLINE(bugprone-nondeterministic-pointer-iteration-order)
+    for (const auto* v : batch_matmul_only_vars) {
+      if (any_notfit.count(v) != 0 && any_fit.count(v) == 0) not_fit_drop_vars.insert(v);
+    }
+  }
+
+  // Finalize the previous assignment at the next iteration (and after the
+  // loop), so every early continue and delegated lowering shares this policy.
+  // A replacement sequence receives its source comments exactly once, before
+  // its first emitted statement; unchanged assignments already carry them.
+  AssignStmtPtr previous_assign;
+  size_t first_emitted = 0;
+  auto preserve_assignment_comments = [&]() {
+    if (!previous_assign || previous_assign->leading_comments_.empty() || result.size() == first_emitted ||
+        result[first_emitted] == previous_assign) {
+      return;
+    }
+    auto first_assign = As<AssignStmt>(result[first_emitted]);
+    INTERNAL_CHECK_SPAN(first_assign, previous_assign->span_)
+        << "FlattenTileNdTo2D: an assignment replacement must start with an assignment";
+    auto commented = MutableCopy(first_assign);
+    commented->leading_comments_.insert(commented->leading_comments_.begin(),
+                                        previous_assign->leading_comments_.begin(),
+                                        previous_assign->leading_comments_.end());
+    result[first_emitted] = commented;
+  };
+
+  for (size_t stmt_index = 0; stmt_index < stmts.size(); ++stmt_index) {
+    preserve_assignment_comments();
+    const auto& stmt = stmts[stmt_index];
+    previous_assign = As<AssignStmt>(stmt);
+    first_emitted = result.size();
+    // Statement-level nodes below each carry their own source node's span
+    // (`ret->span_`, `assign->span_`, `for_stmt->body_->span_`, ...). Ops rebuilt
+    // from an RHS `Call` use that Call's tighter span — see `span`, bound once the
+    // Call is in hand.
+
+    // ReturnStmt: substitute return values
+    if (auto ret = As<ReturnStmt>(stmt)) {
+      std::vector<ExprPtr> new_values;
+      new_values.reserve(ret->value_.size());
+      for (const auto& v : ret->value_) {
+        new_values.push_back(Substitute(v, ctx.var_map));
+      }
+      result.push_back(std::make_shared<ReturnStmt>(new_values, ret->span_));
+      continue;
+    }
+
+    // YieldStmt: substitute variables
+    if (auto yield = As<YieldStmt>(stmt)) {
+      std::vector<ExprPtr> new_values;
+      new_values.reserve(yield->value_.size());
+      for (const auto& v : yield->value_) {
+        new_values.push_back(Substitute(v, ctx.var_map));
+      }
+      result.push_back(std::make_shared<YieldStmt>(new_values, yield->span_));
+      continue;
+    }
+
+    // SeqStmts: recurse
+    if (auto seq = As<SeqStmts>(stmt)) {
+      auto inner = TransformBody(seq->stmts_, ctx, op_registry);
+      result.insert(result.end(), inner.begin(), inner.end());
+      continue;
+    }
+
+    // ScopeStmt: recurse into body — dispatch on the concrete derived class
+    // since ScopeStmt is abstract and MutableCopy needs a concrete type.
+    if (auto scope = As<ScopeStmt>(stmt)) {
+      auto body_stmts = FlattenToStmts(scope->body_);
+      auto inner = TransformBody(body_stmts, ctx, op_registry);
+      auto new_body = SeqStmts::Flatten(std::move(inner), scope->body_->span_);
+      auto rewrite = [&](auto&& concrete) -> StmtPtr {
+        auto new_scope = MutableCopy(concrete);
+        new_scope->body_ = new_body;
+        return new_scope;
+      };
+      if (auto in_core = As<InCoreScopeStmt>(stmt)) {
+        result.push_back(rewrite(in_core));
+      } else if (auto cluster = As<ClusterScopeStmt>(stmt)) {
+        result.push_back(rewrite(cluster));
+      } else if (auto hier = As<HierarchyScopeStmt>(stmt)) {
+        result.push_back(rewrite(hier));
+      } else if (auto spmd = As<SpmdScopeStmt>(stmt)) {
+        result.push_back(rewrite(spmd));
+      } else if (auto split_aiv = As<SplitAivScopeStmt>(stmt)) {
+        result.push_back(rewrite(split_aiv));
+      } else if (auto runtime_scope = As<RuntimeScopeStmt>(stmt)) {
+        result.push_back(rewrite(runtime_scope));
+      } else {
+        INTERNAL_UNREACHABLE_SPAN(scope->span_) << "Unknown ScopeStmt subclass: " << scope->TypeName();
+      }
+      continue;
+    }
+
+    // IfStmt: recurse into branches, substitute return_vars
+    if (auto if_stmt = As<IfStmt>(stmt)) {
+      auto new_cond = Substitute(if_stmt->condition_, ctx.var_map);
+
+      auto then_ctx = ctx;
+      auto then_stmts = FlattenToStmts(if_stmt->then_body_);
+      auto new_then = TransformBody(then_stmts, then_ctx, op_registry);
+      // Extract yield types before moving the vector
+      auto yield_types = FindYieldTypes(new_then);
+      auto new_then_body = SeqStmts::Flatten(std::move(new_then), if_stmt->then_body_->span_);
+
+      FlattenContext else_ctx = ctx;
+      std::optional<StmtPtr> new_else_body;
+      if (if_stmt->else_body_.has_value()) {
+        auto else_stmts = FlattenToStmts(*if_stmt->else_body_);
+        auto new_else = TransformBody(else_stmts, else_ctx, op_registry);
+        new_else_body = SeqStmts::Flatten(std::move(new_else), (*if_stmt->else_body_)->span_);
+      }
+
+      // Update return_vars types based on yield types (positional matching)
+      if (yield_types.empty() && new_else_body.has_value()) {
+        yield_types = FindYieldTypes(FlattenToStmts(*new_else_body));
+      }
+      std::vector<VarPtr> new_return_vars;
+      new_return_vars.reserve(if_stmt->return_vars_.size());
+      for (size_t i = 0; i < if_stmt->return_vars_.size(); ++i) {
+        const auto& rv = if_stmt->return_vars_[i];
+        if (i < yield_types.size() && yield_types[i] != rv->GetType()) {
+          auto new_rv = std::make_shared<Var>(rv->name_hint_, yield_types[i], rv->span_);
+          new_return_vars.push_back(new_rv);
+          ctx.Insert(rv, new_rv);
+        } else {
+          new_return_vars.push_back(rv);
+        }
+      }
+
+      auto new_if = MutableCopy(if_stmt);
+      new_if->condition_ = new_cond;
+      new_if->then_body_ = new_then_body;
+      new_if->else_body_ = new_else_body;
+      new_if->return_vars_ = new_return_vars;
+      result.push_back(new_if);
+      continue;
+    }
+
+    // ForStmt: recurse into body, substitute return_vars
+    if (auto for_stmt = As<ForStmt>(stmt)) {
+      auto new_start = Substitute(for_stmt->start_, ctx.var_map);
+      auto new_stop = Substitute(for_stmt->stop_, ctx.var_map);
+      auto new_step = Substitute(for_stmt->step_, ctx.var_map);
+
+      auto body_ctx = ctx;
+      std::vector<IterArgPtr> new_iter_args;
+      new_iter_args.reserve(for_stmt->iter_args_.size());
+      for (const auto& ia : for_stmt->iter_args_) {
+        auto new_init = Substitute(ia->initValue_, ctx.var_map);
+        auto new_ia = ia;
+        if (new_init != ia->initValue_) {
+          new_ia = std::make_shared<IterArg>(ia->name_hint_, new_init->GetType(), new_init, ia->span_);
+          body_ctx.Insert(ia, new_ia);
+        } else {
+          body_ctx.Erase(ia);
+        }
+        new_iter_args.push_back(new_ia);
+      }
+
+      auto body_stmts = FlattenToStmts(for_stmt->body_);
+      auto new_body_stmts = TransformBody(body_stmts, body_ctx, op_registry);
+      auto new_body = SeqStmts::Flatten(std::move(new_body_stmts), for_stmt->body_->span_);
+
+      // Update return_vars types to match iter_arg types (positional matching)
+      std::vector<VarPtr> new_return_vars;
+      new_return_vars.reserve(for_stmt->return_vars_.size());
+      for (size_t i = 0; i < for_stmt->return_vars_.size(); ++i) {
+        const auto& rv = for_stmt->return_vars_[i];
+        if (i < new_iter_args.size() && new_iter_args[i]->GetType() != rv->GetType()) {
+          auto new_rv = std::make_shared<Var>(rv->name_hint_, new_iter_args[i]->GetType(), rv->span_);
+          new_return_vars.push_back(new_rv);
+          ctx.Insert(rv, new_rv);
+        } else {
+          new_return_vars.push_back(rv);
+        }
+      }
+
+      auto new_for = MutableCopy(for_stmt);
+      new_for->start_ = new_start;
+      new_for->stop_ = new_stop;
+      new_for->step_ = new_step;
+      new_for->iter_args_ = new_iter_args;
+      new_for->body_ = new_body;
+      new_for->return_vars_ = new_return_vars;
+      result.push_back(new_for);
+      continue;
+    }
+
+    // WhileStmt: recurse into body, substitute return_vars
+    if (auto while_stmt = As<WhileStmt>(stmt)) {
+      auto body_ctx = ctx;
+      std::vector<IterArgPtr> new_iter_args;
+      new_iter_args.reserve(while_stmt->iter_args_.size());
+      for (const auto& ia : while_stmt->iter_args_) {
+        auto new_init = Substitute(ia->initValue_, ctx.var_map);
+        auto new_ia = ia;
+        if (new_init != ia->initValue_) {
+          new_ia = std::make_shared<IterArg>(ia->name_hint_, new_init->GetType(), new_init, ia->span_);
+          body_ctx.Insert(ia, new_ia);
+        } else {
+          body_ctx.Erase(ia);
+        }
+        new_iter_args.push_back(new_ia);
+      }
+
+      auto new_cond = Substitute(while_stmt->condition_, body_ctx.var_map);
+      auto body_stmts = FlattenToStmts(while_stmt->body_);
+      auto new_body_stmts = TransformBody(body_stmts, body_ctx, op_registry);
+      auto new_body = SeqStmts::Flatten(std::move(new_body_stmts), while_stmt->body_->span_);
+
+      // Update return_vars types to match iter_arg types (positional matching)
+      std::vector<VarPtr> new_return_vars;
+      new_return_vars.reserve(while_stmt->return_vars_.size());
+      for (size_t i = 0; i < while_stmt->return_vars_.size(); ++i) {
+        const auto& rv = while_stmt->return_vars_[i];
+        if (i < new_iter_args.size() && new_iter_args[i]->GetType() != rv->GetType()) {
+          auto new_rv = std::make_shared<Var>(rv->name_hint_, new_iter_args[i]->GetType(), rv->span_);
+          new_return_vars.push_back(new_rv);
+          ctx.Insert(rv, new_rv);
+        } else {
+          new_return_vars.push_back(rv);
+        }
+      }
+
+      auto new_while = MutableCopy(while_stmt);
+      new_while->condition_ = new_cond;
+      new_while->iter_args_ = new_iter_args;
+      new_while->body_ = new_body;
+      new_while->return_vars_ = new_return_vars;
+      result.push_back(new_while);
+      continue;
+    }
+
+    // EvalStmt: substitute variables in the expression
+    if (auto eval = As<EvalStmt>(stmt)) {
+      auto new_expr = Substitute(eval->expr_, ctx.var_map);
+      if (new_expr != eval->expr_) {
+        // Re-create tile ops via OpRegistry for proper type deduction
+        if (auto call = As<Call>(new_expr)) {
+          if (call->op_ && call->op_->name_.substr(0, 5) == "tile.") {
+            auto new_call = op_registry.Create(call->op_->name_, call->args_, call->kwargs_, call->span_);
+            new_call = transform_utils::PreserveCallAttrs(call, new_call);
+            result.push_back(std::make_shared<EvalStmt>(new_call, eval->span_));
+            continue;
+          }
+        }
+        result.push_back(std::make_shared<EvalStmt>(new_expr, eval->span_));
+      } else {
+        result.push_back(stmt);
+      }
+      continue;
+    }
+
+    // AssignStmt: the main transformation logic
+    auto assign = As<AssignStmt>(stmt);
+    if (!assign) {
+      result.push_back(stmt);
+      continue;
+    }
+
+    // Drop the dead whole load/transpose_view chain of a !fit batch_matmul: it is
+    // loaded per batch at the matmul (ExtractBatchPage !fit path), so the whole
+    // tile is never referenced and must not occupy L1.
+    if (not_fit_drop_vars.count(assign->var_.get()) != 0) {
+      ctx.Insert(assign->var_, assign->var_);  // identity mapping so any lookup resolves
+      continue;
+    }
+
+    auto call = As<Call>(assign->value_);
+    auto global_var = call ? As<GlobalVar>(call->op_) : nullptr;
+
+    // Non-call assignment or function call (GlobalVar): substitute and pass through
+    if (!call || global_var) {
+      auto new_value = Substitute(assign->value_, ctx.var_map);
+      auto new_lhs_type = RemapTypeReferences(assign->var_->GetType(), ctx);
+      if (new_value != assign->value_ || new_lhs_type != assign->var_->GetType()) {
+        auto new_type = WithRemappedAllocation(new_value->GetType(), new_lhs_type, ctx);
+        auto new_var = std::make_shared<Var>(assign->var_->name_hint_, new_type, assign->var_->span_);
+        result.push_back(std::make_shared<AssignStmt>(new_var, new_value, assign->span_));
+        ctx.Insert(assign->var_, new_var);
+      } else {
+        result.push_back(stmt);
+      }
+      continue;
+    }
+
+    // Everything below rebuilds ops derived from this RHS `Call`, so they take the
+    // Call's own span rather than the statement's. The two differ whenever the RHS
+    // does not start at the assignment — always by column (`t = pl.tile.exp(x)`),
+    // and by line for a parenthesized or wrapped RHS.
+    //
+    // Invariant: `span` is for expressions and ops ONLY. Every `AssignStmt` built
+    // below — including the auxiliary ones the lowering paths insert (the rank-N
+    // Mat load's `tensor.view`, the rank-N store's `tile.reshape`, the transpose
+    // scratch `tile.create`) — must pass `assign->span_`, so statement-level
+    // verifiers and `INTERNAL_CHECK_SPAN(..., assign->span_)` consumers keep
+    // reporting the statement rather than the operator inside it.
+    const Span& span = call->span_;
+
+    const auto& op_name = call->op_->name_;
+
+    // ---- tile.load on >2D tile: flatten the result tile to 2D (hardware tiles
+    //      are always 2D), keeping the tensor-rank source window for codegen —
+    //      except a natural Mat load with a real batch (>1) collapses its window
+    //      to 2D as well (the ND2NZ path rejects rank>2 GlobalTensors). ----
+    if (IsOp(call, "tile.load")) {
+      // A batch_matmul operand load is KEPT here and sliced per batch by
+      // ExtractBatchPage (the fit path) — both operands, transposed or not, are
+      // handled identically (whole tile in L1 + per-batch slice). Only a !fit
+      // operand load is dropped (above), to be re-emitted per batch.
+
+      // Substitute args via ctx.var_map so all operand Vars reference the latest SSA values.
+      std::vector<ExprPtr> sub_args;
+      sub_args.reserve(call->args_.size());
+      for (const auto& arg : call->args_) {
+        sub_args.push_back(Substitute(arg, ctx.var_map));
+      }
+
+      auto result_tile = As<TileType>(call->GetType());
+      if (result_tile && result_tile->shape_.size() > 2) {
+        const bool pending_batch_matmul_mat = batch_matmul_only_vars.count(assign->var_.get()) != 0 &&
+                                              !HasKwarg(call->kwargs_, "target_memory") &&
+                                              result_tile->memory_space_ != MemorySpace::Mat;
+        const std::optional<MemorySpace> flat_memory_space =
+            pending_batch_matmul_mat ? std::make_optional(MemorySpace::Mat) : result_tile->memory_space_;
+
+        // Rank>2 tile.load: keep the original tensor-rank offsets/shapes, but
+        // construct a 2D TileType for the result. DeduceTileLoadType produces a
+        // rank>2 TileType from those shapes, but hardware tiles are always 2D.
+        // The pass manually overrides the result type to 2D.
+        auto [merged, last] = ComputeMergedShape(result_tile->shape_, "tile.load result");
+
+        auto flat_shape_exprs = Make2DShapeExprs(merged, last, span);
+        // Preserve any TileView (blayout/slayout/fractal/pad/compact) the source tile
+        // already carried — e.g. LowerCompositeOps tags a transposed-load Mat
+        // rhs with TileView(blayout=row_major, slayout=col_major) so the
+        // downstream TLOAD matches the DN2ZN pattern. The implicit Mat default
+        // (col/row = ND) would otherwise emit an unsupported DN2ND TLOAD (#1540).
+        std::optional<TileView> flat_tile_view;
+        if (result_tile->tile_view_.has_value()) {
+          const auto& orig_tv = *result_tile->tile_view_;
+          // Carry the original valid_shape through the flatten. When it is a
+          // proper per-dim valid_shape (e.g. a dynamic min(CHUNK, D-c) tail from
+          // the dynamic-tile strip-mine), merge it the same way as the physical
+          // shape so the runtime tail extent survives; otherwise the flattened
+          // tile is fully valid (valid_shape == physical 2D shape).
+          std::vector<ExprPtr> flat_valid = flat_shape_exprs;
+          if (orig_tv.valid_shape.size() == result_tile->shape_.size()) {
+            flat_valid = ComputeMergedValidShape(orig_tv.valid_shape, span);
+          }
+          flat_tile_view = TileView(flat_valid, /*stride=*/{}, /*start_offset=*/nullptr, orig_tv.blayout,
+                                    orig_tv.slayout, orig_tv.fractal, orig_tv.pad, orig_tv.compact);
+        } else {
+          flat_tile_view = tile_view_semantics::GetImplicitTileView(flat_shape_exprs, flat_memory_space);
+        }
+        // Carry the MemRef through: the flattened tile is the same storage, and a
+        // parse-time declared allocation rides this field to InitMemRef.
+        // Dropping it would silently un-bind every ND user-bound tile. The binding
+        // sits on the assigned Var; `result_tile` is the RHS Call's deduced type,
+        // which never carries a MemRef — see WithCarriedMemRef.
+        auto bound_memref = GetTypeMemRef(assign->var_->GetType());
+        auto flat_tile_type = RemapTypeReferences(
+            std::make_shared<TileType>(flat_shape_exprs, result_tile->dtype_,
+                                       bound_memref.has_value() ? bound_memref : result_tile->memref_,
+                                       flat_tile_view, flat_memory_space),
+            ctx);
+
+        // A natural Mat load lowers to ND2NZ, which requires a 2D GlobalTensor.
+        // Materialize that source-window collapse in IR with tensor.view; plain
+        // Vec loads and transposed Mat loads keep their tensor-rank source window.
+        // The collapse below exists because a natural Mat load lowers to ND2NZ,
+        // which pto-isa only accepts on a 2D GlobalTensor. An NZ *source* takes
+        // the NZ2NZ path instead, and BlockNzTensorViews (which runs right after
+        // this pass) will give it the blocked rank-5 window that path wants.
+        // Collapsing here would flatten the fractal dims into a row count and
+        // destroy that structure, so leave the window at tensor rank and only
+        // flatten the tile.
+        if (IsNaturalNzMatLoad(result_tile, pending_batch_matmul_mat) && !IsNzSourceLoad(sub_args)) {
+          auto tensor = AsVarLike(sub_args[0]);
+          auto tensor_type = tensor ? AsTensorTypeLike(tensor->GetType()) : nullptr;
+          INTERNAL_CHECK_SPAN(tensor && tensor_type, span)
+              << "FlattenTileNdTo2D: tile.load source must be tensor-like for NZ 2D collapse";
+          INTERNAL_CHECK_SPAN(tensor_type->shape_.size() == result_tile->shape_.size(), span)
+              << "FlattenTileNdTo2D: tile.load source rank must match result tile rank for NZ 2D collapse";
+
+          auto offsets_tuple = As<MakeTuple>(sub_args[1]);
+          auto shapes_tuple = As<MakeTuple>(sub_args[2]);
+          INTERNAL_CHECK_SPAN(offsets_tuple && shapes_tuple, span)
+              << "FlattenTileNdTo2D: tile.load offsets and shapes must be tuples";
+          auto valid_shape_tuple = shapes_tuple;
+          if (sub_args.size() >= 4) {
+            valid_shape_tuple = As<MakeTuple>(sub_args[3]);
+            INTERNAL_CHECK_SPAN(valid_shape_tuple, span)
+                << "FlattenTileNdTo2D: tile.load valid_shape must be a tuple";
+          }
+          INTERNAL_CHECK_SPAN(offsets_tuple->elements_.size() == tensor_type->shape_.size() &&
+                                  shapes_tuple->elements_.size() == tensor_type->shape_.size() &&
+                                  valid_shape_tuple->elements_.size() == tensor_type->shape_.size(),
+                              span)
+              << "FlattenTileNdTo2D: tile.load offset/shape ranks must match tensor rank";
+          INTERNAL_CHECK_SPAN(tile_conversion_utils::IsRowMajorCollapseContiguous(
+                                  valid_shape_tuple->elements_, tensor_type->shape_),
+                              span)
+              << "FlattenTileNdTo2D: tile.load NZ 2D source-window collapse requires the valid "
+                 "sub-box of the leading dims to be contiguous in row-major order";
+
+          auto view_call = CreateCollapsedTensorView(tensor, tensor_type, span);
+          auto view_var =
+              std::make_shared<Var>(assign->var_->name_hint_ + "_view2d", view_call->GetType(), span);
+          result.push_back(std::make_shared<AssignStmt>(view_var, view_call, assign->span_));
+
+          auto row_offset = CollapseLeadingOffsetsToRow(offsets_tuple->elements_, tensor_type->shape_, span);
+          sub_args[0] = view_var;
+          sub_args[1] = std::make_shared<MakeTuple>(
+              std::vector<ExprPtr>{row_offset, offsets_tuple->elements_.back()}, span);
+          sub_args[2] =
+              std::make_shared<MakeTuple>(CollapseLeadingDimsTo2D(shapes_tuple->elements_, span), span);
+          auto flat_valid_shape =
+              std::make_shared<MakeTuple>(CollapseLeadingDimsTo2D(valid_shape_tuple->elements_, span), span);
+          if (sub_args.size() >= 4) {
+            sub_args[3] = flat_valid_shape;
+          } else {
+            sub_args.push_back(flat_valid_shape);
+          }
+        }
+
+        auto flat_kwargs = call->kwargs_;
+        if (pending_batch_matmul_mat) {
+          flat_kwargs.emplace_back("target_memory", MemorySpace::Mat);
+        }
+        CallPtr flat_call = std::make_shared<Call>(call->op_, sub_args, flat_kwargs, call->attrs_,
+                                                   flat_tile_type, call->span_);
+        flat_call = WithRemappedCallAttrs(call, WithRemappedResultAllocation(flat_call, assign, ctx), ctx);
+        auto flat_var =
+            std::make_shared<Var>(assign->var_->name_hint_, flat_call->GetType(), assign->var_->span_);
+        result.push_back(std::make_shared<AssignStmt>(flat_var, flat_call, assign->span_));
+        ctx.Insert(assign->var_, flat_var);
+        continue;
+      }
+      // ≤2D tile.load: honor any pending var_map substitutions
+      auto deduced_call = op_registry.Create(op_name, sub_args, call->kwargs_, span);
+      auto new_call =
+          WithRemappedCallAttrs(call, WithRemappedResultAllocation(deduced_call, assign, ctx), ctx);
+      auto new_var =
+          std::make_shared<Var>(assign->var_->name_hint_, new_call->GetType(), assign->var_->span_);
+      result.push_back(std::make_shared<AssignStmt>(new_var, new_call, assign->span_));
+      ctx.Insert(assign->var_, new_var);
+      continue;
+    }
+
+    // ---- tile.store: inject original tensor-rank partition shape for rank>2 tensors ----
+    // tile.store semantics: (2D) tile -> rank>2 tensor. Original tensor-rank
+    // offsets are preserved; codegen uses the tensor view plus a partition_view
+    // over the original tensor-rank window to produce the 2D result.
+    // Signature: (tile, offsets, output_tensor[, shapes])
+    if (IsOp(call, "tile.store")) {
+      // ---- Column-packed batched accumulator: one store per batch page ----
+      // See EmitPackedAccumulatorDrain for why the pages cannot share one 2D
+      // buffer, and BuildAccPackingMap for the chain analysis that decides it.
+      if (const auto* acc_plan = ctx.AccPackingFor(call->args_[0])) {
+        ctx.Insert(assign->var_,
+                   EmitPackedAccumulatorDrain(*acc_plan, call, assign, ctx, op_registry, span, &result));
+        continue;
+      }
+
+      auto orig_tile_type = As<TileType>(call->args_[0]->GetType());
+
+      std::vector<ExprPtr> new_args;
+      new_args.reserve(call->args_.size() + 1);
+      // Push all original args (tile, offsets, output_tensor) with substitution
+      for (const auto& arg : call->args_) {
+        new_args.push_back(Substitute(arg, ctx.var_map));
+      }
+
+      // If the (substituted) tile operand is still >2D, insert a
+      // ``tile.reshape`` to flatten it to 2D. Codegen for ``tile.store``
+      // requires a 2D tile; the original N-rank shape still flows through as
+      // the ``shapes`` partition operand built below from ``orig_tile_type``.
+      // This is a safety net for hand-built IR: every producer the DSL can
+      // write is flattened by its own branch above, a user-written
+      // ``pl.reshape(tile_2d, [B, 1, D])`` feeding ``pl.assemble`` into a
+      // rank>2 tensor view included.
+      auto tile_arg_type = As<TileType>(new_args[0]->GetType());
+      if (tile_arg_type && tile_arg_type->shape_.size() > 2) {
+        auto [merged, last] = ComputeMergedShape(tile_arg_type->shape_, "tile.store tile operand");
+        auto reshape_shape = MakeShapeTupleFromInts({merged, last}, span);
+        auto reshape_call = op_registry.Create("tile.reshape", {new_args[0], reshape_shape}, span);
+        auto flat_var = std::make_shared<Var>("flat_tile", reshape_call->GetType(), span);
+        result.push_back(std::make_shared<AssignStmt>(flat_var, reshape_call, assign->span_));
+        new_args[0] = flat_var;
+      }
+
+      auto out_tensor_type = As<TensorType>(new_args[2]->GetType());
+      if (orig_tile_type && out_tensor_type && out_tensor_type->shape_.size() > 2) {
+        // Inject the tensor-rank partition shape tuple as the 4th argument. It
+        // must be a box the destination actually contains, and the offsets are
+        // part of deciding that — see ComputeStorePartitionShape for why
+        // aligning the tile's dims against the tensor's trailing dims is not
+        // enough once the tile's leading extent collapses several tensor dims.
+        //
+        // Derived from the tile's VALID shape, not its physical shape: the
+        // partition describes the region the store actually transfers, which is
+        // what the 2D path in codegen also sizes it from (`tile.store` reads
+        // GetEffectiveTileView(...).valid_shape there). A chunked tail block —
+        // physical [1, 16, 512] carrying valid [1, 10, 512] — writes 10 rows,
+        // and deriving the window from 16 would both overstate the destination
+        // region and refuse the store outright when 16 does not divide the axis
+        // it would have to span. GetEffectiveTileView falls back to the physical
+        // shape when no valid_shape is set, so the aligned case is unchanged.
+        const auto store_tile_view = tile_view_semantics::GetEffectiveTileView(*orig_tile_type);
+        auto store_offsets = As<MakeTuple>(new_args[1]);
+        INTERNAL_CHECK_SPAN(store_offsets, span) << "Internal error: tile.store offsets must be a tuple";
+        new_args.push_back(std::make_shared<MakeTuple>(
+            ComputeStorePartitionShape(store_tile_view.valid_shape, out_tensor_type->shape_,
+                                       store_offsets->elements_, span),
+            span));
+      }
+
+      // Construct call directly: store result type = output tensor type (args[2])
+      auto out_type = new_args[2]->GetType();
+      CallPtr new_call = std::make_shared<Call>(call->op_, new_args, call->kwargs_, out_type, call->span_);
+      new_call = WithRemappedCallAttrs(call, new_call, ctx);
+      auto new_type = WithRemappedAllocation(new_call->GetType(), assign->var_->GetType(), ctx);
+      auto new_var = std::make_shared<Var>(assign->var_->name_hint_, new_type, assign->var_->span_);
+      result.push_back(std::make_shared<AssignStmt>(new_var, new_call, assign->span_));
+      ctx.Insert(assign->var_, new_var);
+      continue;
+    }
+
+    // ---- tile.create / tile.full with >2D shape: flatten shape directly ----
+    if (IsOp(call, "tile.create") || IsOp(call, "tile.full")) {
+      auto result_tile = As<TileType>(call->GetType());
+      if (result_tile && (result_tile->shape_.size() > 2 || ctx.AccPackingForVar(assign->var_))) {
+        ctx.Insert(assign->var_, EmitFlattenedTileAlloc(call, assign, result_tile, op_name, ctx, op_registry,
+                                                        span, &result));
+        continue;
+      }
+      // Already-2D allocations still need the generic rewrite below: their
+      // fill value or LHS-only allocation slot can reference a rewritten scalar.
+    }
+
+    // ---- tile.batch_matmul: delegate to LowerBatchMatmul ----
+    if (IsOp(call, "tile.batch_matmul")) {
+      auto lowering = LowerBatchMatmul(assign, call, stmts, stmt_index, ctx, op_registry, span);
+      result.insert(result.end(), lowering.stmts.begin(), lowering.stmts.end());
+      if (lowering.fused_store) {
+        ctx.Insert(lowering.store_orig_var, lowering.store_result_var);
+        ++stmt_index;  // Skip the next tile.store; it has been fused above.
+      } else {
+        ctx.Insert(assign->var_, lowering.output_var);
+      }
+      continue;
+    }
+
+    // ---- tile.batch_matmul_acc: delegate to LowerBatchMatmulAcc ----
+    if (IsOp(call, "tile.batch_matmul_acc")) {
+      auto lowering = LowerBatchMatmulAcc(assign, call, stmts, ctx, op_registry, span);
+      result.insert(result.end(), lowering.stmts.begin(), lowering.stmts.end());
+      ctx.Insert(assign->var_, lowering.output_var);
+      continue;
+    }
+
+    // ---- tile.transpose feeding only tile.batch_matmul[_acc]: skip and let lowering peel it ----
+    if (IsOp(call, "tile.transpose") && batch_matmul_only_vars.count(assign->var_.get()) != 0) {
+      ctx.Insert(assign->var_, assign->var_);  // identity mapping for safety
+      continue;
+    }
+
+    // Logical 2-D accumulator windows keep their shape; only the parent and
+    // coordinates change. The same translation is used for slice and writeback.
+    if (IsOp(call, "tile.slice") || IsOp(call, "tile.assemble")) {
+      const auto* plan = ctx.AccPackingFor(call->args_[0]);
+      if (plan && plan->row_windows) {
+        std::vector<ExprPtr> args;
+        for (const auto& arg : call->args_) args.push_back(Substitute(arg, ctx.var_map));
+        args[2] = PackedRowWindowOffsets(*plan, call->args_[2], ctx, span);
+        auto rewritten = op_registry.Create(op_name, args, call->kwargs_, span);
+        CallPtr new_call = std::make_shared<Call>(rewritten->op_, rewritten->args_, rewritten->kwargs_,
+                                                  call->attrs_, rewritten->GetType(), span);
+        new_call = WithRemappedCallAttrs(call, new_call, ctx);
+        auto new_type = WithRemappedAllocation(new_call->GetType(), assign->var_->GetType(), ctx);
+        auto new_var = std::make_shared<Var>(assign->var_->name_hint_, new_type, assign->var_->span_);
+        result.push_back(std::make_shared<AssignStmt>(new_var, new_call, assign->span_));
+        ctx.Insert(assign->var_, new_var);
+        continue;
+      }
+    }
+
+    // ---- standalone tile.transpose: this pass solely owns scratch materialization ----
+    // High-level transposes arrive in the 3-arg form (input, axis1, axis2); the
+    // pto.ttrans scratch is emitted here as the codegen-ready 4-arg form.
+    //   >2D  → LowerNdTranspose: per-page 2D transposes, each with sliced scratch.
+    //   2D   → emit one scratch tile.create + a 4-arg tile.transpose.
+    // An already-4-arg 2D transpose (e.g. hand-built IR) falls through to the generic
+    // re-create path unchanged.
+    if (IsOp(call, "tile.transpose") && batch_matmul_only_vars.count(assign->var_.get()) == 0) {
+      if (IsNdTile(As<TileType>(call->args_[0]->GetType()))) {
+        auto lowering = LowerNdTranspose(assign, call, ctx, op_registry, span);
+        result.insert(result.end(), lowering.stmts.begin(), lowering.stmts.end());
+        ctx.Insert(assign->var_, lowering.output_var);
+        continue;
+      }
+      if (call->args_.size() == 3) {
+        auto in = Substitute(call->args_[0], ctx.var_map);
+        auto in_type = As<TileType>(in->GetType());
+        INTERNAL_CHECK_SPAN(in_type, span)
+            << "Internal error: tile.transpose input must be TileType in FlattenTileNdTo2D";
+        // pto.ttrans reuses the SOURCE type for both ins operands, so scratch shape ==
+        // input shape (NOT the transposed output shape), in the input's memory space.
+        MemorySpace scratch_mem =
+            in_type->memory_space_.has_value() ? *in_type->memory_space_ : MemorySpace::Vec;
+        auto scratch_shape = std::make_shared<MakeTuple>(in_type->shape_, span);
+        std::vector<std::pair<std::string, std::any>> scratch_kw = {
+            {"dtype", in_type->dtype_},
+            {"target_memory", scratch_mem},
+        };
+        auto scratch_create = op_registry.Create("tile.create", {scratch_shape}, scratch_kw, span);
+        auto scratch_var = std::make_shared<Var>("transpose_tmp", scratch_create->GetType(), span);
+        result.push_back(std::make_shared<AssignStmt>(scratch_var, scratch_create, assign->span_));
+
+        auto t_call =
+            op_registry.Create("tile.transpose", {in, call->args_[1], call->args_[2], scratch_var}, span);
+        t_call = WithRemappedCallAttrs(call, t_call, ctx);
+        t_call = WithRemappedResultAllocation(t_call, assign, ctx);
+        auto t_var = std::make_shared<Var>(assign->var_->name_hint_, t_call->GetType(), assign->var_->span_);
+        result.push_back(std::make_shared<AssignStmt>(t_var, t_call, assign->span_));
+        ctx.Insert(assign->var_, t_var);
+        continue;
+      }
+      // 4-arg 2D transpose: fall through to the generic re-create path below.
+    }
+
+    // ---- tile.reshape feeding only tile.batch_matmul: skip (identity) when it is
+    //      a safe batch-only reshape that `NormalizeBatchMatmulOperand` peels, so
+    //      no orphan rank>2 reshape survives. The underlying tile.load is reused by
+    //      the lowering (fit path) or re-emitted per batch (!fit path). ----
+    if (IsOp(call, "tile.reshape") && batch_matmul_only_vars.count(assign->var_.get()) != 0 &&
+        IsSafePeelableBatchMatmulReshape(call)) {
+      ctx.Insert(assign->var_, assign->var_);  // identity mapping for safety
+      continue;
+    }
+
+    // ---- tile.reshape / tile.reinterpret_view onto a >2D target: rewrite the
+    //      explicit target-shape operand to its 2D collapse (see the helper).
+    //      A null result means "not one of these, or already 2D" and falls
+    //      through to the generic re-create path below. ----
+    if (auto flat_view = TryFlattenRankRaisingView(call, assign, op_name, ctx, op_registry, span, &result)) {
+      ctx.Insert(assign->var_, flat_view);
+      continue;
+    }
+
+    // ---- tile.assemble into a >2D target: fold the ND offset into the flattened
+    //      (row, col) space (see the helper). A null result means "not an
+    //      assemble, or already 2D" and falls through to the generic path. ----
+    if (auto folded = TryFoldNdAssembleOffset(call, assign, ctx, op_registry, span, &result)) {
+      ctx.Insert(assign->var_, folded);
+      continue;
+    }
+
+    // Generic calls: arguments, cached result types and expression-valued attrs
+    // all contain live references. Substitute them together, including type-only
+    // and attrs-only changes, then bind the new value and record its defining Var.
+    // Otherwise a consumer can remap the stale type into a definition-less clone
+    // (printed as __FREE_VAR). This applies to every op, not just GM aliases.
+    {
+      auto new_call = As<Call>(Substitute(call, ctx.var_map));
+      INTERNAL_CHECK_SPAN(new_call, assign->span_)
+          << "FlattenTileNdTo2D: call substitution must remain a Call";
+      auto new_lhs_type = RemapTypeReferences(assign->var_->GetType(), ctx);
+      if (new_call == call && new_lhs_type == assign->var_->GetType()) {
+        result.push_back(stmt);
+      } else {
+        // Changed tile operands can have a lower rank. Re-deduce their result
+        // type, while retaining the substituted attrs (Create supplies none).
+        // Metadata-only changes need no re-deduction: the substituted cached
+        // type can carry view information absent from the operands.
+        if (op_name.substr(0, 5) == "tile." && new_call->args_ != call->args_) {
+          auto deduced = op_registry.Create(op_name, new_call->args_, new_call->kwargs_, span);
+          new_call = std::make_shared<Call>(deduced->op_, deduced->args_, deduced->kwargs_, new_call->attrs_,
+                                            deduced->GetType(), deduced->span_);
+        }
+
+        // Allocation annotations can live only on the defining Var. Carry them
+        // for every rebuild, including changes confined to the type or attrs.
+        auto new_type = WithRemappedAllocation(new_call->GetType(), new_lhs_type, ctx);
+        auto rhs_tile = As<TileType>(new_call->GetType());
+        auto lhs_tile = As<TileType>(new_type);
+        if (rhs_tile && lhs_tile && rhs_tile->memory_space_ != lhs_tile->memory_space_) {
+          // Memory space is part of the value type and must match on both sides.
+          // MemRef is allocation metadata and may remain only on the defining Var.
+          auto call_type = CloneTypeWithMemRef(new_type, GetTypeMemRef(new_call->GetType()));
+          new_call = std::make_shared<Call>(new_call->op_, new_call->args_, new_call->kwargs_,
+                                            new_call->attrs_, call_type, new_call->span_);
+        }
+        auto new_var = std::make_shared<Var>(assign->var_->name_hint_, new_type, assign->var_->span_);
+        result.push_back(std::make_shared<AssignStmt>(new_var, new_call, assign->span_));
+        ctx.Insert(assign->var_, new_var);
+      }
+    }
+  }
+
+  preserve_assignment_comments();
+  return result;
+}
+
+}  // namespace rewrite_internal
+
+FunctionPtr Rewrite(const FunctionPtr& func) {
+  auto& op_registry = OpRegistry::GetInstance();
+
+  rewrite_internal::FlattenContext ctx;
+  // Decide the batched-accumulator packing ONCE, over the whole function: a
+  // chain routinely spans blocks (create outside the K loop, batch_matmul_acc
+  // inside it, store after it) and TransformBody's own pre-scan is per-block, so
+  // nothing block-local can tell the `tile.create` to allocate [M, B*N]. Shared
+  // by pointer because FlattenContext is copied once per nested block.
+  ctx.acc_packing = rewrite_internal::BuildAccPackingMap(func);
+  rewrite_internal::VarUseCounter use_counter;
+  use_counter.VisitFunction(func);
+  ctx.use_counts =
+      std::make_shared<const std::unordered_map<const Var*, size_t>>(std::move(use_counter.counts));
+
+  auto body_stmts = FlattenToStmts(func->body_);
+  auto new_stmts = rewrite_internal::TransformBody(body_stmts, ctx, op_registry);
+  // The body SeqStmts wrapper spans the whole function; the ops inside it carry
+  // their own statements' spans (see TransformBody).
+  auto new_body = SeqStmts::Flatten(std::move(new_stmts), func->span_);
+
+  // return_types_ are unchanged: InCore functions return tensors (not tiles),
+  // and this pass only flattens tile shapes. GM tensor metadata can still be
+  // remapped to reference rewritten scalar definitions.
+  auto new_func = MutableCopy(func);
+  new_func->body_ = new_body;
+  return new_func;
+}
+
+}  // namespace flatten_tile_nd_to_2d
+}  // namespace ir
+}  // namespace pypto

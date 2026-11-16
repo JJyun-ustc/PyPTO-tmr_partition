@@ -1,0 +1,535 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
+
+/**
+ * @file matmul.cpp
+ * @brief Matrix multiplication tensor operations
+ *
+ * This file implements matrix multiplication operations for tensors,
+ * supporting transpose options and output dtype control.
+ */
+
+#include <any>
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <optional>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "pypto/core/any_cast.h"
+#include "pypto/core/dtype.h"
+#include "pypto/core/error.h"
+#include "pypto/core/logging.h"
+#include "pypto/ir/kind_traits.h"
+#include "pypto/ir/op_registry.h"
+#include "pypto/ir/scalar_expr.h"
+#include "pypto/ir/span.h"
+#include "pypto/ir/transforms/printer.h"
+#include "pypto/ir/type.h"
+#include "pypto/ir/type_inference.h"
+
+namespace pypto {
+namespace ir {
+
+// Helper to get kwargs value with default (uses vector to preserve order)
+template <typename T>
+T GetKwarg(const std::vector<std::pair<std::string, std::any>>& kwargs, const std::string& key,
+           const std::optional<T>& default_value = std::nullopt) {
+  for (const auto& [k, v] : kwargs) {
+    if (k == key) {
+      return AnyCast<T>(v, "kwarg key: " + key);
+    }
+  }
+  if (default_value) {
+    return *default_value;
+  }
+  throw ValueError("Missing kwarg: " + key);
+}
+
+namespace {
+
+/// Verify that the two contraction extents agree, when both are statically known.
+/// `context` names the failing form, e.g. "tensor.matmul requires matching inner dimensions".
+void CheckContractionExtents(const ExprPtr& k_lhs, const ExprPtr& k_rhs, const std::string& context) {
+  auto k_lhs_const = As<ConstInt>(k_lhs);
+  auto k_rhs_const = As<ConstInt>(k_rhs);
+  if (k_lhs_const && k_rhs_const) {
+    CHECK(k_lhs_const->value_ == k_rhs_const->value_)
+        << context << ", but got lhs K=" << k_lhs_const->value_ << " and rhs K=" << k_rhs_const->value_;
+  }
+}
+
+/// Reject an ``out_dtype`` the Cube cannot produce for these operands.
+///
+/// ``out_dtype`` names the element type the matmul's result tensor carries, and
+/// that result leaves L0C through the FIXPIPE. The accumulator is fixed by the
+/// operand domain (``MatmulAccumulatorDataType``) and the plain writeback offers
+/// exactly one conversion, ``f32 -> f16`` / ``f32 -> bf16``. An INT8 x INT8
+/// matmul therefore cannot hand back FP32: that is a dequant, and it needs a
+/// scale ``tensor.matmul`` has nowhere to carry. The other rejected directions
+/// need a scale too but are not dequantizations, so the message names the one it
+/// actually has (``DescribeCubeWritebackScaledConversion``).
+///
+/// Without this check the request is simply dropped -- ``ConvertTensorToTileOps``
+/// builds ``tile.matmul`` from the operands alone -- and the mismatch surfaces
+/// far away, as a ccec type error on the generated ``TStore`` ("the 2nd parameter
+/// maybe need a type '__cc__ float *'") or, where that store happens to compile,
+/// as silently wrong numbers.
+void CheckTensorMatmulOutDataType(DataType out_dtype, DataType lhs_dtype, DataType rhs_dtype,
+                                  const Span& span) {
+  const DataType accumulator = MatmulAccumulatorDataType(lhs_dtype, rhs_dtype);
+  if (CubeWritebackSupportsDataType(accumulator, out_dtype)) return;
+  CHECK_SPAN(false, span) << "tensor.matmul: out_dtype=" << out_dtype.ToString() << " is not supported for "
+                          << lhs_dtype.ToString() << " x " << rhs_dtype.ToString()
+                          << " operands -- the Cube accumulates them in " << accumulator.ToString()
+                          << ", and the unscaled writeback out of L0C converts only fp32 to fp16 or "
+                          << "bf16. Reaching " << out_dtype.ToString() << " from " << accumulator.ToString()
+                          << " is " << DescribeCubeWritebackScaledConversion(accumulator, out_dtype)
+                          << ", which needs a scale out_dtype cannot carry. Pass out_dtype="
+                          << accumulator.ToString()
+                          << " and convert the result explicitly with pl.cast(result, <dtype>).";
+}
+
+}  // namespace
+
+TypePtr DeduceTensorMatMulType(const std::vector<ExprPtr>& args,
+                               const std::vector<std::pair<std::string, std::any>>& kwargs) {
+  // tensor.matmul requires exactly 2 Expr arguments (lhs, rhs)
+  CHECK(args.size() == 2) << "tensor.matmul requires exactly 2 arguments (lhs, rhs), but got " << args.size();
+
+  // Both operands must be tensor-shaped. ``AsTensorTypeLike`` accepts a
+  // ``DistributedTensorType`` (window) operand the same as a plain tensor
+  // (issue #1694): inside an InCore scope a window is just this rank's local GM,
+  // so the Cube loads it through the same ``tile.load``. The product is fresh
+  // local data, so the result below is a plain ``TensorType``, never a window view.
+  auto lhs_type = AsTensorTypeLike(args[0]->GetType());
+  auto rhs_type = AsTensorTypeLike(args[1]->GetType());
+
+  CHECK(lhs_type) << "tensor.matmul requires first argument to be a TensorType or "
+                  << "DistributedTensorType, but got " << args[0]->GetType()->TypeName();
+  CHECK(rhs_type) << "tensor.matmul requires second argument to be a TensorType or "
+                  << "DistributedTensorType, but got " << args[1]->GetType()->TypeName();
+
+  // Extract shapes
+  const auto& lhs_shape = lhs_type->shape_;
+  const auto& rhs_shape = rhs_type->shape_;
+
+  CHECK(lhs_shape.size() >= 1) << "tensor.matmul requires lhs to have at least 1 dimension";
+  CHECK(rhs_shape.size() >= 1) << "tensor.matmul requires rhs to have at least 1 dimension";
+
+  // Read kwargs (with defaults)
+  DataType out_dtype;
+  bool out_dtype_requested = false;
+  try {
+    out_dtype = GetKwarg<DataType>(kwargs, "out_dtype");
+    out_dtype_requested = true;
+  } catch (const ValueError& e) {
+    auto promoted = PromoteDataTypes(lhs_type->dtype_, rhs_type->dtype_);
+    CHECK(promoted) << "Cannot promote data types for tensor.matmul";
+    out_dtype = *promoted;
+  } catch (const TypeError& e) {
+    throw TypeError("Invalid kwarg type for out_dtype: " + std::string(e.what()));
+  }
+  // Outside the try: this check reports a user error as a ValueError of its own,
+  // which the "out_dtype omitted" handler above must not swallow.
+  if (out_dtype_requested) {
+    CheckTensorMatmulOutDataType(out_dtype, lhs_type->dtype_, rhs_type->dtype_, args[0]->span_);
+  }
+
+  bool a_trans = GetKwarg<bool>(kwargs, "a_trans", false);
+  bool b_trans = GetKwarg<bool>(kwargs, "b_trans", false);
+
+  // A transpose flag names an axis swap on its own operand, which only exists once
+  // that operand is 2D. Honoring it silently on a 1D operand would deduce a shape
+  // the caller never asked for, so reject it with an actionable message instead.
+  CHECK(!a_trans || lhs_shape.size() >= 2)
+      << "tensor.matmul: a_trans does not apply to a 1D lhs (a vector has no axes to swap); "
+      << "drop a_trans or pass a 2D lhs";
+  CHECK(!b_trans || rhs_shape.size() >= 2)
+      << "tensor.matmul: b_trans does not apply to a 1D rhs (a vector has no axes to swap); "
+      << "drop b_trans or pass a 2D rhs";
+
+  // Compute output shape based on transpose flags
+  // For 2D: lhs [M, K] x rhs [K, N] -> [M, N]
+  // With transpose: lhs [K, M]^T x rhs [N, K]^T -> [M, N]
+
+  std::vector<ExprPtr> output_shape;
+
+  if (lhs_shape.size() == 1 && rhs_shape.size() == 1) {
+    // Vector x vector (dot product): [K] x [K] -> scalar (0D tensor)
+    CheckContractionExtents(lhs_shape[0], rhs_shape[0],
+                            "tensor.matmul dot product requires matching dimensions");
+    output_shape = {};
+  } else if (lhs_shape.size() == 2 && rhs_shape.size() == 1) {
+    // Matrix x vector: [M, K] x [K] -> [M]
+    // With a_trans the lhs is stored [K, M], so the contraction axis is dim 0.
+    ExprPtr m_dim = a_trans ? lhs_shape[1] : lhs_shape[0];
+    ExprPtr k_lhs = a_trans ? lhs_shape[0] : lhs_shape[1];
+    CheckContractionExtents(k_lhs, rhs_shape[0], "tensor.matmul requires matching inner dimensions");
+    output_shape = {m_dim};
+  } else if (lhs_shape.size() == 1 && rhs_shape.size() == 2) {
+    // Vector x matrix: [K] x [K, N] -> [N]
+    // With b_trans the rhs is stored [N, K], so the contraction axis is dim 1.
+    ExprPtr k_rhs = b_trans ? rhs_shape[1] : rhs_shape[0];
+    ExprPtr n_dim = b_trans ? rhs_shape[0] : rhs_shape[1];
+    CheckContractionExtents(lhs_shape[0], k_rhs, "tensor.matmul requires matching inner dimensions");
+    output_shape = {n_dim};
+  } else if (lhs_shape.size() == 2 && rhs_shape.size() == 2) {
+    // 2D x 2D matrix multiplication
+    ExprPtr m_dim = a_trans ? lhs_shape[1] : lhs_shape[0];
+    ExprPtr k_lhs = a_trans ? lhs_shape[0] : lhs_shape[1];
+    ExprPtr k_rhs = b_trans ? rhs_shape[1] : rhs_shape[0];
+    ExprPtr n_dim = b_trans ? rhs_shape[0] : rhs_shape[1];
+
+    // Verify K dimensions match (when statically known)
+    CheckContractionExtents(k_lhs, k_rhs, "tensor.matmul requires matching inner dimensions");
+
+    output_shape = {m_dim, n_dim};
+    // Only ordinary 2D tensors have this valid-region propagation contract;
+    // distributed windows retain their existing local-GM inference behavior.
+    if (As<TensorType>(args[0]->GetType()) && As<TensorType>(args[1]->GetType())) {
+      const auto& lhs_valid = GetEffectiveTensorValidShape(*lhs_type);
+      const auto& rhs_valid = GetEffectiveTensorValidShape(*rhs_type);
+      CHECK_SPAN(lhs_valid.size() == 2 && rhs_valid.size() == 2, args[0]->span_)
+          << "tensor.matmul requires valid_shape rank to match the 2D operand shape";
+      const auto& valid_k_lhs = lhs_valid[a_trans ? 0 : 1];
+      const auto& valid_k_rhs = rhs_valid[b_trans ? 1 : 0];
+      // Match tile.matmul: PTO contracts over lhs valid K, which rhs must cover.
+      CHECK_SPAN(ProveValidExtentLessEqual(valid_k_lhs, valid_k_rhs) != ProofResult::kFalse, args[0]->span_)
+          << "tensor.matmul requires rhs valid K to cover lhs valid K, but got lhs K="
+          << PythonPrint(valid_k_lhs) << " and rhs K=" << PythonPrint(valid_k_rhs);
+
+      // The product owns fresh storage. Do not inherit either operand's view
+      // layout, strides, padding policy, or memory reference. TensorType removes
+      // a redundant full valid_shape, preserving the canonical full-box type.
+      TensorView view;
+      view.valid_shape = {lhs_valid[a_trans ? 1 : 0], rhs_valid[b_trans ? 0 : 1]};
+      return std::make_shared<TensorType>(output_shape, out_dtype, std::nullopt, std::move(view));
+    }
+  } else {
+    // For higher-dimensional tensors (both must have at least 2 dimensions),
+    // use batched matmul semantics
+    size_t lhs_ndim = lhs_shape.size();
+    size_t rhs_ndim = rhs_shape.size();
+
+    // Ensure both tensors have at least 2 dimensions for batched matmul
+    CHECK(lhs_ndim >= 2 && rhs_ndim >= 2)
+        << "tensor.matmul requires both tensors to have at least 2 dimensions "
+        << "for batched matmul, but got lhs shape size " << lhs_ndim << " and rhs shape size " << rhs_ndim;
+
+    // Extract batch dimensions (all except last 2)
+    std::vector<ExprPtr> lhs_batch(lhs_shape.begin(), lhs_shape.end() - 2);
+    std::vector<ExprPtr> rhs_batch(rhs_shape.begin(), rhs_shape.end() - 2);
+
+    // Broadcast batch dimensions
+    auto broadcast_result = BroadcastShapes(lhs_batch, rhs_batch);
+    CHECK(broadcast_result.success) << "Cannot broadcast batch dimensions for tensor.matmul";
+
+    output_shape = broadcast_result.shape;
+
+    // Append matrix dimensions
+    ExprPtr m_dim = a_trans ? lhs_shape[lhs_ndim - 1] : lhs_shape[lhs_ndim - 2];
+    ExprPtr k_lhs = a_trans ? lhs_shape[lhs_ndim - 2] : lhs_shape[lhs_ndim - 1];
+    ExprPtr k_rhs = b_trans ? rhs_shape[rhs_ndim - 1] : rhs_shape[rhs_ndim - 2];
+    ExprPtr n_dim = b_trans ? rhs_shape[rhs_ndim - 2] : rhs_shape[rhs_ndim - 1];
+
+    // Verify K dimensions match (when statically known)
+    CheckContractionExtents(k_lhs, k_rhs,
+                            "tensor.matmul requires matching inner dimensions for batched matmul");
+
+    output_shape.push_back(m_dim);
+    output_shape.push_back(n_dim);
+  }
+
+  return std::make_shared<TensorType>(output_shape, out_dtype);
+}
+
+// ============================================================================
+// tensor.quant_mx: GM MXFP8 quantization
+// ============================================================================
+
+TypePtr DeduceTensorQuantMxType(const std::vector<ExprPtr>& args,
+                                const std::vector<std::pair<std::string, std::any>>& kwargs) {
+  constexpr const char* kOpName = "tensor.quant_mx";
+  const Span span = args.empty() ? Span::unknown() : args[0]->span_;
+  CHECK_SPAN(args.size() == 1, span) << kOpName << " requires exactly one source tensor";
+  auto src = AsTensorTypeLike(args[0]->GetType());
+  CHECK_SPAN(src, span) << kOpName << " requires a TensorType or DistributedTensorType source, but got "
+                        << args[0]->GetType()->TypeName();
+  CHECK_SPAN(src->shape_.size() == 2, span) << kOpName << " requires a 2D source tensor";
+  CHECK_SPAN(src->dtype_ == DataType::FP16 || src->dtype_ == DataType::BF16 || src->dtype_ == DataType::FP32,
+             span)
+      << kOpName << " requires source dtype FP16, BF16, or FP32, but got " << src->dtype_.ToString();
+
+  const int group_axis = GetKwarg<int>(kwargs, "group_axis");
+  CHECK_SPAN(group_axis == 0 || group_axis == 1, span)
+      << kOpName << " group_axis must be 0 or 1, but got " << group_axis;
+  const DataType dtype = GetKwarg<DataType>(kwargs, "dtype", DataType::FP8E4M3FN);
+  CHECK_SPAN(dtype == DataType::FP8E4M3FN, span)
+      << kOpName << " supports only dtype FP8E4M3FN (MXFP8), but got " << dtype.ToString();
+
+  auto dim0 = As<ConstInt>(src->shape_[0]);
+  auto k = As<ConstInt>(src->shape_[1]);
+  CHECK_SPAN(dim0 && k && dim0->value_ > 0 && k->value_ > 0, span)
+      << kOpName << " requires static positive 2D dimensions";
+  CHECK_SPAN(k->value_ % 64 == 0, span) << kOpName << " requires K divisible by 64, but got " << k->value_;
+  const int64_t outer_alignment = group_axis == 1 ? 16 : 32;
+  const char* outer_name = group_axis == 1 ? "M" : "N";
+  CHECK_SPAN(dim0->value_ % outer_alignment == 0, span)
+      << kOpName << " with group_axis=" << group_axis << " requires " << outer_name << " divisible by "
+      << outer_alignment << ", but got " << dim0->value_;
+
+  const auto group_count = std::make_shared<ConstInt>(k->value_ / 32, DataType::INDEX, span);
+  std::vector<ExprPtr> data_shape = src->shape_;
+  std::vector<ExprPtr> scale_shape;
+  TensorLayout scale_layout;
+  if (group_axis == 1) {
+    scale_shape = {src->shape_[0], group_count};
+    scale_layout = TensorLayout::MX_A_ZZ;
+  } else {
+    data_shape = {src->shape_[1], src->shape_[0]};
+    scale_shape = {group_count, src->shape_[0]};
+    scale_layout = TensorLayout::MX_B_NN;
+  }
+  TypePtr data = std::make_shared<TensorType>(std::move(data_shape), dtype);
+  TypePtr scale = std::make_shared<TensorType>(std::move(scale_shape), DataType::FP8E8M0, std::nullopt,
+                                               TensorView(std::vector<ExprPtr>{}, scale_layout));
+  return std::make_shared<TupleType>(std::vector<TypePtr>{data, scale});
+}
+
+// ============================================================================
+// tensor.matmul_mx: oriented MXFP8 matrix multiplication
+// ============================================================================
+
+TypePtr DeduceTensorMatMulMxType(const std::vector<ExprPtr>& args,
+                                 const std::vector<std::pair<std::string, std::any>>& kwargs) {
+  constexpr const char* kOpName = "tensor.matmul_mx";
+  const Span span = args.empty() ? Span::unknown() : args[0]->span_;
+  CHECK_SPAN(args.size() == 4, span) << kOpName << " requires lhs, lhs_scale, rhs, and rhs_scale";
+  CHECK_SPAN(kwargs.empty(), span) << kOpName << " does not accept keyword arguments";
+  auto lhs = AsTensorTypeLike(args[0]->GetType());
+  auto lhs_scale = AsTensorTypeLike(args[1]->GetType());
+  auto rhs = AsTensorTypeLike(args[2]->GetType());
+  auto rhs_scale = AsTensorTypeLike(args[3]->GetType());
+  CHECK_SPAN(lhs && lhs_scale && rhs && rhs_scale, span)
+      << kOpName << " requires all operands to be TensorType or DistributedTensorType";
+  CHECK_SPAN(lhs->shape_.size() == 2 && lhs_scale->shape_.size() == 2 && rhs->shape_.size() == 2 &&
+                 rhs_scale->shape_.size() == 2,
+             span)
+      << kOpName << " requires oriented 2D data and scale tensors";
+  CHECK_SPAN(lhs->dtype_ == DataType::FP8E4M3FN && rhs->dtype_ == DataType::FP8E4M3FN, span)
+      << kOpName << " requires FP8E4M3FN data tensors";
+  CHECK_SPAN(lhs_scale->dtype_ == DataType::FP8E8M0 && rhs_scale->dtype_ == DataType::FP8E8M0, span)
+      << kOpName << " requires FP8E8M0 scale tensors";
+  const auto lhs_layout =
+      lhs_scale->tensor_view_.has_value() ? lhs_scale->tensor_view_->layout : TensorLayout::ND;
+  const auto rhs_layout =
+      rhs_scale->tensor_view_.has_value() ? rhs_scale->tensor_view_->layout : TensorLayout::ND;
+  CHECK_SPAN(lhs_layout == TensorLayout::MX_A_ZZ, span) << kOpName << " requires lhs_scale layout MX_A_ZZ";
+  CHECK_SPAN(rhs_layout == TensorLayout::MX_B_NN, span) << kOpName << " requires rhs_scale layout MX_B_NN";
+
+  auto m = As<ConstInt>(lhs->shape_[0]);
+  auto k_lhs = As<ConstInt>(lhs->shape_[1]);
+  auto k_rhs = As<ConstInt>(rhs->shape_[0]);
+  auto n = As<ConstInt>(rhs->shape_[1]);
+  CHECK_SPAN(
+      m && k_lhs && k_rhs && n && m->value_ > 0 && k_lhs->value_ > 0 && k_rhs->value_ > 0 && n->value_ > 0,
+      span)
+      << kOpName << " requires static positive M, K, and N";
+  CHECK_SPAN(k_lhs->value_ == k_rhs->value_, span)
+      << kOpName << " requires matching K dimensions, but got " << k_lhs->value_ << " and " << k_rhs->value_;
+  CHECK_SPAN(m->value_ % 16 == 0 && n->value_ % 32 == 0 && k_lhs->value_ % 64 == 0, span)
+      << kOpName << " requires M divisible by 16, N divisible by 32, and K divisible by 64";
+  const int64_t groups = k_lhs->value_ / 32;
+  auto check_shape = [span, kOpName](const std::vector<ExprPtr>& shape, int64_t dim0, int64_t dim1,
+                                     const char* operand) {
+    auto got0 = As<ConstInt>(shape[0]);
+    auto got1 = As<ConstInt>(shape[1]);
+    CHECK_SPAN(got0 && got1 && got0->value_ == dim0 && got1->value_ == dim1, span)
+        << kOpName << " requires " << operand << " shape [" << dim0 << ", " << dim1 << "]";
+  };
+  check_shape(lhs_scale->shape_, m->value_, groups, "lhs_scale");
+  check_shape(rhs_scale->shape_, groups, n->value_, "rhs_scale");
+  return std::make_shared<TensorType>(std::vector<ExprPtr>{lhs->shape_[0], rhs->shape_[1]}, DataType::FP32);
+}
+
+// ============================================================================
+// Registration Function for Tensor Matrix Multiplication Operations
+// ============================================================================
+
+REGISTER_OP("tensor.matmul")
+    .set_op_category("TensorOp")
+    .set_description("Matrix multiplication of two tensors with optional transpose")
+    .add_argument("lhs", "Left-hand side tensor (TensorType)")
+    .add_argument("rhs", "Right-hand side tensor (TensorType)")
+    .set_attr<DataType>("out_dtype")
+    .set_attr<bool>("a_trans")
+    .set_attr<bool>("b_trans")
+    .set_attr<bool>("c_matrix_nz")
+    .f_deduce_type([](const std::vector<ExprPtr>& args,
+                      const std::vector<std::pair<std::string, std::any>>& kwargs) {
+      return DeduceTensorMatMulType(args, kwargs);
+    });
+
+REGISTER_OP("tensor.quant_mx")
+    .set_op_category("TensorOp")
+    .set_description("MXFP8 quantization of a 2D GM tensor into data and MX scale tensors")
+    .add_argument("src", "FP16/BF16/FP32 source tensor")
+    .set_attr<int>("group_axis")
+    .set_attr<DataType>("dtype")
+    .set_output_arity(2)
+    .no_arg_writes()
+    .f_deduce_type([](const std::vector<ExprPtr>& args,
+                      const std::vector<std::pair<std::string, std::any>>& kwargs) {
+      return DeduceTensorQuantMxType(args, kwargs);
+    });
+
+REGISTER_OP("tensor.matmul_mx")
+    .set_op_category("TensorOp")
+    .set_description("MXFP8 matrix multiplication of oriented data and scale tensors")
+    .add_argument("lhs", "Left FP8E4M3FN tensor [M, K]")
+    .add_argument("lhs_scale", "Left FP8E8M0 MX_A_ZZ scale tensor [M, K/32]")
+    .add_argument("rhs", "Right FP8E4M3FN tensor [K, N]")
+    .add_argument("rhs_scale", "Right FP8E8M0 MX_B_NN scale tensor [K/32, N]")
+    .f_deduce_type([](const std::vector<ExprPtr>& args,
+                      const std::vector<std::pair<std::string, std::any>>& kwargs) {
+      return DeduceTensorMatMulMxType(args, kwargs);
+    });
+
+// ============================================================================
+// tensor.matmul_acc: Matrix multiplication with accumulation
+// ============================================================================
+
+TypePtr DeduceTensorMatMulAccType(const std::vector<ExprPtr>& args,
+                                  const std::vector<std::pair<std::string, std::any>>& kwargs) {
+  CHECK(args.size() == 3 || args.size() == 4)
+      << "tensor.matmul_acc requires 3 arguments (acc, lhs, rhs) or 4 with the optional init_cond "
+      << "predicate, but got " << args.size();
+  CheckMatmulInitCond(args, 3, "tensor.matmul_acc");
+
+  // lhs / rhs take a window operand for the same reason as in tensor.matmul above: the Cube
+  // loads them from GM. The accumulator does NOT -- it is never loaded at all (nothing but the
+  // matrix unit writes L0C), so a window has no data path into it and ConvertTensorToTileOps
+  // would reject it as "tile.matmul_acc requires acc to be a TileType". Keep the exact-kind
+  // match here so that limitation is reported at the call site, with a remedy.
+  auto acc_type = As<TensorType>(args[0]->GetType());
+  auto lhs_type = AsTensorTypeLike(args[1]->GetType());
+  auto rhs_type = AsTensorTypeLike(args[2]->GetType());
+
+  CHECK(acc_type) << "tensor.matmul_acc requires first argument (acc) to be a TensorType, but got "
+                  << args[0]->GetType()->TypeName()
+                  << ". A distributed window cannot be a Cube accumulator: only the matrix unit "
+                     "writes L0C, so there is no data path from GM into it. Accumulate into a "
+                     "local tensor and store the result into the window afterwards.";
+  CHECK(lhs_type) << "tensor.matmul_acc requires second argument (lhs) to be a TensorType or "
+                  << "DistributedTensorType, but got " << args[1]->GetType()->TypeName();
+  CHECK(rhs_type) << "tensor.matmul_acc requires third argument (rhs) to be a TensorType or "
+                  << "DistributedTensorType, but got " << args[2]->GetType()->TypeName();
+
+  const auto& acc_shape = acc_type->shape_;
+  const auto& lhs_shape = lhs_type->shape_;
+  const auto& rhs_shape = rhs_type->shape_;
+
+  CHECK(acc_shape.size() >= 2) << "tensor.matmul_acc requires acc to be at least 2D, but got "
+                               << acc_shape.size() << "D";
+  CHECK(lhs_shape.size() >= 2) << "tensor.matmul_acc requires lhs to be at least 2D, but got "
+                               << lhs_shape.size() << "D";
+  CHECK(rhs_shape.size() >= 2) << "tensor.matmul_acc requires rhs to be at least 2D, but got "
+                               << rhs_shape.size() << "D";
+
+  CHECK(lhs_type->dtype_ == rhs_type->dtype_)
+      << "tensor.matmul_acc requires identical lhs and rhs dtypes, but got " << lhs_type->dtype_.ToString()
+      << " and " << rhs_type->dtype_.ToString();
+
+  auto result_dtype =
+      (lhs_type->dtype_.IsFloat() && rhs_type->dtype_.IsFloat()) ? DataType::FP32 : DataType::INT32;
+  CHECK(acc_type->dtype_ == result_dtype)
+      << "tensor.matmul_acc requires accumulator dtype " << result_dtype.ToString() << ", but got "
+      << acc_type->dtype_.ToString();
+
+  bool a_trans = GetKwarg<bool>(kwargs, "a_trans", false);
+  bool b_trans = GetKwarg<bool>(kwargs, "b_trans", false);
+
+  // Trailing matrix dims (after applying transpose).
+  size_t lhs_ndim = lhs_shape.size();
+  size_t rhs_ndim = rhs_shape.size();
+  ExprPtr m_dim = a_trans ? lhs_shape[lhs_ndim - 1] : lhs_shape[lhs_ndim - 2];
+  ExprPtr k_lhs = a_trans ? lhs_shape[lhs_ndim - 2] : lhs_shape[lhs_ndim - 1];
+  ExprPtr k_rhs = b_trans ? rhs_shape[rhs_ndim - 1] : rhs_shape[rhs_ndim - 2];
+  ExprPtr n_dim = b_trans ? rhs_shape[rhs_ndim - 2] : rhs_shape[rhs_ndim - 1];
+
+  // Verify K dimensions match.
+  auto k_lhs_const = As<ConstInt>(k_lhs);
+  auto k_rhs_const = As<ConstInt>(k_rhs);
+  if (k_lhs_const && k_rhs_const) {
+    CHECK(k_lhs_const->value_ == k_rhs_const->value_)
+        << "tensor.matmul_acc: lhs K=" << k_lhs_const->value_ << " != rhs K=" << k_rhs_const->value_;
+  }
+
+  // Verify trailing M, N match acc.
+  size_t acc_ndim = acc_shape.size();
+  auto m_acc = As<ConstInt>(acc_shape[acc_ndim - 2]);
+  auto n_acc = As<ConstInt>(acc_shape[acc_ndim - 1]);
+  auto m_lhs_const = As<ConstInt>(m_dim);
+  auto n_rhs_const = As<ConstInt>(n_dim);
+  if (m_acc && m_lhs_const) {
+    CHECK(m_acc->value_ == m_lhs_const->value_)
+        << "tensor.matmul_acc: acc M=" << m_acc->value_ << " != matmul M=" << m_lhs_const->value_;
+  }
+  if (n_acc && n_rhs_const) {
+    CHECK(n_acc->value_ == n_rhs_const->value_)
+        << "tensor.matmul_acc: acc N=" << n_acc->value_ << " != matmul N=" << n_rhs_const->value_;
+  }
+
+  // Batch dim handling: lhs and rhs batch dims broadcast against each other; the
+  // result must equal the acc batch dims (acc is the in-place accumulation target
+  // and is not broadcast).
+  std::vector<ExprPtr> acc_batch(acc_shape.begin(), acc_shape.end() - 2);
+  std::vector<ExprPtr> lhs_batch(lhs_shape.begin(), lhs_shape.end() - 2);
+  std::vector<ExprPtr> rhs_batch(rhs_shape.begin(), rhs_shape.end() - 2);
+  auto broadcast_result = BroadcastShapes(lhs_batch, rhs_batch);
+  CHECK(broadcast_result.success) << "Cannot broadcast batch dimensions for tensor.matmul_acc";
+  CHECK(broadcast_result.shape.size() == acc_batch.size())
+      << "tensor.matmul_acc: acc batch rank (" << acc_batch.size()
+      << ") must equal broadcast(lhs, rhs) batch rank (" << broadcast_result.shape.size() << ")";
+  for (size_t i = 0; i < acc_batch.size(); ++i) {
+    auto acc_const = As<ConstInt>(acc_batch[i]);
+    auto bcast_const = As<ConstInt>(broadcast_result.shape[i]);
+    if (acc_const && bcast_const) {
+      CHECK(acc_const->value_ == bcast_const->value_)
+          << "tensor.matmul_acc: acc batch dim " << i << " (" << acc_const->value_
+          << ") must equal broadcast(lhs, rhs) batch dim " << i << " (" << bcast_const->value_ << ")";
+    }
+  }
+
+  return std::make_shared<TensorType>(acc_shape, result_dtype);
+}
+
+REGISTER_OP("tensor.matmul_acc")
+    .set_op_category("TensorOp")
+    .set_description("Matrix multiplication with accumulation: acc = acc + lhs @ rhs")
+    .add_argument("acc", "Accumulator tensor (TensorType)")
+    .add_argument("lhs", "Left-hand side tensor (TensorType)")
+    .add_argument("rhs", "Right-hand side tensor (TensorType)")
+    .add_argument("init_cond",
+                  "Optional BOOL scalar; where it holds the accumulator is overwritten with "
+                  "lhs @ rhs instead of accumulated into (the split-K `k == 0` step)")
+    .set_attr<bool>("a_trans")
+    .set_attr<bool>("b_trans")
+    .f_deduce_type([](const std::vector<ExprPtr>& args,
+                      const std::vector<std::pair<std::string, std::any>>& kwargs) {
+      return DeduceTensorMatMulAccType(args, kwargs);
+    });
+
+}  // namespace ir
+}  // namespace pypto

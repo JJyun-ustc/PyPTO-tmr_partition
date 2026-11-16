@@ -1,0 +1,518 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+
+"""Unit tests for UseAfterDef structural property verifier."""
+
+import pytest
+from pypto import DataType, ir, passes
+from pypto.ir import builder
+
+
+def _use_after_def_props() -> passes.IRPropertySet:
+    props = passes.IRPropertySet()
+    props.insert(passes.IRProperty.UseAfterDef)
+    return props
+
+
+def _errors(diagnostics: list[passes.Diagnostic]) -> list[passes.Diagnostic]:
+    return [d for d in diagnostics if d.severity == passes.DiagnosticSeverity.Error]
+
+
+# ---------------------------------------------------------------------------
+# Valid cases
+# ---------------------------------------------------------------------------
+
+
+def test_valid_simple():
+    """Variable defined (via param) before use — no error."""
+    ib = builder.IRBuilder()
+
+    with ib.function("valid_simple") as f:
+        a = f.param("a", ir.ScalarType(DataType.INT64))
+        f.return_type(ir.ScalarType(DataType.INT64))
+        x = ib.let("x", a)
+        ib.return_stmt(x)
+
+    program = ir.Program([f.get_result()], "prog", ir.Span.unknown())
+    assert len(_errors(passes.PropertyVerifierRegistry.verify(_use_after_def_props(), program))) == 0
+
+
+def test_valid_sequential_assigns():
+    """Chained assignments each reference previously defined variables."""
+    ib = builder.IRBuilder()
+
+    with ib.function("valid_chain") as f:
+        a = f.param("a", ir.ScalarType(DataType.INT64))
+        f.return_type(ir.ScalarType(DataType.INT64))
+        x = ib.let("x", a)
+        y = ib.let("y", x)
+        z = ib.let("z", y)
+        ib.return_stmt(z)
+
+    program = ir.Program([f.get_result()], "prog", ir.Span.unknown())
+    assert len(_errors(passes.PropertyVerifierRegistry.verify(_use_after_def_props(), program))) == 0
+
+
+def test_valid_for_loop_var_in_body():
+    """Loop variable is valid inside the loop body."""
+    ib = builder.IRBuilder()
+
+    with ib.function("valid_for") as f:
+        n = f.param("n", ir.ScalarType(DataType.INT64))
+        f.return_type(ir.ScalarType(DataType.INT64))
+        i = ib.var("i", ir.ScalarType(DataType.INT64))
+        with ib.for_loop(i, 0, n, 1):
+            _tmp = ib.let("tmp", i)
+        ib.return_stmt(n)
+
+    program = ir.Program([f.get_result()], "prog", ir.Span.unknown())
+    assert len(_errors(passes.PropertyVerifierRegistry.verify(_use_after_def_props(), program))) == 0
+
+
+def test_valid_return_var_after_for():
+    """return_var from a for loop is accessible after the loop ends."""
+    span = ir.Span.unknown()
+    a = ir.Var("a", ir.ScalarType(DataType.INT64), span)
+    loop_var = ir.Var("i", ir.ScalarType(DataType.INT64), span)
+    iter_arg = ir.IterArg("acc", ir.ScalarType(DataType.INT64), a, span)
+    result_var = ir.Var("result", ir.ScalarType(DataType.INT64), span)
+
+    yield_stmt = ir.YieldStmt([iter_arg], span)
+    for_stmt = ir.ForStmt(
+        loop_var,
+        ir.ConstInt(0, DataType.INT64, span),
+        ir.ConstInt(10, DataType.INT64, span),
+        ir.ConstInt(1, DataType.INT64, span),
+        [iter_arg],
+        yield_stmt,
+        [result_var],
+        span,
+    )
+    # result_var is defined by the for loop — using it after is valid
+    ret = ir.ReturnStmt([result_var], span)
+    body = ir.SeqStmts([for_stmt, ret], span)
+    func = ir.Function("valid_rv", [a], [ir.ScalarType(DataType.INT64)], body, span)
+    program = ir.Program([func], "prog", span)
+
+    assert len(_errors(passes.PropertyVerifierRegistry.verify(_use_after_def_props(), program))) == 0
+
+
+# ---------------------------------------------------------------------------
+# Invalid cases
+# ---------------------------------------------------------------------------
+
+
+def test_invalid_use_before_def():
+    """Variable x used in RHS of an AssignStmt before x is defined."""
+    span = ir.Span.unknown()
+    a = ir.Var("a", ir.ScalarType(DataType.INT64), span)
+    x = ir.Var("x", ir.ScalarType(DataType.INT64), span)
+    y = ir.Var("y", ir.ScalarType(DataType.INT64), span)
+
+    # use_x references x before def_x defines it
+    use_x = ir.AssignStmt(y, x, span)
+    def_x = ir.AssignStmt(x, a, span)
+    ret = ir.ReturnStmt([a], span)
+
+    body = ir.SeqStmts([use_x, def_x, ret], span)
+    func = ir.Function("bad_func", [a], [ir.ScalarType(DataType.INT64)], body, span)
+    program = ir.Program([func], "prog", span)
+
+    errors = _errors(passes.PropertyVerifierRegistry.verify(_use_after_def_props(), program))
+    assert len(errors) >= 1
+    assert any("x" in d.message for d in errors)
+
+
+def test_invalid_loop_var_used_after_loop():
+    """Loop variable is out of scope outside the loop body."""
+    span = ir.Span.unknown()
+    a = ir.Var("a", ir.ScalarType(DataType.INT64), span)
+    loop_var = ir.Var("i", ir.ScalarType(DataType.INT64), span)
+    y = ir.Var("y", ir.ScalarType(DataType.INT64), span)
+
+    for_body = ir.ReturnStmt([], span)
+    for_stmt = ir.ForStmt(
+        loop_var,
+        ir.ConstInt(0, DataType.INT64, span),
+        ir.ConstInt(10, DataType.INT64, span),
+        ir.ConstInt(1, DataType.INT64, span),
+        [],
+        for_body,
+        [],
+        span,
+    )
+    # loop_var is used after the loop — it is no longer in scope
+    use_after = ir.AssignStmt(y, loop_var, span)
+    ret = ir.ReturnStmt([a], span)
+
+    body = ir.SeqStmts([for_stmt, use_after, ret], span)
+    func = ir.Function("loop_escape", [a], [ir.ScalarType(DataType.INT64)], body, span)
+    program = ir.Program([func], "prog", span)
+
+    errors = _errors(passes.PropertyVerifierRegistry.verify(_use_after_def_props(), program))
+    assert len(errors) >= 1
+    assert any("i" in d.message for d in errors)
+
+
+def test_error_code():
+    """UseAfterDef errors carry error code 401."""
+    span = ir.Span.unknown()
+    a = ir.Var("a", ir.ScalarType(DataType.INT64), span)
+    x = ir.Var("x", ir.ScalarType(DataType.INT64), span)
+    y = ir.Var("y", ir.ScalarType(DataType.INT64), span)
+
+    use_x = ir.AssignStmt(y, x, span)
+    ret = ir.ReturnStmt([a], span)
+    body = ir.SeqStmts([use_x, ret], span)
+    func = ir.Function("err_code_func", [a], [ir.ScalarType(DataType.INT64)], body, span)
+    program = ir.Program([func], "prog", span)
+
+    errors = _errors(passes.PropertyVerifierRegistry.verify(_use_after_def_props(), program))
+    assert len(errors) >= 1
+    assert all(d.error_code == 401 for d in errors)
+    assert all(d.rule_name == "UseAfterDefCheck" for d in errors)
+
+
+def test_use_after_def_is_structural_property():
+    """UseAfterDef must be present in GetStructuralProperties()."""
+    structural = passes.get_structural_properties()
+    assert structural.contains(passes.IRProperty.UseAfterDef)
+
+
+def test_invalid_undefined_var_in_tensor_view_valid_shape():
+    """Var in TensorView.valid_shape that is not defined should be flagged."""
+    span = ir.Span.unknown()
+    dim16 = ir.ConstInt(16, DataType.INT32, span)
+    # param 'a' has a plain tensor type (no TensorView, no dynamic vars)
+    plain_type = ir.TensorType([dim16, dim16], DataType.FP32)
+    a = ir.Var("a", plain_type, span)
+    # 'n' is a stale var — never defined by any statement or param type
+    n = ir.Var("n", ir.ScalarType(DataType.INT64), span)
+    tensor_view = ir.TensorView([], ir.TensorLayout.ND, [n, dim16])
+    view_type = ir.TensorType([dim16, dim16], DataType.FP32, None, tensor_view)
+    t = ir.Var("t", view_type, span)
+
+    # t is defined via assign, but n (in its type's valid_shape) is never defined
+    def_t = ir.AssignStmt(t, a, span)
+    ret = ir.ReturnStmt([t], span)
+    body = ir.SeqStmts([def_t, ret], span)
+    func = ir.Function("bad_type", [a], [plain_type], body, span)
+    program = ir.Program([func], "prog", span)
+
+    errors = _errors(passes.PropertyVerifierRegistry.verify(_use_after_def_props(), program))
+    assert len(errors) >= 1
+    assert any("n" in d.message for d in errors)
+
+
+def test_invalid_undefined_var_in_distributed_tensor_view_valid_shape():
+    """Undefined valid-shape vars in DistributedTensorType are SSA uses."""
+    span = ir.Span.unknown()
+    dim16 = ir.ConstInt(16, DataType.INT32, span)
+    plain_type = ir.TensorType([dim16, dim16], DataType.FP32)
+    a = ir.Var("a", plain_type, span)
+    n = ir.Var("n", ir.ScalarType(DataType.INT64), span)
+    tensor_view = ir.TensorView([], ir.TensorLayout.ND, [n, dim16])
+    distributed_type = ir.DistributedTensorType([dim16, dim16], DataType.FP32, None, tensor_view)
+    t = ir.Var("t", distributed_type, span)
+
+    body = ir.SeqStmts([ir.AssignStmt(t, a, span), ir.ReturnStmt([t], span)], span)
+    func = ir.Function("bad_distributed_valid_shape", [a], [plain_type], body, span)
+    program = ir.Program([func], "prog", span)
+
+    errors = _errors(passes.PropertyVerifierRegistry.verify(_use_after_def_props(), program))
+    assert any("n" in d.message for d in errors)
+
+
+def test_invalid_undefined_var_in_distributed_tensor_view_stride():
+    """Undefined stride vars in DistributedTensorType are SSA uses."""
+    span = ir.Span.unknown()
+    dim16 = ir.ConstInt(16, DataType.INT32, span)
+    dim1 = ir.ConstInt(1, DataType.INT32, span)
+    plain_type = ir.TensorType([dim16, dim16], DataType.FP32)
+    a = ir.Var("a", plain_type, span)
+    stride = ir.Var("stride", ir.ScalarType(DataType.INT64), span)
+    tensor_view = ir.TensorView([stride, dim1], ir.TensorLayout.ND, [])
+    distributed_type = ir.DistributedTensorType([dim16, dim16], DataType.FP32, None, tensor_view)
+    t = ir.Var("t", distributed_type, span)
+
+    body = ir.SeqStmts([ir.AssignStmt(t, a, span), ir.ReturnStmt([t], span)], span)
+    func = ir.Function("bad_distributed_stride", [a], [plain_type], body, span)
+    program = ir.Program([func], "prog", span)
+
+    errors = _errors(passes.PropertyVerifierRegistry.verify(_use_after_def_props(), program))
+    assert any("stride" in d.message for d in errors)
+
+
+def test_valid_distributed_parameter_metadata_vars_are_signature_definitions():
+    """Distributed shape, valid-shape, and stride vars in params are in scope."""
+    span = ir.Span.unknown()
+    shape_dim = ir.Var("shape_dim", ir.ScalarType(DataType.INT64), span)
+    valid_dim = ir.Var("valid_dim", ir.ScalarType(DataType.INT64), span)
+    stride = ir.Var("stride", ir.ScalarType(DataType.INT64), span)
+    tensor_view = ir.TensorView([stride], ir.TensorLayout.ND, [valid_dim])
+    distributed_type = ir.DistributedTensorType([shape_dim], DataType.FP32, None, tensor_view)
+    t = ir.Var("t", distributed_type, span)
+
+    body = ir.ReturnStmt([t], span)
+    func = ir.Function("distributed_signature", [t], [ir.TensorType([1], DataType.FP32)], body, span)
+    program = ir.Program([func], "prog", span)
+
+    assert len(_errors(passes.PropertyVerifierRegistry.verify(_use_after_def_props(), program))) == 0
+
+
+def test_valid_type_dynamic_var_in_param_shape():
+    """Var in parameter's TensorType shape should not be flagged (type-dynamic)."""
+    span = ir.Span.unknown()
+    n = ir.Var("n", ir.ScalarType(DataType.INT64), span)
+    tensor_type = ir.TensorType([n], DataType.FP32)
+    t = ir.Var("t", tensor_type, span)
+
+    body = ir.ReturnStmt([t], span)
+    func = ir.Function("dynamic_shape", [t], [tensor_type], body, span)
+    program = ir.Program([func], "prog", span)
+
+    assert len(_errors(passes.PropertyVerifierRegistry.verify(_use_after_def_props(), program))) == 0
+
+
+def test_valid_type_dynamic_var_in_param_tensor_view():
+    """Var in parameter's TensorView.valid_shape should not be flagged (type-dynamic)."""
+    span = ir.Span.unknown()
+    n = ir.Var("n", ir.ScalarType(DataType.INT64), span)
+    dim16 = ir.ConstInt(16, DataType.INT32, span)
+    tensor_view = ir.TensorView([], ir.TensorLayout.ND, [n])
+    tensor_type = ir.TensorType([dim16], DataType.FP32, None, tensor_view)
+    t = ir.Var("t", tensor_type, span)
+
+    body = ir.ReturnStmt([t], span)
+    func = ir.Function("dynamic_view", [t], [tensor_type], body, span)
+    program = ir.Program([func], "prog", span)
+
+    assert len(_errors(passes.PropertyVerifierRegistry.verify(_use_after_def_props(), program))) == 0
+
+
+def test_valid_then_only_leak_visible_after_if():
+    """Variable defined only in then-branch (no else, no return_vars) is visible after if.
+
+    UseAfterDef verifier permits this — SSAVerify is responsible for checking
+    whether the leak is valid SSA form.
+    """
+    span = ir.Span.unknown()
+    a = ir.Var("a", ir.ScalarType(DataType.INT64), span)
+    cond = ir.Var("cond", ir.ScalarType(DataType.BOOL), span)
+    x = ir.Var("x", ir.ScalarType(DataType.INT64), span)
+    y = ir.Var("y", ir.ScalarType(DataType.INT64), span)
+
+    # x is defined only in the then-branch, no else branch, no return_vars
+    def_x = ir.AssignStmt(x, a, span)
+    if_stmt = ir.IfStmt(cond, def_x, None, [], span)
+    # use x after the if — UseAfterDef should NOT flag this
+    use_x = ir.AssignStmt(y, x, span)
+    ret = ir.ReturnStmt([a], span)
+    body = ir.SeqStmts([if_stmt, use_x, ret], span)
+    func = ir.Function("then_leak_func", [a, cond], [ir.ScalarType(DataType.INT64)], body, span)
+    program = ir.Program([func], "prog", span)
+
+    assert len(_errors(passes.PropertyVerifierRegistry.verify(_use_after_def_props(), program))) == 0
+
+
+# ---------------------------------------------------------------------------
+# Function attrs
+#
+# ``Function::attrs_`` is evaluated where the parameters bind, so a reference to
+# a parameter is a legal use and a reference to anything else has no definition
+# in this function. Covering both here is what makes a separate "function attrs
+# must be static" property unnecessary (RFC #2338).
+# ---------------------------------------------------------------------------
+
+
+def _func_with_attrs(attrs):
+    """Single-parameter function carrying ``attrs``, returning its parameter."""
+    span = ir.Span.unknown()
+    x = ir.Var("x", ir.ScalarType(DataType.INT64), span)
+    func = ir.Function(
+        "kernel",
+        [x],
+        [ir.ScalarType(DataType.INT64)],
+        ir.ReturnStmt([x], span),
+        span,
+        attrs=attrs(x),
+    )
+    return ir.Program([func], "prog", span)
+
+
+def test_function_attr_referencing_a_param_is_valid():
+    """A parameter is bound where function attrs are evaluated, so this is a real def."""
+    program = _func_with_attrs(lambda x: {"stationary": x})
+    assert len(_errors(passes.PropertyVerifierRegistry.verify(_use_after_def_props(), program))) == 0
+
+
+def test_function_attr_referencing_an_undefined_var_is_flagged():
+    """A caller-local in a function attr — the old Function-carried SPMD launch spec."""
+    span = ir.Span.unknown()
+    ghost = ir.Var("ghost", ir.ScalarType(DataType.INT32), span)
+    program = _func_with_attrs(lambda x: {"core_num": ghost})
+    errors = _errors(passes.PropertyVerifierRegistry.verify(_use_after_def_props(), program))
+    assert len(errors) == 1
+    assert "ghost" in errors[0].message
+
+
+def test_function_attr_var_list_is_walked():
+    """vector<VarPtr> attrs are walked element-wise, like Call attrs."""
+    span = ir.Span.unknown()
+    ghost = ir.Var("ghost", ir.ScalarType(DataType.INT32), span)
+    program = _func_with_attrs(lambda x: {"dump_vars": [x, ghost]})
+    errors = _errors(passes.PropertyVerifierRegistry.verify(_use_after_def_props(), program))
+    assert len(errors) == 1
+    assert "ghost" in errors[0].message
+
+
+def test_function_attr_expr_tree_is_walked():
+    """A whole Expr attr is recursed into, not just its root node."""
+    span = ir.Span.unknown()
+    ghost = ir.Var("ghost", ir.ScalarType(DataType.INT32), span)
+    program = _func_with_attrs(lambda x: {"core_num": ir.add(ghost, ir.ConstInt(1, DataType.INT32, span))})
+    errors = _errors(passes.PropertyVerifierRegistry.verify(_use_after_def_props(), program))
+    assert len(errors) == 1
+    assert "ghost" in errors[0].message
+
+
+def test_static_function_attrs_are_ignored():
+    """Scalars and strings name nothing, so they produce no diagnostics."""
+    program = _func_with_attrs(lambda x: {"core_num": 8, "tag": "abc", "flag": True})
+    assert len(_errors(passes.PropertyVerifierRegistry.verify(_use_after_def_props(), program))) == 0
+
+
+def _scope_mode_errors(body, params, *, lexical):
+    """Select final BufferIR's lexical mode or the unchanged legacy property."""
+    span = ir.Span.unknown()
+    function = ir.Function("scopes", params, [], body, span, type=ir.FunctionType.InCore)
+    props = passes.IRPropertySet()
+    props.insert(passes.IRProperty.BufferIR if lexical else passes.IRProperty.UseAfterDef)
+    diagnostics = passes.PropertyVerifierRegistry.verify(props, ir.Program([function], "scopes", span))
+    return [d for d in _errors(diagnostics) if d.rule_name == "UseAfterDefCheck"]
+
+
+@pytest.mark.parametrize("lexical", [False, True])
+@pytest.mark.parametrize("kind", ["if", "for", "while"])
+def test_lexical_mode_restores_body_definitions_without_changing_legacy_leaks(lexical, kind):
+    span = ir.Span.unknown()
+    type_ = ir.ScalarType(DataType.INDEX)
+    outer = ir.Var("outer", type_, span)
+    local = ir.Var("local", type_, span)
+    definition = ir.AssignStmt(local, outer, span)
+    if kind == "if":
+        scope = ir.IfStmt(ir.ConstBool(True, span), definition, None, [], span)
+    elif kind == "for":
+        scope = ir.ForStmt(
+            ir.Var("i", type_, span),
+            ir.ConstInt(0, DataType.INDEX, span),
+            ir.ConstInt(1, DataType.INDEX, span),
+            ir.ConstInt(1, DataType.INDEX, span),
+            [],
+            definition,
+            [],
+            span,
+        )
+    else:
+        scope = ir.WhileStmt(ir.ConstBool(True, span), [], definition, [], span)
+    body = ir.SeqStmts([scope, ir.EvalStmt(local, span), ir.EvalStmt(outer, span)], span)
+    errors = _scope_mode_errors(body, [outer], lexical=lexical)
+    assert len(errors) == int(lexical)
+    if lexical:
+        assert "'local' used before definition" in errors[0].message
+
+
+@pytest.mark.parametrize("lexical", [False, True])
+def test_sibling_branch_cannot_see_then_definition(lexical):
+    span = ir.Span.unknown()
+    outer = ir.Var("outer", ir.ScalarType(DataType.INDEX), span)
+    local = ir.Var("local", outer.type, span)
+    branch = ir.IfStmt(
+        ir.ConstBool(True, span),
+        ir.AssignStmt(local, outer, span),
+        ir.EvalStmt(local, span),
+        [],
+        span,
+    )
+    errors = _scope_mode_errors(branch, [outer], lexical=lexical)
+    assert len(errors) == 1
+    assert "'local' used before definition" in errors[0].message
+
+
+def test_lexical_mode_restores_deep_scopes_and_large_enclosing_environment():
+    """Outer definitions survive many nested/sibling scopes; locals remain local."""
+    span = ir.Span.unknown()
+    type_ = ir.ScalarType(DataType.INDEX)
+    params = [ir.Var(f"p{i}", type_, span) for i in range(128)]
+    local = ir.Var("deep_local", type_, span)
+    body = ir.SeqStmts([ir.AssignStmt(local, params[0], span), ir.EvalStmt(local, span)], span)
+    for depth in range(64):
+        sibling = ir.Var(f"sibling_{depth}", type_, span)
+        body = ir.IfStmt(
+            ir.ConstBool(True, span),
+            body,
+            ir.SeqStmts([ir.AssignStmt(sibling, params[depth], span), ir.EvalStmt(sibling, span)], span),
+            [],
+            span,
+        )
+    after = [ir.EvalStmt(param, span) for param in params]
+    after.append(ir.EvalStmt(local, span))
+    errors = _scope_mode_errors(ir.SeqStmts([body, *after], span), params, lexical=True)
+    assert len(errors) == 1
+    assert "'deep_local' used before definition" in errors[0].message
+
+
+def test_lexical_mode_preserves_while_carry_and_outer_bindings():
+    span = ir.Span.unknown()
+    type_ = ir.ScalarType(DataType.INDEX)
+    outer = ir.Var("outer", type_, span)
+    carry = ir.IterArg("carry", type_, outer, span)
+    result = ir.Var("result", type_, span)
+    loop = ir.WhileStmt(
+        ir.Gt(carry, ir.ConstInt(0, DataType.INDEX, span), DataType.BOOL, span),
+        [carry],
+        ir.SeqStmts([ir.EvalStmt(outer, span), ir.YieldStmt([carry], span)], span),
+        [result],
+        span,
+    )
+    body = ir.SeqStmts(
+        [loop, ir.EvalStmt(result, span), ir.EvalStmt(outer, span), ir.EvalStmt(carry, span)], span
+    )
+    errors = _scope_mode_errors(body, [outer], lexical=True)
+    assert len(errors) == 1
+    assert "'carry' used before definition" in errors[0].message
+
+
+@pytest.mark.parametrize("lexical", [False, True])
+def test_window_size_uses_are_checked_only_in_strict_mode(lexical):
+    """Strict size checks preserve the standalone legacy window-leaf behavior."""
+    span = ir.Span.unknown()
+    size = ir.Var("undefined_size", ir.ScalarType(DataType.INDEX), span)
+    window = ir.WindowBuffer(ir.Var("pointer", ir.PtrType(), span), size, span=span)
+    errors = _scope_mode_errors(ir.EvalStmt(window, span), [], lexical=lexical)
+    assert len(errors) == int(lexical)
+    if lexical:
+        assert "'undefined_size' used before definition" in errors[0].message
+
+
+def test_lexical_mode_still_checks_type_metadata_uses():
+    span = ir.Span.unknown()
+    extent = ir.Var("missing_extent", ir.ScalarType(DataType.INDEX), span)
+    plain_type = ir.TensorType([16, 32], DataType.FP32)
+    incoming = ir.Var("incoming", plain_type, span)
+    view = ir.TensorView([], ir.TensorLayout.ND, [extent, ir.ConstInt(32, DataType.INDEX, span)])
+    local = ir.Var("local", ir.TensorType([16, 32], DataType.FP32, None, view), span)
+    body = ir.SeqStmts([ir.AssignStmt(local, incoming, span), ir.EvalStmt(local, span)], span)
+    errors = _scope_mode_errors(body, [incoming], lexical=True)
+    assert len(errors) == 1
+    assert "'missing_extent' used before definition" in errors[0].message
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

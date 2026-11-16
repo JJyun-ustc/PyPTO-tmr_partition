@@ -1,0 +1,615 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+
+"""Tests for the LegalizeTileCast pass."""
+
+import pypto.language as pl
+import pytest
+from pypto import backend, ir, passes
+from pypto.backend import BackendType
+from pypto.language.parser.diagnostics import InvalidOperationError
+
+_TILE_CAST = ir.get_op("tile.cast").name
+
+
+class _CastTargetCollector(ir.IRVisitor):
+    """Record each tile.cast's (src_dtype, target_type) in visitation order."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.pairs: list[tuple[str, str]] = []
+
+    def visit_call(self, op: ir.Call) -> None:
+        if op.op.name == _TILE_CAST:
+            src_ty = op.args[0].type
+            assert isinstance(src_ty, ir.TileType)
+            src = str(src_ty.dtype)
+            dst = str(op.kwargs["target_type"])
+            self.pairs.append((src, dst))
+        super().visit_call(op)
+
+
+def _cast_pairs(prog) -> list[tuple[str, str]]:
+    c = _CastTargetCollector()
+    c.visit_program(prog)
+    return c.pairs
+
+
+def _run(program, backend_type: BackendType):
+    backend.reset_for_testing()
+    backend.set_backend_type(backend_type)
+    try:
+        return passes.legalize_tile_cast()(program)
+    finally:
+        backend.reset_for_testing()
+
+
+def test_legalize_tile_cast_pass_factory_exists():
+    p = passes.legalize_tile_cast()
+    assert p is not None
+    assert p.get_name() == "LegalizeTileCast"
+
+
+def test_a5_int32_to_fp16_becomes_fp32_bridge():
+    """A5 has no native I32→FP16; expand to I32→FP32→FP16."""
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            x: pl.Tensor[[16, 16], pl.INT32],
+            out: pl.Out[pl.Tensor[[16, 16], pl.FP16]],
+        ) -> pl.Tensor[[16, 16], pl.FP16]:
+            t: pl.Tile[[16, 16], pl.INT32] = pl.load(x, [0, 0], [16, 16])
+            c: pl.Tile[[16, 16], pl.FP16] = pl.tile.cast(t, target_type=pl.FP16, mode="round")
+            out_t: pl.Tensor[[16, 16], pl.FP16] = pl.store(c, [0, 0], out)
+            return out_t
+
+        @pl.function
+        def main(self, x: pl.Tensor[[16, 16], pl.INT32]) -> pl.Tensor[[16, 16], pl.FP16]:
+            o: pl.Tensor[[16, 16], pl.FP16] = pl.create_tensor([16, 16], dtype=pl.FP16)
+            return self.kernel(x, o)
+
+    after = _run(Before, BackendType.Ascend950)
+    pairs = _cast_pairs(after)
+    assert pairs == [("int32", "fp32"), ("fp32", "fp16")], pairs
+
+
+def test_a5_fp4e2m1x2_to_bf16_cast_is_silent_and_expands_last_dim(capfd):
+    """Hand-written FP4E2M1X2→BF16 is a native hop; last axis expands 2:1."""
+    from pypto import LogLevel, get_log_level, set_log_level  # noqa: PLC0415
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            x: pl.Tensor[[16, 32], pl.FP4E2M1X2],
+            out: pl.Out[pl.Tensor[[16, 64], pl.BF16]],
+        ) -> pl.Tensor[[16, 64], pl.BF16]:
+            t = pl.load(x, [0, 0], [16, 32])
+            c = pl.cast(t, pl.BF16)
+            return pl.store(c, [0, 0], out)
+
+    prev = get_log_level()
+    set_log_level(LogLevel.WARN)
+    try:
+        capfd.readouterr()
+        after = _run(Before, BackendType.Ascend950)
+    finally:
+        set_log_level(prev)
+    assert _cast_pairs(after) == [("fp4e2m1x2", "bfloat16")]
+    err = capfd.readouterr().err
+    assert "LegalizeTileCast" not in err
+    assert "FP4→BF16→FP32→FP8" not in err
+
+    class _ShapeCollector(ir.IRVisitor):
+        def __init__(self) -> None:
+            super().__init__()
+            self.cast_out_shape: tuple[int, int] | None = None
+
+        def visit_call(self, op: ir.Call) -> None:
+            if op.op.name == _TILE_CAST:
+                ty = op.type
+                assert isinstance(ty, ir.TileType)
+                rows = ty.shape[0]
+                cols = ty.shape[1]
+                assert isinstance(rows, ir.ConstInt)
+                assert isinstance(cols, ir.ConstInt)
+                self.cast_out_shape = (rows.value, cols.value)
+            super().visit_call(op)
+
+    shapes = _ShapeCollector()
+    shapes.visit_program(after)
+    assert shapes.cast_out_shape == (16, 64)
+
+
+def test_a5_uint8_ub_alias_to_bf16_stays_one_native_cast():
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            packed: pl.Tensor[[32, 256], pl.UINT8],
+            output: pl.Out[pl.Tensor[[32, 512], pl.BF16]],
+        ) -> pl.Tensor[[32, 512], pl.BF16]:
+            payload = pl.tile.load(packed, [0, 0], [32, 256])
+            fp4 = pl.reinterpret_view(payload, pl.FP4E2M1X2)
+            decoded = pl.cast(fp4, pl.BF16)
+            return pl.tile.store(decoded, [0, 0], output)
+
+    after = _run(Before, BackendType.Ascend950)
+    ir.assert_structural_equal(after, Before)
+    assert _cast_pairs(after) == [("fp4e2m1x2", "bfloat16")]
+
+
+def test_a5_fp4e2m1x2_to_fp8_cast_emits_warning(capfd):
+    """Packed E2M1→FP8 is legalized with a warning about the three-hop bridge."""
+    from pypto import LogLevel, get_log_level, set_log_level  # noqa: PLC0415
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            x: pl.Tensor[[16, 32], pl.FP4E2M1X2],
+            out: pl.Out[pl.Tensor[[16, 64], pl.FP8E4M3FN]],
+        ) -> pl.Tensor[[16, 64], pl.FP8E4M3FN]:
+            t = pl.load(x, [0, 0], [16, 32])
+            c = pl.cast(t, pl.FP8E4M3FN)
+            return pl.store(c, [0, 0], out)
+
+    prev = get_log_level()
+    set_log_level(LogLevel.WARN)
+    try:
+        capfd.readouterr()
+        after = _run(Before, BackendType.Ascend950)
+    finally:
+        set_log_level(prev)
+    assert _cast_pairs(after) == [
+        ("fp4e2m1x2", "bfloat16"),
+        ("bfloat16", "fp32"),
+        ("fp32", "fp8e4m3fn"),
+    ]
+    err = capfd.readouterr().err
+    assert "LegalizeTileCast" in err
+    assert "FP4→BF16→FP32→FP8" in err
+    assert "LUT" in err
+
+
+def test_a5_packed_fp4e2m1x2_cast_expands_last_dim_valid_shape():
+    """Hand-written FP4E2M1X2→FP8 legalization expands the last axis 2:1."""
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            x: pl.Tensor[[16, 32], pl.FP4E2M1X2],
+            out: pl.Out[pl.Tensor[[16, 64], pl.FP8E4M3FN]],
+        ) -> pl.Tensor[[16, 64], pl.FP8E4M3FN]:
+            t = pl.load(x, [0, 0], [16, 32], valid_shape=[8, 24])
+            c = pl.cast(t, pl.FP8E4M3FN)
+            return pl.store(c, [0, 0], out)
+
+    after = _run(Before, BackendType.Ascend950)
+
+    assert _cast_pairs(after) == [
+        ("fp4e2m1x2", "bfloat16"),
+        ("bfloat16", "fp32"),
+        ("fp32", "fp8e4m3fn"),
+    ]
+
+    class _ValidShapeCollector(ir.IRVisitor):
+        def __init__(self) -> None:
+            super().__init__()
+            self.shapes: list[tuple[int, int]] = []
+
+        def visit_call(self, op: ir.Call) -> None:
+            if op.op.name == _TILE_CAST:
+                tile_type = op.type
+                assert isinstance(tile_type, ir.TileType)
+                valid = tile_type.get_effective_tile_view().valid_shape
+                rows, cols = valid
+                assert isinstance(rows, ir.ConstInt)
+                assert isinstance(cols, ir.ConstInt)
+                self.shapes.append((rows.value, cols.value))
+            super().visit_call(op)
+
+    collector = _ValidShapeCollector()
+    collector.visit_program(after)
+    assert collector.shapes
+    assert collector.shapes[0] == (8, 48)
+    assert all(shape == (8, 48) for shape in collector.shapes)
+
+    class _StrideCollector(ir.IRVisitor):
+        def __init__(self) -> None:
+            super().__init__()
+            self.strides: list[list[int]] = []
+
+        def visit_call(self, op: ir.Call) -> None:
+            if op.op.name == _TILE_CAST:
+                tile_type = op.type
+                assert isinstance(tile_type, ir.TileType)
+                stride = tile_type.get_effective_tile_view().stride
+                values: list[int] = []
+                for dim in stride:
+                    assert isinstance(dim, ir.ConstInt)
+                    values.append(dim.value)
+                self.strides.append(values)
+            super().visit_call(op)
+
+    strides = _StrideCollector()
+    strides.visit_program(after)
+    assert strides.strides
+    # Packed physical [16, 32] stride [32, 1] unpacks to [16, 64] stride [64, 1].
+    # valid_shape [8, 24] → [8, 48] is the sub-rectangle, not the row pitch.
+    assert strides.strides[0] == [64, 1]
+    assert all(stride == [64, 1] for stride in strides.strides)
+
+
+@pytest.mark.parametrize(
+    ("source_dtype", "target_dtype"),
+    [(pl.FP4E2M1X2, pl.FP4E1M2X2), (pl.FP4E1M2X2, pl.FP4E2M1X2)],
+)
+def test_packed_fp4_format_cast_is_rejected(source_dtype, target_dtype):
+    """Equal byte geometry must not silently relabel distinct packed formats."""
+    with pytest.raises(InvalidOperationError, match="cast between FP4E2M1X2 and FP4E1M2X2"):
+
+        @pl.program
+        class Bad:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.Tensor[[16, 32], source_dtype],
+                out: pl.Out[pl.Tensor[[16, 32], target_dtype]],
+            ) -> pl.Tensor[[16, 32], target_dtype]:
+                t = pl.load(x, [0, 0], [16, 32])
+                c = pl.cast(t, target_dtype)
+                return pl.store(c, [0, 0], out)
+
+
+def test_cast_to_packed_fp4_rejects_dynamic_last_dim():
+    """Wider → FP4E2M1X2 requires a static positive even last dim."""
+    n = pl.dynamic("N")
+
+    with pytest.raises(InvalidOperationError, match="static positive even last dimension"):
+
+        @pl.program
+        class Bad:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.Tensor[[16, n], pl.BF16],
+                out: pl.Out[pl.Tensor[[16, n // 2], pl.FP4E2M1X2]],
+            ) -> pl.Tensor[[16, n // 2], pl.FP4E2M1X2]:
+                t = pl.load(x, [0, 0], [16, n])
+                c = pl.cast(t, pl.FP4E2M1X2)
+                return pl.store(c, [0, 0], out)
+
+
+def test_a2a3_int32_to_fp16_stays_native():
+    """A2A3 has a native I32→FP16 deq path — leave the single cast."""
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            x: pl.Tensor[[16, 16], pl.INT32],
+            out: pl.Out[pl.Tensor[[16, 16], pl.FP16]],
+        ) -> pl.Tensor[[16, 16], pl.FP16]:
+            t: pl.Tile[[16, 16], pl.INT32] = pl.load(x, [0, 0], [16, 16])
+            c: pl.Tile[[16, 16], pl.FP16] = pl.tile.cast(t, target_type=pl.FP16, mode="round")
+            out_t: pl.Tensor[[16, 16], pl.FP16] = pl.store(c, [0, 0], out)
+            return out_t
+
+        @pl.function
+        def main(self, x: pl.Tensor[[16, 16], pl.INT32]) -> pl.Tensor[[16, 16], pl.FP16]:
+            o: pl.Tensor[[16, 16], pl.FP16] = pl.create_tensor([16, 16], dtype=pl.FP16)
+            return self.kernel(x, o)
+
+    after = _run(Before, BackendType.Ascend910)
+    pairs = _cast_pairs(after)
+    assert pairs == [("int32", "fp16")], pairs
+
+
+def test_a5_fp16_to_bf16_via_fp32():
+    """A5 has no native FP16→BF16; expand via FP32."""
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            x: pl.Tensor[[16, 16], pl.FP16],
+            out: pl.Out[pl.Tensor[[16, 16], pl.BF16]],
+        ) -> pl.Tensor[[16, 16], pl.BF16]:
+            t: pl.Tile[[16, 16], pl.FP16] = pl.load(x, [0, 0], [16, 16])
+            c: pl.Tile[[16, 16], pl.BF16] = pl.tile.cast(t, target_type=pl.BF16, mode="round")
+            out_t: pl.Tensor[[16, 16], pl.BF16] = pl.store(c, [0, 0], out)
+            return out_t
+
+        @pl.function
+        def main(self, x: pl.Tensor[[16, 16], pl.FP16]) -> pl.Tensor[[16, 16], pl.BF16]:
+            o: pl.Tensor[[16, 16], pl.BF16] = pl.create_tensor([16, 16], dtype=pl.BF16)
+            return self.kernel(x, o)
+
+    after = _run(Before, BackendType.Ascend950)
+    pairs = _cast_pairs(after)
+    assert pairs == [("fp16", "fp32"), ("fp32", "bfloat16")], pairs
+
+
+def test_native_fp32_to_fp16_unchanged_on_a5():
+    """Already-native casts (and FIXPIPE-foldable ones) must not be rewritten."""
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            x: pl.Tensor[[16, 16], pl.FP32],
+            out: pl.Out[pl.Tensor[[16, 16], pl.FP16]],
+        ) -> pl.Tensor[[16, 16], pl.FP16]:
+            t: pl.Tile[[16, 16], pl.FP32] = pl.load(x, [0, 0], [16, 16])
+            c: pl.Tile[[16, 16], pl.FP16] = pl.tile.cast(t, target_type=pl.FP16, mode="rint")
+            out_t: pl.Tensor[[16, 16], pl.FP16] = pl.store(c, [0, 0], out)
+            return out_t
+
+        @pl.function
+        def main(self, x: pl.Tensor[[16, 16], pl.FP32]) -> pl.Tensor[[16, 16], pl.FP16]:
+            o: pl.Tensor[[16, 16], pl.FP16] = pl.create_tensor([16, 16], dtype=pl.FP16)
+            return self.kernel(x, o)
+
+    after = _run(Before, BackendType.Ascend950)
+    pairs = _cast_pairs(after)
+    assert pairs == [("fp32", "fp16")], pairs
+    ir.assert_structural_equal(after, Before)
+
+
+def test_idempotent_on_already_bridged_chain():
+    """Hand-written I32→FP32→FP16 stays unchanged (each hop already native)."""
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            x: pl.Tensor[[16, 16], pl.INT32],
+            out: pl.Out[pl.Tensor[[16, 16], pl.FP16]],
+        ) -> pl.Tensor[[16, 16], pl.FP16]:
+            t: pl.Tile[[16, 16], pl.INT32] = pl.load(x, [0, 0], [16, 16])
+            m: pl.Tile[[16, 16], pl.FP32] = pl.tile.cast(t, target_type=pl.FP32, mode="round")
+            c: pl.Tile[[16, 16], pl.FP16] = pl.tile.cast(m, target_type=pl.FP16, mode="round")
+            out_t: pl.Tensor[[16, 16], pl.FP16] = pl.store(c, [0, 0], out)
+            return out_t
+
+        @pl.function
+        def main(self, x: pl.Tensor[[16, 16], pl.INT32]) -> pl.Tensor[[16, 16], pl.FP16]:
+            o: pl.Tensor[[16, 16], pl.FP16] = pl.create_tensor([16, 16], dtype=pl.FP16)
+            return self.kernel(x, o)
+
+    after = _run(Before, BackendType.Ascend950)
+    assert _cast_pairs(after) == [("int32", "fp32"), ("fp32", "fp16")]
+    ir.assert_structural_equal(after, Before)
+
+
+def test_a5_uint32_to_fp32_rejects_narrowing_bridge():
+    """A narrowing bridge must never be chosen, even when it is the shortest path.
+
+    A5 has no native UINT32 -> FP32. The only 2-hop routes go through INT16 /
+    UINT16 / UINT8, all of which discard values a direct conversion would keep
+    (40000 is exactly representable in FP32 but not in INT16), so the pass must
+    refuse rather than silently emit a lossy chain.
+    """
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            x: pl.Tensor[[16, 16], pl.UINT32],
+            out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
+            t: pl.Tile[[16, 16], pl.UINT32] = pl.load(x, [0, 0], [16, 16])
+            c: pl.Tile[[16, 16], pl.FP32] = pl.tile.cast(t, target_type=pl.FP32, mode="none")
+            out_t: pl.Tensor[[16, 16], pl.FP32] = pl.store(c, [0, 0], out)
+            return out_t
+
+    with pytest.raises(ValueError) as excinfo:
+        _run(Before, BackendType.Ascend950)
+    assert "cast" in str(excinfo.value).lower()
+
+
+def test_resolve_arch_without_configured_backend_is_a_noop():
+    """With no backend configured the pass must do nothing, not raise.
+
+    The native-cast table belongs to the BackendHandler, so with no backend
+    there is nothing to legalize against. Both PassContext::GetBackendHandler()
+    and BackendConfig::GetBackend() CHECK-fail when unconfigured, so the pass
+    probes IsConfigured() first and returns the function untouched.
+
+    FP32 -> INT8 is the discriminating pair: it is a 2-hop chain under *both*
+    shipped profiles, so leaving it as a single cast can only mean no profile
+    was applied at all.
+    """
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            x: pl.Tensor[[16, 16], pl.FP32],
+            out: pl.Out[pl.Tensor[[16, 16], pl.INT8]],
+        ) -> pl.Tensor[[16, 16], pl.INT8]:
+            t: pl.Tile[[16, 16], pl.FP32] = pl.load(x, [0, 0], [16, 16])
+            c: pl.Tile[[16, 16], pl.INT8] = pl.tile.cast(t, target_type=pl.INT8, mode="round")
+            out_t: pl.Tensor[[16, 16], pl.INT8] = pl.store(c, [0, 0], out)
+            return out_t
+
+    backend.reset_for_testing()
+    try:
+        after = passes.legalize_tile_cast()(Before)
+    finally:
+        backend.reset_for_testing()
+    assert _cast_pairs(after) == [("fp32", "int8")]
+    ir.assert_structural_equal(after, Before)
+
+
+@pytest.mark.parametrize(
+    "backend_type,src,dst,expected",
+    [
+        # HF8 exists only on a5; a2a3 has no path and must reject.
+        (BackendType.Ascend950, "HF8", "FP32", [("hf8", "fp32")]),
+        (BackendType.Ascend910, "HF8", "FP32", None),
+        # INT4 exists only on a2a3; a5 has no path and must reject.
+        (BackendType.Ascend910, "FP16", "INT4", [("fp16", "int4")]),
+        (BackendType.Ascend950, "FP16", "INT4", None),
+    ],
+)
+def test_native_table_is_owned_by_the_backend_handler(backend_type, src, dst, expected):
+    """Each arch's native-cast table lives on its own BackendHandler.
+
+    These four cases are the ones that differ between the two shipped tables,
+    so editing the wrong handler flips exactly this test.
+    """
+    src_dt, dst_dt = getattr(pl, src), getattr(pl, dst)
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            x: pl.Tensor[[16, 16], src_dt],
+            out: pl.Out[pl.Tensor[[16, 16], dst_dt]],
+        ) -> pl.Tensor[[16, 16], dst_dt]:
+            t: pl.Tile[[16, 16], src_dt] = pl.load(x, [0, 0], [16, 16])
+            c: pl.Tile[[16, 16], dst_dt] = pl.tile.cast(t, target_type=dst_dt, mode="round")
+            out_t: pl.Tensor[[16, 16], dst_dt] = pl.store(c, [0, 0], out)
+            return out_t
+
+    if expected is None:
+        with pytest.raises(ValueError, match="no native cast path"):
+            _run(Before, backend_type)
+    else:
+        assert _cast_pairs(_run(Before, backend_type)) == expected
+
+
+def _saturation_modes(program) -> list[int | None]:
+    """Each tile.cast's saturation_mode in visitation order; None where left implicit.
+
+    None is the *default* (saturating), not "unspecified": the IR records only a
+    deviation from ``ir::kDefaultSaturationMode``.
+    """
+
+    class _Collector(ir.IRVisitor):
+        def __init__(self) -> None:
+            super().__init__()
+            self.modes: list[int | None] = []
+
+        def visit_call(self, op: ir.Call) -> None:
+            if op.op.name == _TILE_CAST:
+                mode = op.kwargs.get("saturation_mode")
+                assert mode is None or isinstance(mode, int)
+                self.modes.append(mode)
+            super().visit_call(op)
+
+    collector = _Collector()
+    collector.visit_program(program)
+    return collector.modes
+
+
+def test_an_opt_out_applies_only_to_the_final_legalized_hop():
+    """A2/A3 FP32→INT8 expands via FP16; saturation names the destination, so it rides the last hop.
+
+    Only the final hop reaches the dtype the author named, so an opt-out belongs
+    there. The widening intermediate keeps the default: it converts into a dtype
+    the author never named, and every value INT8 can represent passes through FP16
+    exactly either way.
+    """
+    saturation_mode = "off"
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            x: pl.Tensor[[16, 64], pl.FP32],
+            out: pl.Out[pl.Tensor[[16, 64], pl.INT8]],
+        ) -> pl.Tensor[[16, 64], pl.INT8]:
+            t = pl.load(x, [0, 0], [16, 64])
+            c = pl.cast(t, pl.INT8, mode="trunc", saturation_mode=saturation_mode)
+            return pl.store(c, [0, 0], out)
+
+    after = _run(Before, BackendType.Ascend910)
+    assert _cast_pairs(after) == [("fp32", "fp16"), ("fp16", "int8")]
+    assert _saturation_modes(after) == [None, 0], "intermediate defaulted, final opted out"
+
+
+def test_native_cast_keeps_its_saturation_unchanged():
+    """A single-hop cast is not rewritten, so its opt-out must survive untouched."""
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            x: pl.Tensor[[16, 64], pl.FP16],
+            out: pl.Out[pl.Tensor[[16, 64], pl.INT8]],
+        ) -> pl.Tensor[[16, 64], pl.INT8]:
+            t = pl.load(x, [0, 0], [16, 64])
+            c = pl.cast(t, pl.INT8, mode="trunc", saturation_mode="off")
+            return pl.store(c, [0, 0], out)
+
+    after = _run(Before, BackendType.Ascend910)
+    assert _cast_pairs(after) == [("fp16", "int8")]
+    assert _saturation_modes(after) == [0]
+
+
+def test_legalized_chain_keeps_a_caller_supplied_tmp_on_the_final_hop():
+    """An explicit scratch operand belongs to the narrowing hop, which is the last one.
+
+    The intermediate widening hop needs no scratch, and dropping the operand
+    would silently discard the tile the author allocated for the cast.
+    """
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            x: pl.Tensor[[16, 64], pl.FP32],
+            out: pl.Out[pl.Tensor[[16, 64], pl.INT8]],
+        ) -> pl.Tensor[[16, 64], pl.INT8]:
+            t = pl.load(x, [0, 0], [16, 64])
+            tmp = pl.tile.create([1, 256], dtype=pl.INT8, target_memory=pl.Mem.Vec)
+            c = pl.tile.cast(t, pl.INT8, mode="trunc", tmp=tmp)
+            return pl.store(c, [0, 0], out)
+
+    after = _run(Before, BackendType.Ascend910)
+    assert _cast_pairs(after) == [("fp32", "fp16"), ("fp16", "int8")]
+
+    class _ArityCollector(ir.IRVisitor):
+        def __init__(self) -> None:
+            super().__init__()
+            self.arities: list[int] = []
+
+        def visit_call(self, op: ir.Call) -> None:
+            if op.op.name == _TILE_CAST:
+                self.arities.append(len(op.args))
+            super().visit_call(op)
+
+    collector = _ArityCollector()
+    collector.visit_program(after)
+    assert collector.arities == [1, 2]
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

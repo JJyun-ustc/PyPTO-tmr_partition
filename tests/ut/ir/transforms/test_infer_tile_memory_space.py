@@ -1,0 +1,4915 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+
+"""Unit tests for InferTileMemorySpace pass.
+
+Test strategy:
+  Build a `Before` program, apply the pass, and compare the result to an
+  explicitly-constructed `Expected` program using `assert_structural_equal`.
+  Memory-space annotations are expressed via the 3-arg `pl.Tile[...]` form.
+  Auto-inserted `tile.move` ops are expressed directly in `Expected`.
+"""
+
+import textwrap
+
+import pypto.language as pl
+import pytest
+from pypto import backend, ir, passes
+from pypto.backend import BackendType
+
+_OP_TILE_GET_BLOCK_IDX = ir.get_op("tile.get_block_idx").name
+_OP_TILE_LOAD = ir.get_op("tile.load").name
+_OP_TILE_MATMUL = ir.get_op("tile.matmul").name
+
+
+@pytest.fixture(autouse=True)
+def _reset_backend():
+    """Ensure no backend is configured so TileView inference is deterministic.
+
+    InferTileMemorySpace consults backend-specific layout specs when a backend
+    is configured. Tests in other files set Ascend and may share an xdist
+    worker; resetting before each test guarantees the no-backend defaults
+    assumed by the Expected programs.
+    """
+    backend.reset_for_testing()
+    yield
+    backend.reset_for_testing()
+
+
+class TestInferTileMemorySpaceKwargOps:
+    """Test memory_space inference for ops that read from target_memory kwarg."""
+
+    def test_load_default_vec(self):
+        """tile.load without target_memory kwarg defaults to Vec."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                out_0: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                x_tile: pl.Tile[[64], pl.FP32] = pl.load(x, [0], [64])
+                out_0: pl.Tensor[[64], pl.FP32] = pl.store(x_tile, [0], out_0)
+                return out_0
+
+            @pl.function
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                out_0: pl.Tensor[[64], pl.FP32] = pl.create_tensor([64], dtype=pl.FP32)
+                y: pl.Tensor[[64], pl.FP32] = self.main_incore_0(x, out_0)
+                return y
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                out_0: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                x_tile: pl.Tile[[64], pl.FP32, pl.MemorySpace.Vec] = pl.load(
+                    x,
+                    [0],
+                    [64],
+                    target_memory=pl.Mem.Vec,
+                )
+                out_0: pl.Tensor[[64], pl.FP32] = pl.store(x_tile, [0], out_0)
+                return out_0
+
+            @pl.function
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                out_0: pl.Tensor[[64], pl.FP32] = pl.create_tensor([64], dtype=pl.FP32)
+                y: pl.Tensor[[64], pl.FP32] = self.main_incore_0(x, out_0)
+                return y
+
+        After = passes.infer_tile_memory_space()(Before)
+        ir.assert_structural_equal(After, Expected)
+
+    def test_load_with_mat_kwarg(self):
+        """tile.load(target_memory=Mat) -> Mat."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                x: pl.Tensor[[16, 128], pl.BF16],
+                out_0: pl.Out[pl.Tensor[[16, 128], pl.BF16]],
+            ) -> pl.Tensor[[16, 128], pl.BF16]:
+                x_tile: pl.Tile[[16, 128], pl.BF16] = pl.load(
+                    x, [0, 0], [16, 128], target_memory=pl.MemorySpace.Mat
+                )
+                out_0: pl.Tensor[[16, 128], pl.BF16] = pl.store(x_tile, [0, 0], out_0)
+                return out_0
+
+            @pl.function
+            def main(self, x: pl.Tensor[[16, 128], pl.BF16]) -> pl.Tensor[[16, 128], pl.BF16]:
+                out_0: pl.Tensor[[16, 128], pl.BF16] = pl.create_tensor([16, 128], dtype=pl.BF16)
+                y: pl.Tensor[[16, 128], pl.BF16] = self.main_incore_0(x, out_0)
+                return y
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                x: pl.Tensor[[16, 128], pl.BF16],
+                out_0: pl.Out[pl.Tensor[[16, 128], pl.BF16]],
+            ) -> pl.Tensor[[16, 128], pl.BF16]:
+                x_tile: pl.Tile[[16, 128], pl.BF16, pl.MemorySpace.Mat] = pl.load(
+                    x, [0, 0], [16, 128], target_memory=pl.MemorySpace.Mat
+                )
+                x_tile_V: pl.Tile[
+                    [16, 128],
+                    pl.BF16,
+                    pl.MemorySpace.Vec,
+                    pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major),
+                ] = pl.move(x_tile, target_memory=pl.MemorySpace.Vec)
+                out_0: pl.Tensor[[16, 128], pl.BF16] = pl.store(x_tile_V, [0, 0], out_0)
+                return out_0
+
+            @pl.function
+            def main(self, x: pl.Tensor[[16, 128], pl.BF16]) -> pl.Tensor[[16, 128], pl.BF16]:
+                out_0: pl.Tensor[[16, 128], pl.BF16] = pl.create_tensor([16, 128], dtype=pl.BF16)
+                y: pl.Tensor[[16, 128], pl.BF16] = self.main_incore_0(x, out_0)
+                return y
+
+        After = passes.infer_tile_memory_space()(Before)
+        ir.assert_structural_equal(After, Expected)
+
+    def test_move_with_left_kwarg(self):
+        """tile.move(target_memory=Left) -> Left."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                x: pl.Tensor[[16, 128], pl.BF16],
+                out_0: pl.Out[pl.Tensor[[16, 128], pl.BF16]],
+            ) -> pl.Tensor[[16, 128], pl.BF16]:
+                x_tile: pl.Tile[[16, 128], pl.BF16] = pl.load(
+                    x, [0, 0], [16, 128], target_memory=pl.MemorySpace.Mat
+                )
+                x_left: pl.Tile[[16, 128], pl.BF16] = pl.move(x_tile, target_memory=pl.MemorySpace.Left)
+                out_0: pl.Tensor[[16, 128], pl.BF16] = pl.store(x_left, [0, 0], out_0)
+                return out_0
+
+            @pl.function
+            def main(self, x: pl.Tensor[[16, 128], pl.BF16]) -> pl.Tensor[[16, 128], pl.BF16]:
+                out_0: pl.Tensor[[16, 128], pl.BF16] = pl.create_tensor([16, 128], dtype=pl.BF16)
+                y: pl.Tensor[[16, 128], pl.BF16] = self.main_incore_0(x, out_0)
+                return y
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                x: pl.Tensor[[16, 128], pl.BF16],
+                out_0: pl.Out[pl.Tensor[[16, 128], pl.BF16]],
+            ) -> pl.Tensor[[16, 128], pl.BF16]:
+                x_tile: pl.Tile[[16, 128], pl.BF16, pl.MemorySpace.Mat] = pl.load(
+                    x, [0, 0], [16, 128], target_memory=pl.MemorySpace.Mat
+                )
+                x_left: pl.Tile[[16, 128], pl.BF16, pl.MemorySpace.Left] = pl.move(
+                    x_tile, target_memory=pl.MemorySpace.Left
+                )
+                x_left_V: pl.Tile[
+                    [16, 128],
+                    pl.BF16,
+                    pl.MemorySpace.Vec,
+                    pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major),
+                ] = pl.move(x_left, target_memory=pl.MemorySpace.Vec)
+                out_0: pl.Tensor[[16, 128], pl.BF16] = pl.store(x_left_V, [0, 0], out_0)
+                return out_0
+
+            @pl.function
+            def main(self, x: pl.Tensor[[16, 128], pl.BF16]) -> pl.Tensor[[16, 128], pl.BF16]:
+                out_0: pl.Tensor[[16, 128], pl.BF16] = pl.create_tensor([16, 128], dtype=pl.BF16)
+                y: pl.Tensor[[16, 128], pl.BF16] = self.main_incore_0(x, out_0)
+                return y
+
+        After = passes.infer_tile_memory_space()(Before)
+        ir.assert_structural_equal(After, Expected)
+
+    def test_create_default_vec(self):
+        """tile.create without target_memory kwarg defaults to Vec."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                out_0: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                t_tile: pl.Tile[[64], pl.FP32] = pl.tile.create([64], dtype=pl.FP32)
+                x_tile: pl.Tile[[64], pl.FP32] = pl.load(x, [0], [64])
+                y_tile: pl.Tile[[64], pl.FP32] = pl.tile.add(t_tile, x_tile)
+                out_0: pl.Tensor[[64], pl.FP32] = pl.store(y_tile, [0], out_0)
+                return out_0
+
+            @pl.function
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                out_0: pl.Tensor[[64], pl.FP32] = pl.create_tensor([64], dtype=pl.FP32)
+                y: pl.Tensor[[64], pl.FP32] = self.main_incore_0(x, out_0)
+                return y
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                out_0: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                t_tile: pl.Tile[[64], pl.FP32, pl.MemorySpace.Vec] = pl.tile.create(
+                    [64],
+                    dtype=pl.FP32,
+                    target_memory=pl.Mem.Vec,
+                )
+                x_tile: pl.Tile[[64], pl.FP32, pl.MemorySpace.Vec] = pl.load(
+                    x,
+                    [0],
+                    [64],
+                    target_memory=pl.Mem.Vec,
+                )
+                y_tile: pl.Tile[[64], pl.FP32, pl.MemorySpace.Vec] = pl.tile.add(t_tile, x_tile)
+                out_0: pl.Tensor[[64], pl.FP32] = pl.store(y_tile, [0], out_0)
+                return out_0
+
+            @pl.function
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                out_0: pl.Tensor[[64], pl.FP32] = pl.create_tensor([64], dtype=pl.FP32)
+                y: pl.Tensor[[64], pl.FP32] = self.main_incore_0(x, out_0)
+                return y
+
+        After = passes.infer_tile_memory_space()(Before)
+        ir.assert_structural_equal(After, Expected)
+
+
+class TestInferTileMemorySpaceCubeOps:
+    """Test memory_space inference for cube ops (matmul, gemv, etc.)."""
+
+    def test_matmul_gets_acc(self):
+        """tile.matmul output -> Acc; unset inputs staged in Mat, then auto-moved to Left/Right.
+
+        The loads carry no ``target_memory``, so the Left/Right demand from the
+        matmul back-propagates onto the retargetable DDR producers. L1 (Mat) is
+        the only buffer a tload can fill that MTE1 can then move into L0A/L0B,
+        so the loads resolve to Mat rather than Vec.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                x: pl.Tensor[[16, 128], pl.BF16],
+                y: pl.Tensor[[128, 128], pl.BF16],
+                out_0: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+            ) -> pl.Tensor[[16, 128], pl.FP32]:
+                x_tile: pl.Tile[[16, 128], pl.BF16] = pl.load(x, [0, 0], [16, 128])
+                y_tile: pl.Tile[[128, 128], pl.BF16] = pl.load(y, [0, 0], [128, 128])
+                z_tile: pl.Tile[[16, 128], pl.FP32] = pl.matmul(x_tile, y_tile)
+                out_0: pl.Tensor[[16, 128], pl.FP32] = pl.store(z_tile, [0, 0], out_0)
+                return out_0
+
+            @pl.function
+            def main(
+                self,
+                x: pl.Tensor[[16, 128], pl.BF16],
+                y: pl.Tensor[[128, 128], pl.BF16],
+            ) -> pl.Tensor[[16, 128], pl.FP32]:
+                out_0: pl.Tensor[[16, 128], pl.FP32] = pl.create_tensor([16, 128], dtype=pl.FP32)
+                z: pl.Tensor[[16, 128], pl.FP32] = self.main_incore_0(x, y, out_0)
+                return z
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                x: pl.Tensor[[16, 128], pl.BF16],
+                y: pl.Tensor[[128, 128], pl.BF16],
+                out_0: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+            ) -> pl.Tensor[[16, 128], pl.FP32]:
+                x_tile: pl.Tile[[16, 128], pl.BF16, pl.MemorySpace.Mat] = pl.load(
+                    x,
+                    [0, 0],
+                    [16, 128],
+                    target_memory=pl.Mem.Mat,
+                )
+                y_tile: pl.Tile[[128, 128], pl.BF16, pl.MemorySpace.Mat] = pl.load(
+                    y,
+                    [0, 0],
+                    [128, 128],
+                    target_memory=pl.Mem.Mat,
+                )
+                x_tile_L: pl.Tile[[16, 128], pl.BF16, pl.MemorySpace.Left] = pl.move(
+                    x_tile, target_memory=pl.MemorySpace.Left
+                )
+                y_tile_R: pl.Tile[[128, 128], pl.BF16, pl.MemorySpace.Right] = pl.move(
+                    y_tile, target_memory=pl.MemorySpace.Right
+                )
+                z_tile: pl.Tile[[16, 128], pl.FP32, pl.MemorySpace.Acc] = pl.matmul(x_tile_L, y_tile_R)
+                out_0: pl.Tensor[[16, 128], pl.FP32] = pl.store(z_tile, [0, 0], out_0)
+                return out_0
+
+            @pl.function
+            def main(
+                self,
+                x: pl.Tensor[[16, 128], pl.BF16],
+                y: pl.Tensor[[128, 128], pl.BF16],
+            ) -> pl.Tensor[[16, 128], pl.FP32]:
+                out_0: pl.Tensor[[16, 128], pl.FP32] = pl.create_tensor([16, 128], dtype=pl.FP32)
+                z: pl.Tensor[[16, 128], pl.FP32] = self.main_incore_0(x, y, out_0)
+                return z
+
+        After = passes.infer_tile_memory_space()(Before)
+        ir.assert_structural_equal(After, Expected)
+
+    def test_inserted_matmul_move_remaps_dump_vars_attr(self):
+        """Var-valued Call attrs follow an operand replaced by tile.move.
+
+        ``Expected`` pins the whole rewrite: the ``dump_vars`` entry names the
+        post-move ``Mem.Left`` operand, not the pre-move ``Mem.Mat`` load it was
+        written against.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.Tensor[[16, 128], pl.BF16],
+                y: pl.Tensor[[128, 128], pl.BF16],
+                out: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+            ) -> pl.Tensor[[16, 128], pl.FP32]:
+                x_tile = pl.load(x, [0, 0], [16, 128])
+                y_tile = pl.load(y, [0, 0], [128, 128])
+                z_tile = pl.matmul(x_tile, y_tile, attrs={"dump_vars": [x_tile]})
+                result = pl.store(z_tile, [0, 0], out)
+                return result
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.Tensor[[16, 128], pl.BF16],
+                y: pl.Tensor[[128, 128], pl.BF16],
+                out: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+            ) -> pl.Tensor[[16, 128], pl.FP32]:
+                x_tile: pl.Tile[[16, 128], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    x, [0, 0], [16, 128], [16, 128], target_memory=pl.Mem.Mat
+                )
+                y_tile: pl.Tile[[128, 128], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    y, [0, 0], [128, 128], [128, 128], target_memory=pl.Mem.Mat
+                )
+                x_tile_Left: pl.Tile[[16, 128], pl.BF16, pl.Mem.Left] = pl.tile.move(
+                    x_tile, target_memory=pl.Mem.Left
+                )
+                y_tile_Right: pl.Tile[[128, 128], pl.BF16, pl.Mem.Right] = pl.tile.move(
+                    y_tile, target_memory=pl.Mem.Right
+                )
+                z_tile: pl.Tile[[16, 128], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(
+                    x_tile_Left, y_tile_Right, attrs={"dump_vars": [x_tile_Left]}
+                )
+                result: pl.Tensor[[16, 128], pl.FP32] = pl.tile.store(z_tile, [0, 0], out)
+                return result
+
+        ir.assert_structural_equal(passes.infer_tile_memory_space()(Before), Expected)
+
+    def test_distinct_inserted_moves_expand_dump_vars_attr(self):
+        """One dumped source used in both matmul slots follows both moves.
+
+        ``x_tile`` feeds the Left and the Right slot, so it is moved twice and
+        the single ``dump_vars`` entry expands to both post-move operands.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.Tensor[[128, 128], pl.BF16],
+                out: pl.Out[pl.Tensor[[128, 128], pl.FP32]],
+            ) -> pl.Tensor[[128, 128], pl.FP32]:
+                x_tile = pl.load(x, [0, 0], [128, 128])
+                z_tile = pl.matmul(x_tile, x_tile, attrs={"dump_vars": [x_tile]})
+                result = pl.store(z_tile, [0, 0], out)
+                return result
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.Tensor[[128, 128], pl.BF16],
+                out: pl.Out[pl.Tensor[[128, 128], pl.FP32]],
+            ) -> pl.Tensor[[128, 128], pl.FP32]:
+                x_tile: pl.Tile[[128, 128], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    x, [0, 0], [128, 128], [128, 128], target_memory=pl.Mem.Mat
+                )
+                x_tile_Left: pl.Tile[[128, 128], pl.BF16, pl.Mem.Left] = pl.tile.move(
+                    x_tile, target_memory=pl.Mem.Left
+                )
+                x_tile_Right: pl.Tile[[128, 128], pl.BF16, pl.Mem.Right] = pl.tile.move(
+                    x_tile, target_memory=pl.Mem.Right
+                )
+                z_tile: pl.Tile[[128, 128], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(
+                    x_tile_Left, x_tile_Right, attrs={"dump_vars": [x_tile_Left, x_tile_Right]}
+                )
+                result: pl.Tensor[[128, 128], pl.FP32] = pl.tile.store(z_tile, [0, 0], out)
+                return result
+
+        ir.assert_structural_equal(passes.infer_tile_memory_space()(Before), Expected)
+
+    def test_matmul_full_pipeline(self):
+        """Full matmul pipeline: load->Mat, move->Left/Right, matmul->Acc."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def qk_matmul(
+                self,
+                qi: pl.Tensor[[16, 128], pl.BF16],
+                kj_t: pl.Tensor[[128, 128], pl.BF16],
+                out_0: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+            ) -> pl.Tensor[[16, 128], pl.FP32]:
+                qi_l1: pl.Tile[[16, 128], pl.BF16] = pl.load(
+                    qi, [0, 0], [16, 128], target_memory=pl.MemorySpace.Mat
+                )
+                kj_l1: pl.Tile[[128, 128], pl.BF16] = pl.load(
+                    kj_t, [0, 0], [128, 128], target_memory=pl.MemorySpace.Mat
+                )
+                qi_l0a: pl.Tile[[16, 128], pl.BF16] = pl.move(qi_l1, target_memory=pl.MemorySpace.Left)
+                kj_l0b: pl.Tile[[128, 128], pl.BF16] = pl.move(kj_l1, target_memory=pl.MemorySpace.Right)
+                sij: pl.Tile[[16, 128], pl.FP32] = pl.matmul(qi_l0a, kj_l0b)
+                out_0: pl.Tensor[[16, 128], pl.FP32] = pl.store(sij, [0, 0], out_0)
+                return out_0
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                qi: pl.Tensor[[16, 128], pl.BF16],
+                kj_t: pl.Tensor[[128, 128], pl.BF16],
+            ) -> pl.Tensor[[16, 128], pl.FP32]:
+                out_0: pl.Tensor[[16, 128], pl.FP32] = pl.create_tensor([16, 128], dtype=pl.FP32)
+                sij: pl.Tensor[[16, 128], pl.FP32] = self.qk_matmul(qi, kj_t, out_0)
+                return sij
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def qk_matmul(
+                self,
+                qi: pl.Tensor[[16, 128], pl.BF16],
+                kj_t: pl.Tensor[[128, 128], pl.BF16],
+                out_0: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+            ) -> pl.Tensor[[16, 128], pl.FP32]:
+                qi_l1: pl.Tile[[16, 128], pl.BF16, pl.MemorySpace.Mat] = pl.load(
+                    qi, [0, 0], [16, 128], target_memory=pl.MemorySpace.Mat
+                )
+                kj_l1: pl.Tile[[128, 128], pl.BF16, pl.MemorySpace.Mat] = pl.load(
+                    kj_t, [0, 0], [128, 128], target_memory=pl.MemorySpace.Mat
+                )
+                qi_l0a: pl.Tile[[16, 128], pl.BF16, pl.MemorySpace.Left] = pl.move(
+                    qi_l1, target_memory=pl.MemorySpace.Left
+                )
+                kj_l0b: pl.Tile[[128, 128], pl.BF16, pl.MemorySpace.Right] = pl.move(
+                    kj_l1, target_memory=pl.MemorySpace.Right
+                )
+                sij: pl.Tile[[16, 128], pl.FP32, pl.MemorySpace.Acc] = pl.matmul(qi_l0a, kj_l0b)
+                out_0: pl.Tensor[[16, 128], pl.FP32] = pl.store(sij, [0, 0], out_0)
+                return out_0
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                qi: pl.Tensor[[16, 128], pl.BF16],
+                kj_t: pl.Tensor[[128, 128], pl.BF16],
+            ) -> pl.Tensor[[16, 128], pl.FP32]:
+                out_0: pl.Tensor[[16, 128], pl.FP32] = pl.create_tensor([16, 128], dtype=pl.FP32)
+                sij: pl.Tensor[[16, 128], pl.FP32] = self.qk_matmul(qi, kj_t, out_0)
+                return sij
+
+        After = passes.infer_tile_memory_space()(Before)
+        ir.assert_structural_equal(After, Expected)
+
+
+class TestInferTileMemorySpaceOtherOps:
+    """Test memory_space inference for other tile ops (default to Vec)."""
+
+    def test_elementwise_inherits_vec(self):
+        """tile.add(vec_tile, vec_tile) inherits Vec from inputs."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                out_0: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                x_tile: pl.Tile[[64], pl.FP32] = pl.load(x, [0], [64])
+                y_tile: pl.Tile[[64], pl.FP32] = pl.tile.add(x_tile, x_tile)
+                out_0: pl.Tensor[[64], pl.FP32] = pl.store(y_tile, [0], out_0)
+                return out_0
+
+            @pl.function
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                out_0: pl.Tensor[[64], pl.FP32] = pl.create_tensor([64], dtype=pl.FP32)
+                y: pl.Tensor[[64], pl.FP32] = self.main_incore_0(x, out_0)
+                return y
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                out_0: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                x_tile: pl.Tile[[64], pl.FP32, pl.MemorySpace.Vec] = pl.load(
+                    x,
+                    [0],
+                    [64],
+                    target_memory=pl.Mem.Vec,
+                )
+                y_tile: pl.Tile[[64], pl.FP32, pl.MemorySpace.Vec] = pl.tile.add(x_tile, x_tile)
+                out_0: pl.Tensor[[64], pl.FP32] = pl.store(y_tile, [0], out_0)
+                return out_0
+
+            @pl.function
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                out_0: pl.Tensor[[64], pl.FP32] = pl.create_tensor([64], dtype=pl.FP32)
+                y: pl.Tensor[[64], pl.FP32] = self.main_incore_0(x, out_0)
+                return y
+
+        After = passes.infer_tile_memory_space()(Before)
+        ir.assert_structural_equal(After, Expected)
+
+    def test_elementwise_after_matmul_gets_vec(self):
+        """tile.add after matmul: auto-insert move Acc->Vec before add."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                x: pl.Tensor[[16, 128], pl.BF16],
+                y: pl.Tensor[[128, 128], pl.BF16],
+                out_0: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+            ) -> pl.Tensor[[16, 128], pl.FP32]:
+                x_mat: pl.Tile[[16, 128], pl.BF16] = pl.load(
+                    x, [0, 0], [16, 128], target_memory=pl.MemorySpace.Mat
+                )
+                y_mat: pl.Tile[[128, 128], pl.BF16] = pl.load(
+                    y, [0, 0], [128, 128], target_memory=pl.MemorySpace.Mat
+                )
+                x_left: pl.Tile[[16, 128], pl.BF16] = pl.move(x_mat, target_memory=pl.MemorySpace.Left)
+                y_right: pl.Tile[[128, 128], pl.BF16] = pl.move(y_mat, target_memory=pl.MemorySpace.Right)
+                z_tile: pl.Tile[[16, 128], pl.FP32] = pl.matmul(x_left, y_right)
+                w_tile: pl.Tile[[16, 128], pl.FP32] = pl.tile.add(z_tile, z_tile)
+                out_0: pl.Tensor[[16, 128], pl.FP32] = pl.store(w_tile, [0, 0], out_0)
+                return out_0
+
+            @pl.function
+            def main(
+                self,
+                x: pl.Tensor[[16, 128], pl.BF16],
+                y: pl.Tensor[[128, 128], pl.BF16],
+            ) -> pl.Tensor[[16, 128], pl.FP32]:
+                out_0: pl.Tensor[[16, 128], pl.FP32] = pl.create_tensor([16, 128], dtype=pl.FP32)
+                z: pl.Tensor[[16, 128], pl.FP32] = self.main_incore_0(x, y, out_0)
+                return z
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                x: pl.Tensor[[16, 128], pl.BF16],
+                y: pl.Tensor[[128, 128], pl.BF16],
+                out_0: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+            ) -> pl.Tensor[[16, 128], pl.FP32]:
+                x_mat: pl.Tile[[16, 128], pl.BF16, pl.MemorySpace.Mat] = pl.load(
+                    x, [0, 0], [16, 128], target_memory=pl.MemorySpace.Mat
+                )
+                y_mat: pl.Tile[[128, 128], pl.BF16, pl.MemorySpace.Mat] = pl.load(
+                    y, [0, 0], [128, 128], target_memory=pl.MemorySpace.Mat
+                )
+                x_left: pl.Tile[[16, 128], pl.BF16, pl.MemorySpace.Left] = pl.move(
+                    x_mat, target_memory=pl.MemorySpace.Left
+                )
+                y_right: pl.Tile[[128, 128], pl.BF16, pl.MemorySpace.Right] = pl.move(
+                    y_mat, target_memory=pl.MemorySpace.Right
+                )
+                z_tile: pl.Tile[[16, 128], pl.FP32, pl.MemorySpace.Acc] = pl.matmul(x_left, y_right)
+                # ISA constraint: Acc→Vec data path lands ND in Vec; the inserted
+                # move pins blayout=row_major, slayout=none_box on its kwargs.
+                z_tile_V: pl.Tile[[16, 128], pl.FP32, pl.MemorySpace.Vec] = pl.move(
+                    z_tile,
+                    target_memory=pl.MemorySpace.Vec,
+                    blayout=pl.TileLayout.row_major,
+                    slayout=pl.TileLayout.none_box,
+                )
+                w_tile: pl.Tile[[16, 128], pl.FP32, pl.MemorySpace.Vec] = pl.tile.add(z_tile_V, z_tile_V)
+                out_0: pl.Tensor[[16, 128], pl.FP32] = pl.store(w_tile, [0, 0], out_0)
+                return out_0
+
+            @pl.function
+            def main(
+                self,
+                x: pl.Tensor[[16, 128], pl.BF16],
+                y: pl.Tensor[[128, 128], pl.BF16],
+            ) -> pl.Tensor[[16, 128], pl.FP32]:
+                out_0: pl.Tensor[[16, 128], pl.FP32] = pl.create_tensor([16, 128], dtype=pl.FP32)
+                z: pl.Tensor[[16, 128], pl.FP32] = self.main_incore_0(x, y, out_0)
+                return z
+
+        After = passes.infer_tile_memory_space()(Before)
+        ir.assert_structural_equal(After, Expected)
+
+    def test_chained_elementwise_inherits(self):
+        """Chained elementwise ops: add then mul both inherit Vec."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                out_0: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                x_tile: pl.Tile[[64], pl.FP32] = pl.load(x, [0], [64])
+                y_tile: pl.Tile[[64], pl.FP32] = pl.tile.add(x_tile, x_tile)
+                z_tile: pl.Tile[[64], pl.FP32] = pl.tile.mul(y_tile, y_tile)
+                out_0: pl.Tensor[[64], pl.FP32] = pl.store(z_tile, [0], out_0)
+                return out_0
+
+            @pl.function
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                out_0: pl.Tensor[[64], pl.FP32] = pl.create_tensor([64], dtype=pl.FP32)
+                y: pl.Tensor[[64], pl.FP32] = self.main_incore_0(x, out_0)
+                return y
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                out_0: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                x_tile: pl.Tile[[64], pl.FP32, pl.MemorySpace.Vec] = pl.load(
+                    x,
+                    [0],
+                    [64],
+                    target_memory=pl.Mem.Vec,
+                )
+                y_tile: pl.Tile[[64], pl.FP32, pl.MemorySpace.Vec] = pl.tile.add(x_tile, x_tile)
+                z_tile: pl.Tile[[64], pl.FP32, pl.MemorySpace.Vec] = pl.tile.mul(y_tile, y_tile)
+                out_0: pl.Tensor[[64], pl.FP32] = pl.store(z_tile, [0], out_0)
+                return out_0
+
+            @pl.function
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                out_0: pl.Tensor[[64], pl.FP32] = pl.create_tensor([64], dtype=pl.FP32)
+                y: pl.Tensor[[64], pl.FP32] = self.main_incore_0(x, out_0)
+                return y
+
+        After = passes.infer_tile_memory_space()(Before)
+        ir.assert_structural_equal(After, Expected)
+
+
+class TestInferTileMemorySpaceEdgeCases:
+    """Test edge cases and pass-through behavior."""
+
+    def test_orchestration_unchanged(self):
+        """Non-InCore (Orchestration) functions pass through unchanged."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return x
+
+        After = passes.infer_tile_memory_space()(Before)
+        ir.assert_structural_equal(After, Before)
+
+    def test_multiple_incore_functions(self):
+        """Multiple InCore functions are all processed."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def incore_a(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                out_0: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                x_tile: pl.Tile[[64], pl.FP32] = pl.load(x, [0], [64])
+                out_0: pl.Tensor[[64], pl.FP32] = pl.store(x_tile, [0], out_0)
+                return out_0
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def incore_b(
+                self,
+                y: pl.Tensor[[32], pl.FP16],
+                out_0: pl.Out[pl.Tensor[[32], pl.FP16]],
+            ) -> pl.Tensor[[32], pl.FP16]:
+                y_tile: pl.Tile[[32], pl.FP16] = pl.load(y, [0], [32])
+                out_0: pl.Tensor[[32], pl.FP16] = pl.store(y_tile, [0], out_0)
+                return out_0
+
+            @pl.function
+            def main(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                y: pl.Tensor[[32], pl.FP16],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                out_a: pl.Tensor[[64], pl.FP32] = pl.create_tensor([64], dtype=pl.FP32)
+                a: pl.Tensor[[64], pl.FP32] = self.incore_a(x, out_a)
+                out_b: pl.Tensor[[32], pl.FP16] = pl.create_tensor([32], dtype=pl.FP16)
+                _b: pl.Tensor[[32], pl.FP16] = self.incore_b(y, out_b)
+                return a
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def incore_a(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                out_0: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                x_tile: pl.Tile[[64], pl.FP32, pl.MemorySpace.Vec] = pl.load(
+                    x,
+                    [0],
+                    [64],
+                    target_memory=pl.Mem.Vec,
+                )
+                out_0: pl.Tensor[[64], pl.FP32] = pl.store(x_tile, [0], out_0)
+                return out_0
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def incore_b(
+                self,
+                y: pl.Tensor[[32], pl.FP16],
+                out_0: pl.Out[pl.Tensor[[32], pl.FP16]],
+            ) -> pl.Tensor[[32], pl.FP16]:
+                y_tile: pl.Tile[[32], pl.FP16, pl.MemorySpace.Vec] = pl.load(
+                    y,
+                    [0],
+                    [32],
+                    target_memory=pl.Mem.Vec,
+                )
+                out_0: pl.Tensor[[32], pl.FP16] = pl.store(y_tile, [0], out_0)
+                return out_0
+
+            @pl.function
+            def main(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                y: pl.Tensor[[32], pl.FP16],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                out_a: pl.Tensor[[64], pl.FP32] = pl.create_tensor([64], dtype=pl.FP32)
+                a: pl.Tensor[[64], pl.FP32] = self.incore_a(x, out_a)
+                out_b: pl.Tensor[[32], pl.FP16] = pl.create_tensor([32], dtype=pl.FP16)
+                _b: pl.Tensor[[32], pl.FP16] = self.incore_b(y, out_b)
+                return a
+
+        After = passes.infer_tile_memory_space()(Before)
+        ir.assert_structural_equal(After, Expected)
+
+    def test_pass_is_idempotent(self):
+        """Running the pass twice produces the same result."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                out_0: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                x_tile: pl.Tile[[64], pl.FP32] = pl.load(x, [0], [64])
+                y_tile: pl.Tile[[64], pl.FP32] = pl.tile.add(x_tile, x_tile)
+                out_0: pl.Tensor[[64], pl.FP32] = pl.store(y_tile, [0], out_0)
+                return out_0
+
+            @pl.function
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                out_0: pl.Tensor[[64], pl.FP32] = pl.create_tensor([64], dtype=pl.FP32)
+                y: pl.Tensor[[64], pl.FP32] = self.main_incore_0(x, out_0)
+                return y
+
+        first_pass = passes.infer_tile_memory_space()(Before)
+        second_pass = passes.infer_tile_memory_space()(first_pass)
+        ir.assert_structural_equal(first_pass, second_pass)
+
+
+class TestTileTargetMemoryParsing:
+    """Test that target_memory in type annotations is parsed correctly (parser, not pass)."""
+
+    def test_parse_tile_with_target_memory_3arg(self):
+        """pl.Tile[[shape], dtype, pl.MemorySpace.Vec] parses target_memory."""
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                out_0: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                x_tile: pl.Tile[[64], pl.FP32, pl.MemorySpace.Vec] = pl.load(x, [0], [64])
+                out_0: pl.Tensor[[64], pl.FP32] = pl.store(x_tile, [0], out_0)
+                return out_0
+
+            @pl.function
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                out_0: pl.Tensor[[64], pl.FP32] = pl.create_tensor([64], dtype=pl.FP32)
+                y: pl.Tensor[[64], pl.FP32] = self.main_incore_0(x, out_0)
+                return y
+
+        incore = Program.get_function("main_incore_0")
+        assert incore is not None
+        assert isinstance(incore.body, ir.SeqStmts)
+        x_tile_assign = incore.body.stmts[0]
+        assert isinstance(x_tile_assign, ir.AssignStmt)
+        assert isinstance(x_tile_assign.var.type, ir.TileType)
+        assert x_tile_assign.var.type.memory_space == ir.MemorySpace.Vec
+
+    def test_parse_tile_with_target_memory_mat(self):
+        """pl.Tile[[shape], dtype, pl.MemorySpace.Mat] parses target_memory=Mat."""
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                x: pl.Tensor[[16, 128], pl.BF16],
+                out_0: pl.Out[pl.Tensor[[16, 128], pl.BF16]],
+            ) -> pl.Tensor[[16, 128], pl.BF16]:
+                x_tile: pl.Tile[[16, 128], pl.BF16, pl.MemorySpace.Mat] = pl.load(
+                    x, [0, 0], [16, 128], target_memory=pl.MemorySpace.Mat
+                )
+                out_0: pl.Tensor[[16, 128], pl.BF16] = pl.store(x_tile, [0, 0], out_0)
+                return out_0
+
+            @pl.function
+            def main(self, x: pl.Tensor[[16, 128], pl.BF16]) -> pl.Tensor[[16, 128], pl.BF16]:
+                out_0: pl.Tensor[[16, 128], pl.BF16] = pl.create_tensor([16, 128], dtype=pl.BF16)
+                y: pl.Tensor[[16, 128], pl.BF16] = self.main_incore_0(x, out_0)
+                return y
+
+        incore = Program.get_function("main_incore_0")
+        assert incore is not None
+        assert isinstance(incore.body, ir.SeqStmts)
+        x_tile_assign = incore.body.stmts[0]
+        assert isinstance(x_tile_assign, ir.AssignStmt)
+        assert isinstance(x_tile_assign.var.type, ir.TileType)
+        assert x_tile_assign.var.type.memory_space == ir.MemorySpace.Mat
+
+
+class TestInferTileMemorySpaceInheritOps:
+    """Test memory_space inference for view/transform ops that inherit from input."""
+
+    def test_reshape_inherits_vec(self):
+        """tile.reshape inherits Vec memory space from input tile."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                out_0: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                x_tile: pl.Tile[[64], pl.FP32] = pl.load(x, [0], [64])
+                reshaped: pl.Tile[[8, 8], pl.FP32] = pl.tile.reshape(x_tile, [8, 8])
+                flat: pl.Tile[[64], pl.FP32] = pl.tile.reshape(reshaped, [64])
+                out_0: pl.Tensor[[64], pl.FP32] = pl.store(flat, [0], out_0)
+                return out_0
+
+            @pl.function
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                out_0: pl.Tensor[[64], pl.FP32] = pl.create_tensor([64], dtype=pl.FP32)
+                y: pl.Tensor[[64], pl.FP32] = self.main_incore_0(x, out_0)
+                return y
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                out_0: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                x_tile: pl.Tile[[64], pl.FP32, pl.MemorySpace.Vec] = pl.load(
+                    x,
+                    [0],
+                    [64],
+                    target_memory=pl.Mem.Vec,
+                )
+                reshaped: pl.Tile[[8, 8], pl.FP32, pl.MemorySpace.Vec] = pl.tile.reshape(x_tile, [8, 8])
+                flat: pl.Tile[[64], pl.FP32, pl.MemorySpace.Vec] = pl.tile.reshape(reshaped, [64])
+                out_0: pl.Tensor[[64], pl.FP32] = pl.store(flat, [0], out_0)
+                return out_0
+
+            @pl.function
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                out_0: pl.Tensor[[64], pl.FP32] = pl.create_tensor([64], dtype=pl.FP32)
+                y: pl.Tensor[[64], pl.FP32] = self.main_incore_0(x, out_0)
+                return y
+
+        After = passes.infer_tile_memory_space()(Before)
+        ir.assert_structural_equal(After, Expected)
+
+    def test_slice_inherits_vec(self):
+        """tile.slice inherits Vec memory space from input tile."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                out_0: pl.Out[pl.Tensor[[32], pl.FP32]],
+            ) -> pl.Tensor[[32], pl.FP32]:
+                x_tile: pl.Tile[[64], pl.FP32] = pl.load(x, [0], [64])
+                sliced: pl.Tile[[32], pl.FP32] = pl.tile.slice(x_tile, [32], [0])
+                out_0: pl.Tensor[[32], pl.FP32] = pl.store(sliced, [0], out_0)
+                return out_0
+
+            @pl.function
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[32], pl.FP32]:
+                out_0: pl.Tensor[[32], pl.FP32] = pl.create_tensor([32], dtype=pl.FP32)
+                y: pl.Tensor[[32], pl.FP32] = self.main_incore_0(x, out_0)
+                return y
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                out_0: pl.Out[pl.Tensor[[32], pl.FP32]],
+            ) -> pl.Tensor[[32], pl.FP32]:
+                x_tile: pl.Tile[[64], pl.FP32, pl.MemorySpace.Vec] = pl.load(
+                    x,
+                    [0],
+                    [64],
+                    target_memory=pl.Mem.Vec,
+                )
+                sliced: pl.Tile[[32], pl.FP32, pl.MemorySpace.Vec] = pl.tile.slice(x_tile, [32], [0])
+                out_0: pl.Tensor[[32], pl.FP32] = pl.store(sliced, [0], out_0)
+                return out_0
+
+            @pl.function
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[32], pl.FP32]:
+                out_0: pl.Tensor[[32], pl.FP32] = pl.create_tensor([32], dtype=pl.FP32)
+                y: pl.Tensor[[32], pl.FP32] = self.main_incore_0(x, out_0)
+                return y
+
+        After = passes.infer_tile_memory_space()(Before)
+        ir.assert_structural_equal(After, Expected)
+
+    def test_reshape_inherits_mat(self):
+        """tile.reshape inherits Mat memory space from input loaded to Mat."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                x: pl.Tensor[[16, 128], pl.BF16],
+                out_0: pl.Out[pl.Tensor[[16, 128], pl.BF16]],
+            ) -> pl.Tensor[[16, 128], pl.BF16]:
+                x_tile: pl.Tile[[16, 128], pl.BF16] = pl.load(
+                    x, [0, 0], [16, 128], target_memory=pl.MemorySpace.Mat
+                )
+                reshaped: pl.Tile[[2048], pl.BF16] = pl.tile.reshape(x_tile, [2048])
+                flat: pl.Tile[[16, 128], pl.BF16] = pl.tile.reshape(reshaped, [16, 128])
+                out_0: pl.Tensor[[16, 128], pl.BF16] = pl.store(flat, [0, 0], out_0)
+                return out_0
+
+            @pl.function
+            def main(self, x: pl.Tensor[[16, 128], pl.BF16]) -> pl.Tensor[[16, 128], pl.BF16]:
+                out_0: pl.Tensor[[16, 128], pl.BF16] = pl.create_tensor([16, 128], dtype=pl.BF16)
+                y: pl.Tensor[[16, 128], pl.BF16] = self.main_incore_0(x, out_0)
+                return y
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                x: pl.Tensor[[16, 128], pl.BF16],
+                out_0: pl.Out[pl.Tensor[[16, 128], pl.BF16]],
+            ) -> pl.Tensor[[16, 128], pl.BF16]:
+                x_tile: pl.Tile[[16, 128], pl.BF16, pl.MemorySpace.Mat] = pl.load(
+                    x, [0, 0], [16, 128], target_memory=pl.MemorySpace.Mat
+                )
+                # Mat-implicit reshape result (col_major / row_major) — printer elides.
+                reshaped: pl.Tile[[2048], pl.BF16, pl.MemorySpace.Mat] = pl.tile.reshape(x_tile, [2048])
+                flat: pl.Tile[[16, 128], pl.BF16, pl.MemorySpace.Mat] = pl.tile.reshape(reshaped, [16, 128])
+                # Move preserves Mat layout into Vec — non-Vec-implicit, so surfaced.
+                flat_V: pl.Tile[
+                    [16, 128],
+                    pl.BF16,
+                    pl.MemorySpace.Vec,
+                    pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major),
+                ] = pl.move(flat, target_memory=pl.MemorySpace.Vec)
+                out_0: pl.Tensor[[16, 128], pl.BF16] = pl.store(flat_V, [0, 0], out_0)
+                return out_0
+
+            @pl.function
+            def main(self, x: pl.Tensor[[16, 128], pl.BF16]) -> pl.Tensor[[16, 128], pl.BF16]:
+                out_0: pl.Tensor[[16, 128], pl.BF16] = pl.create_tensor([16, 128], dtype=pl.BF16)
+                y: pl.Tensor[[16, 128], pl.BF16] = self.main_incore_0(x, out_0)
+                return y
+
+        After = passes.infer_tile_memory_space()(Before)
+        ir.assert_structural_equal(After, Expected)
+
+    def test_slice_inherits_mat(self):
+        """tile.slice inherits Mat memory space from Mat input."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                x: pl.Tensor[[16, 128], pl.BF16],
+                out_0: pl.Out[pl.Tensor[[16, 64], pl.BF16]],
+            ) -> pl.Tensor[[16, 64], pl.BF16]:
+                x_tile: pl.Tile[[16, 128], pl.BF16] = pl.load(
+                    x, [0, 0], [16, 128], target_memory=pl.MemorySpace.Mat
+                )
+                sliced: pl.Tile[[16, 64], pl.BF16] = pl.tile.slice(x_tile, [16, 64], [0, 0])
+                out_0: pl.Tensor[[16, 64], pl.BF16] = pl.store(sliced, [0, 0], out_0)
+                return out_0
+
+            @pl.function
+            def main(self, x: pl.Tensor[[16, 128], pl.BF16]) -> pl.Tensor[[16, 64], pl.BF16]:
+                out_0: pl.Tensor[[16, 64], pl.BF16] = pl.create_tensor([16, 64], dtype=pl.BF16)
+                y: pl.Tensor[[16, 64], pl.BF16] = self.main_incore_0(x, out_0)
+                return y
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                x: pl.Tensor[[16, 128], pl.BF16],
+                out_0: pl.Out[pl.Tensor[[16, 64], pl.BF16]],
+            ) -> pl.Tensor[[16, 64], pl.BF16]:
+                x_tile: pl.Tile[[16, 128], pl.BF16, pl.MemorySpace.Mat] = pl.load(
+                    x, [0, 0], [16, 128], target_memory=pl.MemorySpace.Mat
+                )
+                # tile.slice now propagates the source TileView (Mat-implicit
+                # col_major / row_major) into the result so pto.subview is legal,
+                # which means the printer elides the implicit annotation here.
+                sliced: pl.Tile[[16, 64], pl.BF16, pl.MemorySpace.Mat] = pl.tile.slice(
+                    x_tile, [16, 64], [0, 0]
+                )
+                # The move into Vec preserves the slice's Mat-style layout
+                # (col_major / row_major) on the destination buffer; the printer
+                # surfaces this because it differs from the Vec-implicit defaults.
+                sliced_V: pl.Tile[
+                    [16, 64],
+                    pl.BF16,
+                    pl.MemorySpace.Vec,
+                    pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major),
+                ] = pl.move(sliced, target_memory=pl.MemorySpace.Vec)
+                out_0: pl.Tensor[[16, 64], pl.BF16] = pl.store(sliced_V, [0, 0], out_0)
+                return out_0
+
+            @pl.function
+            def main(self, x: pl.Tensor[[16, 128], pl.BF16]) -> pl.Tensor[[16, 64], pl.BF16]:
+                out_0: pl.Tensor[[16, 64], pl.BF16] = pl.create_tensor([16, 64], dtype=pl.BF16)
+                y: pl.Tensor[[16, 64], pl.BF16] = self.main_incore_0(x, out_0)
+                return y
+
+        After = passes.infer_tile_memory_space()(Before)
+        ir.assert_structural_equal(After, Expected)
+
+    def test_chained_view_ops_inherit(self):
+        """reshape(slice(load(Mat))) — all inherit Mat from the load."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                x: pl.Tensor[[16, 128], pl.BF16],
+                out_0: pl.Out[pl.Tensor[[16, 64], pl.BF16]],
+            ) -> pl.Tensor[[16, 64], pl.BF16]:
+                x_tile: pl.Tile[[16, 128], pl.BF16] = pl.load(
+                    x, [0, 0], [16, 128], target_memory=pl.MemorySpace.Mat
+                )
+                sliced: pl.Tile[[16, 64], pl.BF16] = pl.tile.slice(x_tile, [16, 64], [0, 0])
+                reshaped: pl.Tile[[1024], pl.BF16] = pl.tile.reshape(sliced, [1024])
+                out_0: pl.Tensor[[16, 64], pl.BF16] = pl.store(reshaped, [0, 0], out_0)
+                return out_0
+
+            @pl.function
+            def main(self, x: pl.Tensor[[16, 128], pl.BF16]) -> pl.Tensor[[16, 64], pl.BF16]:
+                out_0: pl.Tensor[[16, 64], pl.BF16] = pl.create_tensor([16, 64], dtype=pl.BF16)
+                y: pl.Tensor[[16, 64], pl.BF16] = self.main_incore_0(x, out_0)
+                return y
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                x: pl.Tensor[[16, 128], pl.BF16],
+                out_0: pl.Out[pl.Tensor[[16, 64], pl.BF16]],
+            ) -> pl.Tensor[[16, 64], pl.BF16]:
+                x_tile: pl.Tile[[16, 128], pl.BF16, pl.MemorySpace.Mat] = pl.load(
+                    x, [0, 0], [16, 128], target_memory=pl.MemorySpace.Mat
+                )
+                # Slice and reshape stay Mat-implicit — printer elides.
+                sliced: pl.Tile[[16, 64], pl.BF16, pl.MemorySpace.Mat] = pl.tile.slice(
+                    x_tile, [16, 64], [0, 0]
+                )
+                reshaped: pl.Tile[[1024], pl.BF16, pl.MemorySpace.Mat] = pl.tile.reshape(sliced, [1024])
+                # Move preserves Mat layout into Vec — non-Vec-implicit, so surfaced.
+                reshaped_V: pl.Tile[
+                    [1024],
+                    pl.BF16,
+                    pl.MemorySpace.Vec,
+                    pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major),
+                ] = pl.move(reshaped, target_memory=pl.MemorySpace.Vec)
+                out_0: pl.Tensor[[16, 64], pl.BF16] = pl.store(reshaped_V, [0, 0], out_0)
+                return out_0
+
+            @pl.function
+            def main(self, x: pl.Tensor[[16, 128], pl.BF16]) -> pl.Tensor[[16, 64], pl.BF16]:
+                out_0: pl.Tensor[[16, 64], pl.BF16] = pl.create_tensor([16, 64], dtype=pl.BF16)
+                y: pl.Tensor[[16, 64], pl.BF16] = self.main_incore_0(x, out_0)
+                return y
+
+        After = passes.infer_tile_memory_space()(Before)
+        ir.assert_structural_equal(After, Expected)
+
+
+class TestAutoMoveInsertion:
+    """Test that InferTileMemorySpace auto-inserts tile.move for input mismatches."""
+
+    def test_matmul_auto_moves_from_vec(self):
+        """tile.matmul with Vec inputs -> auto-insert moves to Left/Right.
+
+        The loads pin ``target_memory=Vec`` explicitly: an unset load feeding a
+        matmul now resolves to Mat (covered by ``test_matmul_gets_acc``), so the
+        Vec source has to be spelled out for this test to keep covering the
+        Vec->Left / Vec->Right move insertion.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                x: pl.Tensor[[16, 128], pl.BF16],
+                y: pl.Tensor[[128, 128], pl.BF16],
+                out_0: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+            ) -> pl.Tensor[[16, 128], pl.FP32]:
+                x_tile: pl.Tile[[16, 128], pl.BF16] = pl.load(
+                    x, [0, 0], [16, 128], target_memory=pl.MemorySpace.Vec
+                )
+                y_tile: pl.Tile[[128, 128], pl.BF16] = pl.load(
+                    y, [0, 0], [128, 128], target_memory=pl.MemorySpace.Vec
+                )
+                z_tile: pl.Tile[[16, 128], pl.FP32] = pl.matmul(x_tile, y_tile)
+                out_0: pl.Tensor[[16, 128], pl.FP32] = pl.store(z_tile, [0, 0], out_0)
+                return out_0
+
+            @pl.function
+            def main(
+                self,
+                x: pl.Tensor[[16, 128], pl.BF16],
+                y: pl.Tensor[[128, 128], pl.BF16],
+            ) -> pl.Tensor[[16, 128], pl.FP32]:
+                out_0: pl.Tensor[[16, 128], pl.FP32] = pl.create_tensor([16, 128], dtype=pl.FP32)
+                z: pl.Tensor[[16, 128], pl.FP32] = self.main_incore_0(x, y, out_0)
+                return z
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                x: pl.Tensor[[16, 128], pl.BF16],
+                y: pl.Tensor[[128, 128], pl.BF16],
+                out_0: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+            ) -> pl.Tensor[[16, 128], pl.FP32]:
+                x_tile: pl.Tile[[16, 128], pl.BF16, pl.MemorySpace.Vec] = pl.load(
+                    x,
+                    [0, 0],
+                    [16, 128],
+                    target_memory=pl.Mem.Vec,
+                )
+                y_tile: pl.Tile[[128, 128], pl.BF16, pl.MemorySpace.Vec] = pl.load(
+                    y,
+                    [0, 0],
+                    [128, 128],
+                    target_memory=pl.Mem.Vec,
+                )
+                x_tile_L: pl.Tile[[16, 128], pl.BF16, pl.MemorySpace.Left] = pl.move(
+                    x_tile, target_memory=pl.MemorySpace.Left
+                )
+                y_tile_R: pl.Tile[[128, 128], pl.BF16, pl.MemorySpace.Right] = pl.move(
+                    y_tile, target_memory=pl.MemorySpace.Right
+                )
+                z_tile: pl.Tile[[16, 128], pl.FP32, pl.MemorySpace.Acc] = pl.matmul(x_tile_L, y_tile_R)
+                out_0: pl.Tensor[[16, 128], pl.FP32] = pl.store(z_tile, [0, 0], out_0)
+                return out_0
+
+            @pl.function
+            def main(
+                self,
+                x: pl.Tensor[[16, 128], pl.BF16],
+                y: pl.Tensor[[128, 128], pl.BF16],
+            ) -> pl.Tensor[[16, 128], pl.FP32]:
+                out_0: pl.Tensor[[16, 128], pl.FP32] = pl.create_tensor([16, 128], dtype=pl.FP32)
+                z: pl.Tensor[[16, 128], pl.FP32] = self.main_incore_0(x, y, out_0)
+                return z
+
+        After = passes.infer_tile_memory_space()(Before)
+        ir.assert_structural_equal(After, Expected)
+
+    def test_matmul_auto_moves_from_mat(self):
+        """tile.matmul with Mat inputs -> auto-insert moves to Left/Right."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                x: pl.Tensor[[16, 128], pl.BF16],
+                y: pl.Tensor[[128, 128], pl.BF16],
+                out_0: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+            ) -> pl.Tensor[[16, 128], pl.FP32]:
+                x_tile: pl.Tile[[16, 128], pl.BF16] = pl.load(
+                    x, [0, 0], [16, 128], target_memory=pl.MemorySpace.Mat
+                )
+                y_tile: pl.Tile[[128, 128], pl.BF16] = pl.load(
+                    y, [0, 0], [128, 128], target_memory=pl.MemorySpace.Mat
+                )
+                z_tile: pl.Tile[[16, 128], pl.FP32] = pl.matmul(x_tile, y_tile)
+                out_0: pl.Tensor[[16, 128], pl.FP32] = pl.store(z_tile, [0, 0], out_0)
+                return out_0
+
+            @pl.function
+            def main(
+                self,
+                x: pl.Tensor[[16, 128], pl.BF16],
+                y: pl.Tensor[[128, 128], pl.BF16],
+            ) -> pl.Tensor[[16, 128], pl.FP32]:
+                out_0: pl.Tensor[[16, 128], pl.FP32] = pl.create_tensor([16, 128], dtype=pl.FP32)
+                z: pl.Tensor[[16, 128], pl.FP32] = self.main_incore_0(x, y, out_0)
+                return z
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                x: pl.Tensor[[16, 128], pl.BF16],
+                y: pl.Tensor[[128, 128], pl.BF16],
+                out_0: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+            ) -> pl.Tensor[[16, 128], pl.FP32]:
+                x_tile: pl.Tile[[16, 128], pl.BF16, pl.MemorySpace.Mat] = pl.load(
+                    x, [0, 0], [16, 128], target_memory=pl.MemorySpace.Mat
+                )
+                y_tile: pl.Tile[[128, 128], pl.BF16, pl.MemorySpace.Mat] = pl.load(
+                    y, [0, 0], [128, 128], target_memory=pl.MemorySpace.Mat
+                )
+                x_tile_L: pl.Tile[[16, 128], pl.BF16, pl.MemorySpace.Left] = pl.move(
+                    x_tile, target_memory=pl.MemorySpace.Left
+                )
+                y_tile_R: pl.Tile[[128, 128], pl.BF16, pl.MemorySpace.Right] = pl.move(
+                    y_tile, target_memory=pl.MemorySpace.Right
+                )
+                z_tile: pl.Tile[[16, 128], pl.FP32, pl.MemorySpace.Acc] = pl.matmul(x_tile_L, y_tile_R)
+                out_0: pl.Tensor[[16, 128], pl.FP32] = pl.store(z_tile, [0, 0], out_0)
+                return out_0
+
+            @pl.function
+            def main(
+                self,
+                x: pl.Tensor[[16, 128], pl.BF16],
+                y: pl.Tensor[[128, 128], pl.BF16],
+            ) -> pl.Tensor[[16, 128], pl.FP32]:
+                out_0: pl.Tensor[[16, 128], pl.FP32] = pl.create_tensor([16, 128], dtype=pl.FP32)
+                z: pl.Tensor[[16, 128], pl.FP32] = self.main_incore_0(x, y, out_0)
+                return z
+
+        After = passes.infer_tile_memory_space()(Before)
+        ir.assert_structural_equal(After, Expected)
+
+    def test_matmul_moves_are_inserted_at_first_consumer(self):
+        """Auto-inserted moves should be materialized at first constrained use.
+
+        For two matmuls sharing `lhs_tile`, the lhs move is inserted once before
+        the first matmul, while each rhs move is inserted just before its
+        respective matmul.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                lhs: pl.Tensor[[4, 128], pl.BF16],
+                rhs0: pl.Tensor[[128, 64], pl.BF16],
+                rhs1: pl.Tensor[[128, 64], pl.BF16],
+                out_0: pl.Out[pl.Tensor[[4, 64], pl.FP32]],
+            ) -> pl.Tensor[[4, 64], pl.FP32]:
+                lhs_tile: pl.Tile[[4, 128], pl.BF16] = pl.load(
+                    lhs, [0, 0], [4, 128], target_memory=pl.MemorySpace.Mat
+                )
+                rhs0_tile: pl.Tile[[128, 64], pl.BF16] = pl.load(
+                    rhs0, [0, 0], [128, 64], target_memory=pl.MemorySpace.Mat
+                )
+                rhs1_tile: pl.Tile[[128, 64], pl.BF16] = pl.load(
+                    rhs1, [0, 0], [128, 64], target_memory=pl.MemorySpace.Mat
+                )
+                _acc0: pl.Tile[[4, 64], pl.FP32] = pl.matmul(lhs_tile, rhs0_tile)
+                acc1: pl.Tile[[4, 64], pl.FP32] = pl.matmul(lhs_tile, rhs1_tile)
+                out_0_store: pl.Tensor[[4, 64], pl.FP32] = pl.store(acc1, [0, 0], out_0)
+                return out_0_store
+
+            @pl.function
+            def main(
+                self,
+                lhs: pl.Tensor[[4, 128], pl.BF16],
+                rhs0: pl.Tensor[[128, 64], pl.BF16],
+                rhs1: pl.Tensor[[128, 64], pl.BF16],
+            ) -> pl.Tensor[[4, 64], pl.FP32]:
+                out_0: pl.Tensor[[4, 64], pl.FP32] = pl.create_tensor([4, 64], dtype=pl.FP32)
+                result: pl.Tensor[[4, 64], pl.FP32] = self.main_incore_0(lhs, rhs0, rhs1, out_0)
+                return result
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                lhs: pl.Tensor[[4, 128], pl.BF16],
+                rhs0: pl.Tensor[[128, 64], pl.BF16],
+                rhs1: pl.Tensor[[128, 64], pl.BF16],
+                out_0: pl.Out[pl.Tensor[[4, 64], pl.FP32]],
+            ) -> pl.Tensor[[4, 64], pl.FP32]:
+                lhs_tile: pl.Tile[[4, 128], pl.BF16, pl.MemorySpace.Mat] = pl.load(
+                    lhs, [0, 0], [4, 128], target_memory=pl.MemorySpace.Mat
+                )
+                rhs0_tile: pl.Tile[[128, 64], pl.BF16, pl.MemorySpace.Mat] = pl.load(
+                    rhs0, [0, 0], [128, 64], target_memory=pl.MemorySpace.Mat
+                )
+                rhs1_tile: pl.Tile[[128, 64], pl.BF16, pl.MemorySpace.Mat] = pl.load(
+                    rhs1, [0, 0], [128, 64], target_memory=pl.MemorySpace.Mat
+                )
+                lhs_tile_L: pl.Tile[[4, 128], pl.BF16, pl.MemorySpace.Left] = pl.move(
+                    lhs_tile, target_memory=pl.MemorySpace.Left
+                )
+                rhs0_tile_R: pl.Tile[[128, 64], pl.BF16, pl.MemorySpace.Right] = pl.move(
+                    rhs0_tile, target_memory=pl.MemorySpace.Right
+                )
+                _acc0: pl.Tile[[4, 64], pl.FP32, pl.MemorySpace.Acc] = pl.matmul(lhs_tile_L, rhs0_tile_R)
+                rhs1_tile_R: pl.Tile[[128, 64], pl.BF16, pl.MemorySpace.Right] = pl.move(
+                    rhs1_tile, target_memory=pl.MemorySpace.Right
+                )
+                acc1: pl.Tile[[4, 64], pl.FP32, pl.MemorySpace.Acc] = pl.matmul(lhs_tile_L, rhs1_tile_R)
+                out_0_store: pl.Tensor[[4, 64], pl.FP32] = pl.store(acc1, [0, 0], out_0)
+                return out_0_store
+
+            @pl.function
+            def main(
+                self,
+                lhs: pl.Tensor[[4, 128], pl.BF16],
+                rhs0: pl.Tensor[[128, 64], pl.BF16],
+                rhs1: pl.Tensor[[128, 64], pl.BF16],
+            ) -> pl.Tensor[[4, 64], pl.FP32]:
+                out_0: pl.Tensor[[4, 64], pl.FP32] = pl.create_tensor([4, 64], dtype=pl.FP32)
+                result: pl.Tensor[[4, 64], pl.FP32] = self.main_incore_0(lhs, rhs0, rhs1, out_0)
+                return result
+
+        After = passes.infer_tile_memory_space()(Before)
+        ir.assert_structural_equal(After, Expected)
+
+    def test_no_move_when_already_correct(self):
+        """No move inserted when input already in correct space."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                x: pl.Tensor[[16, 128], pl.BF16],
+                y: pl.Tensor[[128, 128], pl.BF16],
+                out_0: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+            ) -> pl.Tensor[[16, 128], pl.FP32]:
+                x_tile: pl.Tile[[16, 128], pl.BF16] = pl.load(
+                    x, [0, 0], [16, 128], target_memory=pl.MemorySpace.Mat
+                )
+                y_tile: pl.Tile[[128, 128], pl.BF16] = pl.load(
+                    y, [0, 0], [128, 128], target_memory=pl.MemorySpace.Mat
+                )
+                x_left: pl.Tile[[16, 128], pl.BF16] = pl.move(x_tile, target_memory=pl.MemorySpace.Left)
+                y_right: pl.Tile[[128, 128], pl.BF16] = pl.move(y_tile, target_memory=pl.MemorySpace.Right)
+                z_tile: pl.Tile[[16, 128], pl.FP32] = pl.matmul(x_left, y_right)
+                out_0: pl.Tensor[[16, 128], pl.FP32] = pl.store(z_tile, [0, 0], out_0)
+                return out_0
+
+            @pl.function
+            def main(
+                self,
+                x: pl.Tensor[[16, 128], pl.BF16],
+                y: pl.Tensor[[128, 128], pl.BF16],
+            ) -> pl.Tensor[[16, 128], pl.FP32]:
+                out_0: pl.Tensor[[16, 128], pl.FP32] = pl.create_tensor([16, 128], dtype=pl.FP32)
+                z: pl.Tensor[[16, 128], pl.FP32] = self.main_incore_0(x, y, out_0)
+                return z
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                x: pl.Tensor[[16, 128], pl.BF16],
+                y: pl.Tensor[[128, 128], pl.BF16],
+                out_0: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+            ) -> pl.Tensor[[16, 128], pl.FP32]:
+                x_tile: pl.Tile[[16, 128], pl.BF16, pl.MemorySpace.Mat] = pl.load(
+                    x, [0, 0], [16, 128], target_memory=pl.MemorySpace.Mat
+                )
+                y_tile: pl.Tile[[128, 128], pl.BF16, pl.MemorySpace.Mat] = pl.load(
+                    y, [0, 0], [128, 128], target_memory=pl.MemorySpace.Mat
+                )
+                x_left: pl.Tile[[16, 128], pl.BF16, pl.MemorySpace.Left] = pl.move(
+                    x_tile, target_memory=pl.MemorySpace.Left
+                )
+                y_right: pl.Tile[[128, 128], pl.BF16, pl.MemorySpace.Right] = pl.move(
+                    y_tile, target_memory=pl.MemorySpace.Right
+                )
+                z_tile: pl.Tile[[16, 128], pl.FP32, pl.MemorySpace.Acc] = pl.matmul(x_left, y_right)
+                out_0: pl.Tensor[[16, 128], pl.FP32] = pl.store(z_tile, [0, 0], out_0)
+                return out_0
+
+            @pl.function
+            def main(
+                self,
+                x: pl.Tensor[[16, 128], pl.BF16],
+                y: pl.Tensor[[128, 128], pl.BF16],
+            ) -> pl.Tensor[[16, 128], pl.FP32]:
+                out_0: pl.Tensor[[16, 128], pl.FP32] = pl.create_tensor([16, 128], dtype=pl.FP32)
+                z: pl.Tensor[[16, 128], pl.FP32] = self.main_incore_0(x, y, out_0)
+                return z
+
+        After = passes.infer_tile_memory_space()(Before)
+        ir.assert_structural_equal(After, Expected)
+
+    def test_eval_stmt_consumer_collects_and_inserts_move(self):
+        """EvalStmt consumers should also trigger required auto-inserted moves."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                x: pl.Tensor[[16, 16], pl.FP32],
+                value: pl.Scalar[pl.FP32],
+                out_0: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                x_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(
+                    x, [0, 0], [16, 16], target_memory=pl.MemorySpace.Mat
+                )
+                pl.tile.write(x_tile, [0, 0], value)
+                return out_0
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                x: pl.Tensor[[16, 16], pl.FP32],
+                value: pl.Scalar[pl.FP32],
+                out_0: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                x_tile: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Mat] = pl.load(
+                    x, [0, 0], [16, 16], target_memory=pl.MemorySpace.Mat
+                )
+                x_tile_V: pl.Tile[
+                    [16, 16],
+                    pl.FP32,
+                    pl.MemorySpace.Vec,
+                    pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major),
+                ] = pl.move(x_tile, target_memory=pl.MemorySpace.Vec)
+                pl.tile.write(x_tile_V, [0, 0], value)
+                return out_0
+
+        After = passes.infer_tile_memory_space()(Before)
+        ir.assert_structural_equal(After, Expected)
+
+    def test_store_no_move_for_vec(self):
+        """tile.store accepts Vec — no move needed for Vec tile."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                out_0: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                x_tile: pl.Tile[[64], pl.FP32] = pl.load(x, [0], [64])
+                out_0: pl.Tensor[[64], pl.FP32] = pl.store(x_tile, [0], out_0)
+                return out_0
+
+            @pl.function
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                out_0: pl.Tensor[[64], pl.FP32] = pl.create_tensor([64], dtype=pl.FP32)
+                y: pl.Tensor[[64], pl.FP32] = self.main_incore_0(x, out_0)
+                return y
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                out_0: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                x_tile: pl.Tile[[64], pl.FP32, pl.MemorySpace.Vec] = pl.load(
+                    x,
+                    [0],
+                    [64],
+                    target_memory=pl.Mem.Vec,
+                )
+                out_0: pl.Tensor[[64], pl.FP32] = pl.store(x_tile, [0], out_0)
+                return out_0
+
+            @pl.function
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                out_0: pl.Tensor[[64], pl.FP32] = pl.create_tensor([64], dtype=pl.FP32)
+                y: pl.Tensor[[64], pl.FP32] = self.main_incore_0(x, out_0)
+                return y
+
+        After = passes.infer_tile_memory_space()(Before)
+        ir.assert_structural_equal(After, Expected)
+
+    def test_store_no_move_for_acc(self):
+        """tile.store accepts Acc — no move needed for matmul output."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                x: pl.Tensor[[16, 128], pl.BF16],
+                y: pl.Tensor[[128, 128], pl.BF16],
+                out_0: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+            ) -> pl.Tensor[[16, 128], pl.FP32]:
+                x_tile: pl.Tile[[16, 128], pl.BF16] = pl.load(
+                    x, [0, 0], [16, 128], target_memory=pl.MemorySpace.Mat
+                )
+                y_tile: pl.Tile[[128, 128], pl.BF16] = pl.load(
+                    y, [0, 0], [128, 128], target_memory=pl.MemorySpace.Mat
+                )
+                x_left: pl.Tile[[16, 128], pl.BF16] = pl.move(x_tile, target_memory=pl.MemorySpace.Left)
+                y_right: pl.Tile[[128, 128], pl.BF16] = pl.move(y_tile, target_memory=pl.MemorySpace.Right)
+                z_tile: pl.Tile[[16, 128], pl.FP32] = pl.matmul(x_left, y_right)
+                out_0: pl.Tensor[[16, 128], pl.FP32] = pl.store(z_tile, [0, 0], out_0)
+                return out_0
+
+            @pl.function
+            def main(
+                self,
+                x: pl.Tensor[[16, 128], pl.BF16],
+                y: pl.Tensor[[128, 128], pl.BF16],
+            ) -> pl.Tensor[[16, 128], pl.FP32]:
+                out_0: pl.Tensor[[16, 128], pl.FP32] = pl.create_tensor([16, 128], dtype=pl.FP32)
+                z: pl.Tensor[[16, 128], pl.FP32] = self.main_incore_0(x, y, out_0)
+                return z
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                x: pl.Tensor[[16, 128], pl.BF16],
+                y: pl.Tensor[[128, 128], pl.BF16],
+                out_0: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+            ) -> pl.Tensor[[16, 128], pl.FP32]:
+                x_tile: pl.Tile[[16, 128], pl.BF16, pl.MemorySpace.Mat] = pl.load(
+                    x, [0, 0], [16, 128], target_memory=pl.MemorySpace.Mat
+                )
+                y_tile: pl.Tile[[128, 128], pl.BF16, pl.MemorySpace.Mat] = pl.load(
+                    y, [0, 0], [128, 128], target_memory=pl.MemorySpace.Mat
+                )
+                x_left: pl.Tile[[16, 128], pl.BF16, pl.MemorySpace.Left] = pl.move(
+                    x_tile, target_memory=pl.MemorySpace.Left
+                )
+                y_right: pl.Tile[[128, 128], pl.BF16, pl.MemorySpace.Right] = pl.move(
+                    y_tile, target_memory=pl.MemorySpace.Right
+                )
+                z_tile: pl.Tile[[16, 128], pl.FP32, pl.MemorySpace.Acc] = pl.matmul(x_left, y_right)
+                out_0: pl.Tensor[[16, 128], pl.FP32] = pl.store(z_tile, [0, 0], out_0)
+                return out_0
+
+            @pl.function
+            def main(
+                self,
+                x: pl.Tensor[[16, 128], pl.BF16],
+                y: pl.Tensor[[128, 128], pl.BF16],
+            ) -> pl.Tensor[[16, 128], pl.FP32]:
+                out_0: pl.Tensor[[16, 128], pl.FP32] = pl.create_tensor([16, 128], dtype=pl.FP32)
+                z: pl.Tensor[[16, 128], pl.FP32] = self.main_incore_0(x, y, out_0)
+                return z
+
+        After = passes.infer_tile_memory_space()(Before)
+        ir.assert_structural_equal(After, Expected)
+
+    def test_cast_of_if_phi_acc_operand_gets_move(self):
+        """An op's input constraint must be enforced when the operand is an
+        IfStmt phi, not only when it is an AssignStmt or ForStmt result.
+
+        ``tile.cast`` declares ``set_input_memory(0, Vec)``. Here its operand is
+        the phi of an ``if``/``else`` whose branches both produce ``Acc`` (the
+        canonical peeled-accumulator shape: a fresh ``matmul`` seed on one side,
+        an in-place ``matmul_acc`` on the other). The analyzer records memory
+        spaces only from AssignStmts and ForStmt carries, so before the IfStmt
+        override the phi was absent from ``var_memory_``, ``CheckInputConstraints``
+        skipped the operand, and no ``Acc -> Vec`` move was queued. The cast then
+        kept an ``Acc`` operand in violation of its own contract, leaving no
+        cube/vector boundary ``tile.move`` for ExpandMixedKernel to lower into a
+        ``tpush_to_aiv`` / ``tpop_from_aic`` pair — it split the kernel with the
+        cast referencing a var defined only on the cube side.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                x: pl.Tensor[[16, 128], pl.BF16],
+                y: pl.Tensor[[128, 128], pl.BF16],
+                flag: pl.Scalar[pl.INDEX],
+                out_0: pl.Out[pl.Tensor[[16, 128], pl.BF16]],
+            ) -> pl.Tensor[[16, 128], pl.BF16]:
+                x_tile: pl.Tile[[16, 128], pl.BF16, pl.MemorySpace.Mat] = pl.load(
+                    x, [0, 0], [16, 128], target_memory=pl.MemorySpace.Mat
+                )
+                y_tile: pl.Tile[[128, 128], pl.BF16, pl.MemorySpace.Mat] = pl.load(
+                    y, [0, 0], [128, 128], target_memory=pl.MemorySpace.Mat
+                )
+                seed: pl.Tile[[16, 128], pl.FP32, pl.MemorySpace.Acc] = pl.matmul(x_tile, y_tile)
+                if flag < 1:
+                    acc = pl.yield_(seed)
+                else:
+                    acc_more: pl.Tile[[16, 128], pl.FP32, pl.MemorySpace.Acc] = pl.matmul_acc(
+                        seed, x_tile, y_tile
+                    )
+                    acc = pl.yield_(acc_more)
+                narrowed: pl.Tile[[16, 128], pl.BF16] = pl.cast(acc, pl.BF16, mode="rint")
+                out_0: pl.Tensor[[16, 128], pl.BF16] = pl.store(narrowed, [0, 0], out_0)
+                return out_0
+
+            @pl.function
+            def main(
+                self,
+                x: pl.Tensor[[16, 128], pl.BF16],
+                y: pl.Tensor[[128, 128], pl.BF16],
+                flag: pl.Scalar[pl.INDEX],
+            ) -> pl.Tensor[[16, 128], pl.BF16]:
+                out_0: pl.Tensor[[16, 128], pl.BF16] = pl.create_tensor([16, 128], dtype=pl.BF16)
+                z: pl.Tensor[[16, 128], pl.BF16] = self.main_incore_0(x, y, flag, out_0)
+                return z
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                x: pl.Tensor[[16, 128], pl.BF16],
+                y: pl.Tensor[[128, 128], pl.BF16],
+                flag: pl.Scalar[pl.INDEX],
+                out_0: pl.Out[pl.Tensor[[16, 128], pl.BF16]],
+            ) -> pl.Tensor[[16, 128], pl.BF16]:
+                x_tile: pl.Tile[[16, 128], pl.BF16, pl.MemorySpace.Mat] = pl.load(
+                    x, [0, 0], [16, 128], target_memory=pl.MemorySpace.Mat
+                )
+                y_tile: pl.Tile[[128, 128], pl.BF16, pl.MemorySpace.Mat] = pl.load(
+                    y, [0, 0], [128, 128], target_memory=pl.MemorySpace.Mat
+                )
+                x_tile_Left: pl.Tile[[16, 128], pl.BF16, pl.MemorySpace.Left] = pl.move(
+                    x_tile, target_memory=pl.MemorySpace.Left
+                )
+                y_tile_Right: pl.Tile[[128, 128], pl.BF16, pl.MemorySpace.Right] = pl.move(
+                    y_tile, target_memory=pl.MemorySpace.Right
+                )
+                seed: pl.Tile[[16, 128], pl.FP32, pl.MemorySpace.Acc] = pl.matmul(x_tile_Left, y_tile_Right)
+                if flag < 1:
+                    acc: pl.Tile[[16, 128], pl.FP32, pl.MemorySpace.Acc] = pl.yield_(seed)
+                else:
+                    acc_more: pl.Tile[[16, 128], pl.FP32, pl.MemorySpace.Acc] = pl.matmul_acc(
+                        seed, x_tile_Left, y_tile_Right
+                    )
+                    acc: pl.Tile[[16, 128], pl.FP32, pl.MemorySpace.Acc] = pl.yield_(acc_more)
+                # The move this test guards: the phi operand is narrowed to Vec
+                # before the cast, giving ExpandMixedKernel a real CV boundary.
+                acc_Vec: pl.Tile[[16, 128], pl.FP32, pl.MemorySpace.Vec] = pl.move(
+                    acc,
+                    target_memory=pl.MemorySpace.Vec,
+                    blayout=pl.TileLayout.row_major,
+                    slayout=pl.TileLayout.none_box,
+                )
+                narrowed: pl.Tile[[16, 128], pl.BF16, pl.MemorySpace.Vec] = pl.cast(
+                    acc_Vec, pl.BF16, mode="rint"
+                )
+                out_0: pl.Tensor[[16, 128], pl.BF16] = pl.store(narrowed, [0, 0], out_0)
+                return out_0
+
+            @pl.function
+            def main(
+                self,
+                x: pl.Tensor[[16, 128], pl.BF16],
+                y: pl.Tensor[[128, 128], pl.BF16],
+                flag: pl.Scalar[pl.INDEX],
+            ) -> pl.Tensor[[16, 128], pl.BF16]:
+                out_0: pl.Tensor[[16, 128], pl.BF16] = pl.create_tensor([16, 128], dtype=pl.BF16)
+                z: pl.Tensor[[16, 128], pl.BF16] = self.main_incore_0(x, y, flag, out_0)
+                return z
+
+        After = passes.infer_tile_memory_space()(Before)
+        ir.assert_structural_equal(After, Expected)
+
+    def test_divergent_branch_spaces_leave_the_phi_unrecorded(self):
+        """When the two branches yield different memory spaces, the IfStmt phi has
+        no single well-defined space and the analyzer must record none.
+
+        Reconciling such a phi needs a ``tile.move`` in one branch — Phase 2/3's
+        job, not something the analyzer can express. Recording either side would
+        make Phase 3 retype the phi to it and strand the other branch's yield, so
+        the slot is skipped and the pass leaves this shape exactly as it found it
+        (the state before the IfStmt override existed). Guards the branch-
+        disagreement check, not the divergence itself, which is pre-existing and
+        reported by the type checker.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                x: pl.Tensor[[16, 128], pl.BF16],
+                y: pl.Tensor[[128, 128], pl.BF16],
+                z: pl.Tensor[[16, 128], pl.FP32],
+                flag: pl.Scalar[pl.INDEX],
+                out_0: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+            ) -> pl.Tensor[[16, 128], pl.FP32]:
+                xt: pl.Tile[[16, 128], pl.BF16, pl.MemorySpace.Mat] = pl.load(
+                    x, [0, 0], [16, 128], target_memory=pl.MemorySpace.Mat
+                )
+                yt: pl.Tile[[128, 128], pl.BF16, pl.MemorySpace.Mat] = pl.load(
+                    y, [0, 0], [128, 128], target_memory=pl.MemorySpace.Mat
+                )
+                zt: pl.Tile[[16, 128], pl.FP32, pl.MemorySpace.Vec] = pl.load(z, [0, 0], [16, 128])
+                if flag < 1:
+                    a: pl.Tile[[16, 128], pl.FP32, pl.MemorySpace.Acc] = pl.matmul(xt, yt)
+                    phi = pl.yield_(a)
+                else:
+                    b: pl.Tile[[16, 128], pl.FP32, pl.MemorySpace.Vec] = pl.add(zt, zt)
+                    phi = pl.yield_(b)
+                out_0: pl.Tensor[[16, 128], pl.FP32] = pl.store(phi, [0, 0], out_0)
+                return out_0
+
+            @pl.function
+            def main(
+                self,
+                x: pl.Tensor[[16, 128], pl.BF16],
+                y: pl.Tensor[[128, 128], pl.BF16],
+                z: pl.Tensor[[16, 128], pl.FP32],
+                flag: pl.Scalar[pl.INDEX],
+            ) -> pl.Tensor[[16, 128], pl.FP32]:
+                out_0: pl.Tensor[[16, 128], pl.FP32] = pl.create_tensor([16, 128], dtype=pl.FP32)
+                return self.main_incore_0(x, y, z, flag, out_0)
+
+        After = passes.infer_tile_memory_space()(Before)
+        printed = ir.python_print(After)
+        # Each branch keeps the space its own producer resolved to; the phi is not
+        # retyped onto either one.
+        assert "a: pl.Tile[[16, 128], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(" in printed, printed
+        assert "b: pl.Tile[[16, 128], pl.FP32, pl.Mem.Vec] = pl.tile.add(" in printed, printed
+        # No move is invented to reconcile the divergence.
+        assert "pl.tile.move(a," not in printed, printed
+        assert "pl.tile.move(b," not in printed, printed
+
+
+class TestInferTileMemorySpaceSSAAlias:
+    """SSA-alias propagation added by the backward-demand-inference refactor.
+
+    `y = x` where both sides are Tile-typed must forward x's resolved memory
+    space onto y. The pl.DSL parser emits these aliases when eliding no-op
+    wrappers (e.g. commented-out `pl.fillpad`), and earlier pipeline stages
+    also produce them. Before the refactor, aliases without an explicit
+    `pl.Mem.*` annotation left y with no memory_space set and later-phase
+    consumers (MoveCollector, Phase 3) diverged from x.
+    """
+
+    def test_ssa_alias_inherits_memory_space_from_source(self):
+        """`y = x` inherits x's resolved memory_space. tile.store demands Vec/Acc,
+        so a Mat alias requires a Mat→Vec move before the store — present in
+        both Before and Expected so the pass only has to propagate the alias's
+        memory_space, isolating what this test verifies."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                x: pl.Tensor[[16, 128], pl.BF16],
+                y: pl.Tensor[[128, 128], pl.BF16],
+                out_0: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+            ) -> pl.Tensor[[16, 128], pl.FP32]:
+                x_tile: pl.Tile[[16, 128], pl.BF16] = pl.load(
+                    x, [0, 0], [16, 128], target_memory=pl.MemorySpace.Mat
+                )
+                y_tile: pl.Tile[[128, 128], pl.BF16] = pl.load(
+                    y, [0, 0], [128, 128], target_memory=pl.MemorySpace.Mat
+                )
+                # The alias carries no memory_space annotation — Phase 1 must
+                # copy Mat over from x_tile.
+                x_alias: pl.Tile[[16, 128], pl.BF16] = x_tile
+                z_tile: pl.Tile[[16, 128], pl.FP32] = pl.matmul(x_alias, y_tile)
+                out_0: pl.Tensor[[16, 128], pl.FP32] = pl.store(z_tile, [0, 0], out_0)
+                return out_0
+
+            @pl.function
+            def main(
+                self,
+                x: pl.Tensor[[16, 128], pl.BF16],
+                y: pl.Tensor[[128, 128], pl.BF16],
+            ) -> pl.Tensor[[16, 128], pl.FP32]:
+                out_0: pl.Tensor[[16, 128], pl.FP32] = pl.create_tensor([16, 128], dtype=pl.FP32)
+                return self.main_incore_0(x, y, out_0)
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                x: pl.Tensor[[16, 128], pl.BF16],
+                y: pl.Tensor[[128, 128], pl.BF16],
+                out_0: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+            ) -> pl.Tensor[[16, 128], pl.FP32]:
+                x_tile: pl.Tile[[16, 128], pl.BF16, pl.MemorySpace.Mat] = pl.load(
+                    x, [0, 0], [16, 128], target_memory=pl.MemorySpace.Mat
+                )
+                y_tile: pl.Tile[[128, 128], pl.BF16, pl.MemorySpace.Mat] = pl.load(
+                    y, [0, 0], [128, 128], target_memory=pl.MemorySpace.Mat
+                )
+                x_alias: pl.Tile[[16, 128], pl.BF16, pl.MemorySpace.Mat] = x_tile
+                x_alias_L: pl.Tile[[16, 128], pl.BF16, pl.MemorySpace.Left] = pl.move(
+                    x_alias, target_memory=pl.MemorySpace.Left
+                )
+                y_tile_R: pl.Tile[[128, 128], pl.BF16, pl.MemorySpace.Right] = pl.move(
+                    y_tile, target_memory=pl.MemorySpace.Right
+                )
+                z_tile: pl.Tile[[16, 128], pl.FP32, pl.MemorySpace.Acc] = pl.matmul(x_alias_L, y_tile_R)
+                out_0: pl.Tensor[[16, 128], pl.FP32] = pl.store(z_tile, [0, 0], out_0)
+                return out_0
+
+            @pl.function
+            def main(
+                self,
+                x: pl.Tensor[[16, 128], pl.BF16],
+                y: pl.Tensor[[128, 128], pl.BF16],
+            ) -> pl.Tensor[[16, 128], pl.FP32]:
+                out_0: pl.Tensor[[16, 128], pl.FP32] = pl.create_tensor([16, 128], dtype=pl.FP32)
+                return self.main_incore_0(x, y, out_0)
+
+        After = passes.infer_tile_memory_space()(Before)
+        ir.assert_structural_equal(After, Expected)
+
+    def test_ssa_alias_chain_feeds_matmul(self):
+        """`y = x`, `z = y`: both aliases inherit x's memory_space. Verifies
+        Phase 1 handles transitive SSA-alias chains in a single forward sweep."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                x: pl.Tensor[[16, 128], pl.BF16],
+                y: pl.Tensor[[128, 128], pl.BF16],
+                out_0: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+            ) -> pl.Tensor[[16, 128], pl.FP32]:
+                x_tile: pl.Tile[[16, 128], pl.BF16] = pl.load(
+                    x, [0, 0], [16, 128], target_memory=pl.MemorySpace.Mat
+                )
+                alias_1: pl.Tile[[16, 128], pl.BF16] = x_tile
+                alias_2: pl.Tile[[16, 128], pl.BF16] = alias_1
+                y_tile: pl.Tile[[128, 128], pl.BF16] = pl.load(
+                    y, [0, 0], [128, 128], target_memory=pl.MemorySpace.Mat
+                )
+                z_tile: pl.Tile[[16, 128], pl.FP32] = pl.matmul(alias_2, y_tile)
+                out_0: pl.Tensor[[16, 128], pl.FP32] = pl.store(z_tile, [0, 0], out_0)
+                return out_0
+
+            @pl.function
+            def main(
+                self,
+                x: pl.Tensor[[16, 128], pl.BF16],
+                y: pl.Tensor[[128, 128], pl.BF16],
+            ) -> pl.Tensor[[16, 128], pl.FP32]:
+                out_0: pl.Tensor[[16, 128], pl.FP32] = pl.create_tensor([16, 128], dtype=pl.FP32)
+                return self.main_incore_0(x, y, out_0)
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                x: pl.Tensor[[16, 128], pl.BF16],
+                y: pl.Tensor[[128, 128], pl.BF16],
+                out_0: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+            ) -> pl.Tensor[[16, 128], pl.FP32]:
+                x_tile: pl.Tile[[16, 128], pl.BF16, pl.MemorySpace.Mat] = pl.load(
+                    x, [0, 0], [16, 128], target_memory=pl.MemorySpace.Mat
+                )
+                alias_1: pl.Tile[[16, 128], pl.BF16, pl.MemorySpace.Mat] = x_tile
+                alias_2: pl.Tile[[16, 128], pl.BF16, pl.MemorySpace.Mat] = alias_1
+                y_tile: pl.Tile[[128, 128], pl.BF16, pl.MemorySpace.Mat] = pl.load(
+                    y, [0, 0], [128, 128], target_memory=pl.MemorySpace.Mat
+                )
+                alias_2_L: pl.Tile[[16, 128], pl.BF16, pl.MemorySpace.Left] = pl.move(
+                    alias_2, target_memory=pl.MemorySpace.Left
+                )
+                y_tile_R: pl.Tile[[128, 128], pl.BF16, pl.MemorySpace.Right] = pl.move(
+                    y_tile, target_memory=pl.MemorySpace.Right
+                )
+                z_tile: pl.Tile[[16, 128], pl.FP32, pl.MemorySpace.Acc] = pl.matmul(alias_2_L, y_tile_R)
+                out_0: pl.Tensor[[16, 128], pl.FP32] = pl.store(z_tile, [0, 0], out_0)
+                return out_0
+
+            @pl.function
+            def main(
+                self,
+                x: pl.Tensor[[16, 128], pl.BF16],
+                y: pl.Tensor[[128, 128], pl.BF16],
+            ) -> pl.Tensor[[16, 128], pl.FP32]:
+                out_0: pl.Tensor[[16, 128], pl.FP32] = pl.create_tensor([16, 128], dtype=pl.FP32)
+                return self.main_incore_0(x, y, out_0)
+
+        After = passes.infer_tile_memory_space()(Before)
+        ir.assert_structural_equal(After, Expected)
+
+
+class TestInferTileMemorySpaceLoopCarried:
+    """ForStmt accumulator back-propagation (analyzer VisitStmt_(ForStmt)).
+
+    When a loop body writes a non-Vec space (e.g. Acc from matmul_acc) into a
+    yielded tile, the analyzer copies that space onto the matching return_var,
+    the iter_arg, AND the TileType init carrier underneath the iter_arg
+    (cpp lines 213-247). This is what fixes the accumulator pattern where a
+    conservative `tile.create -> Vec` init would otherwise leave the final
+    `tile.store` reading a Vec tile and mislead ExpandMixedKernel.
+    """
+
+    def test_forstmt_accumulator_backprops_acc_to_create_init(self):
+        """`acc0 = tile.create` (Vec default) carried into a matmul_acc loop is
+        back-propagated to Acc.
+
+        Derivation (no snapshot):
+        - `matmul_acc` resolves its output to Acc via `set_output_memory(Acc)`,
+          so the yielded `acc_next` is Acc.
+        - ForStmt back-prop sets `return_vars_[0]` (r), `iter_args_[0]` (acc),
+          and the init carrier `acc0` all to Acc (cpp 230, 238, 244-246).
+        - `acc0 = tile.create` is a retargetable producer, so Phase 3 rewrites
+          its absent/Vec `target_memory` kwarg to Acc and refreshes its type
+          (cpp 508-547, doc step 4).
+        - `matmul_acc` input 0 now reads an Acc `acc`, inputs 1/2 already
+          Left/Right -> no moves inserted. `tile.store` accepts {Vec, Acc}, so
+          the Acc `r` needs no move.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                lhs: pl.Tensor[[16, 32], pl.BF16],
+                rhs: pl.Tensor[[32, 16], pl.BF16],
+                out_0: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                acc0: pl.Tile[[16, 16], pl.FP32] = pl.tile.create([16, 16], dtype=pl.FP32)
+                lhs_m: pl.Tile[[16, 32], pl.BF16] = pl.load(
+                    lhs, [0, 0], [16, 32], target_memory=pl.MemorySpace.Mat
+                )
+                rhs_m: pl.Tile[[32, 16], pl.BF16] = pl.load(
+                    rhs, [0, 0], [32, 16], target_memory=pl.MemorySpace.Mat
+                )
+                lhs_l: pl.Tile[[16, 32], pl.BF16] = pl.move(lhs_m, target_memory=pl.MemorySpace.Left)
+                rhs_r: pl.Tile[[32, 16], pl.BF16] = pl.move(rhs_m, target_memory=pl.MemorySpace.Right)
+                for i, (acc,) in pl.range(0, 4, 1, init_values=(acc0,)):
+                    acc_next: pl.Tile[[16, 16], pl.FP32] = pl.matmul_acc(acc, lhs_l, rhs_r)
+                    r = pl.yield_(acc_next)
+                out_0: pl.Tensor[[16, 16], pl.FP32] = pl.store(r, [0, 0], out_0)
+                return out_0
+
+            @pl.function
+            def main(
+                self,
+                lhs: pl.Tensor[[16, 32], pl.BF16],
+                rhs: pl.Tensor[[32, 16], pl.BF16],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                out_0: pl.Tensor[[16, 16], pl.FP32] = pl.create_tensor([16, 16], dtype=pl.FP32)
+                return self.main_incore_0(lhs, rhs, out_0)
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                lhs: pl.Tensor[[16, 32], pl.BF16],
+                rhs: pl.Tensor[[32, 16], pl.BF16],
+                out_0: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                # acc0 promoted Vec -> Acc; target_memory kwarg rewritten to Acc.
+                acc0: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Acc] = pl.tile.create(
+                    [16, 16], dtype=pl.FP32, target_memory=pl.MemorySpace.Acc
+                )
+                lhs_m: pl.Tile[[16, 32], pl.BF16, pl.MemorySpace.Mat] = pl.load(
+                    lhs, [0, 0], [16, 32], target_memory=pl.MemorySpace.Mat
+                )
+                rhs_m: pl.Tile[[32, 16], pl.BF16, pl.MemorySpace.Mat] = pl.load(
+                    rhs, [0, 0], [32, 16], target_memory=pl.MemorySpace.Mat
+                )
+                lhs_l: pl.Tile[[16, 32], pl.BF16, pl.MemorySpace.Left] = pl.move(
+                    lhs_m, target_memory=pl.MemorySpace.Left
+                )
+                rhs_r: pl.Tile[[32, 16], pl.BF16, pl.MemorySpace.Right] = pl.move(
+                    rhs_m, target_memory=pl.MemorySpace.Right
+                )
+                # iter_arg acc and return_var r both back-propagated to Acc.
+                for i, (acc,) in pl.range(0, 4, 1, init_values=(acc0,)):
+                    acc_next: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Acc] = pl.matmul_acc(
+                        acc, lhs_l, rhs_r
+                    )
+                    r = pl.yield_(acc_next)
+                out_0: pl.Tensor[[16, 16], pl.FP32] = pl.store(r, [0, 0], out_0)
+                return out_0
+
+            @pl.function
+            def main(
+                self,
+                lhs: pl.Tensor[[16, 32], pl.BF16],
+                rhs: pl.Tensor[[32, 16], pl.BF16],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                out_0: pl.Tensor[[16, 16], pl.FP32] = pl.create_tensor([16, 16], dtype=pl.FP32)
+                return self.main_incore_0(lhs, rhs, out_0)
+
+        After = passes.infer_tile_memory_space()(Before)
+        ir.assert_structural_equal(After, Expected)
+
+    def test_ifstmt_return_var_init_backprops_acc(self):
+        """An IfStmt return_var used as a loop init is back-propagated to Acc.
+
+        This targets the IfStmt-return_var fallback in ForStmt analysis: the
+        analyzer never visits an IfStmt return_var as an AssignStmt, so `sel`
+        would otherwise keep its own (here unset) space. When that var is the
+        loop init whose iter_arg yields Acc, the ForStmt post-body back-prop
+        sets `var_memory_[init_var] = Acc`, and Phase 3 rewrites `sel`'s Var
+        type accordingly. `sel`'s Acc annotation in `Expected` is therefore the
+        discriminating assertion: no other path in the analyzer records it.
+
+        Derivation (no snapshot):
+        - Both branches allocate the accumulator directly in L0C via
+          `tile.create(target_memory=Acc)`. That is the only way a value can
+          come to live in Acc other than being produced by the matrix unit —
+          nothing moves *into* L0C on any target, so a GM load can never supply
+          a `matmul_acc` accumulator.
+        - `sel` (IfStmt return_var) carries no space of its own.
+        - The loop body's `matmul_acc(acc, lhs_l, rhs_r)` resolves to Acc, so
+          `acc_next` (yield) is Acc.
+        - Back-prop: r -> Acc, iter_arg acc -> Acc, and `sel` (the init carrier)
+          -> Acc. Phase 3 rewrites `sel`'s Var type to Acc.
+        - The pass does not insert a legalization move inside the if-branches
+          for `sel` (IfStmt yields are invisible to MoveCollector); none is
+          needed, since both branches already produce Acc.
+        - `tile.store` reads the Acc `r` -> no move.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                lhs: pl.Tensor[[16, 32], pl.BF16],
+                rhs: pl.Tensor[[32, 16], pl.BF16],
+                flag: pl.Scalar[pl.INT32],
+                out_0: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                lhs_m: pl.Tile[[16, 32], pl.BF16] = pl.load(
+                    lhs, [0, 0], [16, 32], target_memory=pl.MemorySpace.Mat
+                )
+                rhs_m: pl.Tile[[32, 16], pl.BF16] = pl.load(
+                    rhs, [0, 0], [32, 16], target_memory=pl.MemorySpace.Mat
+                )
+                lhs_l: pl.Tile[[16, 32], pl.BF16] = pl.move(lhs_m, target_memory=pl.MemorySpace.Left)
+                rhs_r: pl.Tile[[32, 16], pl.BF16] = pl.move(rhs_m, target_memory=pl.MemorySpace.Right)
+                if flag > 0:
+                    a: pl.Tile[[16, 16], pl.FP32] = pl.tile.create(
+                        [16, 16], dtype=pl.FP32, target_memory=pl.MemorySpace.Acc
+                    )
+                    sel = pl.yield_(a)
+                else:
+                    b: pl.Tile[[16, 16], pl.FP32] = pl.tile.create(
+                        [16, 16], dtype=pl.FP32, target_memory=pl.MemorySpace.Acc
+                    )
+                    sel = pl.yield_(b)
+                for i, (acc,) in pl.range(0, 4, 1, init_values=(sel,)):
+                    acc_next: pl.Tile[[16, 16], pl.FP32] = pl.matmul_acc(acc, lhs_l, rhs_r)
+                    r = pl.yield_(acc_next)
+                out_0: pl.Tensor[[16, 16], pl.FP32] = pl.store(r, [0, 0], out_0)
+                return out_0
+
+            @pl.function
+            def main(
+                self,
+                lhs: pl.Tensor[[16, 32], pl.BF16],
+                rhs: pl.Tensor[[32, 16], pl.BF16],
+                flag: pl.Scalar[pl.INT32],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                out_0: pl.Tensor[[16, 16], pl.FP32] = pl.create_tensor([16, 16], dtype=pl.FP32)
+                return self.main_incore_0(lhs, rhs, flag, out_0)
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                lhs: pl.Tensor[[16, 32], pl.BF16],
+                rhs: pl.Tensor[[32, 16], pl.BF16],
+                flag: pl.Scalar[pl.INT32],
+                out_0: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                lhs_m: pl.Tile[[16, 32], pl.BF16, pl.MemorySpace.Mat] = pl.load(
+                    lhs, [0, 0], [16, 32], target_memory=pl.MemorySpace.Mat
+                )
+                rhs_m: pl.Tile[[32, 16], pl.BF16, pl.MemorySpace.Mat] = pl.load(
+                    rhs, [0, 0], [32, 16], target_memory=pl.MemorySpace.Mat
+                )
+                lhs_l: pl.Tile[[16, 32], pl.BF16, pl.MemorySpace.Left] = pl.move(
+                    lhs_m, target_memory=pl.MemorySpace.Left
+                )
+                rhs_r: pl.Tile[[32, 16], pl.BF16, pl.MemorySpace.Right] = pl.move(
+                    rhs_m, target_memory=pl.MemorySpace.Right
+                )
+                if flag > 0:
+                    a: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Acc] = pl.tile.create(
+                        [16, 16], dtype=pl.FP32, target_memory=pl.MemorySpace.Acc
+                    )
+                    # sel (IfStmt return_var) resolved to Acc by ForStmt back-prop.
+                    sel: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Acc] = pl.yield_(a)
+                else:
+                    b: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Acc] = pl.tile.create(
+                        [16, 16], dtype=pl.FP32, target_memory=pl.MemorySpace.Acc
+                    )
+                    sel: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Acc] = pl.yield_(b)
+                for i, (acc,) in pl.range(0, 4, 1, init_values=(sel,)):
+                    acc_next: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Acc] = pl.matmul_acc(
+                        acc, lhs_l, rhs_r
+                    )
+                    r = pl.yield_(acc_next)
+                out_0: pl.Tensor[[16, 16], pl.FP32] = pl.store(r, [0, 0], out_0)
+                return out_0
+
+            @pl.function
+            def main(
+                self,
+                lhs: pl.Tensor[[16, 32], pl.BF16],
+                rhs: pl.Tensor[[32, 16], pl.BF16],
+                flag: pl.Scalar[pl.INT32],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                out_0: pl.Tensor[[16, 16], pl.FP32] = pl.create_tensor([16, 16], dtype=pl.FP32)
+                return self.main_incore_0(lhs, rhs, flag, out_0)
+
+        After = passes.infer_tile_memory_space()(Before)
+        ir.assert_structural_equal(After, Expected)
+
+    def test_passthrough_iter_arg_yield_reaches_the_return_var(self):
+        """A carry yielded unchanged is an `IterArg`, and its space must still
+        reach the loop's `return_var`.
+
+        `pl.yield_(a, b_next)` holds `a` and advances `b`, so the yield value for
+        slot 0 is the `IterArg` itself, not an AssignStmt-defined `Var`. `IterArg`
+        has its own ObjectKind, so `As<Var>` returns null there and the whole slot
+        is skipped -- `r_a` never enters `var_memory_`.
+
+        Derivation (no snapshot):
+        - `seed = matmul_acc(...)` resolves to Acc, so `acc0 = tile.create` is
+          retargeted to Acc and the iter_arg `a` is seeded Acc from it.
+        - The ForStmt back-prop reads yield slot 0 (`a`, an `IterArg`) and copies
+          Acc onto `r_a`.
+        - `tile.reshape` is `output_inherits_input`, so `z` inherits `r_a`'s Acc.
+
+        With `As<Var>` the yield slot is skipped, `r_a` stays unrecorded, and `z`
+        falls through to Vec -- a reshape of an accumulator typed as if it lived
+        in UB.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                lhs: pl.Tensor[[16, 32], pl.BF16],
+                rhs: pl.Tensor[[32, 16], pl.BF16],
+                v: pl.Tensor[[64], pl.FP32],
+                out_0: pl.Out[pl.Tensor[[256], pl.FP32]],
+            ) -> pl.Tensor[[256], pl.FP32]:
+                acc0: pl.Tile[[16, 16], pl.FP32] = pl.tile.create([16, 16], dtype=pl.FP32)
+                lhs_m: pl.Tile[[16, 32], pl.BF16] = pl.load(
+                    lhs, [0, 0], [16, 32], target_memory=pl.MemorySpace.Mat
+                )
+                rhs_m: pl.Tile[[32, 16], pl.BF16] = pl.load(
+                    rhs, [0, 0], [32, 16], target_memory=pl.MemorySpace.Mat
+                )
+                lhs_l: pl.Tile[[16, 32], pl.BF16] = pl.move(lhs_m, target_memory=pl.MemorySpace.Left)
+                rhs_r: pl.Tile[[32, 16], pl.BF16] = pl.move(rhs_m, target_memory=pl.MemorySpace.Right)
+                seed: pl.Tile[[16, 16], pl.FP32] = pl.matmul_acc(acc0, lhs_l, rhs_r)
+                v0: pl.Tile[[64], pl.FP32] = pl.load(v, [0], [64])
+                # Slot 0 is held across the loop, so its yield value is the IterArg.
+                for i, (a, b) in pl.range(0, 4, 1, init_values=(seed, v0)):
+                    b_next: pl.Tile[[64], pl.FP32] = pl.tile.add(b, b)
+                    r_a, r_b = pl.yield_(a, b_next)
+                z: pl.Tile[[256], pl.FP32] = pl.tile.reshape(r_a, [256])
+                out_0: pl.Tensor[[256], pl.FP32] = pl.store(z, [0], out_0)
+                return out_0
+
+            @pl.function
+            def main(
+                self,
+                lhs: pl.Tensor[[16, 32], pl.BF16],
+                rhs: pl.Tensor[[32, 16], pl.BF16],
+                v: pl.Tensor[[64], pl.FP32],
+            ) -> pl.Tensor[[256], pl.FP32]:
+                out_0: pl.Tensor[[256], pl.FP32] = pl.create_tensor([256], dtype=pl.FP32)
+                return self.main_incore_0(lhs, rhs, v, out_0)
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                lhs: pl.Tensor[[16, 32], pl.BF16],
+                rhs: pl.Tensor[[32, 16], pl.BF16],
+                v: pl.Tensor[[64], pl.FP32],
+                out_0: pl.Out[pl.Tensor[[256], pl.FP32]],
+            ) -> pl.Tensor[[256], pl.FP32]:
+                acc0: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Acc] = pl.tile.create(
+                    [16, 16], dtype=pl.FP32, target_memory=pl.MemorySpace.Acc
+                )
+                lhs_m: pl.Tile[[16, 32], pl.BF16, pl.MemorySpace.Mat] = pl.load(
+                    lhs, [0, 0], [16, 32], target_memory=pl.MemorySpace.Mat
+                )
+                rhs_m: pl.Tile[[32, 16], pl.BF16, pl.MemorySpace.Mat] = pl.load(
+                    rhs, [0, 0], [32, 16], target_memory=pl.MemorySpace.Mat
+                )
+                lhs_l: pl.Tile[[16, 32], pl.BF16, pl.MemorySpace.Left] = pl.move(
+                    lhs_m, target_memory=pl.MemorySpace.Left
+                )
+                rhs_r: pl.Tile[[32, 16], pl.BF16, pl.MemorySpace.Right] = pl.move(
+                    rhs_m, target_memory=pl.MemorySpace.Right
+                )
+                seed: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Acc] = pl.matmul_acc(acc0, lhs_l, rhs_r)
+                v0: pl.Tile[[64], pl.FP32, pl.MemorySpace.Vec] = pl.load(
+                    v, [0], [64], target_memory=pl.Mem.Vec
+                )
+                for i, (a, b) in pl.range(0, 4, 1, init_values=(seed, v0)):
+                    b_next: pl.Tile[[64], pl.FP32, pl.MemorySpace.Vec] = pl.tile.add(b, b)
+                    r_a, r_b = pl.yield_(a, b_next)
+                # z inherits r_a, which only carries Acc if the IterArg yield was read.
+                z: pl.Tile[[256], pl.FP32, pl.MemorySpace.Acc] = pl.tile.reshape(r_a, [256])
+                out_0: pl.Tensor[[256], pl.FP32] = pl.store(z, [0], out_0)
+                return out_0
+
+            @pl.function
+            def main(
+                self,
+                lhs: pl.Tensor[[16, 32], pl.BF16],
+                rhs: pl.Tensor[[32, 16], pl.BF16],
+                v: pl.Tensor[[64], pl.FP32],
+            ) -> pl.Tensor[[256], pl.FP32]:
+                out_0: pl.Tensor[[256], pl.FP32] = pl.create_tensor([256], dtype=pl.FP32)
+                return self.main_incore_0(lhs, rhs, v, out_0)
+
+        After = passes.infer_tile_memory_space()(Before)
+        ir.assert_structural_equal(After, Expected)
+
+    def test_nested_carry_backprop_reaches_the_outer_iter_arg(self):
+        """An inner loop's back-prop must promote its init carrier even when that
+        carrier is the enclosing loop's `IterArg`.
+
+        The inner loop seeds from `acc_o` and writes Acc, so the back-prop has to
+        land Acc on `acc_o` itself -- `As<Var>` skips it because `IterArg` carries
+        its own ObjectKind. The outer loop's own back-prop runs only after its
+        whole body has been analysed, so it cannot stand in: `flat` is resolved
+        mid-body and reads whatever `acc_o` holds at that moment.
+
+        Derivation (no snapshot):
+        - Inner `matmul_acc` yields Acc, promoting `r_i`, `acc_i` and the init
+          carrier `acc_o`.
+        - `tile.reshape` is `output_inherits_input`, so `flat` inherits `acc_o`.
+        - `tile.store` accepts {Vec, Acc}, so the Acc `flat` needs no move.
+
+        With `As<Var>` the promotion never reaches `acc_o`, so `flat` is typed Vec
+        while the buffer it aliases lives in L0C.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                lhs: pl.Tensor[[16, 32], pl.BF16],
+                rhs: pl.Tensor[[32, 16], pl.BF16],
+                out_0: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+                out_1: pl.Out[pl.Tensor[[256], pl.FP32]],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                acc0: pl.Tile[[16, 16], pl.FP32] = pl.tile.create([16, 16], dtype=pl.FP32)
+                lhs_m: pl.Tile[[16, 32], pl.BF16] = pl.load(
+                    lhs, [0, 0], [16, 32], target_memory=pl.MemorySpace.Mat
+                )
+                rhs_m: pl.Tile[[32, 16], pl.BF16] = pl.load(
+                    rhs, [0, 0], [32, 16], target_memory=pl.MemorySpace.Mat
+                )
+                lhs_l: pl.Tile[[16, 32], pl.BF16] = pl.move(lhs_m, target_memory=pl.MemorySpace.Left)
+                rhs_r: pl.Tile[[32, 16], pl.BF16] = pl.move(rhs_m, target_memory=pl.MemorySpace.Right)
+                for o, (acc_o,) in pl.range(0, 2, 1, init_values=(acc0,)):
+                    for i, (acc_i,) in pl.range(0, 4, 1, init_values=(acc_o,)):
+                        acc_next: pl.Tile[[16, 16], pl.FP32] = pl.matmul_acc(acc_i, lhs_l, rhs_r)
+                        r_i = pl.yield_(acc_next)
+                    flat: pl.Tile[[256], pl.FP32] = pl.tile.reshape(acc_o, [256])
+                    out_1: pl.Tensor[[256], pl.FP32] = pl.store(flat, [0], out_1)
+                    r_o = pl.yield_(r_i)
+                out_0: pl.Tensor[[16, 16], pl.FP32] = pl.store(r_o, [0, 0], out_0)
+                return out_0
+
+            @pl.function
+            def main(
+                self,
+                lhs: pl.Tensor[[16, 32], pl.BF16],
+                rhs: pl.Tensor[[32, 16], pl.BF16],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                out_0: pl.Tensor[[16, 16], pl.FP32] = pl.create_tensor([16, 16], dtype=pl.FP32)
+                out_1: pl.Tensor[[256], pl.FP32] = pl.create_tensor([256], dtype=pl.FP32)
+                return self.main_incore_0(lhs, rhs, out_0, out_1)
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                lhs: pl.Tensor[[16, 32], pl.BF16],
+                rhs: pl.Tensor[[32, 16], pl.BF16],
+                out_0: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+                out_1: pl.Out[pl.Tensor[[256], pl.FP32]],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                acc0: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Acc] = pl.tile.create(
+                    [16, 16], dtype=pl.FP32, target_memory=pl.MemorySpace.Acc
+                )
+                lhs_m: pl.Tile[[16, 32], pl.BF16, pl.MemorySpace.Mat] = pl.load(
+                    lhs, [0, 0], [16, 32], target_memory=pl.MemorySpace.Mat
+                )
+                rhs_m: pl.Tile[[32, 16], pl.BF16, pl.MemorySpace.Mat] = pl.load(
+                    rhs, [0, 0], [32, 16], target_memory=pl.MemorySpace.Mat
+                )
+                lhs_l: pl.Tile[[16, 32], pl.BF16, pl.MemorySpace.Left] = pl.move(
+                    lhs_m, target_memory=pl.MemorySpace.Left
+                )
+                rhs_r: pl.Tile[[32, 16], pl.BF16, pl.MemorySpace.Right] = pl.move(
+                    rhs_m, target_memory=pl.MemorySpace.Right
+                )
+                for o, (acc_o,) in pl.range(0, 2, 1, init_values=(acc0,)):
+                    for i, (acc_i,) in pl.range(0, 4, 1, init_values=(acc_o,)):
+                        acc_next: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Acc] = pl.matmul_acc(
+                            acc_i, lhs_l, rhs_r
+                        )
+                        r_i = pl.yield_(acc_next)
+                    # Acc only if the inner back-prop reached the outer IterArg.
+                    flat: pl.Tile[[256], pl.FP32, pl.MemorySpace.Acc] = pl.tile.reshape(acc_o, [256])
+                    out_1: pl.Tensor[[256], pl.FP32] = pl.store(flat, [0], out_1)
+                    r_o = pl.yield_(r_i)
+                out_0: pl.Tensor[[16, 16], pl.FP32] = pl.store(r_o, [0, 0], out_0)
+                return out_0
+
+            @pl.function
+            def main(
+                self,
+                lhs: pl.Tensor[[16, 32], pl.BF16],
+                rhs: pl.Tensor[[32, 16], pl.BF16],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                out_0: pl.Tensor[[16, 16], pl.FP32] = pl.create_tensor([16, 16], dtype=pl.FP32)
+                out_1: pl.Tensor[[256], pl.FP32] = pl.create_tensor([256], dtype=pl.FP32)
+                return self.main_incore_0(lhs, rhs, out_0, out_1)
+
+        After = passes.infer_tile_memory_space()(Before)
+        ir.assert_structural_equal(After, Expected)
+
+
+class TestInferTileMemorySpaceDemandBackprop:
+    """Backward demand propagation through inherit-input view chains (Phase 0).
+
+    A `tile.load` with no `target_memory` kwarg feeding a `tile.slice`
+    (`OutputMemoryInheritsInput`) into a `tile.matmul` (input 0 demands Left).
+    Phase 0 records the Left demand on the slice output and propagates it back
+    through the slice->load inherit-input edge onto the load.
+    """
+
+    def test_load_slice_matmul_demand_stages_through_mat_then_moves(self):
+        """Left demand back-propagated to a retargetable `tile.load` stages the
+        load through Mat, with the Left/Right moves inserted at the matmul.
+
+        Derivation (no snapshot):
+        - Phase 0 records matmul input-0 demand Left on `x_sl`, then propagates
+          it back through the slice->load inherit-input edge onto `x_tile`
+          (cpp 106-157, doc 41-50).
+        - Phase 1: `x_tile = tile.load` is retargetable with demand Left. A
+          retargetable DDR producer can only produce {Vec, Mat} directly, and a
+          cube-operand demand (Left/Right/*Scale/Bias) resolves to Mat: L1 is
+          the only buffer a tload can fill that MTE1 can then move into
+          L0A/L0B.
+        - `x_sl = tile.slice` inherits Mat from `x_tile` (a Mat-resident slice
+          is first-class; pass 19 folds it into `tile.extract`); `y_tile`
+          carries a Right demand and likewise resolves to Mat.
+        - matmul demands Left/Right but the operands are Mat, so Phase 2/3
+          insert `x_sl_Left` and `y_tile_Right` moves before the matmul, which
+          itself resolves to Acc. `tile.store` accepts Acc -> no move.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                x: pl.Tensor[[16, 256], pl.BF16],
+                y: pl.Tensor[[128, 128], pl.BF16],
+                out_0: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+            ) -> pl.Tensor[[16, 128], pl.FP32]:
+                x_tile: pl.Tile[[16, 256], pl.BF16] = pl.load(x, [0, 0], [16, 256])
+                x_sl: pl.Tile[[16, 128], pl.BF16] = pl.tile.slice(x_tile, [16, 128], [0, 0])
+                y_tile: pl.Tile[[128, 128], pl.BF16] = pl.load(y, [0, 0], [128, 128])
+                z_tile: pl.Tile[[16, 128], pl.FP32] = pl.matmul(x_sl, y_tile)
+                out_0: pl.Tensor[[16, 128], pl.FP32] = pl.store(z_tile, [0, 0], out_0)
+                return out_0
+
+            @pl.function
+            def main(
+                self,
+                x: pl.Tensor[[16, 256], pl.BF16],
+                y: pl.Tensor[[128, 128], pl.BF16],
+            ) -> pl.Tensor[[16, 128], pl.FP32]:
+                out_0: pl.Tensor[[16, 128], pl.FP32] = pl.create_tensor([16, 128], dtype=pl.FP32)
+                return self.main_incore_0(x, y, out_0)
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                x: pl.Tensor[[16, 256], pl.BF16],
+                y: pl.Tensor[[128, 128], pl.BF16],
+                out_0: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+            ) -> pl.Tensor[[16, 128], pl.FP32]:
+                # Left demand staged through Mat on the retargetable load.
+                x_tile: pl.Tile[[16, 256], pl.BF16, pl.MemorySpace.Mat] = pl.load(
+                    x,
+                    [0, 0],
+                    [16, 256],
+                    target_memory=pl.Mem.Mat,
+                )
+                x_sl: pl.Tile[[16, 128], pl.BF16, pl.MemorySpace.Mat] = pl.tile.slice(
+                    x_tile, [16, 128], [0, 0]
+                )
+                y_tile: pl.Tile[[128, 128], pl.BF16, pl.MemorySpace.Mat] = pl.load(
+                    y,
+                    [0, 0],
+                    [128, 128],
+                    target_memory=pl.Mem.Mat,
+                )
+                x_sl_L: pl.Tile[[16, 128], pl.BF16, pl.MemorySpace.Left] = pl.move(
+                    x_sl, target_memory=pl.MemorySpace.Left
+                )
+                y_tile_R: pl.Tile[[128, 128], pl.BF16, pl.MemorySpace.Right] = pl.move(
+                    y_tile, target_memory=pl.MemorySpace.Right
+                )
+                z_tile: pl.Tile[[16, 128], pl.FP32, pl.MemorySpace.Acc] = pl.matmul(x_sl_L, y_tile_R)
+                out_0: pl.Tensor[[16, 128], pl.FP32] = pl.store(z_tile, [0, 0], out_0)
+                return out_0
+
+            @pl.function
+            def main(
+                self,
+                x: pl.Tensor[[16, 256], pl.BF16],
+                y: pl.Tensor[[128, 128], pl.BF16],
+            ) -> pl.Tensor[[16, 128], pl.FP32]:
+                out_0: pl.Tensor[[16, 128], pl.FP32] = pl.create_tensor([16, 128], dtype=pl.FP32)
+                return self.main_incore_0(x, y, out_0)
+
+        After = passes.infer_tile_memory_space()(Before)
+        ir.assert_structural_equal(After, Expected)
+
+
+class TestInferTileMemorySpaceUnreachableDemand:
+    """A demand for a space with no inbound edge in the move graph.
+
+    `Acc` is the only such space today: nothing writes L0C except the MAD unit,
+    so `BackendHandler::CanMoveTile` reports no move into it from anywhere. A
+    tile that must be an accumulator therefore has to be *created* in `Acc` --
+    Phase 2 cannot repair the mismatch with a `tile.move` the way it does for a
+    Left/Right operand reached from Mat.
+
+    Which producers can honour such a demand is decided by the registry's own
+    execution-memory-access evidence, not by an op-name list:
+
+    * `tile.create` declares `no_execution_memory_access()` -- it moves no data,
+      so it is free to name any buffer, `Acc` included.
+    * `tile.load` declares `functional_execution_memory_access()` -- it drives
+      MTE2, which fills {Vec, Mat} and never L0C, so the demand is genuinely
+      unsatisfiable and must be reported.
+    """
+
+    def test_unset_create_feeding_matmul_acc_is_placed_in_acc(self):
+        """The remedy the operand-constraint diagnostic advertises must work.
+
+        Leaving the allocation unset is one of the three fixes `OpRegistry`
+        suggests for a wrongly-placed accumulator. Before the unreachable-demand
+        branch existed, this fell through to the `Vec` fallback and Phase 2 then
+        emitted a `tile.move(..., target_memory=Acc)` that no target implements;
+        it survived to `ExpandMixedKernel` and aborted there with an internal
+        error naming neither the tile nor the line that created it.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                lhs: pl.Tensor[[16, 16], pl.FP32],
+                rhs: pl.Tensor[[16, 16], pl.FP32],
+                output: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                lhs_tile = pl.load(lhs, [0, 0], [16, 16], target_memory=pl.Mem.Mat)
+                rhs_tile = pl.load(rhs, [0, 0], [16, 16], target_memory=pl.Mem.Mat)
+                acc_tile = pl.tile.create([16, 16], pl.FP32)
+                out_tile = pl.tile.matmul_acc(acc_tile, lhs_tile, rhs_tile)
+                return pl.store(out_tile, [0, 0], output)
+
+        printed = ir.python_print(passes.infer_tile_memory_space()(Before))
+
+        # The allocation is born in Acc ...
+        create_line = next(ln for ln in printed.splitlines() if "tile.create" in ln)
+        assert "pl.Mem.Acc" in create_line, create_line
+        # ... so no move into Acc is needed. Only the Left/Right cube operands move.
+        assert "target_memory=pl.MemorySpace.Acc" not in printed
+        for line in printed.splitlines():
+            if "tile.move" in line:
+                assert "pl.Mem.Left" in line or "pl.Mem.Right" in line, line
+
+    def test_unset_load_feeding_matmul_acc_is_a_user_error(self):
+        """A DDR-facing producer cannot reach Acc, and says so.
+
+        MTE2 fills {Vec, Mat} and never L0C, so no placement satisfies the
+        demand. This must be a `ValueError` against the user's source, not an
+        internal error from a backend that received an impossible `tile.move`.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                acc: pl.Tensor[[16, 16], pl.FP32],
+                lhs: pl.Tensor[[16, 16], pl.FP32],
+                rhs: pl.Tensor[[16, 16], pl.FP32],
+                output: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                lhs_tile = pl.load(lhs, [0, 0], [16, 16], target_memory=pl.Mem.Mat)
+                rhs_tile = pl.load(rhs, [0, 0], [16, 16], target_memory=pl.Mem.Mat)
+                acc_tile = pl.load(acc, [0, 0], [16, 16])
+                out_tile = pl.tile.matmul_acc(acc_tile, lhs_tile, rhs_tile)
+                return pl.store(out_tile, [0, 0], output)
+
+        with pytest.raises(ValueError) as excinfo:
+            passes.infer_tile_memory_space()(Before)
+
+        message = str(excinfo.value)
+        assert "tile.load" in message
+        assert "Acc memory" in message
+        # The diagnostic must name the way out, not just the refusal.
+        assert "pl.tile.create" in message
+
+
+class TestInferTileMemorySpaceTileParams:
+    """Tile *parameters*, which this pass seeds from rather than infers.
+
+    A parameter's space is part of the signature -- the caller decides where the
+    tile lives -- so it is never inferred here. Which function types may carry
+    one differs: an `InCore` kernel is entered from orchestration and takes
+    tensors, while `AIC`/`AIV` sub-workers are entered from a mixed kernel and
+    take the cross-core handoff tile directly.
+    """
+
+    def test_aiv_tile_param_seeds_instead_of_aborting(self):
+        """A hand-authored AIV kernel with a tile parameter must compile.
+
+        This pass covers every `IsInCoreType` function, so AIC/AIV reach the
+        Phase 1 analyzer. Its parameter loop previously rejected *any* TileType
+        parameter with the InCore-only rule, turning a supported, tested form
+        (`test_expand_mixed_kernel_split_aiv.py` authors exactly this) into an
+        internal error.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.AIV)
+            def worker(
+                self,
+                qk: pl.Tile[[128, 128], pl.FP32, pl.Mem.Vec],
+                out_0: pl.Out[pl.Tensor[[128, 128], pl.FP32]],
+            ) -> pl.Tensor[[128, 128], pl.FP32]:
+                r = pl.exp(qk)
+                return pl.store(r, [0, 0], out_0)
+
+        printed = ir.python_print(passes.infer_tile_memory_space()(Before))
+        # The declared space survives, and the body op resolves against it.
+        assert "pl.Mem.Vec" in printed
+        assert "tile.exp" in printed
+
+    def test_aiv_tile_param_without_space_is_a_user_error(self):
+        """The caller owns a parameter's space, so an omitted one cannot be inferred."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.AIV)
+            def worker(
+                self,
+                qk: pl.Tile[[128, 128], pl.FP32],
+                out_0: pl.Out[pl.Tensor[[128, 128], pl.FP32]],
+            ) -> pl.Tensor[[128, 128], pl.FP32]:
+                r = pl.exp(qk)
+                return pl.store(r, [0, 0], out_0)
+
+        with pytest.raises(ValueError) as excinfo:
+            passes.infer_tile_memory_space()(Before)
+        assert "qk" in str(excinfo.value)
+        assert "signature" in str(excinfo.value)
+
+
+class TestInferTileMemorySpaceIterArgInherit:
+    """An inherit-input op whose argument is a loop iter-arg must inherit that
+    iter-arg's space — IterArg is matched via ``AsVarLike``, not ``As<Var>`` (kind
+    traits)."""
+
+    def test_assemble_into_mat_iter_arg_keeps_scratch_mat(self):
+        """Regression: a ``tile.assemble(target, source, offset)`` whose Mat-scratch
+        *target* is a loop-carried iter-arg must inherit the iter-arg's Mat space, not
+        fall through to the Acc *source*.
+
+        ``InheritFromInput`` used ``As<Var>``, which does not match an ``IterArg``, so the
+        (still-unresolved) Mat iter-arg target was skipped and the Acc source won —
+        forcing the whole Mat scratch chain into Acc. That is the L0c overflow behind
+        AutoTileMatmulL0's full-K Mat-scratch path. The fix seeds each iter-arg's space
+        from its init before the body is analysed and matches IterArg args via
+        ``AsVarLike``.
+        """
+        # A backend is needed so the Mat tile.create carries the implicit NZ TileView,
+        # matching the tile.assemble result type for the loop-carried reassignment.
+        backend.set_backend_type(BackendType.Ascend910)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                a: pl.Tensor[[64, 64], pl.FP32],
+                b: pl.Tensor[[64, 64], pl.FP32],
+                out: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
+            ) -> pl.Tensor[[64, 64], pl.FP32]:
+                tile_x = pl.tile.create([64, 64], dtype=pl.FP32, target_memory=pl.MemorySpace.Mat)
+                a_mat = pl.load(a, [0, 0], [64, 64], target_memory=pl.MemorySpace.Mat)
+                b_mat = pl.load(b, [0, 0], [64, 64], target_memory=pl.MemorySpace.Mat)
+                for _i in pl.range(2):
+                    a_l = pl.move(a_mat, target_memory=pl.MemorySpace.Left)
+                    b_r = pl.move(b_mat, target_memory=pl.MemorySpace.Right)
+                    c = pl.matmul(a_l, b_r)  # Acc (L0C)
+                    tile_x = pl.tile.assemble(tile_x, c, [0, 0])  # Acc source -> Mat iter-arg target
+                out = pl.store(pl.move(tile_x, target_memory=pl.MemorySpace.Vec), [0, 0], out)
+                return out
+
+        After = passes.infer_tile_memory_space()(passes.convert_to_ssa()(Before))
+        printed = ir.python_print(After)
+
+        # The Mat scratch chain (create + assemble results) must stay Mat; only the
+        # matmul output is Acc. Before the fix the scratch chain was inferred Acc.
+        create_line = next(line for line in printed.splitlines() if "tile.create(" in line)
+        assert "Mem.Mat" in create_line, f"scratch tile.create must stay Mat: {create_line.strip()}"
+        assemble_lines = [line for line in printed.splitlines() if "tile.assemble(" in line]
+        assert assemble_lines, "expected tile.assemble in the lowered loop"
+        for line in assemble_lines:
+            assert "Mem.Mat" in line and "Mem.Acc" not in line, (
+                "an Acc->Mat assemble whose target is a Mat iter-arg must inherit the Mat "
+                f"target, not the Acc source: {line.strip()}"
+            )
+
+    def test_assemble_into_mat_iter_arg_keeps_scratch_mat_nested(self):
+        """Nested-loop variant — the structure ``BuildFullKPipelined`` actually emits.
+
+        The inner loop's iter-arg init is the *outer* iter-arg, so the seed must
+        propagate Mat outer -> inner (each iter-arg seeded from its init: the outer from
+        the ``tile.create``, the inner from the outer iter-arg via ``AsVarLike``). Pins
+        the recursive seeding the single-loop test does not reach.
+        """
+        backend.set_backend_type(BackendType.Ascend910)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                a: pl.Tensor[[64, 64], pl.FP32],
+                b: pl.Tensor[[64, 64], pl.FP32],
+                out: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
+            ) -> pl.Tensor[[64, 64], pl.FP32]:
+                tile_x = pl.tile.create([64, 64], dtype=pl.FP32, target_memory=pl.MemorySpace.Mat)
+                a_mat = pl.load(a, [0, 0], [64, 64], target_memory=pl.MemorySpace.Mat)
+                b_mat = pl.load(b, [0, 0], [64, 64], target_memory=pl.MemorySpace.Mat)
+                for _o in pl.range(2):
+                    for _i in pl.range(2):
+                        a_l = pl.move(a_mat, target_memory=pl.MemorySpace.Left)
+                        b_r = pl.move(b_mat, target_memory=pl.MemorySpace.Right)
+                        c = pl.matmul(a_l, b_r)  # Acc (L0C)
+                        tile_x = pl.tile.assemble(tile_x, c, [0, 0])  # target = nested iter-arg
+                out = pl.store(pl.move(tile_x, target_memory=pl.MemorySpace.Vec), [0, 0], out)
+                return out
+
+        After = passes.infer_tile_memory_space()(passes.convert_to_ssa()(Before))
+        printed = ir.python_print(After)
+
+        create_line = next(line for line in printed.splitlines() if "tile.create(" in line)
+        assert "Mem.Mat" in create_line, f"scratch tile.create must stay Mat: {create_line.strip()}"
+        assemble_lines = [line for line in printed.splitlines() if "tile.assemble(" in line]
+        assert assemble_lines, "expected tile.assemble in the nested loop"
+        for line in assemble_lines:
+            assert "Mem.Mat" in line and "Mem.Acc" not in line, (
+                f"the outer->inner iter-arg seed must keep the nested-loop Mat scratch in Mat: {line.strip()}"
+            )
+
+
+class TestInferTileMemorySpaceLoopCarriedOperand:
+    """A *loop-carried* operand is an ``IterArg``, which ``As<Var>`` does not match.
+
+    Every stage that reads call arguments has to use ``AsVarLike`` or the operand
+    falls through the whole pass: Phase 0 records no demand for it, Phase 2 queues
+    no ``tile.move``, Phase 3 substitutes nothing, and the ``TileMemoryInferred``
+    verifier does not even report the resulting violation.
+    """
+
+    def test_carried_operand_in_a_forbidden_space_gets_its_move(self):
+        """Regression: a Vec tile carried into ``tile.matmul``'s Right slot.
+
+        ``tile.matmul`` constrains input 1 to Right. The operand here is the loop's
+        own iter-arg sitting in Vec, so Phase 2 must queue a Vec -> Right move and
+        Phase 3 must insert it and rewrite the operand.
+
+        Before the fix all four stages read the argument with ``As<Var>``, which
+        returns null for an ``IterArg``. The matmul kept its Vec operand -- IR no
+        target can execute -- and the property verifier stayed silent about it,
+        so the violation only surfaced in the backend.
+        """
+        backend.set_backend_type(BackendType.Ascend910)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                a: pl.Tensor[[64, 64], pl.FP32],
+                b: pl.Tensor[[64, 64], pl.FP32],
+                out: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
+            ) -> pl.Tensor[[64, 64], pl.FP32]:
+                a_mat = pl.load(a, [0, 0], [64, 64], target_memory=pl.MemorySpace.Mat)
+                # Pinned to Vec, so the carried operand really does violate
+                # matmul's Right constraint rather than being placed around it.
+                w0 = pl.load(b, [0, 0], [64, 64], target_memory=pl.MemorySpace.Vec)
+                acc = pl.tile.create([64, 64], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
+                w = w0
+                for _i in pl.range(2):
+                    a_l = pl.move(a_mat, target_memory=pl.MemorySpace.Left)
+                    c = pl.matmul(a_l, w)
+                    acc = pl.tile.add(acc, pl.move(c, target_memory=pl.MemorySpace.Vec))
+                    # Rebind so `w` stays a genuine carry rather than being
+                    # hoisted out of the loop; assemble is inherit-input, so it
+                    # keeps `w` on the Vec its pinned producer gave it.
+                    w = pl.tile.assemble(w, w, [0, 0])
+                out = pl.store(acc, [0, 0], out)
+                return out
+
+        After = passes.infer_tile_memory_space()(passes.convert_to_ssa()(Before))
+        printed = ir.python_print(After)
+
+        matmul_line = next(line for line in printed.splitlines() if "tile.matmul(" in line)
+        # The Right operand must be a moved tile, never the raw Vec iter-arg.
+        assert "_Right" in matmul_line, (
+            "a loop-carried matmul operand in Vec must be moved to Right, but the "
+            f"iter-arg was passed through unmoved: {matmul_line.strip()}"
+        )
+        move_lines = [line for line in printed.splitlines() if "Mem.Right" in line and "tile.move(" in line]
+        assert move_lines, "expected an inserted Vec -> Right tile.move for the carried operand"
+
+    def test_carried_demand_reaches_the_producer_outside_the_loop(self):
+        """A demand raised inside the loop body must reach the carry's init producer.
+
+        Phase 1 seeds each iter-arg's space *from its init*, so the space the body
+        demands of the iter-arg is the space the init producer has to be placed in.
+        Phase 0 therefore records an ``iter_arg -> init`` demand edge alongside the
+        inherit-input ones.
+
+        Here the carried weight feeds ``tile.matmul_acc``'s Right slot. A cube
+        operand demand resolves a retargetable DDR producer to Mat (L1 is the only
+        buffer a tload can fill that MTE1 can then move into L0B). Without the
+        carry edge the load defaulted to Vec and the operand was routed
+        GM -> UB -> L0B, putting a cube-only operand on the vector core.
+        """
+        backend.set_backend_type(BackendType.Ascend910)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                a: pl.Tensor[[64, 64], pl.FP32],
+                b: pl.Tensor[[64, 64], pl.FP32],
+                out: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
+            ) -> pl.Tensor[[64, 64], pl.FP32]:
+                a_l = pl.move(
+                    pl.load(a, [0, 0], [64, 64], target_memory=pl.MemorySpace.Mat),
+                    target_memory=pl.MemorySpace.Left,
+                )
+                # No target_memory: the pass places it, and the only signal is
+                # the demand raised on the carry inside the body.
+                w = pl.load(b, [0, 0], [64, 64])
+                acc = pl.tile.create([64, 64], dtype=pl.FP32, target_memory=pl.MemorySpace.Acc)
+                for _i in pl.range(2):
+                    acc = pl.tile.matmul_acc(acc, a_l, w)
+                    # Rebind so `w` is genuinely carried rather than hoisted.
+                    w = pl.tile.assemble(w, w, [0, 0])
+                out = pl.store(pl.move(acc, target_memory=pl.MemorySpace.Vec), [0, 0], out)
+                return out
+
+        After = passes.infer_tile_memory_space()(passes.convert_to_ssa()(Before))
+        printed = ir.python_print(After)
+
+        load_line = next(line for line in printed.splitlines() if "tile.load(" in line and "b__ssa" in line)
+        assert "Mem.Mat" in load_line, (
+            "the Right demand raised on the carried operand must reach the init "
+            f"producer and stage it through Mat, not Vec: {load_line.strip()}"
+        )
+
+    def test_carried_accumulator_demand_reaches_an_unpromoted_create(self):
+        """The reported case: the loop yields the carry itself, not the op's result.
+
+        The ordinary accumulator shape is masked by the ForStmt yield
+        back-propagation, which promotes the init carrier from the yielded value.
+        That stand-in disappears the moment the loop yields something other than
+        the constrained op's result -- here `pl.yield_(a)` yields the carry
+        itself, so the `Acc` demand can only reach `acc0` through the carry edge.
+
+        Before the fix `acc0` resolved to `Vec` and the program was rejected with
+        `tile.matmul_acc requires argument 0 to live in Acc memory`.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.Tensor[[16, 16], pl.FP32],
+                y: pl.Tensor[[16, 16], pl.FP32],
+                out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                lhs_l = pl.move(
+                    pl.load(x, [0, 0], [16, 16], target_memory=pl.MemorySpace.Mat),
+                    target_memory=pl.MemorySpace.Left,
+                )
+                rhs_r = pl.move(
+                    pl.load(y, [0, 0], [16, 16], target_memory=pl.MemorySpace.Mat),
+                    target_memory=pl.MemorySpace.Right,
+                )
+                acc0: pl.Tile[[16, 16], pl.FP32] = pl.tile.create([16, 16], dtype=pl.FP32)
+                for _i, (a,) in pl.range(0, 4, 1, init_values=(acc0,)):
+                    _tmp = pl.matmul_acc(a, lhs_l, rhs_r)
+                    r = pl.yield_(a)
+                out = pl.store(pl.move(r, target_memory=pl.MemorySpace.Vec), [0, 0], out)
+                return out
+
+        After = passes.infer_tile_memory_space()(Before)
+        printed = ir.python_print(After)
+
+        create_line = next(line for line in printed.splitlines() if "tile.create(" in line)
+        assert "Mem.Acc" in create_line, (
+            "the carried accumulator's Acc demand must reach the unset tile.create; "
+            f"got: {create_line.strip()}"
+        )
+
+    def test_while_carried_operand_gets_its_move(self):
+        """`pl.while_` carries the same construct as `pl.range`, and needs the same handling.
+
+        A WhileStmt has the same iter_args_ / return_vars_ / body_ shape as a
+        ForStmt, but the analyzer only overrode ForStmt -- so a while-carried tile
+        never entered `var_memory_` at all. Phase 2 then found no entry for the
+        operand and skipped its constraint check, queueing no move, and the
+        operand reached `tile.matmul`'s Right slot with no memory space
+        whatsoever.
+        """
+        backend.set_backend_type(BackendType.Ascend910)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                a: pl.Tensor[[64, 64], pl.FP32],
+                b: pl.Tensor[[64, 64], pl.FP32],
+                keep_going: pl.Scalar[pl.BOOL],
+                out: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
+            ) -> pl.Tensor[[64, 64], pl.FP32]:
+                a_mat = pl.load(a, [0, 0], [64, 64], target_memory=pl.MemorySpace.Mat)
+                w0 = pl.load(b, [0, 0], [64, 64], target_memory=pl.MemorySpace.Vec)
+                acc0 = pl.tile.create([64, 64], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
+                for acc, w in pl.while_(init_values=(acc0, w0)):
+                    pl.cond(keep_going)
+                    a_l = pl.move(a_mat, target_memory=pl.MemorySpace.Left)
+                    c = pl.matmul(a_l, w)
+                    nxt = pl.tile.add(acc, pl.move(c, target_memory=pl.MemorySpace.Vec))
+                    (acc_rv, w_rv) = pl.yield_(nxt, w)
+                out = pl.store(acc_rv, [0, 0], out)
+                return out
+
+        After = passes.infer_tile_memory_space()(passes.convert_to_ssa()(Before))
+        printed = ir.python_print(After)
+
+        matmul_line = next(line for line in printed.splitlines() if "tile.matmul(" in line)
+        assert "_Right" in matmul_line, (
+            "a while-carried matmul operand must be moved to Right, but the "
+            f"iter-arg was passed through unmoved: {matmul_line.strip()}"
+        )
+        assert any("Mem.Right" in line and "tile.move(" in line for line in printed.splitlines()), (
+            "expected an inserted tile.move to Right for the while-carried operand"
+        )
+
+
+class TestLoopInvariantMatResidency:
+    """Regression coverage for tensor-loop stationary operand residency (#2077)."""
+
+    @staticmethod
+    def _line_index(printed: str, *needles: str) -> int:
+        return next(
+            index
+            for index, line in enumerate(printed.splitlines())
+            if all(needle in line for needle in needles)
+        )
+
+    @staticmethod
+    def _line_indices(printed: str, *needles: str) -> list[int]:
+        return [
+            index
+            for index, line in enumerate(printed.splitlines())
+            if all(needle in line for needle in needles)
+        ]
+
+    @staticmethod
+    def _run_infer(program):
+        backend.set_backend_type(BackendType.Ascend910)
+        return passes.infer_tile_memory_space()(passes.convert_to_ssa()(program))
+
+    @staticmethod
+    def _run_tensor_infer(program):
+        backend.set_backend_type(BackendType.Ascend910)
+        program = passes.convert_to_ssa()(program)
+        program = passes.convert_tensor_to_tile_ops()(program)
+        program = passes.flatten_tile_nd_to_2d()(program)
+        program = passes.auto_tile_matmul_l0()(program)
+        program = passes.canonicalize_tile_slice()(program)
+        return passes.infer_tile_memory_space()(program)
+
+    @staticmethod
+    def _parse_marked_program(
+        params: str,
+        call_args: str,
+        body: str,
+        *,
+        fresh_param: str,
+        fresh_expr: str,
+    ):
+        """Build a marked fixture whose candidate actual is compiler-owned."""
+        param_lines = textwrap.dedent(params).strip().splitlines()
+        fresh_declarations = [line for line in param_lines if line.strip().startswith(f"{fresh_param}:")]
+        assert len(fresh_declarations) == 1, fresh_param
+        main_params = "\n".join(
+            line for line in param_lines if not line.strip().startswith(f"{fresh_param}:")
+        )
+        source = f"""
+@pl.program
+class MarkedResidencyGate:
+    @pl.function(type=pl.FunctionType.InCore)
+    def kernel(
+        self,
+{textwrap.indent(textwrap.dedent(params).strip(), "        ")}
+    ) -> pl.Tensor[[16, 128], pl.FP32]:
+{textwrap.indent(textwrap.dedent(body).strip(), "        ")}
+        return out
+
+    @pl.function(type=pl.FunctionType.Orchestration)
+    def main(
+        self,
+{textwrap.indent(main_params, "        ")}
+    ) -> pl.Tensor[[16, 128], pl.FP32]:
+        {fresh_param} = {fresh_expr}
+        result = self.kernel({call_args})
+        return result
+"""
+        program = pl.parse_program(source)
+
+        return TestLoopInvariantMatResidency._stamp_mat_bridge_loads(program)
+
+    @staticmethod
+    def _stamp_mat_bridge_loads(program):
+        """Mirror ConvertTensorToTileOps provenance on every GM-to-Mat bridge."""
+        marker = "__compiler_tensor_to_tile_mat_bridge"
+
+        class _StampMatBridgeLoads(ir.IRMutator):
+            def visit_call(self, op):
+                expr = super().visit_call(op)
+                call = expr if isinstance(expr, ir.Call) else op
+                if (
+                    call.op.name == _OP_TILE_LOAD
+                    and isinstance(call.type, ir.TileType)
+                    and call.type.memory_space == pl.MemorySpace.Mat
+                ):
+                    attrs = dict(call.attrs)
+                    attrs[marker] = True
+                    return ir.Call(
+                        call.op,
+                        list(call.args),
+                        dict(call.kwargs),
+                        attrs,
+                        call.type,
+                        call.span,
+                    )
+                return expr
+
+        return _StampMatBridgeLoads().visit_program(program)
+
+    @staticmethod
+    def _parse_marked_wrapper_program(main_body: str | None, wrapper_type: str = "pl.FunctionType.InCore"):
+        """Build worker and wrapper call sites, optionally with an orchestration root."""
+        main = ""
+        if main_body is not None:
+            main = f"""
+
+    @pl.function(type=pl.FunctionType.Orchestration)
+    def main(
+        self,
+        lhs: pl.Tensor[[16, 128], pl.BF16],
+        mutation: pl.InOut[pl.Tensor[[16, 128], pl.BF16]],
+        rhs: pl.Tensor[[128, 128], pl.BF16],
+        out: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+    ) -> pl.Tensor[[16, 128], pl.FP32]:
+{textwrap.indent(textwrap.dedent(main_body).strip(), "        ")}
+        return result
+"""
+        program = pl.parse_program(
+            f"""
+@pl.program
+class MarkedWrapperResidency:
+    @pl.function(type=pl.FunctionType.InCore)
+    def worker(
+        self,
+        lhs: pl.Tensor[[16, 128], pl.BF16],
+        mutation: pl.InOut[pl.Tensor[[16, 128], pl.BF16]],
+        rhs: pl.Tensor[[128, 128], pl.BF16],
+        out: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+    ) -> pl.Tensor[[16, 128], pl.FP32]:
+        for n in pl.range(0, 2, 1):
+            lhs_mat = pl.tile.load(lhs, [0, 0], [16, 128], target_memory=pl.Mem.Mat)
+            rhs_mat = pl.tile.load(rhs, [0, 0], [128, 128], target_memory=pl.Mem.Mat)
+            lhs_left = pl.tile.move(lhs_mat, target_memory=pl.Mem.Left)
+            rhs_right = pl.tile.move(rhs_mat, target_memory=pl.Mem.Right)
+            c = pl.tile.matmul(lhs_left, rhs_right)
+        return out
+
+    @pl.function(type={wrapper_type})
+    def wrapper(
+        self,
+        lhs: pl.Tensor[[16, 128], pl.BF16],
+        mutation: pl.InOut[pl.Tensor[[16, 128], pl.BF16]],
+        rhs: pl.Tensor[[128, 128], pl.BF16],
+        out: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+    ) -> pl.Tensor[[16, 128], pl.FP32]:
+        result = self.worker(lhs, mutation, rhs, out)
+        return result
+{main}
+"""
+        )
+        return TestLoopInvariantMatResidency._stamp_mat_bridge_loads(program)
+
+    @staticmethod
+    def _marked_matmul_chain() -> str:
+        return """
+lhs_mat = pl.tile.load(
+    lhs,
+    [0, 0],
+    [16, 128],
+    target_memory=pl.Mem.Mat,
+)
+rhs_mat = pl.tile.load(rhs, [0, 0], [128, 128], target_memory=pl.Mem.Mat)
+lhs_left = pl.tile.move(lhs_mat, target_memory=pl.Mem.Left)
+rhs_right = pl.tile.move(rhs_mat, target_memory=pl.Mem.Right)
+c = pl.tile.matmul(lhs_left, rhs_right)
+"""
+
+    @staticmethod
+    def _basic_marked_params() -> str:
+        return """
+lhs: pl.Tensor[[16, 128], pl.BF16],
+rhs: pl.Tensor[[128, 128], pl.BF16],
+trips: pl.Scalar[pl.INDEX],
+out: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+"""
+
+    def test_retargeted_bridge_preserves_unrelated_attrs_and_strips_private_marker(self):
+        """Phase 3 preserves unrelated attrs while consuming bridge provenance.
+
+        The bridge marker and an unrelated sentinel ride into the pass on the
+        same ``tile.load``. ``Expected`` pins that the load comes out retargeted
+        to ``Mem.Vec`` still carrying the sentinel, with the private marker
+        consumed — and, being a whole-program comparison, that no other call
+        picked the marker up either.
+        """
+        program = """
+@pl.program
+class RetargetedBridgeAttrs:
+    @pl.function(type=pl.FunctionType.InCore)
+    def kernel(
+        self,
+        lhs: pl.Tensor[[16, 128], pl.BF16],
+        rhs: pl.Tensor[[128, 128], pl.BF16],
+        out: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+    ) -> pl.Tensor[[16, 128], pl.FP32]:
+        for n in pl.range(0, 2, 1):
+{body}
+            out = pl.tile.store(c, [0, 0], out)
+        return out
+
+    @pl.function(type=pl.FunctionType.Orchestration)
+    def main(
+        self,
+        lhs: pl.Tensor[[16, 128], pl.BF16],
+        rhs: pl.Tensor[[128, 128], pl.BF16],
+        out: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+    ) -> pl.Tensor[[16, 128], pl.FP32]:
+        result = self.kernel(lhs, rhs, out)
+        return result
+"""
+        before_body = """            lhs_mat = pl.tile.load(
+                lhs, [0, 0], [16, 128],
+                attrs={"__compiler_tensor_to_tile_mat_bridge": True, "residency_test_sentinel": 7},
+            )
+            rhs_mat = pl.tile.load(rhs, [0, 0], [128, 128], target_memory=pl.Mem.Mat)
+            lhs_left = pl.tile.extract(lhs_mat, 0, 0, [16, 128], target_memory=pl.Mem.Left)
+            rhs_right = pl.tile.move(rhs_mat, target_memory=pl.Mem.Right)
+            c = pl.tile.matmul(lhs_left, rhs_right)"""
+        expected_body = """            lhs_mat: pl.Tile[[16, 128], pl.BF16, pl.Mem.Vec] = pl.tile.load(
+                lhs, [0, 0], [16, 128], [16, 128], target_memory=pl.Mem.Vec,
+                attrs={"residency_test_sentinel": 7},
+            )
+            rhs_mat: pl.Tile[[128, 128], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                rhs, [0, 0], [128, 128], [128, 128], target_memory=pl.Mem.Mat
+            )
+            lhs_left: pl.Tile[
+                [16, 128], pl.BF16, pl.Mem.Left, pl.TileView(blayout=pl.TileLayout.row_major)
+            ] = pl.tile.extract(lhs_mat, 0, 0, [16, 128], target_memory=pl.Mem.Left)
+            rhs_right: pl.Tile[[128, 128], pl.BF16, pl.Mem.Right] = pl.tile.move(
+                rhs_mat, target_memory=pl.Mem.Right
+            )
+            c: pl.Tile[[16, 128], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(lhs_left, rhs_right)"""
+
+        Before = passes.convert_to_ssa()(pl.parse_program(program.format(body=before_body)))
+        Expected = passes.convert_to_ssa()(pl.parse_program(program.format(body=expected_body)))
+        backend.set_backend_type(BackendType.Ascend910)
+        ir.assert_structural_equal(passes.infer_tile_memory_space()(Before), Expected)
+
+    def test_private_marker_stripped_when_function_has_no_tile_memory(self):
+        """The early no-Tile path consumes transient provenance too.
+
+        Nothing in this kernel has a Tile memory space to infer, so the pass
+        takes its early-out path — which must still strip the private marker
+        while leaving the unrelated sentinel alone.
+        """
+        program = """
+@pl.program
+class MarkerOnlyScalarCall:
+    @pl.function(type=pl.FunctionType.InCore)
+    def kernel(
+        self,
+        out: pl.Out[pl.Tensor[[1], pl.FP32]],
+    ) -> pl.Tensor[[1], pl.FP32]:
+        idx = pl.tile.get_block_idx({attrs})
+        return out
+"""
+        Before = passes.convert_to_ssa()(
+            pl.parse_program(
+                program.format(
+                    attrs='attrs={"__compiler_tensor_to_tile_mat_bridge": True, '
+                    '"residency_test_sentinel": 11}'
+                )
+            )
+        )
+        Expected = passes.convert_to_ssa()(
+            pl.parse_program(program.format(attrs='attrs={"residency_test_sentinel": 11}'))
+        )
+        backend.set_backend_type(BackendType.Ascend910)
+        ir.assert_structural_equal(passes.infer_tile_memory_space()(Before), Expected)
+
+    def test_tensor_matmul_stationary_lhs_loads_once(self):
+        """The tensor API reproduction hoists GM->L1 and invariant L1->L0A.
+
+        The RHS slice remains loop-variant and therefore streams inside the
+        loop.  This is the load-once QK shape reported in #2077, reduced to two
+        N tiles so the test stays compact.
+        """
+        backend.set_backend_type(BackendType.Ascend910)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                lhs: pl.Tensor[[16, 128], pl.BF16],
+                rhs: pl.Tensor[[128, 256], pl.BF16],
+                out: pl.Out[pl.Tensor[[16, 256], pl.FP32]],
+            ) -> pl.Tensor[[16, 256], pl.FP32]:
+                for n, (acc,) in pl.range(0, 256, 128, init_values=(out,)):
+                    rhs_n: pl.Tensor[[128, 128], pl.BF16] = pl.slice(rhs, [128, 128], [0, n])
+                    c_n: pl.Tensor[[16, 128], pl.FP32] = pl.matmul(lhs, rhs_n, out_dtype=pl.FP32)
+                    acc_next: pl.Tensor[[16, 256], pl.FP32] = pl.assemble(acc, c_n, [0, n])
+                    result = pl.yield_(acc_next)
+                return result
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                rhs: pl.Tensor[[128, 256], pl.BF16],
+                out: pl.Out[pl.Tensor[[16, 256], pl.FP32]],
+            ) -> pl.Tensor[[16, 256], pl.FP32]:
+                fresh_lhs = pl.create_tensor([16, 128], dtype=pl.BF16)
+                result = self.kernel(fresh_lhs, rhs, out)
+                return result
+
+        After = self._run_tensor_infer(Before)
+        printed = ir.python_print(After)
+
+        loop = self._line_index(printed, "for n")
+        lhs_load = self._line_index(printed, "lhs__ssa_v0_mat", "tile.load")
+        lhs_l0 = self._line_index(printed, "lhs__ssa_v0_mat_Left", "tile.move")
+        rhs_load = self._line_index(printed, "rhs_n__tile", "tile.load")
+        assert len(self._line_indices(printed, "lhs__ssa_v0_mat", "tile.load")) == 1
+        assert len(self._line_indices(printed, "lhs__ssa_v0_mat_Left", "tile.move")) == 1
+        assert lhs_load < loop
+        assert lhs_l0 < loop
+        assert rhs_load > loop
+        assert "__compiler_tensor_to_tile_mat_bridge" not in printed
+
+    def test_tensor_matmul_k_tiled_lhs_panel_loads_once(self):
+        """A stationary GM->Mat panel survives AutoTile's K-pipeline fanout.
+
+        AutoTileMatmulL0 emits a K-dependent Left extract feeding the single
+        predicated ``matmul_acc`` of the K-loop body. Only the whole-panel
+        GM->Mat load is invariant; the L0 staging remains in the inner
+        pipeline.
+        """
+        backend.set_backend_type(BackendType.Ascend910)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                lhs: pl.Tensor[[256, 256], pl.BF16],
+                rhs: pl.Tensor[[256, 256], pl.BF16],
+                out: pl.Out[pl.Tensor[[256, 256], pl.FP32]],
+            ) -> pl.Tensor[[256, 256], pl.FP32]:
+                for n, (acc,) in pl.range(0, 256, 128, init_values=(out,)):
+                    rhs_n = pl.slice(rhs, [256, 128], [0, n])
+                    c_n = pl.matmul(lhs, rhs_n, out_dtype=pl.FP32)
+                    acc_next = pl.assemble(acc, c_n, [0, n])
+                    result = pl.yield_(acc_next)
+                return result
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                rhs: pl.Tensor[[256, 256], pl.BF16],
+                out: pl.Out[pl.Tensor[[256, 256], pl.FP32]],
+            ) -> pl.Tensor[[256, 256], pl.FP32]:
+                fresh_lhs = pl.create_tensor([256, 256], dtype=pl.BF16)
+                result = self.kernel(fresh_lhs, rhs, out)
+                return result
+
+        printed = ir.python_print(self._run_tensor_infer(Before))
+        loop = self._line_index(printed, "for n")
+        lhs_loads = self._line_indices(printed, "lhs__ssa_v0_mat", "tile.load")
+        lhs_extracts = self._line_indices(printed, "c_n__tile_l0_a", "tile.extract")
+        rhs_load = self._line_index(printed, "rhs_n__tile", "tile.load")
+        assert len(lhs_loads) == 1
+        assert len(lhs_extracts) == 1, "fixture must exercise K-dependent L0 staging"
+        # The K-loop body is one predicated accumulate; no peeled tile.matmul.
+        assert len(self._line_indices(printed, "tile.matmul(")) == 0
+        assert len(self._line_indices(printed, "tile.matmul_acc(")) == 1
+        assert lhs_loads[0] < loop
+        assert all(index > loop for index in lhs_extracts)
+        assert rhs_load > loop
+        assert "__compiler_tensor_to_tile_mat_bridge" not in printed
+
+    def test_direct_incore_entry_declines_residency(self):
+        """An uncalled InCore function has no analyzable alias evidence."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                lhs: pl.Tensor[[16, 128], pl.BF16],
+                rhs: pl.Tensor[[128, 256], pl.BF16],
+                out: pl.Out[pl.Tensor[[16, 256], pl.FP32]],
+            ) -> pl.Tensor[[16, 256], pl.FP32]:
+                for n, (acc,) in pl.range(0, 256, 128, init_values=(out,)):
+                    rhs_n = pl.slice(rhs, [128, 128], [0, n])
+                    c_n = pl.matmul(lhs, rhs_n, out_dtype=pl.FP32)
+                    acc_next = pl.assemble(acc, c_n, [0, n])
+                    result = pl.yield_(acc_next)
+                return result
+
+        printed = ir.python_print(self._run_tensor_infer(Before))
+        assert self._line_index(printed, "lhs__ssa_v0_mat", "tile.load") > self._line_index(printed, "for n")
+
+    def test_direct_incore_wrapper_does_not_seed_worker_residency(self):
+        """Distinct wrapper parameters are not an external no-alias proof.
+
+        A direct caller may pass the same allocation for ``wrapper.lhs`` and
+        ``wrapper.mutation``.  The wrapper-to-worker call must therefore poison the
+        worker's read-parameter evidence instead of treating the two wrapper
+        parameter roots as proven distinct.
+        """
+        before = self._parse_marked_wrapper_program(main_body=None)
+        printed = ir.python_print(self._run_infer(before))
+        assert self._line_index(printed, "tile.load(lhs") > self._line_index(printed, "for n")
+        assert "__compiler_tensor_to_tile_mat_bridge" not in printed
+
+    def test_orchestration_through_incore_wrapper_declines_worker_residency(self):
+        """Alias evidence is intentionally direct, not propagated through wrappers."""
+        before = self._parse_marked_wrapper_program(
+            """
+result = self.wrapper(lhs, mutation, rhs, out)
+"""
+        )
+        printed = ir.python_print(self._run_infer(before))
+        assert self._line_index(printed, "tile.load(lhs") > self._line_index(printed, "for n")
+        assert "__compiler_tensor_to_tile_mat_bridge" not in printed
+
+    def test_called_orchestration_helper_does_not_seed_worker_residency(self):
+        """A called orchestration helper cannot establish trusted storage provenance."""
+        before = self._parse_marked_wrapper_program(
+            """
+result = self.wrapper(mutation, mutation, rhs, out)
+""",
+            wrapper_type="pl.FunctionType.Orchestration",
+        )
+        printed = ir.python_print(self._run_infer(before))
+        assert self._line_index(printed, "tile.load(lhs") > self._line_index(printed, "for n")
+        assert "__compiler_tensor_to_tile_mat_bridge" not in printed
+
+    def test_safe_direct_call_and_incore_wrapper_call_decline_worker_residency(self):
+        """One non-orchestration site invalidates otherwise-safe direct evidence."""
+        before = self._parse_marked_wrapper_program(
+            """
+fresh_lhs = pl.create_tensor([16, 128], dtype=pl.BF16)
+result = self.worker(fresh_lhs, mutation, rhs, out)
+"""
+        )
+        printed = ir.python_print(self._run_infer(before))
+        assert self._line_index(printed, "tile.load(lhs") > self._line_index(printed, "for n")
+        assert "__compiler_tensor_to_tile_mat_bridge" not in printed
+
+    def test_safe_call_and_aliasing_submit_decline_worker_residency(self):
+        """An unsafe Submit poisons otherwise-safe direct Call evidence."""
+        before = pl.parse_program(
+            """
+@pl.program
+class MarkedSubmitResidency:
+    @pl.function(type=pl.FunctionType.InCore)
+    def worker(
+        self,
+        lhs: pl.Tensor[[16, 128], pl.BF16],
+        mutation: pl.InOut[pl.Tensor[[16, 128], pl.BF16]],
+        rhs: pl.Tensor[[128, 128], pl.BF16],
+        out: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+    ) -> pl.Tensor[[16, 128], pl.FP32]:
+        for n in pl.range(0, 2, 1):
+            lhs_mat = pl.tile.load(lhs, [0, 0], [16, 128], target_memory=pl.Mem.Mat)
+            rhs_mat = pl.tile.load(rhs, [0, 0], [128, 128], target_memory=pl.Mem.Mat)
+            lhs_left = pl.tile.move(lhs_mat, target_memory=pl.Mem.Left)
+            rhs_right = pl.tile.move(rhs_mat, target_memory=pl.Mem.Right)
+            c = pl.tile.matmul(lhs_left, rhs_right)
+        return out
+
+    @pl.function(type=pl.FunctionType.Orchestration)
+    def main(
+        self,
+        safe_mutation: pl.InOut[pl.Tensor[[16, 128], pl.BF16]],
+        shared: pl.InOut[pl.Tensor[[16, 128], pl.BF16]],
+        rhs: pl.Tensor[[128, 128], pl.BF16],
+        safe_out: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+        submit_out: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+    ) -> pl.Tensor[[16, 128], pl.FP32]:
+        fresh_safe_lhs = pl.create_tensor([16, 128], dtype=pl.BF16)
+        _safe = self.worker(fresh_safe_lhs, safe_mutation, rhs, safe_out)
+        with pl.manual_scope():
+            result, _tid = pl.submit(self.worker, shared, shared, rhs, submit_out)
+        return result
+"""
+        )
+        before = self._stamp_mat_bridge_loads(before)
+        printed = ir.python_print(self._run_infer(before))
+        assert self._line_index(printed, "tile.load(lhs") > self._line_index(printed, "for n")
+        assert "__compiler_tensor_to_tile_mat_bridge" not in printed
+
+    @pytest.mark.parametrize("include_direct_call", [False, True], ids=["submit-only", "direct-plus-submit"])
+    def test_distinct_root_submit_always_declines_worker_residency(self, include_direct_call):
+        """Submit is never positive storage-disjointness evidence."""
+        direct_call = (
+            "_safe = self.worker(fresh_safe_lhs, safe_mutation, rhs, safe_out)" if include_direct_call else ""
+        )
+        before = pl.parse_program(
+            f"""
+@pl.program
+class MarkedDistinctSubmitResidency:
+    @pl.function(type=pl.FunctionType.InCore)
+    def worker(
+        self,
+        lhs: pl.Tensor[[16, 128], pl.BF16],
+        mutation: pl.InOut[pl.Tensor[[16, 128], pl.BF16]],
+        rhs: pl.Tensor[[128, 128], pl.BF16],
+        out: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+    ) -> pl.Tensor[[16, 128], pl.FP32]:
+        for n in pl.range(0, 2, 1):
+            lhs_mat = pl.tile.load(lhs, [0, 0], [16, 128], target_memory=pl.Mem.Mat)
+            rhs_mat = pl.tile.load(rhs, [0, 0], [128, 128], target_memory=pl.Mem.Mat)
+            lhs_left = pl.tile.move(lhs_mat, target_memory=pl.Mem.Left)
+            rhs_right = pl.tile.move(rhs_mat, target_memory=pl.Mem.Right)
+            c = pl.tile.matmul(lhs_left, rhs_right)
+        return out
+
+    @pl.function(type=pl.FunctionType.Orchestration)
+    def main(
+        self,
+        safe_mutation: pl.InOut[pl.Tensor[[16, 128], pl.BF16]],
+        submit_lhs: pl.Tensor[[16, 128], pl.BF16],
+        submit_mutation: pl.InOut[pl.Tensor[[16, 128], pl.BF16]],
+        rhs: pl.Tensor[[128, 128], pl.BF16],
+        safe_out: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+        submit_out: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+    ) -> pl.Tensor[[16, 128], pl.FP32]:
+        fresh_safe_lhs = pl.create_tensor([16, 128], dtype=pl.BF16)
+        {direct_call}
+        with pl.manual_scope():
+            result, _tid = pl.submit(
+                self.worker,
+                submit_lhs,
+                submit_mutation,
+                rhs,
+                submit_out,
+            )
+        return result
+"""
+        )
+        before = self._stamp_mat_bridge_loads(before)
+        printed = ir.python_print(self._run_infer(before))
+        assert self._line_index(printed, "tile.load(lhs") > self._line_index(printed, "for n")
+        assert "__compiler_tensor_to_tile_mat_bridge" not in printed
+
+    def test_external_root_parameters_do_not_prove_noalias(self):
+        """Distinct external parameters may still overlap at runtime."""
+        before = pl.parse_program(
+            """
+@pl.program
+class MarkedExternalAliasUnknown:
+    @pl.function(type=pl.FunctionType.InCore)
+    def worker(
+        self,
+        lhs: pl.Tensor[[16, 128], pl.BF16],
+        mutation: pl.InOut[pl.Tensor[[16, 128], pl.BF16]],
+        rhs: pl.Tensor[[128, 128], pl.BF16],
+        out: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+    ) -> pl.Tensor[[16, 128], pl.FP32]:
+        for n in pl.range(0, 2, 1):
+            lhs_mat = pl.tile.load(lhs, [0, 0], [16, 128], target_memory=pl.Mem.Mat)
+            rhs_mat = pl.tile.load(rhs, [0, 0], [128, 128], target_memory=pl.Mem.Mat)
+            lhs_left = pl.tile.move(lhs_mat, target_memory=pl.Mem.Left)
+            rhs_right = pl.tile.move(rhs_mat, target_memory=pl.Mem.Right)
+            c = pl.tile.matmul(lhs_left, rhs_right)
+        return out
+
+    @pl.function(type=pl.FunctionType.Orchestration)
+    def main(
+        self,
+        lhs: pl.Tensor[[16, 128], pl.BF16],
+        mutation: pl.InOut[pl.Tensor[[16, 128], pl.BF16]],
+        rhs: pl.Tensor[[128, 128], pl.BF16],
+        out: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+    ) -> pl.Tensor[[16, 128], pl.FP32]:
+        result = self.worker(lhs, mutation, rhs, out)
+        return result
+"""
+        )
+        before = self._stamp_mat_bridge_loads(before)
+        printed = ir.python_print(self._run_infer(before))
+        assert self._line_index(printed, "tile.load(lhs") > self._line_index(printed, "for n")
+        assert "__compiler_tensor_to_tile_mat_bridge" not in printed
+
+    def test_plain_alias_of_mat_panel_declines_residency(self):
+        """A plain SSA alias is an additional use of the shared Mat buffer."""
+        before = pl.parse_program(
+            """
+@pl.program
+class MarkedAliasedPanelResidency:
+    @pl.function(type=pl.FunctionType.InCore)
+    def worker(
+        self,
+        lhs: pl.Tensor[[16, 128], pl.BF16],
+        rhs: pl.Tensor[[128, 128], pl.BF16],
+        out: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+    ) -> pl.Tensor[[16, 128], pl.FP32]:
+        for n in pl.range(0, 2, 1):
+            lhs_mat = pl.tile.load(lhs, [0, 0], [16, 128], target_memory=pl.Mem.Mat)
+            alias = lhs_mat
+            patch = pl.tile.create([16, 128], dtype=pl.BF16, target_memory=pl.Mem.Mat)
+            alias_after = pl.tile.assemble(alias, patch, [0, 0])
+            rhs_mat = pl.tile.load(rhs, [0, 0], [128, 128], target_memory=pl.Mem.Mat)
+            lhs_left = pl.tile.move(lhs_mat, target_memory=pl.Mem.Left)
+            mutated_left = pl.tile.move(alias_after, target_memory=pl.Mem.Left)
+            rhs_right = pl.tile.move(rhs_mat, target_memory=pl.Mem.Right)
+            c = pl.tile.matmul(lhs_left, rhs_right)
+            mutated_c = pl.tile.matmul(mutated_left, rhs_right)
+        return out
+
+    @pl.function(type=pl.FunctionType.Orchestration)
+    def main(
+        self,
+        rhs: pl.Tensor[[128, 128], pl.BF16],
+        out: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+    ) -> pl.Tensor[[16, 128], pl.FP32]:
+        fresh_lhs = pl.create_tensor([16, 128], dtype=pl.BF16)
+        result = self.worker(fresh_lhs, rhs, out)
+        return result
+"""
+        )
+        before = self._stamp_mat_bridge_loads(before)
+        printed = ir.python_print(self._run_infer(before))
+        loop = self._line_index(printed, "for n")
+        assert self._line_index(printed, "tile.load(lhs") > loop
+        assert self._line_index(printed, "lhs_left", "tile.move") > loop
+        assert "__compiler_tensor_to_tile_mat_bridge" not in printed
+
+    def test_nested_chain_moves_one_lexical_level(self):
+        """Nested loops are rewritten independently without repeated bubbling."""
+        before = pl.parse_program(
+            """
+@pl.program
+class MarkedNestedResidency:
+    @pl.function(type=pl.FunctionType.InCore)
+    def worker(
+        self,
+        lhs: pl.Tensor[[16, 128], pl.BF16],
+        rhs: pl.Tensor[[128, 128], pl.BF16],
+        out: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+    ) -> pl.Tensor[[16, 128], pl.FP32]:
+        for outer in pl.range(0, 2, 1):
+            for inner in pl.range(0, 2, 1):
+                lhs_mat = pl.tile.load(lhs, [0, 0], [16, 128], target_memory=pl.Mem.Mat)
+                rhs_mat = pl.tile.load(rhs, [0, 0], [128, 128], target_memory=pl.Mem.Mat)
+                lhs_left = pl.tile.move(lhs_mat, target_memory=pl.Mem.Left)
+                rhs_right = pl.tile.move(rhs_mat, target_memory=pl.Mem.Right)
+                c = pl.tile.matmul(lhs_left, rhs_right)
+        return out
+
+    @pl.function(type=pl.FunctionType.Orchestration)
+    def main(
+        self,
+        rhs: pl.Tensor[[128, 128], pl.BF16],
+        out: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+    ) -> pl.Tensor[[16, 128], pl.FP32]:
+        fresh_lhs = pl.create_tensor([16, 128], dtype=pl.BF16)
+        result = self.worker(fresh_lhs, rhs, out)
+        return result
+"""
+        )
+        before = self._stamp_mat_bridge_loads(before)
+        printed = ir.python_print(self._run_infer(before))
+        outer = self._line_index(printed, "for outer")
+        inner = self._line_index(printed, "for inner")
+        lhs_load = self._line_index(printed, "tile.load(lhs")
+        lhs_left = self._line_index(printed, "lhs_left", "tile.move")
+        assert outer < lhs_load < inner
+        assert outer < lhs_left < inner
+        assert "__compiler_tensor_to_tile_mat_bridge" not in printed
+
+    def test_preceding_assigned_side_effect_closes_hoistable_prefix(self):
+        """An assigned store is an effect boundary, not a skippable definition."""
+        before = pl.parse_program(
+            """
+@pl.program
+class MarkedAssignedEffectResidency:
+    @pl.function(type=pl.FunctionType.InCore)
+    def worker(
+        self,
+        lhs: pl.Tensor[[16, 128], pl.BF16],
+        rhs: pl.Tensor[[128, 128], pl.BF16],
+        out: pl.InOut[pl.Tensor[[16, 128], pl.FP32]],
+    ) -> pl.Tensor[[16, 128], pl.FP32]:
+        for n in pl.range(0, 2, 1):
+            zero = pl.tile.create([16, 128], dtype=pl.FP32, target_memory=pl.Mem.Vec)
+            out = pl.tile.store(zero, [0, 0], out)
+            lhs_mat = pl.tile.load(lhs, [0, 0], [16, 128], target_memory=pl.Mem.Mat)
+            rhs_mat = pl.tile.load(rhs, [0, 0], [128, 128], target_memory=pl.Mem.Mat)
+            lhs_left = pl.tile.move(lhs_mat, target_memory=pl.Mem.Left)
+            rhs_right = pl.tile.move(rhs_mat, target_memory=pl.Mem.Right)
+            c = pl.tile.matmul(lhs_left, rhs_right)
+        return out
+
+    @pl.function(type=pl.FunctionType.Orchestration)
+    def main(
+        self,
+        rhs: pl.Tensor[[128, 128], pl.BF16],
+        out: pl.InOut[pl.Tensor[[16, 128], pl.FP32]],
+    ) -> pl.Tensor[[16, 128], pl.FP32]:
+        fresh_lhs = pl.create_tensor([16, 128], dtype=pl.BF16)
+        result = self.worker(fresh_lhs, rhs, out)
+        return result
+"""
+        )
+        before = self._stamp_mat_bridge_loads(before)
+        printed = ir.python_print(self._run_infer(before))
+        loop = self._line_index(printed, "for n")
+        store = self._line_index(printed, "tile.store")
+        lhs_load = self._line_index(printed, "tile.load(lhs")
+        assert loop < store < lhs_load
+        assert "__compiler_tensor_to_tile_mat_bridge" not in printed
+
+    def test_preceding_assigned_sync_closes_hoistable_prefix(self):
+        """An assigned synchronization builtin orders later memory reads."""
+        before = pl.parse_program(
+            """
+@pl.program
+class MarkedAssignedSyncResidency:
+    @pl.function(type=pl.FunctionType.InCore)
+    def worker(
+        self,
+        lhs: pl.Tensor[[16, 128], pl.BF16],
+        rhs: pl.Tensor[[128, 128], pl.BF16],
+        out: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+    ) -> pl.Tensor[[16, 128], pl.FP32]:
+        for n in pl.range(0, 2, 1):
+            fence = pl.system.fence()
+            lhs_mat = pl.tile.load(lhs, [0, 0], [16, 128], target_memory=pl.Mem.Mat)
+            rhs_mat = pl.tile.load(rhs, [0, 0], [128, 128], target_memory=pl.Mem.Mat)
+            lhs_left = pl.tile.move(lhs_mat, target_memory=pl.Mem.Left)
+            rhs_right = pl.tile.move(rhs_mat, target_memory=pl.Mem.Right)
+            c = pl.tile.matmul(lhs_left, rhs_right)
+        return out
+
+    @pl.function(type=pl.FunctionType.Orchestration)
+    def main(
+        self,
+        rhs: pl.Tensor[[128, 128], pl.BF16],
+        out: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+    ) -> pl.Tensor[[16, 128], pl.FP32]:
+        fresh_lhs = pl.create_tensor([16, 128], dtype=pl.BF16)
+        result = self.worker(fresh_lhs, rhs, out)
+        return result
+"""
+        )
+        before = self._stamp_mat_bridge_loads(before)
+        printed = ir.python_print(self._run_infer(before))
+        loop = self._line_index(printed, "for n")
+        fence = self._line_index(printed, "pl.system.fence")
+        lhs_load = self._line_index(printed, "tile.load(lhs")
+        assert loop < fence < lhs_load
+        assert "__compiler_tensor_to_tile_mat_bridge" not in printed
+
+    @pytest.mark.parametrize(
+        "following_sync",
+        [
+            "    fence = pl.system.fence()\n",
+            "    if n < 1:\n        fence = pl.system.fence()\n",
+        ],
+        ids=["direct", "conditional"],
+    )
+    def test_following_sync_keeps_residency_chain_inside_loop(self, following_sync):
+        """Residency cannot cross a later iteration's synchronization point."""
+        body = (
+            "for n in pl.range(0, 2, 1):\n"
+            + textwrap.indent(self._marked_matmul_chain(), "    ")
+            + following_sync
+        )
+        before = self._parse_marked_program(
+            self._basic_marked_params(),
+            "lhs, rhs, trips, out",
+            body,
+            fresh_param="lhs",
+            fresh_expr="pl.create_tensor([16, 128], dtype=pl.BF16)",
+        )
+        printed = ir.python_print(self._run_infer(before))
+        loop = self._line_index(printed, "for n")
+        assert self._line_index(printed, "tile.load(lhs") > loop
+        assert self._line_index(printed, "lhs_left", "tile.move") > loop
+        assert "__compiler_tensor_to_tile_mat_bridge" not in printed
+
+    def test_following_cross_core_op_keeps_residency_chain_inside_loop(self):
+        """Residency cannot cross a later iteration's cross-core transfer."""
+        body = (
+            "for n in pl.range(0, 2, 1):\n"
+            + textwrap.indent(self._marked_matmul_chain(), "    ")
+            + "    pl.tile.tpush_to_aiv(c, split=0)\n"
+        )
+        before = self._parse_marked_program(
+            self._basic_marked_params(),
+            "lhs, rhs, trips, out",
+            body,
+            fresh_param="lhs",
+            fresh_expr="pl.create_tensor([16, 128], dtype=pl.BF16)",
+        )
+        printed = ir.python_print(self._run_infer(before))
+        loop = self._line_index(printed, "for n")
+        assert self._line_index(printed, "tile.load(lhs") > loop
+        assert self._line_index(printed, "lhs_left", "tile.move") > loop
+        assert "__compiler_tensor_to_tile_mat_bridge" not in printed
+
+    def test_iter_initializer_helper_keeps_residency_chain_inside_loop(self):
+        """Residency cannot move before an ordering effect in a loop initializer."""
+        before = pl.parse_program(
+            """
+@pl.program
+class MarkedIterInitializerResidency:
+    @pl.function(type=pl.FunctionType.InCore)
+    def barrier(
+        self,
+        seed: pl.Tensor[[16, 128], pl.FP32],
+    ) -> pl.Tensor[[16, 128], pl.FP32]:
+        fence = pl.system.fence()
+        return seed
+
+    @pl.function(type=pl.FunctionType.InCore)
+    def worker(
+        self,
+        lhs: pl.Tensor[[16, 128], pl.BF16],
+        rhs: pl.Tensor[[128, 128], pl.BF16],
+        seed: pl.Tensor[[16, 128], pl.FP32],
+    ) -> pl.Tensor[[16, 128], pl.FP32]:
+        for n, (carry,) in pl.range(0, 2, 1, init_values=(self.barrier(seed),)):
+            lhs_mat = pl.tile.load(lhs, [0, 0], [16, 128], target_memory=pl.Mem.Mat)
+            rhs_mat = pl.tile.load(rhs, [0, 0], [128, 128], target_memory=pl.Mem.Mat)
+            lhs_left = pl.tile.move(lhs_mat, target_memory=pl.Mem.Left)
+            rhs_right = pl.tile.move(rhs_mat, target_memory=pl.Mem.Right)
+            c = pl.tile.matmul(lhs_left, rhs_right)
+            result = pl.yield_(seed)
+        return result
+
+    @pl.function(type=pl.FunctionType.Orchestration)
+    def main(
+        self,
+        rhs: pl.Tensor[[128, 128], pl.BF16],
+        seed: pl.Tensor[[16, 128], pl.FP32],
+    ) -> pl.Tensor[[16, 128], pl.FP32]:
+        fresh_lhs = pl.create_tensor([16, 128], dtype=pl.BF16)
+        result = self.worker(fresh_lhs, rhs, seed)
+        return result
+"""
+        )
+        before = self._stamp_mat_bridge_loads(before)
+        printed = ir.python_print(self._run_infer(before))
+        loop = self._line_index(printed, "for n")
+        assert self._line_index(printed, "tile.load(lhs") > loop
+        assert self._line_index(printed, "lhs_left", "tile.move") > loop
+        assert "__compiler_tensor_to_tile_mat_bridge" not in printed
+
+    def test_following_helper_call_keeps_residency_chain_inside_loop(self):
+        """A helper may hide synchronization and is an ordering boundary."""
+        before = pl.parse_program(
+            """
+@pl.program
+class MarkedHelperSyncResidency:
+    @pl.function(type=pl.FunctionType.InCore)
+    def barrier(
+        self,
+        out: pl.InOut[pl.Tensor[[16, 128], pl.FP32]],
+    ) -> pl.Tensor[[16, 128], pl.FP32]:
+        fence = pl.system.fence()
+        return out
+
+    @pl.function(type=pl.FunctionType.InCore)
+    def worker(
+        self,
+        lhs: pl.Tensor[[16, 128], pl.BF16],
+        rhs: pl.Tensor[[128, 128], pl.BF16],
+        out: pl.InOut[pl.Tensor[[16, 128], pl.FP32]],
+    ) -> pl.Tensor[[16, 128], pl.FP32]:
+        for n in pl.range(0, 2, 1):
+            lhs_mat = pl.tile.load(lhs, [0, 0], [16, 128], target_memory=pl.Mem.Mat)
+            rhs_mat = pl.tile.load(rhs, [0, 0], [128, 128], target_memory=pl.Mem.Mat)
+            lhs_left = pl.tile.move(lhs_mat, target_memory=pl.Mem.Left)
+            rhs_right = pl.tile.move(rhs_mat, target_memory=pl.Mem.Right)
+            c = pl.tile.matmul(lhs_left, rhs_right)
+            out = self.barrier(out)
+        return out
+
+    @pl.function(type=pl.FunctionType.Orchestration)
+    def main(
+        self,
+        rhs: pl.Tensor[[128, 128], pl.BF16],
+        out: pl.InOut[pl.Tensor[[16, 128], pl.FP32]],
+    ) -> pl.Tensor[[16, 128], pl.FP32]:
+        fresh_lhs = pl.create_tensor([16, 128], dtype=pl.BF16)
+        result = self.worker(fresh_lhs, rhs, out)
+        return result
+"""
+        )
+        before = self._stamp_mat_bridge_loads(before)
+        printed = ir.python_print(self._run_infer(before))
+        loop = self._line_index(printed, "for n")
+        assert self._line_index(printed, "tile.load(lhs") > loop
+        assert self._line_index(printed, "lhs_left", "tile.move") > loop
+        assert "__compiler_tensor_to_tile_mat_bridge" not in printed
+
+    def test_following_submit_keeps_residency_chain_inside_loop(self):
+        """Submit is a loop-wide ordering boundary distinct from Call."""
+
+        def build_program(following: str):
+            program = pl.parse_program(
+                f"""
+@pl.program
+class MarkedFollowingSubmitResidency:
+    @pl.function(type=pl.FunctionType.InCore)
+    def task(
+        self,
+        out: pl.InOut[pl.Tensor[[16, 128], pl.FP32]],
+    ) -> pl.Tensor[[16, 128], pl.FP32]:
+        return out
+
+    @pl.function(type=pl.FunctionType.Orchestration)
+    def worker(
+        self,
+        lhs: pl.Tensor[[16, 128], pl.BF16],
+        rhs: pl.Tensor[[128, 128], pl.BF16],
+        out: pl.InOut[pl.Tensor[[16, 128], pl.FP32]],
+    ) -> pl.Tensor[[16, 128], pl.FP32]:
+        for n in pl.range(0, 2, 1):
+            lhs_mat = pl.tile.load(lhs, [0, 0], [16, 128], target_memory=pl.Mem.Mat)
+            rhs_mat = pl.tile.load(rhs, [0, 0], [128, 128], target_memory=pl.Mem.Mat)
+            lhs_left = pl.tile.move(lhs_mat, target_memory=pl.Mem.Left)
+            rhs_right = pl.tile.move(rhs_mat, target_memory=pl.Mem.Right)
+            c = pl.tile.matmul(lhs_left, rhs_right)
+{textwrap.indent(textwrap.dedent(following).strip(), "            ")}
+        return out
+
+    @pl.function(type=pl.FunctionType.Orchestration)
+    def main(
+        self,
+        rhs: pl.Tensor[[128, 128], pl.BF16],
+        out: pl.InOut[pl.Tensor[[16, 128], pl.FP32]],
+    ) -> pl.Tensor[[16, 128], pl.FP32]:
+        fresh_lhs = pl.create_tensor([16, 128], dtype=pl.BF16)
+        result = self.worker(fresh_lhs, rhs, out)
+        return result
+"""
+            )
+
+            # Submit is valid only in orchestration syntax. Retype this
+            # deliberately constructed function after parsing so this pass's
+            # first-class Submit handling is covered even though residency
+            # currently rewrites only InCore functions.
+            functions = []
+            for function in program.functions.values():
+                if function.name != "worker":
+                    functions.append(function)
+                    continue
+                params = list(zip(function.params, function.param_directions, strict=True))
+                functions.append(
+                    ir.Function(
+                        function.name,
+                        params,
+                        function.return_types,
+                        function.body,
+                        function.span,
+                        ir.FunctionType.InCore,
+                    )
+                )
+            return self._stamp_mat_bridge_loads(ir.Program(functions, program.name, program.span))
+
+        control = build_program("")
+        control_printed = ir.python_print(self._run_infer(control))
+        assert self._line_index(control_printed, "tile.load(lhs") < self._line_index(control_printed, "for n")
+
+        before = build_program(
+            """
+with pl.manual_scope():
+    _result, _tid = pl.submit(self.task, out)
+"""
+        )
+        printed = ir.python_print(self._run_infer(before))
+        loop = self._line_index(printed, "for n")
+        assert self._line_index(printed, "tile.load(lhs") > loop
+        assert self._line_index(printed, "lhs_left", "tile.move") > loop
+        assert "__compiler_tensor_to_tile_mat_bridge" not in printed
+
+    def test_multiple_proven_safe_call_sites_allow_residency(self):
+        """Every caller may use different roots as long as each is provably disjoint."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def worker(
+                self,
+                lhs: pl.Tensor[[16, 128], pl.BF16],
+                rhs: pl.Tensor[[128, 256], pl.BF16],
+                out: pl.Out[pl.Tensor[[16, 256], pl.FP32]],
+            ) -> pl.Tensor[[16, 256], pl.FP32]:
+                for n, (acc,) in pl.range(0, 256, 128, init_values=(out,)):
+                    rhs_n = pl.slice(rhs, [128, 128], [0, n])
+                    c_n = pl.matmul(lhs, rhs_n, out_dtype=pl.FP32)
+                    acc_next = pl.assemble(acc, c_n, [0, n])
+                    result = pl.yield_(acc_next)
+                return result
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                rhs: pl.Tensor[[128, 256], pl.BF16],
+                out0: pl.Out[pl.Tensor[[16, 256], pl.FP32]],
+                out1: pl.Out[pl.Tensor[[16, 256], pl.FP32]],
+            ) -> pl.Tensor[[16, 256], pl.FP32]:
+                fresh_lhs0 = pl.create_tensor([16, 128], dtype=pl.BF16)
+                fresh_lhs1 = pl.create_tensor([16, 128], dtype=pl.BF16)
+                _ignored = self.worker(fresh_lhs0, rhs, out0)
+                result = self.worker(fresh_lhs1, rhs, out1)
+                return result
+
+        printed = ir.python_print(self._run_tensor_infer(Before))
+        assert self._line_index(printed, "lhs__ssa_v0_mat", "tile.load") < self._line_index(printed, "for n")
+
+    def test_unrelated_scalar_actual_does_not_block_residency(self):
+        """Only Tensor buffer roots participate in call-site alias proof."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def worker(
+                self,
+                lhs: pl.Tensor[[16, 128], pl.BF16],
+                rhs: pl.Tensor[[128, 256], pl.BF16],
+                unused_offset: pl.Scalar[pl.INDEX],
+                out: pl.Out[pl.Tensor[[16, 256], pl.FP32]],
+            ) -> pl.Tensor[[16, 256], pl.FP32]:
+                for n, (acc,) in pl.range(0, 256, 128, init_values=(out,)):
+                    rhs_n = pl.slice(rhs, [128, 128], [0, n])
+                    c_n = pl.matmul(lhs, rhs_n, out_dtype=pl.FP32)
+                    acc_next = pl.assemble(acc, c_n, [0, n])
+                    result = pl.yield_(acc_next)
+                return result
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                rhs: pl.Tensor[[128, 256], pl.BF16],
+                base: pl.Scalar[pl.INDEX],
+                out: pl.Out[pl.Tensor[[16, 256], pl.FP32]],
+            ) -> pl.Tensor[[16, 256], pl.FP32]:
+                fresh_lhs = pl.create_tensor([16, 128], dtype=pl.BF16)
+                result = self.worker(fresh_lhs, rhs, base + 1, out)
+                return result
+
+        printed = ir.python_print(self._run_tensor_infer(Before))
+        assert self._line_index(printed, "lhs__ssa_v0_mat", "tile.load") < self._line_index(printed, "for n")
+
+    def test_unknown_peer_read_actual_does_not_block_candidate(self):
+        """An unknown peer Tensor In root is irrelevant to the candidate proof."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def worker(
+                self,
+                lhs: pl.Tensor[[16, 128], pl.BF16],
+                rhs: pl.Tensor[[128, 256], pl.BF16],
+                out: pl.Out[pl.Tensor[[16, 256], pl.FP32]],
+            ) -> pl.Tensor[[16, 256], pl.FP32]:
+                for n, (acc,) in pl.range(0, 256, 128, init_values=(out,)):
+                    rhs_n = pl.slice(rhs, [128, 128], [0, n])
+                    c_n = pl.matmul(lhs, rhs_n, out_dtype=pl.FP32)
+                    acc_next = pl.assemble(acc, c_n, [0, n])
+                    result = pl.yield_(acc_next)
+                return result
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                backing_rhs: pl.Tensor[[256, 256], pl.BF16],
+                out: pl.Out[pl.Tensor[[16, 256], pl.FP32]],
+            ) -> pl.Tensor[[16, 256], pl.FP32]:
+                fresh_lhs = pl.create_tensor([16, 128], dtype=pl.BF16)
+                result = self.worker(fresh_lhs, pl.slice(backing_rhs, [128, 256], [0, 0]), out)
+                return result
+
+        printed = ir.python_print(self._run_tensor_infer(Before))
+        assert self._line_index(printed, "lhs__ssa_v0_mat", "tile.load") < self._line_index(printed, "for n")
+
+    def test_caller_backed_mixed_kernel_keeps_resident_aic_operand(self):
+        """The provenance-backed preheader survives subsequent mixed expansion."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                lhs: pl.Tensor[[16, 128], pl.BF16],
+                rhs: pl.Tensor[[128, 256], pl.BF16],
+                out: pl.Out[pl.Tensor[[16, 256], pl.FP32]],
+            ) -> pl.Tensor[[16, 256], pl.FP32]:
+                for n, (acc,) in pl.range(0, 256, 128, init_values=(out,)):
+                    rhs_n = pl.slice(rhs, [128, 128], [0, n])
+                    c_n = pl.matmul(lhs, rhs_n, out_dtype=pl.FP32)
+                    activated = pl.exp(c_n)
+                    acc_next = pl.assemble(acc, activated, [0, n])
+                    result = pl.yield_(acc_next)
+                return result
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                rhs: pl.Tensor[[128, 256], pl.BF16],
+                out: pl.Out[pl.Tensor[[16, 256], pl.FP32]],
+            ) -> pl.Tensor[[16, 256], pl.FP32]:
+                fresh_lhs = pl.create_tensor([16, 128], dtype=pl.BF16)
+                result = self.kernel(fresh_lhs, rhs, out)
+                return result
+
+        After = passes.expand_mixed_kernel()(self._run_tensor_infer(Before))
+        printed = ir.python_print(After)
+        aic_start = self._line_index(printed, "def kernel_aic")
+        lhs_load = next(
+            index
+            for index, line in enumerate(printed.splitlines()[aic_start:], start=aic_start)
+            if "lhs__ssa_v0_mat" in line and "tile.load" in line
+        )
+        aic_loop = next(
+            index
+            for index, line in enumerate(printed.splitlines()[aic_start:], start=aic_start)
+            if "for n" in line
+        )
+        assert lhs_load < aic_loop
+
+    def test_variant_offset_stays_inside_loop(self):
+        """A load whose offset uses the loop variable is not invariant."""
+        params = """
+lhs: pl.Tensor[[16, 256], pl.BF16],
+rhs: pl.Tensor[[128, 128], pl.BF16],
+out: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+"""
+        body = """
+for n in pl.range(0, 256, 128):
+    lhs_mat = pl.tile.load(lhs, [0, n], [16, 128], target_memory=pl.Mem.Mat)
+    rhs_mat = pl.tile.load(rhs, [0, 0], [128, 128], target_memory=pl.Mem.Mat)
+    lhs_left = pl.tile.move(lhs_mat, target_memory=pl.Mem.Left)
+    rhs_right = pl.tile.move(rhs_mat, target_memory=pl.Mem.Right)
+    c = pl.tile.matmul(lhs_left, rhs_right)
+"""
+        before = self._parse_marked_program(
+            params,
+            "lhs, rhs, out",
+            body,
+            fresh_param="lhs",
+            fresh_expr="pl.create_tensor([16, 256], dtype=pl.BF16)",
+        )
+        printed = ir.python_print(self._run_infer(before))
+        assert self._line_index(printed, "tile.load(lhs") > self._line_index(printed, "for n")
+        assert "__compiler_tensor_to_tile_mat_bridge" not in printed
+
+    def test_non_matmul_chain_is_not_a_residency_candidate(self):
+        """Residency is restricted to a stationary matmul operand role."""
+        params = """
+lhs: pl.Tensor[[16, 128], pl.BF16],
+out: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+"""
+        body = """
+for n in pl.range(0, 2):
+    lhs_mat = pl.tile.load(lhs, [0, 0], [16, 128], target_memory=pl.Mem.Mat)
+    lhs_vec = pl.tile.move(lhs_mat, target_memory=pl.Mem.Vec)
+"""
+        before = self._parse_marked_program(
+            params,
+            "lhs, out",
+            body,
+            fresh_param="lhs",
+            fresh_expr="pl.create_tensor([16, 128], dtype=pl.BF16)",
+        )
+        printed = ir.python_print(self._run_infer(before))
+        assert self._line_index(printed, "tile.load(lhs") > self._line_index(printed, "for n")
+        assert "__compiler_tensor_to_tile_mat_bridge" not in printed
+
+    def test_inout_source_stays_inside_loop(self):
+        """An InOut tensor may alias a write and is never considered resident."""
+        params = """
+lhs: pl.InOut[pl.Tensor[[16, 128], pl.BF16]],
+rhs: pl.Tensor[[128, 128], pl.BF16],
+out: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+"""
+        body = "for n in pl.range(0, 2):\n" + textwrap.indent(self._marked_matmul_chain(), "    ")
+        before = self._parse_marked_program(
+            params,
+            "lhs, rhs, out",
+            body,
+            fresh_param="lhs",
+            fresh_expr="pl.create_tensor([16, 128], dtype=pl.BF16)",
+        )
+        printed = ir.python_print(self._run_infer(before))
+        assert self._line_index(printed, "tile.load(lhs") > self._line_index(printed, "for n")
+        assert "__compiler_tensor_to_tile_mat_bridge" not in printed
+
+    def test_write_through_tensor_view_stays_inside_loop(self):
+        """A zero-copy tensor.view write aliases the candidate source storage."""
+        body = (
+            "lhs_view = pl.tensor.view(lhs, [16, 128])\n"
+            "for n in pl.range(0, 2, 1):\n"
+            + textwrap.indent(self._marked_matmul_chain(), "    ")
+            + "    zero = pl.tile.create([16, 128], dtype=pl.BF16, target_memory=pl.Mem.Vec)\n"
+            + "    updated_lhs = pl.tile.store(zero, [0, 0], lhs_view)\n"
+        )
+        before = self._parse_marked_program(
+            self._basic_marked_params(),
+            "lhs, rhs, trips, out",
+            body,
+            fresh_param="lhs",
+            fresh_expr="pl.create_tensor([16, 128], dtype=pl.BF16)",
+        )
+        printed = ir.python_print(self._run_infer(before))
+        assert self._line_index(printed, "tile.load(lhs") > self._line_index(printed, "for n")
+        assert "__compiler_tensor_to_tile_mat_bridge" not in printed
+
+    def test_one_aliasing_call_site_invalidates_safe_call_sites(self):
+        """One aliasing site poisons otherwise-safe compiler-owned storage."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def worker(
+                self,
+                lhs: pl.Tensor[[16, 128], pl.BF16],
+                mutation: pl.InOut[pl.Tensor[[16, 128], pl.BF16]],
+                rhs: pl.Tensor[[128, 256], pl.BF16],
+                out: pl.Out[pl.Tensor[[16, 256], pl.FP32]],
+            ) -> pl.Tensor[[16, 256], pl.FP32]:
+                for n, (acc,) in pl.range(0, 256, 128, init_values=(out,)):
+                    rhs_n = pl.slice(rhs, [128, 128], [0, n])
+                    c_n = pl.matmul(lhs, rhs_n, out_dtype=pl.FP32)
+                    acc_next = pl.assemble(acc, c_n, [0, n])
+                    result = pl.yield_(acc_next)
+                return result
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                safe_mutation: pl.InOut[pl.Tensor[[16, 128], pl.BF16]],
+                rhs: pl.Tensor[[128, 256], pl.BF16],
+                out0: pl.Out[pl.Tensor[[16, 256], pl.FP32]],
+                out1: pl.Out[pl.Tensor[[16, 256], pl.FP32]],
+            ) -> pl.Tensor[[16, 256], pl.FP32]:
+                fresh_safe_lhs = pl.create_tensor([16, 128], dtype=pl.BF16)
+                _ignored = self.worker(fresh_safe_lhs, safe_mutation, rhs, out0)
+                fresh_shared = pl.create_tensor([16, 128], dtype=pl.BF16)
+                shared_alias = fresh_shared
+                result = self.worker(fresh_shared, shared_alias, rhs, out1)
+                return result
+
+        printed = ir.python_print(self._run_tensor_infer(Before))
+        assert self._line_index(printed, "lhs__ssa_v0_mat", "tile.load") > self._line_index(printed, "for n")
+
+    def test_unknown_call_actual_root_declines_residency(self):
+        """The candidate Tensor In actual itself must have a known buffer root."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def worker(
+                self,
+                lhs: pl.Tensor[[16, 128], pl.BF16],
+                rhs: pl.Tensor[[128, 256], pl.BF16],
+                out: pl.Out[pl.Tensor[[16, 256], pl.FP32]],
+            ) -> pl.Tensor[[16, 256], pl.FP32]:
+                for n, (acc,) in pl.range(0, 256, 128, init_values=(out,)):
+                    rhs_n = pl.slice(rhs, [128, 128], [0, n])
+                    c_n = pl.matmul(lhs, rhs_n, out_dtype=pl.FP32)
+                    acc_next = pl.assemble(acc, c_n, [0, n])
+                    result = pl.yield_(acc_next)
+                return result
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                backing_lhs: pl.Tensor[[32, 128], pl.BF16],
+                rhs: pl.Tensor[[128, 256], pl.BF16],
+                out: pl.Out[pl.Tensor[[16, 256], pl.FP32]],
+            ) -> pl.Tensor[[16, 256], pl.FP32]:
+                result = self.worker(pl.slice(backing_lhs, [16, 128], [0, 0]), rhs, out)
+                return result
+
+        printed = ir.python_print(self._run_tensor_infer(Before))
+        assert self._line_index(printed, "lhs__ssa_v0_mat", "tile.load") > self._line_index(printed, "for n")
+
+    def test_marked_gate_fixture_positive_control(self):
+        """The shared decline fixture hoists when no tested blocker is present."""
+        body = "for n in pl.range(0, 2, 1):\n" + textwrap.indent(self._marked_matmul_chain(), "    ")
+        before = self._parse_marked_program(
+            self._basic_marked_params(),
+            "lhs, rhs, trips, out",
+            body,
+            fresh_param="lhs",
+            fresh_expr="pl.create_tensor([16, 128], dtype=pl.BF16)",
+        )
+        printed = ir.python_print(self._run_infer(before))
+        loop = self._line_index(printed, "for n")
+        assert self._line_index(printed, "tile.load(lhs") < loop
+        assert self._line_index(printed, "lhs_left", "tile.move") < loop
+        assert "__compiler_tensor_to_tile_mat_bridge" not in printed
+
+    def test_marked_stationary_rhs_positive_control(self):
+        """The exact single-use recognizer also supports a resident RHS panel."""
+        body = "for n in pl.range(0, 2, 1):\n" + textwrap.indent(self._marked_matmul_chain(), "    ")
+        before = self._parse_marked_program(
+            self._basic_marked_params(),
+            "lhs, rhs, trips, out",
+            body,
+            fresh_param="rhs",
+            fresh_expr="pl.create_tensor([128, 128], dtype=pl.BF16)",
+        )
+        printed = ir.python_print(self._run_infer(before))
+        loop = self._line_index(printed, "for n")
+        assert self._line_index(printed, "tile.load(lhs") > loop
+        assert self._line_index(printed, "tile.load(rhs") < loop
+        assert self._line_index(printed, "rhs_right", "tile.move") < loop
+        assert "__compiler_tensor_to_tile_mat_bridge" not in printed
+
+    def test_marked_mat_panel_fanout_hoists_only_load(self):
+        """Multiple matching L0 extracts retain their shared Mat panel."""
+        params = """
+lhs: pl.Tensor[[16, 128], pl.BF16],
+rhs: pl.Tensor[[64, 128], pl.BF16],
+out: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+"""
+        body = """
+for n in pl.range(0, 2, 1):
+    lhs_mat = pl.tile.load(lhs, [0, 0], [16, 128], target_memory=pl.Mem.Mat)
+    rhs_mat = pl.tile.load(rhs, [0, 0], [64, 128], target_memory=pl.Mem.Mat)
+    lhs_k0 = pl.tile.extract(lhs_mat, 0, 0, [16, 64], target_memory=pl.Mem.Left)
+    lhs_k1 = pl.tile.extract(lhs_mat, 0, 64, [16, 64], target_memory=pl.Mem.Left)
+    rhs_right = pl.tile.move(rhs_mat, target_memory=pl.Mem.Right)
+    c0 = pl.tile.matmul(lhs_k0, rhs_right)
+    c1 = pl.tile.matmul(lhs_k1, rhs_right)
+"""
+        before = self._parse_marked_program(
+            params,
+            "lhs, rhs, out",
+            body,
+            fresh_param="lhs",
+            fresh_expr="pl.create_tensor([16, 128], dtype=pl.BF16)",
+        )
+        printed = ir.python_print(self._run_infer(before))
+        loop = self._line_index(printed, "for n")
+        assert self._line_index(printed, "tile.load(lhs") < loop
+        assert self._line_index(printed, "lhs_k0", "tile.extract") > loop
+        assert self._line_index(printed, "lhs_k1", "tile.extract") > loop
+        assert self._line_index(printed, "tile.load(rhs") > loop
+        assert "__compiler_tensor_to_tile_mat_bridge" not in printed
+
+    def test_marked_transposed_mat_panel_fanout_hoists_only_load(self):
+        """A transposed Mat view may fan out while its staging stays local."""
+        params = """
+lhs: pl.Tensor[[128, 16], pl.BF16],
+rhs: pl.Tensor[[64, 128], pl.BF16],
+out: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+"""
+        body = """
+for n in pl.range(0, 2, 1):
+    lhs_mat = pl.tile.load(lhs, [0, 0], [128, 16], target_memory=pl.Mem.Mat)
+    lhs_t = pl.tile.transpose_view(lhs_mat)
+    rhs_mat = pl.tile.load(rhs, [0, 0], [64, 128], target_memory=pl.Mem.Mat)
+    lhs_k0 = pl.tile.extract(lhs_t, 0, 0, [16, 64], target_memory=pl.Mem.Left)
+    lhs_k1 = pl.tile.extract(lhs_t, 0, 64, [16, 64], target_memory=pl.Mem.Left)
+    rhs_right = pl.tile.move(rhs_mat, target_memory=pl.Mem.Right)
+    c0 = pl.tile.matmul(lhs_k0, rhs_right)
+    c1 = pl.tile.matmul(lhs_k1, rhs_right)
+"""
+        before = self._parse_marked_program(
+            params,
+            "lhs, rhs, out",
+            body,
+            fresh_param="lhs",
+            fresh_expr="pl.create_tensor([128, 16], dtype=pl.BF16)",
+        )
+        printed = ir.python_print(self._run_infer(before))
+        loop = self._line_index(printed, "for n")
+        assert self._line_index(printed, "tile.load(lhs") < loop
+        assert self._line_index(printed, "transpose_view") > loop
+        assert self._line_index(printed, "lhs_k0", "tile.extract") > loop
+        assert self._line_index(printed, "lhs_k1", "tile.extract") > loop
+        assert "__compiler_tensor_to_tile_mat_bridge" not in printed
+
+    def test_marked_mat_panel_with_unsupported_l0_use_declines(self):
+        """A non-matmul use of one staged tile rejects panel residency."""
+        params = """
+lhs: pl.Tensor[[16, 128], pl.BF16],
+rhs: pl.Tensor[[64, 128], pl.BF16],
+out: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+sink: pl.Out[pl.Tensor[[16, 64], pl.BF16]],
+"""
+        body = """
+for n in pl.range(0, 2, 1):
+    lhs_mat = pl.tile.load(lhs, [0, 0], [16, 128], target_memory=pl.Mem.Mat)
+    rhs_mat = pl.tile.load(rhs, [0, 0], [64, 128], target_memory=pl.Mem.Mat)
+    lhs_k0 = pl.tile.extract(lhs_mat, 0, 0, [16, 64], target_memory=pl.Mem.Left)
+    rhs_right = pl.tile.move(rhs_mat, target_memory=pl.Mem.Right)
+    c = pl.tile.matmul(lhs_k0, rhs_right)
+    stored = pl.tile.store(lhs_k0, [0, 0], sink)
+"""
+        before = self._parse_marked_program(
+            params,
+            "lhs, rhs, out, sink",
+            body,
+            fresh_param="lhs",
+            fresh_expr="pl.create_tensor([16, 128], dtype=pl.BF16)",
+        )
+        printed = ir.python_print(self._run_infer(before))
+        loop = self._line_index(printed, "for n")
+        assert self._line_index(printed, "tile.load(lhs") > loop
+        assert "__compiler_tensor_to_tile_mat_bridge" not in printed
+
+    def test_marked_transpose_prefix_positive_control(self):
+        """A single-use transpose view remains part of the resident prefix."""
+        params = """
+lhs: pl.Tensor[[128, 16], pl.BF16],
+rhs: pl.Tensor[[128, 128], pl.BF16],
+out: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+"""
+        body = """
+for n in pl.range(0, 2, 1):
+    lhs_mat = pl.tile.load(lhs, [0, 0], [128, 16], target_memory=pl.Mem.Mat)
+    lhs_t = pl.tile.transpose_view(lhs_mat)
+    rhs_mat = pl.tile.load(rhs, [0, 0], [128, 128], target_memory=pl.Mem.Mat)
+    lhs_left = pl.tile.move(lhs_t, target_memory=pl.Mem.Left)
+    rhs_right = pl.tile.move(rhs_mat, target_memory=pl.Mem.Right)
+    c = pl.tile.matmul(lhs_left, rhs_right)
+"""
+        before = self._parse_marked_program(
+            params,
+            "lhs, rhs, out",
+            body,
+            fresh_param="lhs",
+            fresh_expr="pl.create_tensor([128, 16], dtype=pl.BF16)",
+        )
+        printed = ir.python_print(self._run_infer(before))
+        loop = self._line_index(printed, "for n")
+        assert self._line_index(printed, "tile.load(lhs") < loop
+        assert self._line_index(printed, "transpose_view") < loop
+        assert self._line_index(printed, "lhs_left", "tile.move") < loop
+        assert "__compiler_tensor_to_tile_mat_bridge" not in printed
+
+    @pytest.mark.parametrize(
+        ("name", "body", "control_needle"),
+        [
+            (
+                "zero-trip",
+                "for n in pl.range(0, 0, 1):\n" + textwrap.indent(_marked_matmul_chain(), "    "),
+                "for n",
+            ),
+            (
+                "dynamic-trip",
+                "for n in pl.range(0, trips, 1):\n" + textwrap.indent(_marked_matmul_chain(), "    "),
+                "for n",
+            ),
+            (
+                "pipeline",
+                "for n in pl.pipeline(0, 2, 1, stage=2):\n" + textwrap.indent(_marked_matmul_chain(), "    "),
+                "pl.pipeline",
+            ),
+            (
+                "conditional",
+                "for n in pl.range(0, 2, 1):\n"
+                "    if n < 1:\n" + textwrap.indent(_marked_matmul_chain(), "        "),
+                "if ",
+            ),
+            (
+                "preceding-continue",
+                "for n in pl.range(0, 2, 1):\n"
+                "    if n < 1:\n"
+                "        continue\n" + textwrap.indent(_marked_matmul_chain(), "    "),
+                "continue",
+            ),
+        ],
+        ids=["zero-trip", "dynamic-trip", "pipeline", "conditional", "preceding-continue"],
+    )
+    def test_marked_chain_declines_control_flow_gates(self, name, body, control_needle):
+        """Provenance-backed candidates still obey speculation/control-flow gates."""
+        before = self._parse_marked_program(
+            self._basic_marked_params(),
+            "lhs, rhs, trips, out",
+            body,
+            fresh_param="lhs",
+            fresh_expr="pl.create_tensor([16, 128], dtype=pl.BF16)",
+        )
+        printed = ir.python_print(self._run_infer(before))
+        assert self._line_index(printed, "tile.load(lhs") > self._line_index(printed, control_needle), name
+        assert "__compiler_tensor_to_tile_mat_bridge" not in printed
+
+    def test_marked_yielded_chain_does_not_hoist(self):
+        """A marked matmul operand that is loop-carried/yielded remains loop-local."""
+        chain = self._marked_matmul_chain()
+        body = (
+            "seed = pl.tile.create([16, 128], dtype=pl.BF16, target_memory=pl.Mem.Left)\n"
+            "for n, (carry,) in pl.range(0, 2, 1, init_values=(seed,)):\n"
+            + textwrap.indent(chain, "    ")
+            + "    carried = pl.yield_(lhs_left)\n"
+        )
+        before = self._parse_marked_program(
+            self._basic_marked_params(),
+            "lhs, rhs, trips, out",
+            body,
+            fresh_param="lhs",
+            fresh_expr="pl.create_tensor([16, 128], dtype=pl.BF16)",
+        )
+        printed = ir.python_print(self._run_infer(before))
+        loop = self._line_index(printed, "for n")
+        # The independent GM->Mat prefix may still become resident, but the
+        # yielded L0 value itself must keep its loop-local definition.
+        assert self._line_index(printed, "lhs_left", "tile.move") > loop
+        assert "__compiler_tensor_to_tile_mat_bridge" not in printed
+
+    def test_marked_terminal_with_second_eval_use_does_not_hoist(self):
+        """A tpush EvalStmt is a real second use of the terminal L0 value."""
+        body = (
+            "for n in pl.range(0, 2, 1):\n"
+            + textwrap.indent(self._marked_matmul_chain(), "    ")
+            + "    pl.tile.tpush_to_aiv(lhs_left, split=0)\n"
+        )
+        before = self._parse_marked_program(
+            self._basic_marked_params(),
+            "lhs, rhs, trips, out",
+            body,
+            fresh_param="lhs",
+            fresh_expr="pl.create_tensor([16, 128], dtype=pl.BF16)",
+        )
+        printed = ir.python_print(self._run_infer(before))
+        loop = self._line_index(printed, "for n")
+        assert self._line_index(printed, "tile.load(lhs") > loop
+        assert self._line_index(printed, "lhs_left", "tile.move") > loop
+        assert "__compiler_tensor_to_tile_mat_bridge" not in printed
+
+    def test_marked_if_return_offset_is_tracked_as_loop_local(self):
+        """An IfStmt return used as a load offset keeps the exact chain local."""
+        params = """
+lhs: pl.Tensor[[16, 256], pl.BF16],
+rhs: pl.Tensor[[128, 128], pl.BF16],
+out: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+"""
+        body = """
+for n in pl.range(0, 2, 1):
+    if n < 1:
+        offset = 0
+    else:
+        offset = 128
+    lhs_mat = pl.tile.load(lhs, [0, offset], [16, 128], target_memory=pl.Mem.Mat)
+    rhs_mat = pl.tile.load(rhs, [0, 0], [128, 128], target_memory=pl.Mem.Mat)
+    lhs_left = pl.tile.move(lhs_mat, target_memory=pl.Mem.Left)
+    rhs_right = pl.tile.move(rhs_mat, target_memory=pl.Mem.Right)
+    c = pl.tile.matmul(lhs_left, rhs_right)
+"""
+        before = self._parse_marked_program(
+            params,
+            "lhs, rhs, out",
+            body,
+            fresh_param="lhs",
+            fresh_expr="pl.create_tensor([16, 256], dtype=pl.BF16)",
+        )
+        printed = ir.python_print(self._run_infer(before))
+        loop = self._line_index(printed, "for n")
+        assert self._line_index(printed, "tile.load(lhs") > loop
+        assert "__compiler_tensor_to_tile_mat_bridge" not in printed
+
+    @pytest.mark.parametrize(
+        (
+            "name",
+            "params",
+            "call_args",
+            "body",
+            "resident_needle",
+            "fresh_param",
+            "fresh_expr",
+        ),
+        [
+            (
+                "l1",
+                """
+a: pl.Tensor[[512, 256], pl.BF16],
+b: pl.Tensor[[512, 256], pl.BF16],
+rhs: pl.Tensor[[128, 128], pl.BF16],
+out: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+""",
+                "a, b, rhs, out",
+                """
+for n in pl.range(0, 2, 1):
+    a_mat = pl.tile.load(a, [0, 0], [512, 256], target_memory=pl.Mem.Mat)
+    b_mat = pl.tile.load(b, [0, 0], [512, 256], target_memory=pl.Mem.Mat)
+    rhs_mat = pl.tile.load(rhs, [0, 0], [128, 128], target_memory=pl.Mem.Mat)
+    a_left = pl.tile.extract(a_mat, 0, 0, [16, 128], target_memory=pl.Mem.Left)
+    b_left = pl.tile.extract(b_mat, 0, 0, [16, 128], target_memory=pl.Mem.Left)
+    rhs_right = pl.tile.move(rhs_mat, target_memory=pl.Mem.Right)
+    ca = pl.tile.matmul(a_left, rhs_right)
+    cb = pl.tile.matmul(b_left, rhs_right)
+                """,
+                "tile.load(a",
+                "a",
+                "pl.create_tensor([512, 256], dtype=pl.BF16)",
+            ),
+            (
+                "l0a",
+                """
+a: pl.Tensor[[256, 128], pl.BF16],
+b: pl.Tensor[[256, 128], pl.BF16],
+rhs: pl.Tensor[[128, 128], pl.BF16],
+out: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+""",
+                "a, b, rhs, out",
+                """
+for n in pl.range(0, 2, 1):
+    a_mat = pl.tile.load(a, [0, 0], [256, 128], target_memory=pl.Mem.Mat)
+    b_mat = pl.tile.load(b, [0, 0], [256, 128], target_memory=pl.Mem.Mat)
+    rhs_mat = pl.tile.load(rhs, [0, 0], [128, 128], target_memory=pl.Mem.Mat)
+    a_left = pl.tile.move(a_mat, target_memory=pl.Mem.Left)
+    b_left = pl.tile.move(b_mat, target_memory=pl.Mem.Left)
+    rhs_right = pl.tile.move(rhs_mat, target_memory=pl.Mem.Right)
+    ca = pl.tile.matmul(a_left, rhs_right)
+    cb = pl.tile.matmul(b_left, rhs_right)
+                """,
+                "a_left",
+                "a",
+                "pl.create_tensor([256, 128], dtype=pl.BF16)",
+            ),
+            (
+                "l0b",
+                """
+lhs: pl.Tensor[[16, 128], pl.BF16],
+rhs0: pl.Tensor[[128, 256], pl.BF16],
+rhs1: pl.Tensor[[128, 256], pl.BF16],
+out: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+""",
+                "lhs, rhs0, rhs1, out",
+                """
+for n in pl.range(0, 2, 1):
+    lhs_mat = pl.tile.load(lhs, [0, 0], [16, 128], target_memory=pl.Mem.Mat)
+    rhs0_mat = pl.tile.load(rhs0, [0, 0], [128, 256], target_memory=pl.Mem.Mat)
+    rhs1_mat = pl.tile.load(rhs1, [0, 0], [128, 256], target_memory=pl.Mem.Mat)
+    lhs_left = pl.tile.move(lhs_mat, target_memory=pl.Mem.Left)
+    rhs0_right = pl.tile.move(rhs0_mat, target_memory=pl.Mem.Right)
+    rhs1_right = pl.tile.move(rhs1_mat, target_memory=pl.Mem.Right)
+    c0 = pl.tile.matmul(lhs_left, rhs0_right)
+    c1 = pl.tile.matmul(lhs_left, rhs1_right)
+                """,
+                "rhs0_right",
+                "rhs0",
+                "pl.create_tensor([128, 256], dtype=pl.BF16)",
+            ),
+            (
+                "outer-live",
+                """
+outer: pl.Tensor[[320, 384], pl.FP32],
+lhs: pl.Tensor[[16, 128], pl.BF16],
+rhs: pl.Tensor[[128, 128], pl.BF16],
+out: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+""",
+                "outer, lhs, rhs, out",
+                """
+outer_mat = pl.tile.load(outer, [0, 0], [320, 384], target_memory=pl.Mem.Mat)
+for n in pl.range(0, 2, 1):
+    lhs_mat = pl.tile.load(lhs, [0, 0], [16, 128], target_memory=pl.Mem.Mat)
+    rhs_mat = pl.tile.load(rhs, [0, 0], [128, 128], target_memory=pl.Mem.Mat)
+    lhs_left = pl.tile.move(lhs_mat, target_memory=pl.Mem.Left)
+    rhs_right = pl.tile.move(rhs_mat, target_memory=pl.Mem.Right)
+    c = pl.tile.matmul(lhs_left, rhs_right)
+                """,
+                "tile.load(lhs",
+                "lhs",
+                "pl.create_tensor([16, 128], dtype=pl.BF16)",
+            ),
+            (
+                "explicit-reserve",
+                """
+lhs: pl.Tensor[[16, 128], pl.BF16],
+rhs: pl.Tensor[[128, 128], pl.BF16],
+out: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+""",
+                "lhs, rhs, out",
+                """
+reserved = pl.reserve_buffer(name="residency_test", size=4096)
+for n in pl.range(0, 2, 1):
+    lhs_mat = pl.tile.load(lhs, [0, 0], [16, 128], target_memory=pl.Mem.Mat)
+    rhs_mat = pl.tile.load(rhs, [0, 0], [128, 128], target_memory=pl.Mem.Mat)
+    lhs_left = pl.tile.move(lhs_mat, target_memory=pl.Mem.Left)
+    rhs_right = pl.tile.move(rhs_mat, target_memory=pl.Mem.Right)
+    c = pl.tile.matmul(lhs_left, rhs_right)
+                """,
+                "tile.load(lhs",
+                "lhs",
+                "pl.create_tensor([16, 128], dtype=pl.BF16)",
+            ),
+        ],
+    )
+    def test_marked_chain_declines_capacity_and_reserve_gates(
+        self,
+        name,
+        params,
+        call_args,
+        body,
+        resident_needle,
+        fresh_param,
+        fresh_expr,
+    ):
+        """Real marked candidates exercise every capacity/reservation gate."""
+        before = self._parse_marked_program(
+            params,
+            call_args,
+            body,
+            fresh_param=fresh_param,
+            fresh_expr=fresh_expr,
+        )
+        printed = ir.python_print(self._run_infer(before))
+        loop = self._line_index(printed, "for n")
+        assert self._line_index(printed, resident_needle) > loop, name
+        assert "__compiler_tensor_to_tile_mat_bridge" not in printed
+
+    def test_manual_tile_load_is_not_hoisted(self):
+        """Hand-authored tile loads do not carry Tensor-to-Tile provenance."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                lhs: pl.Tensor[[16, 128], pl.BF16],
+                rhs: pl.Tensor[[128, 256], pl.BF16],
+                out: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+            ) -> pl.Tensor[[16, 128], pl.FP32]:
+                for outer in pl.range(0, 2):
+                    for n in pl.range(0, 256, 128):
+                        lhs_mat = pl.load(lhs, [0, 0], [16, 128], target_memory=pl.Mem.Mat)
+                        rhs_mat = pl.load(rhs, [0, n], [128, 128], target_memory=pl.Mem.Mat)
+                        lhs_left = pl.move(lhs_mat, target_memory=pl.Mem.Left)
+                        rhs_right = pl.move(rhs_mat, target_memory=pl.Mem.Right)
+                        c = pl.matmul(lhs_left, rhs_right)
+                        out = pl.store(c, [0, 0], out)
+                return out
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                rhs: pl.Tensor[[128, 256], pl.BF16],
+                out: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+            ) -> pl.Tensor[[16, 128], pl.FP32]:
+                fresh_lhs = pl.create_tensor([16, 128], dtype=pl.BF16)
+                result = self.kernel(fresh_lhs, rhs, out)
+                return result
+
+        printed = ir.python_print(self._run_infer(Before))
+        inner_loop = self._line_index(printed, "for n")
+        assert self._line_index(printed, "tile.load(lhs") > inner_loop
+        assert self._line_index(printed, "lhs_left", "tile.move") > inner_loop
+        assert self._line_index(printed, "tile.load(rhs") > inner_loop
+
+    def test_manual_transpose_view_chain_is_not_hoisted(self):
+        """Provenance is required even for an otherwise eligible transpose chain."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                lhs: pl.Tensor[[128, 16], pl.BF16],
+                rhs: pl.Tensor[[128, 128], pl.BF16],
+                out: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+            ) -> pl.Tensor[[16, 128], pl.FP32]:
+                for n in pl.range(0, 2):
+                    lhs_mat = pl.load(lhs, [0, 0], [128, 16], target_memory=pl.Mem.Mat)
+                    lhs_t = pl.tile.transpose_view(lhs_mat)
+                    rhs_mat = pl.load(rhs, [0, 0], [128, 128], target_memory=pl.Mem.Mat)
+                    lhs_left = pl.move(lhs_t, target_memory=pl.Mem.Left)
+                    rhs_right = pl.move(rhs_mat, target_memory=pl.Mem.Right)
+                    c = pl.matmul(lhs_left, rhs_right)
+                    out = pl.store(c, [0, 0], out)
+                return out
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                rhs: pl.Tensor[[128, 128], pl.BF16],
+                out: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+            ) -> pl.Tensor[[16, 128], pl.FP32]:
+                fresh_lhs = pl.create_tensor([128, 16], dtype=pl.BF16)
+                result = self.kernel(fresh_lhs, rhs, out)
+                return result
+
+        printed = ir.python_print(self._run_infer(Before))
+        loop = self._line_index(printed, "for n")
+        assert self._line_index(printed, "tile.load(lhs") > loop
+        assert self._line_index(printed, "transpose_view") > loop
+        assert self._line_index(printed, "lhs_left", "tile.move") > loop
+
+
+class TestRewrittenTileLayout:
+    """Rewritten producer layouts must reach aliases and loop carries (#2753)."""
+
+    def test_alias_chain_inherits_rewritten_view(self):
+        backend.set_backend_type(BackendType.Ascend950)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.AIV)
+            def kernel(
+                self,
+                x: pl.Tile[[32, 128], pl.FP32, pl.Mem.Acc, pl.TileView(valid_shape=[17, 96])],
+            ):
+                value = pl.mul(x, 1.0)
+                alias = value
+                alias2 = alias
+                _result = pl.add(alias2, alias)
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.AIV)
+            def kernel(
+                self,
+                x: pl.Tile[[32, 128], pl.FP32, pl.Mem.Acc, pl.TileView(valid_shape=[17, 96])],
+            ):
+                x_Vec = pl.move(
+                    x,
+                    target_memory=pl.Mem.Vec,
+                    blayout=pl.TileLayout.row_major,
+                    slayout=pl.TileLayout.none_box,
+                )
+                value = pl.mul(x_Vec, 1.0)
+                alias = value
+                alias2 = alias
+                _result = pl.add(alias2, alias)
+
+        After = passes.infer_tile_memory_space()(Before)
+        ir.assert_structural_equal(After, Expected)
+        ir.assert_structural_equal(pl.parse_program(ir.python_print(After)), After)
+
+    @pytest.mark.parametrize("stop", [0, 1, 20])
+    def test_nested_for_carries_inherit_rewritten_layout(self, stop):
+        backend.set_backend_type(BackendType.Ascend950)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.AIV)
+            def kernel(self, x: pl.Tile[[32, 128], pl.FP32, pl.Mem.Acc]):
+                value = pl.mul(x, 1.0)
+                for i, (acc, held) in pl.range(stop, init_values=(value, value)):
+                    alias = held
+                    for j, (inner,) in pl.range(2, init_values=(acc,)):
+                        total = pl.add(inner, alias)
+                        inner_result = pl.yield_(total)
+                    result, held_result = pl.yield_(inner_result, held)
+                _output = pl.add(result, held_result)
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.AIV)
+            def kernel(self, x: pl.Tile[[32, 128], pl.FP32, pl.Mem.Acc]):
+                x_Vec = pl.move(
+                    x,
+                    target_memory=pl.Mem.Vec,
+                    blayout=pl.TileLayout.row_major,
+                    slayout=pl.TileLayout.none_box,
+                )
+                value = pl.mul(x_Vec, 1.0)
+                for i, (acc, held) in pl.range(stop, init_values=(value, value)):
+                    alias = held
+                    for j, (inner,) in pl.range(2, init_values=(acc,)):
+                        total = pl.add(inner, alias)
+                        inner_result = pl.yield_(total)
+                    result, held_result = pl.yield_(inner_result, held)
+                _output = pl.add(result, held_result)
+
+        After = passes.infer_tile_memory_space()(Before)
+        ir.assert_structural_equal(After, Expected)
+        ir.assert_structural_equal(pl.parse_program(ir.python_print(After)), After)
+
+    def test_while_carries_inherit_rewritten_layout(self):
+        backend.set_backend_type(BackendType.Ascend950)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.AIV)
+            def kernel(self, x: pl.Tile[[32, 128], pl.FP32, pl.Mem.Acc], count: pl.Scalar[pl.INT32]):
+                value = pl.mul(x, 1.0)
+                for acc, remaining in pl.while_(init_values=(value, count)):
+                    pl.cond(remaining > 0)
+                    alias = acc
+                    total = pl.add(acc, alias)
+                    result, remaining_result = pl.yield_(total, remaining - pl.const(1, pl.INT32))
+                _output = pl.mul(result, 1.0)
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.AIV)
+            def kernel(self, x: pl.Tile[[32, 128], pl.FP32, pl.Mem.Acc], count: pl.Scalar[pl.INT32]):
+                x_Vec = pl.move(
+                    x,
+                    target_memory=pl.Mem.Vec,
+                    blayout=pl.TileLayout.row_major,
+                    slayout=pl.TileLayout.none_box,
+                )
+                value = pl.mul(x_Vec, 1.0)
+                for acc, remaining in pl.while_(init_values=(value, count)):
+                    pl.cond(remaining > 0)
+                    alias = acc
+                    total = pl.add(acc, alias)
+                    result, remaining_result = pl.yield_(total, remaining - pl.const(1, pl.INT32))
+                _output = pl.mul(result, 1.0)
+
+        After = passes.infer_tile_memory_space()(Before)
+        ir.assert_structural_equal(After, Expected)
+        ir.assert_structural_equal(pl.parse_program(ir.python_print(After)), After)
+
+    def test_explicit_boxed_vec_layout_is_preserved(self):
+        backend.set_backend_type(BackendType.Ascend950)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.AIV)
+            def kernel(
+                self,
+                x: pl.Tile[
+                    [32, 128],
+                    pl.FP32,
+                    pl.Mem.Vec,
+                    pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major),
+                ],
+            ):
+                alias = x
+                for i, (acc,) in pl.range(2, init_values=(alias,)):
+                    held = acc
+                    result = pl.yield_(held)
+                _output = result
+
+        ir.assert_structural_equal(passes.infer_tile_memory_space()(Before), Before)
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

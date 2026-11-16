@@ -1,0 +1,412 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+
+"""Unit tests for UnrollLoops pass.
+
+Tests use the Before/Expected pattern with @pl.program decorator.
+Unrolled IR is piped through convert_to_ssa() so that structural
+equality (assert_structural_equal) can be used for all comparisons.
+"""
+
+import pypto.language as pl
+import pytest
+from pypto import InternalError, ir, passes
+from pypto.ir.printer import python_print
+from pypto.language.parser.diagnostics import ParserSyntaxError
+
+
+def _unroll_and_ssa(program):
+    """Apply unroll_loops followed by convert_to_ssa."""
+    return passes.convert_to_ssa()(passes.unroll_loops()(program))
+
+
+class TestBasicUnroll:
+    """Tests for basic loop unrolling."""
+
+    def test_simple_unroll(self):
+        """Unroll a simple loop with 3 iterations."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                for i in pl.unroll(3):
+                    x = pl.add(x, 1.0)
+                return x
+
+        @pl.program
+        class Expected:
+            @pl.function(strict_ssa=True)
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                x_0: pl.Tensor[[64], pl.FP32] = pl.add(x, 1.0)
+                x_1: pl.Tensor[[64], pl.FP32] = pl.add(x_0, 1.0)
+                x_2: pl.Tensor[[64], pl.FP32] = pl.add(x_1, 1.0)
+                return x_2
+
+        After = _unroll_and_ssa(Before)
+        ir.assert_structural_equal(After, Expected)
+
+    def test_unroll_with_start_stop_step(self):
+        """Unroll with explicit start, stop, step: unroll(0, 6, 2) -> 3 iterations."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                for i in pl.unroll(0, 6, 2):
+                    x = pl.add(x, 1.0)
+                return x
+
+        @pl.program
+        class Expected:
+            @pl.function(strict_ssa=True)
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                x_0: pl.Tensor[[64], pl.FP32] = pl.add(x, 1.0)
+                x_1: pl.Tensor[[64], pl.FP32] = pl.add(x_0, 1.0)
+                x_2: pl.Tensor[[64], pl.FP32] = pl.add(x_1, 1.0)
+                return x_2
+
+        After = _unroll_and_ssa(Before)
+        ir.assert_structural_equal(After, Expected)
+
+    def test_unroll_loop_var_in_expression(self):
+        """Verify loop variable is substituted with constants in expressions."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                for i in pl.unroll(3):
+                    # ``i`` is an INDEX loop var; a tile/tensor scalar operand may
+                    # not carry ``index``, so cast it (see _normalize_scalar_operand).
+                    x = pl.add(x, pl.cast(i, pl.INT32))
+                return x
+
+        @pl.program
+        class Expected:
+            @pl.function(strict_ssa=True)
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                x_0: pl.Tensor[[64], pl.FP32] = pl.add(x, pl.cast(pl.const(0, pl.INDEX), pl.INT32))
+                x_1: pl.Tensor[[64], pl.FP32] = pl.add(x_0, pl.cast(pl.const(1, pl.INDEX), pl.INT32))
+                x_2: pl.Tensor[[64], pl.FP32] = pl.add(x_1, pl.cast(pl.const(2, pl.INDEX), pl.INT32))
+                return x_2
+
+        After = _unroll_and_ssa(Before)
+        ir.assert_structural_equal(After, Expected)
+
+    def test_single_iteration_unroll(self):
+        """Unroll with a single iteration."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                for i in pl.unroll(1):
+                    x = pl.add(x, 1.0)
+                return x
+
+        @pl.program
+        class Expected:
+            @pl.function(strict_ssa=True)
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                x_0: pl.Tensor[[64], pl.FP32] = pl.add(x, 1.0)
+                return x_0
+
+        After = _unroll_and_ssa(Before)
+        ir.assert_structural_equal(After, Expected)
+
+    def test_negative_step_unroll(self):
+        """Negative step unroll(6, 0, -2) iterates i = 6, 4, 2 (3 iterations).
+
+        Exercises both the ``step < 0`` trip-count / emit branches
+        (unroll_loops_pass.cpp:99-101, 124-126) and the ``Neg(ConstInt)``
+        negative-literal extraction in GetConstIntValue (lines 58-64): the
+        parser represents the ``-2`` step as ``neg(ConstInt(2))``. The loop
+        variable is substituted with each descending constant value, so the
+        added literals must be 6, 4, 2 in that order.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                for i in pl.unroll(6, 0, -2):
+                    # ``i`` is an INDEX loop var; cast before use as a scalar operand.
+                    x = pl.add(x, pl.cast(i, pl.INT32))
+                return x
+
+        @pl.program
+        class Expected:
+            @pl.function(strict_ssa=True)
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                x_0: pl.Tensor[[64], pl.FP32] = pl.add(x, pl.cast(pl.const(6, pl.INDEX), pl.INT32))
+                x_1: pl.Tensor[[64], pl.FP32] = pl.add(x_0, pl.cast(pl.const(4, pl.INDEX), pl.INT32))
+                x_2: pl.Tensor[[64], pl.FP32] = pl.add(x_1, pl.cast(pl.const(2, pl.INDEX), pl.INT32))
+                return x_2
+
+        After = _unroll_and_ssa(Before)
+        ir.assert_structural_equal(After, Expected)
+
+
+class TestNestedLoops:
+    """Tests for unrolling with nested loops."""
+
+    def test_unroll_inside_regular_loop(self):
+        """Unroll loop nested inside a regular pl.range() loop."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(self, x: pl.Tensor[[64], pl.FP32], n: pl.Scalar[pl.INT64]) -> pl.Tensor[[64], pl.FP32]:
+                for j in pl.range(n):
+                    for i in pl.unroll(2):
+                        x = pl.add(x, 1.0)
+                return x
+
+        @pl.program
+        class Expected:
+            @pl.function(strict_ssa=True)
+            def main(self, x: pl.Tensor[[64], pl.FP32], n: pl.Scalar[pl.INT64]) -> pl.Tensor[[64], pl.FP32]:
+                for j, (x_iter,) in pl.range(n, init_values=(x,)):
+                    x_0: pl.Tensor[[64], pl.FP32] = pl.add(x_iter, 1.0)
+                    x_1: pl.Tensor[[64], pl.FP32] = pl.add(x_0, 1.0)
+                    x_rv = pl.yield_(x_1)
+                return x_rv
+
+        After = _unroll_and_ssa(Before)
+        ir.assert_structural_equal(After, Expected)
+
+    def test_regular_loop_not_unrolled(self):
+        """Regular (non-unroll) loops should remain unchanged."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                for i in pl.range(10):
+                    x = pl.add(x, 1.0)
+                return x
+
+        After = passes.unroll_loops()(Before)
+        ir.assert_structural_equal(After, Before)
+
+
+class TestZeroTripLoop:
+    """Tests for zero-trip unrolled loops."""
+
+    def test_zero_trip(self):
+        """Unroll loop with zero iterations produces empty body."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                for i in pl.unroll(0, 0, 1):
+                    x = pl.add(x, 1.0)
+                return x
+
+        @pl.program
+        class Expected:
+            @pl.function(strict_ssa=True)
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return x
+
+        After = _unroll_and_ssa(Before)
+        ir.assert_structural_equal(After, Expected)
+
+
+class TestUnrollLimits:
+    """Tests for the compile-time unroll trip-count limit."""
+
+    def test_trip_count_exceeds_max_raises(self):
+        """Trip count above kMaxUnrollIterations (1024) raises ValueError.
+
+        unroll_loops_pass.cpp:102-106 rejects any loop whose computed trip
+        count exceeds 1024. ``pl.unroll(2000)`` has trip count 2000 > 1024,
+        so running the pass must raise rather than expand 2000 body copies.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                for i in pl.unroll(2000):
+                    x = pl.add(x, 1.0)
+                return x
+
+        with pytest.raises(ValueError, match="exceeds maximum allowed"):
+            passes.unroll_loops()(Before)
+
+
+class TestParserValidation:
+    """Tests for parser-level validation of pl.unroll()."""
+
+    def test_unroll_with_init_values_roundtrips_but_cannot_be_unrolled(self):
+        """SSA Unroll is representable IR, but violates UnrollLoops' input contract."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                for i, (acc,) in pl.unroll(3, init_values=(x,)):
+                    updated = pl.add(acc, 1.0)
+                    result = pl.yield_(updated)
+                return result
+
+        restored = pl.parse_program(python_print(Before, format=False))
+        ir.assert_structural_equal(Before, restored)
+        assert ir.structural_hash(Before) == ir.structural_hash(restored)
+        with pytest.raises(InternalError, match="Unroll loops cannot have iter_args"):
+            passes.unroll_loops()(restored)
+
+
+class TestPrinterRoundTrip:
+    """Tests for IR printing of unroll loops."""
+
+    @pytest.mark.parametrize("bounds", ["4", "6, 0, -2", "0"])
+    def test_ssa_unroll_nested_multiple_iter_args(self, bounds):
+        """Nested SSA loops preserve carried values, attrs and signed/empty ranges."""
+        before = pl.parse_program(f"""
+@pl.program
+class Before:
+    @pl.function
+    def main(self, x: pl.Scalar[pl.INDEX], y: pl.Scalar[pl.INDEX]) -> pl.Scalar[pl.INDEX]:
+        for i in pl.unroll({bounds}, attrs={{"marker": 7}}):
+            for j in pl.unroll(2):
+                x = x + i
+                y = y + j
+        return x + y
+""")
+        after = passes.convert_to_ssa()(before)
+        printed = python_print(after, format=False)
+        assert printed.count("init_values=") == 2
+        assert 'attrs={"marker": 7}' in printed
+        restored = pl.parse_program(printed)
+        ir.assert_structural_equal(after, restored)
+        assert ir.structural_hash(after) == ir.structural_hash(restored)
+
+    @pytest.mark.parametrize(
+        ("header", "message"),
+        [
+            ("i in pl.unroll(4, init_values=(x,))", "target must be a tuple"),
+            ("i, (a, b) in pl.unroll(4, init_values=(x,))", "Mismatch"),
+            ("i, (a,) in pl.unroll(0, 4, 0, init_values=(x,))", "step cannot be zero"),
+            ("i, (a,) in pl.unroll(x, init_values=(x,))", "constant integer bounds"),
+        ],
+    )
+    def test_ssa_unroll_rejects_malformed_headers(self, header, message):
+        """Text support retains loop binding and compile-time-bound validation."""
+        with pytest.raises(ParserSyntaxError, match=message):
+            pl.parse_program(f"""
+@pl.program
+class Invalid:
+    @pl.function
+    def main(self, x: pl.Scalar[pl.INDEX]) -> pl.Scalar[pl.INDEX]:
+        for {header}:
+            result = pl.yield_(x)
+        return result
+""")
+
+    def test_unroll_iterator_accepts_init_values(self):
+        """The Python helper agrees with the parsed transitional syntax."""
+        iterator = pl.unroll(2, init_values=(3, 5))
+        assert iterator.__next__() == (0, (3, 5))
+        assert iterator.__next__() == (1, (3, 5))
+        with pytest.raises(StopIteration):
+            iterator.__next__()
+
+    def test_unroll_prints_as_pl_unroll(self):
+        """ForKind.Unroll should print as pl.unroll() in output."""
+
+        @pl.program
+        class Prog:
+            @pl.function
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                for i in pl.unroll(3):
+                    x = pl.add(x, 1.0)
+                return x
+
+        printed = python_print(Prog)
+        assert "pl.unroll(" in printed
+
+
+class TestCallAttrSubstitution:
+    """Tests that Call attrs referencing the loop var are substituted on unroll."""
+
+    def test_device_attr_substituted_on_single_iteration_unroll(self):
+        """A ``device=`` attr (kAttrDevice) referencing the loop var must be
+        substituted with the literal when a single-iteration loop is unrolled.
+
+        Regression test: ``IRMutator::VisitExpr_(const CallPtr&)`` re-mutated a
+        whitelist of ``Var``-typed dependency attrs during loop-var substitution
+        but omitted ``kAttrDevice`` (an ``ExprPtr``-valued attr). At P==1 in a
+        host-orchestration loop, this left ``device=r`` dangling to the
+        now-unbound loop var after unrolling folded ``r`` -> ``0``, producing a
+        ``NameError`` in generated orchestration code.
+        """
+
+        SIZE = 8
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def chip_orch(self, out: pl.Out[pl.Tensor[[SIZE], pl.FP32]]) -> pl.Tensor[[SIZE], pl.FP32]:
+                return out
+
+            @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+            def host_orch(
+                self,
+                outputs: pl.Out[pl.Tensor[[1, SIZE], pl.FP32]],
+            ) -> pl.Tensor[[1, SIZE], pl.FP32]:
+                for r in pl.unroll(1):
+                    self.chip_orch(outputs[r], device=r)
+                return outputs
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.Orchestration, strict_ssa=True)
+            def chip_orch(self, out: pl.Out[pl.Tensor[[SIZE], pl.FP32]]) -> pl.Tensor[[SIZE], pl.FP32]:
+                return out
+
+            @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator, strict_ssa=True)
+            def host_orch(
+                self,
+                outputs: pl.Out[pl.Tensor[[1, SIZE], pl.FP32]],
+            ) -> pl.Tensor[[1, SIZE], pl.FP32]:
+                self.chip_orch(outputs[0], device=0)
+                return outputs
+
+        After = _unroll_and_ssa(Before)
+        ir.assert_structural_equal(After, Expected)
+
+
+class TestPipelineFallback:
+    """Tests that unexpanded unroll loops survive non-codegen pipeline stages."""
+
+    def test_unexpanded_unroll_survives_pipeline(self):
+        """Skipping UnrollLoops should not crash through SSA/flatten/verifier pipeline."""
+
+        @pl.program
+        class Prog:
+            @pl.function
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                for i in pl.unroll(3):
+                    x = pl.add(x, 1.0)
+                return x
+
+        # Run SSA and verifier without UnrollLoops — this validates pipeline
+        # robustness before backend codegen.
+        result = passes.convert_to_ssa()(Prog)
+        result = passes.flatten_call_expr()(result)
+        result = passes.run_verifier()(result)
+        assert result is not None
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

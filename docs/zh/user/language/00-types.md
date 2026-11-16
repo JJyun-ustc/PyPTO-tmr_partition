@@ -1,0 +1,287 @@
+# 类型
+
+> **旧 Python 接口示例：** 本页为兼容现有用法保留 `platform=` 调用，
+> 这些调用会发出 `DeprecationWarning`；新代码应使用 `backend_type` 和
+> `execution_mode`。参见[目标映射](../../dev/08-entry-points.md#迁移旧-platform-示例)。
+
+PyPTO 程序里每个值都带有类型，说明它住在哪里、元素有多宽。写对注解，就是在告诉编译器该分配什么、允许做什么。
+
+> **前置**：[编程模型 § 内存层次](../03-programming-model.md#内存层次)。
+
+## Concept
+
+一条类型注解里编码了三件事，值得分开看 —— 它们的失败方式不同。
+
+**值住在哪里。** `pl.Tensor` 在 DDR，`pl.Tile` 是片上缓冲区，`pl.Scalar` 是寄存器宽度的值。这不是提示：在执行面上做张量操作、在控制面上做 tile 操作，都会被拒绝，而容器类型就是编译器判断的依据。
+
+**元素有多宽。** dtype 常量（`pl.FP16`、`pl.INT32` …）命名一种硬件元素格式。混用是合法的，但从不隐式：没有类型提升，宽度不同的地方必须写 `pl.cast`。
+
+**调用方可以怎么用它。** 参数方向 —— `In`（默认）、`pl.Out[...]`、`pl.InOut[...]` —— 是签名的一部分，不是约定。编译器从方向推导任务依赖，所以方向声明错了得到的是**一张错的依赖图**，而不是一个编译错误。
+
+Shape 默认是静态的，在解析期检查。`pl.dynamic()` 让某一维退出这种检查，代价是编译器本可以从这个维度推出的一切。
+
+## 寄存器标注（IR 基础设施）
+
+`pl.Reg[L, dtype]` 描述具有静态正整数逻辑 lane 数 `L` 的寄存器值。
+可选第三项为 `pl.RegKind.VecReg`（默认值）或 `pl.RegKind.MaskReg`。
+MaskReg 必须使用 `pl.BOOL`，VecReg 禁止使用 BOOL。例如，
+`pl.Reg[64, pl.FP32]` 和 `pl.Reg[64, pl.BOOL, pl.RegKind.MaskReg]`
+都是合法标注。当前描述符支持 IR 构造和二进制序列化，尚不支持寄存器操作、
+scope DSL 执行或 VF 编译；参见[寄存器 IR 描述符](../../dev/ir/02-types.md#寄存器-ir-描述符)。
+
+## Quickstart：读懂一个签名
+
+<!-- doctest: setup -->
+```python
+import pypto.language as pl
+import torch
+from pypto.runtime import RunConfig
+
+CFG = RunConfig(platform="__PLATFORM__")
+torch.manual_seed(0)
+```
+
+<!-- doctest: run -->
+```python
+M = pl.dynamic("M")                       # an axis whose extent varies at run time
+
+
+@pl.jit.incore
+def scale_rows(
+    x: pl.Tensor[[M, 128], pl.FP16],                    # In (default): read-only, DDR
+    acc: pl.InOut[pl.Tensor[[M, 128], pl.FP32]],        # read-write, DDR
+    out: pl.Out[pl.Tensor[[M, 128], pl.FP32]],          # write-only, DDR
+    factor: pl.Scalar[pl.FP32],                         # scalar, passed by value
+):
+    tx = pl.load(x, [0, 0], [64, 128])
+    scaled = pl.mul(pl.cast(tx, pl.FP32), factor)
+    acc = pl.store(pl.add(pl.load(acc, [0, 0], [64, 128]), scaled), [0, 0], acc)
+    out = pl.store(scaled, [0, 0], out)
+    return acc, out
+
+
+@pl.jit
+def apply_scale(
+    x: pl.Tensor[[64, 128], pl.FP16],
+    acc: pl.InOut[pl.Tensor[[64, 128], pl.FP32]],
+    out: pl.Out[pl.Tensor[[64, 128], pl.FP32]],
+):
+    acc, out = scale_rows(x, acc, out, 2.0)             # the dynamic axis binds to 64 here
+    return acc, out
+
+
+x = torch.randn(64, 128, dtype=torch.float16)
+acc = torch.randn(64, 128, dtype=torch.float32)
+out = torch.zeros(64, 128, dtype=torch.float32)
+acc_before = acc.clone()
+
+apply_scale(x, acc, out, config=CFG)
+
+scaled = x.float() * 2.0
+torch.testing.assert_close(out, scaled, rtol=1e-2, atol=1e-2)               # Out was written
+torch.testing.assert_close(acc, acc_before + scaled, rtol=1e-2, atol=1e-2)  # InOut was read *and* written
+```
+
+| 元素 | 读作 |
+| ---- | ---- |
+| `pl.Tensor[[M, 128], pl.FP16]` | 二维 DDR 数组，`M` 行（运行期值），128 列，半精度 |
+| `pl.InOut[...]` | kernel 既读又写 —— 编译器会把它同时排在此前的写者和读者之后 |
+| `pl.Out[...]` | kernel 只写。在写入前读一个 `Out` 参数读到的是未定义内存 |
+| `pl.Scalar[pl.FP32]` | 单个值，不是缓冲区 |
+| `M = pl.dynamic("M")` | 该维编译期未知，每次启动时绑定 |
+
+## Mechanics
+
+### 数据类型
+
+| 常量 | 位宽 | 说明 |
+| ---- | ---- | ---- |
+| `pl.BOOL` | 1 | |
+| `pl.INT4` / `pl.UINT4` | 4 | |
+| `pl.INT8` / `pl.UINT8` | 8 | |
+| `pl.INT16` / `pl.UINT16` | 16 | |
+| `pl.INT32` / `pl.UINT32` | 32 | |
+| `pl.INT64` / `pl.UINT64` | 64 | |
+| `pl.FP16` | 16 | IEEE 半精度 |
+| `pl.BF16` | 16 | Brain float |
+| `pl.FP32` | 32 | IEEE 单精度 |
+| `pl.fp4e2m1x2` / `pl.FP4E2M1X2` | 8 | Packed pair of E2M1 values; shapes count byte carriers |
+| `pl.fp4e1m2x2` / `pl.FP4E1M2X2` | 8 | Packed pair of E1M2 values; shapes count byte carriers |
+| `pl.FP8E4M3FN` / `pl.FP8E5M2` | 8 | MXFP8 数据格式 |
+| `pl.FP8E8M0` | 8 | MX 块缩放指数 |
+| `pl.HF4` / `pl.HF8` | 4 / 8 | 海思浮点格式 |
+| `pl.INDEX` | 64 | 索引运算 —— 循环变量、维度 |
+| `pl.TASK_ID` | — | 已派发任务的生产者句柄 |
+
+`dtype.get_byte()` 返回向上取整后的可按字节寻址元素大小。对于按字节寻址的 dtype，只要字节数是算出来的而不是写死的字面量，就用它。4-bit buffer 不能使用 `logical_elements * dtype.get_byte()`：PyPTO 会把所有语义 4-bit dtype 按每字节两个逻辑元素打包，物理大小为 `ceil(logical_elements / 2)`。
+
+```python
+nbytes = 256 * pl.FP32.get_byte()          # 1024, not 256
+```
+
+`pl.fp4e2m1x2` and `pl.fp4e1m2x2` are distinct packed floating-point formats,
+with uppercase aliases `pl.FP4E2M1X2` and `pl.FP4E1M2X2`. Each element occupies
+one byte and contains two FP4 values. Shapes, `valid_shape`, strides, and
+offsets count these carriers throughout IR, JIT specialization, runtime calls,
+and serialized argument metadata; there is no implicit dimension scaling.
+The old `pl.FP4`, `DataType.FP4`, and `DT_FP4` names are removed.
+
+Explicit packed annotations accept `torch.uint8`. E2M1 also accepts
+`torch.float4_e2m1fn_x2` with its physical shape unchanged; E1M2 uses UINT8
+because Torch has no matching native dtype. Unannotated UINT8 remains UINT8.
+Function calls reject E2M1/E1M2 format mismatches instead of reinterpreting
+one format as the other.
+
+This change establishes the two carrier types and preserves existing E2M1
+operator support. E1M2 numerical casts, additional transfer layouts, and MXFP4
+quantization are deferred. Ascend910/A2A3 execution remains unsupported for
+both packed formats. See [FP4](../../dev/fp4.md) for the existing E2M1 cast and
+alias paths and their layout restrictions.
+
+### 标量绑定的类型注解
+
+标量算术会把操作数统一归一到 `pl.INDEX`，所以即使输入不是 `INDEX`，结果也是：
+
+```python
+v = pl.cast(i, pl.INT32) + 1                        # pl.Scalar[pl.INDEX]
+```
+
+注解决定这个名字绑定时的 dtype，值会被转换过去与之匹配——赋值两侧始终一致：
+
+```python
+v: pl.Scalar[pl.INT32] = pl.cast(i, pl.INT32) + 1   # 绑定 INT32；cast 由解析器补上
+v: pl.Scalar[pl.INDEX] = pl.cast(i, pl.INT32) + 1   # 绑定 INDEX；无需转换
+```
+
+注解要写成你希望这个值被*存储*的 dtype：更窄的注解做的是转换，不是重解释。
+
+返回 INDEX 的调用也遵循相同规则，包括 `pl.tile.get_block_idx()`：
+
+```python
+v: pl.Scalar[pl.INT32] = pl.tile.get_block_idx()    # converts the INDEX result to INT32
+```
+
+这种兼容性仅适用于整数/INDEX 类型对。对 INDEX 表达式使用 FP32 注解会被拒绝；
+浮点转换需要显式使用 `pl.cast`。
+
+### 容器类型
+
+| 类型 | 住在 | 写法 |
+| ---- | ---- | ---- |
+| `pl.Tensor[[shape], dtype]` | DDR | `x: pl.Tensor[[64, 128], pl.FP32]` |
+| `pl.Tile[[shape], dtype]` | 片上缓冲区（默认 Vec） | `t: pl.Tile[[64, 64], pl.FP32]` |
+| `pl.Scalar[dtype]` | 值，不是缓冲区 | `s: pl.Scalar[pl.FP32]` |
+| `pl.Array[extent, dtype]` | 核内数组 | `a: pl.Array[16, pl.INT32]` |
+| `pl.Tuple[T1, T2]` | — | 多值返回注解 |
+
+`pl.TaskId` 是 `pl.Scalar[pl.TASK_ID]` 的便捷别名。
+
+`pl.Array` 通常是创建出来的而不是注解出来的 —— 数组不跨函数边界，所以注解形式很少见。更新是函数式的：它产生一个新的数组值并重绑该名字，因此循环内的数组赋值和其他携带值一样是一个携带值。
+
+```python
+arr = pl.array.create(16, pl.INT32)
+arr[i] = value          # array.update_element — functional, rebinds arr
+x = arr[i]              # array.get_element
+```
+
+### 布局
+
+**`pl.Tensor` 注解请写运行期行主序 shape，不要写布局标记。** 布局是 IR 内部的事，pass 会从实际产生 / 消费各个视图的算子推导出来。
+
+```python
+b: pl.Tensor[[N, K], pl.FP32]              # ✅ source shape, no marker
+```
+
+只写布局的简写 `pl.Tensor[..., pl.DN]` 不被支持：它会抛 `ParserTypeError`。矩阵乘需要转置操作数时，给 `pl.matmul` 传 `a_trans=True` / `b_trans=True`，或在使用处用 `pl.transpose(x, -2, -1)` 导出转置视图。对产生 DN 的算子做切片或 reshape，会自动继承 DN。只要切片保留了末两个轴，它就保持源张量的 layout，因此对 `[N_RANKS, R, C]` 权重取首轴分片（`w[r]`）仍留在父张量的 layout 上。
+
+**layout 注解必须在调用两端一致。** 它是对内存中字节序的断言，而不是请求转换，因此把 ND 类型的实参传给声明为 `pl.NZ`（或 MX scale layout）的形参会在第一个 pass 运行之前被类型检查拒绝：`Layout mismatch at argument 1 of call to 'nz_helper': parameter 'b' is declared NZ but the argument is ND.` 两端都标注，或者都不标注。DN 属于例外：形参无法声明 DN，DN 值是在使用处经 `pl.transpose` 导出的，把它传给声明为 ND 的形参正是预期用法，而非冲突。
+
+`device=` dispatch 是另一个例外：host 只负责指明缓冲区发往哪张卡，因此存放 NZ 打包字节的 ND host 张量可以绑定到 device program 中声明为 `pl.NZ` 的形参。但这只对完整矩阵成立 —— host 张量本身，或保留最后两个轴完整的切片，例如 `[N_RANKS, R, C]` 堆叠张量的 rank 分片 `w[r]`。矩阵内部的窗口（对整体打包一次的 `[N_RANKS * R, C]` 权重取 `w[r * R : (r + 1) * R]`）会被拒绝：这些行在内存中连续，但它们是若干分形列块中的片段，而不是 NZ 打包的 `[R, C]`。应当对每个分片单独打包，再把分片堆叠起来。无法经由这类切片追溯到 host 形参的实参 —— 例如 reshape 的结果或新创建的张量 —— 同样会被拒绝。追溯只在发起 dispatch 的函数内部进行，因此传入辅助函数的窗口在那里表现为形参，不会被追溯回调用方。
+
+`pl.ND` 是默认的行主序布局，不需要写出来。`pl.NZ` 断言该张量在全局内存中的字节**已经**按 PTO 原生 NZ 分形序存放，于是 matmul 权重载入可以跳过在线 ND→NZ 转换。它是对现有字节的断言，不是转换请求：你写的 shape 和切片保持逻辑形式，编译器负责推导分块后的物理描述符。目前要求 dtype 为整字节、张量形状静态且分形对齐（`shape[-2] % 16 == 0`、`shape[-1] % (256 / dtype 位宽) == 0`）、**逻辑秩为 2 或 3**（`[R, C]` 或 `[B, R, C]`，因为底层 NZ 描述符只有一个 batch 槽位），并作为 matmul 操作数读取；其余情形一律报错。
+
+当一个张量的行不连续时 —— 大缓冲区里的一个窗口、外部传进来的跨步切片 —— 用 `pl.TensorView` 描述它，把 stride 显式写出来，而不是留给推断：
+
+```python
+view = pl.TensorView(stride=[1024, 1], layout=pl.TensorLayout.ND, valid_shape=[16, 64])
+```
+
+只要给了 `stride`、`valid_shape`、`pad` 三者之一，`layout=` 就是必填的。`pl.TensorLayout` 是这些布局常量所属的枚举 —— `pl.ND` 就是 `pl.TensorLayout.ND`。
+
+剩下两个布局常量是 `pl.MX_A_ZZ` 与 `pl.MX_B_NN`。它们标注 Ascend950 上 MX（microscaling）操作数的 **GM scale 张量** —— `MX_A_ZZ` 对应左/A 侧 scale pack，`MX_B_NN` 对应右/B 侧 —— 使 Mat 到 scale 的 `pl.move` 能校验源布局，而不是把不兼容的数据按字节拷进 `LeftScale` / `RightScale`。这是唯一一处**要求**在 `pl.Tensor` 注解上写布局标记、而非不建议写的场景。MX 的 `pl.load` 可省略 `target_memory`；Python API 会选择 `pl.Mem.Mat`，`matmul_mx` 操作数放置会插入所需 move。常规 MX 子视图（`slice`、`reshape`、`transpose`、`reinterpret_view`）与 MX `remote_load` 会被拒绝。例外：FP8E8M0 的 `pl.tensor.view` 可在 packed ND backing 与 `MX_A_ZZ` / `MX_B_NN` 之间建立逻辑 rank-2 alias（`layout=mx_*`；PTOAS v0.60 负责物理打包）。矩阵乘本身是 `pl.matmul_mx` 及其 `_acc` / `_bias` 变体，每个操作数各接一块数据 tile 和一块 scale tile。进入算子的两块 data tile 必须都是 `FP8E4M3FN`。The existing packed-input path is E2M1x2 lhs × FP8 rhs: explicitly cast the lhs with `pl.cast(fp4_tile, pl.FP8E4M3FN)` before `matmul_mx`; A5 legalizes it through E2M1x2→BF16→FP32→FP8E4M3FN. 原生 FP4×FP4 与反向 FP8×FP4 均不支持。独立 `pl.quant_mx`（本版本仅 MXFP8，以 `group_axis` 对齐 PTOAS `grpAxis`）已开放；在 Ascend950 上可与 `pl.matmul_mx` 共用一个 InCore mixed task，生成的 data 与 scale 直接经 V2C 传递，scale 会生成 Vec→Mat→scale memory 路径。
+
+`pl.quant_mx(tensor, group_axis=1)` 返回 GM A data `[M,K]` 和
+`MX_A_ZZ[M,K/32]` scale tensor。`group_axis=0` 接受 `[N,K]`，返回 Cube 定向的
+`[K,N]` data 和 `MX_B_NN[K/32,N]` scale。两组 tensor 是 tensor
+`pl.matmul_mx` 的必需输入；该接口仅支持 2-D 并返回 FP32，暂不包含 tensor MX
+累加、bias、transpose flag、batch、dynamic shape 或 FP4。
+
+### 动态 shape
+
+`pl.dynamic(name)` 用来标注**编译时未知、且每次启动都可能不同**的轴 —— 随请求变化的 batch、解码过程中不断增长的序列长度。该维的尺寸成为运行期的值，因此一份编译产物服务这个轴的所有取值：动态维在 JIT 缓存 key 里折叠为 `None`，尺寸变化不会触发重编译。
+
+<!-- doctest: run -->
+```python
+N = pl.dynamic("N")
+TILE = 32                       # the physical tile the kernel moves per call
+
+
+@pl.jit.incore
+def rows(x: pl.Tensor[[N, 64], pl.FP32], out: pl.Out[pl.Tensor[[N, 64], pl.FP32]]):
+    out = pl.store(pl.mul(pl.load(x, [0, 0], [TILE, 64]), 2.0), [0, 0], out)
+    return out
+
+
+@pl.jit
+def drive(x: pl.Tensor[[N, 64], pl.FP32], out: pl.Out[pl.Tensor[[N, 64], pl.FP32]]):
+    return rows(x, out)         # the entry is dynamic too, so both extents share it
+
+
+# Two extents through one program: the dynamic dim collapses to None in the JIT
+# cache key, so the second call is not a recompile.
+for extent in (TILE, 3 * TILE):
+    x = torch.randn(extent, 64, dtype=torch.float32)
+    out = torch.zeros(extent, 64, dtype=torch.float32)
+    drive(x, out, config=CFG)
+    torch.testing.assert_close(out[:TILE], x[:TILE] * 2.0, rtol=1e-4, atol=1e-4)
+```
+
+入口必须保持 dynamic 才成立。给它一个具体形状会把程序钉死在一个 extent 上；而在 dynamic 形状的张量上做编排级运算（而不是交给 InCore kernel）会更早失败 —— 失败在 `InitMemRef`，它需要常量维。上面这个 kernel 搬的是固定的 `TILE`；要覆盖更大输入的全部，用 [控制流](02-control-flow.md) 里的分块循环。
+
+同一个 `DynVar` 对象在多处注解中使用时指的是同一维 —— 复用这个对象，不要在表示同一个值时再造一个同名的。
+
+确实固定的维度就保持静态。静态尺寸是编译器能据以规划的数字 —— 分块选择、展开因子、静态边界检查 —— 动态维则把这个信息藏了起来。
+
+### 参数方向
+
+| 方向 | 语法 | 编译器据此断定 |
+| ---- | ---- | -------------- |
+| In（默认） | `x: pl.Tensor[...]` | 只读。排在生产者之后 |
+| Out | `x: pl.Out[pl.Tensor[...]]` | 只写不读。排在此前的读者与写者之后 |
+| InOut | `x: pl.InOut[pl.Tensor[...]]` | 都有。与一切触碰它的任务之间都有序 |
+
+方向是编译器用来给任务之间定序的依据。把一个 `InOut` 缓冲区声明成 `Out`，等于告诉运行时"在本任务写它之前不需要等任何人" —— 这是一个竞态，不是一条诊断。
+
+## 边界情况
+
+> **致命陷阱：** 把字节数写成元素个数会静默欠分配。`pld.alloc_window_buffer(256)` 预留的是 256 **字节** —— 只够 64 个 FP32，不是 256 个。任何非字面量尺寸都必须写成 `n * pl.<DTYPE>.get_byte()`。没有任何告警；症状是前 64 个元素之后的数据被破坏。
+
+| 症状 | 可能原因 | 修复 |
+| ---- | -------- | ---- |
+| **报 DN layout-only shorthand 的 `ParserTypeError`** | `pl.Tensor[..., pl.DN]` —— 已移除，它把两套坐标系压进了一条注解 | 写源 shape、不带标记；在使用处用 `pl.transpose(x, -2, -1)` 导出 DN；或让它从产生 DN 的算子经切片/reshape 继承 |
+| **只有两个任务重叠时结果才出错** | 读写缓冲区声明成了 `In` 或 `Out` 而非 `InOut` | 按 kernel 实际行为声明方向 |
+| **读 `Out` 参数读到垃圾** | `Out` 承诺的是先写后读 | 若此前内容有意义，改用 `pl.InOut[...]` |
+| **本以为会隐式提升，却要求 `pl.cast`** | 没有隐式提升 | 补上 cast；多跳类型对见 [LegalizeTileCast](../../dev/passes/18-legalize_tile_cast.md) |
+| **两个本应相同的维度被当成互相独立** | 调了两次 `pl.dynamic("M")` | 只创建一次 `DynVar` 并复用该对象 |
+
+并非每个 `pl.cast` 都是一条指令。一对 `(src, dst)` 是映射到单条硬件 `pto.tcvt` 还是展开成一条链，取决于目标架构：`INT32 -> FP16` 在 Ascend910 上是一条指令，在 Ascend950 上会降为 `INT32 -> FP32 -> FP16`。每一跳花费一次 `tcvt`；当中间类型比源类型更窄时，结果可能与直接舍入的转换相差目标类型的 1 ULP。**这是预期行为，不是缺陷** —— 各架构的对照表见 [LegalizeTileCast](../../dev/passes/18-legalize_tile_cast.md)。
+
+对 `Tensor` 和 `Tile` 输入，`pl.cast` 还接受仅关键字参数 `saturation_mode`（`"on"` / `"off"`，或 `1` / `0`）。`"on"` 把超出目标值域的结果钳制到该值域；`"off"` 保留目标平台的非饱和转换，其溢出行为由架构定义。**当目标类型是整数时，默认值是 `"on"`** —— 没有任何标准规定"转换到整数时溢出"应当产生什么，在两者之间"意外得到钳制"更安全，而且在 A2/A3 上它正是硬件原生支持的转换。**浮点**目标类型则保持原样：IEEE 规定窄化溢出产生无穷，除非你显式要求 `"on"`，PyPTO 与之保持一致。多跳 cast 只把该模式作用于最后一跳，即真正到达你所指定 dtype 的那一跳。
+
+## See Also
+
+- [函数与程序](01-functions.md) —— 这些注解出现在哪里，以及签名对调用方意味着什么。
+- [内存与数据搬运](03-memory.md) —— 在这些类型所命名的空间之间搬运数据。
+- [算子](../ops/index.md) —— 哪些算子接受 `Tensor`、哪些接受 `Tile`。
+- [IR 类型](../../dev/ir/02-types.md) —— 这些注解所构建的 IR 层类型系统。
+- [LegalizeTileCast](../../dev/passes/18-legalize_tile_cast.md) —— 分架构的 cast 展开及其精度后果。

@@ -1,0 +1,358 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
+
+// Generated from {{template_package}}.
+//
+// Host builtin ring allreduce — in-place chunked reduce-scatter + allgather,
+// TPUT push model.
+//
+// ABI (matches mesh host builtins):
+//   tensor(0) = data   window-bound FP32 buffer (InOut)
+//   tensor(1) = signal window-bound INT32 matrix [2*(NR-1) + 1, NR] (InOut)
+//   scalar(0) = nranks
+//   scalar(1) = CommContext device pointer
+//
+// Each rank's data buffer holds numel elements (product of tensor shapes). The
+// ring partitions data into NR balanced, potentially ragged chunks — chunk r
+// spans [floor(numel*r/NR), floor(numel*(r+1)/NR)) — and performs RS+AG in-place
+// on those chunk slots. The signal holds one row
+// per ring round (2*(NR-1) rounds) plus a final row for the return barrier.
+//
+// Data movement is PUSH (remote write) via pto::comm::TPUT, mirroring the
+// in-tree allgather / all_to_all host builtins:
+//   * Reduce-scatter: each rank TPUT<AtomicAdd>s its current partial chunk
+//     send_idx = (my_rank - step) % NR into the RIGHT neighbour's slot of the
+//     same index.  The remote atomic-add accumulates the receiver's own value
+//     together with the sender's contribution (Sum only — the host builtin is
+//     ReduceOp::kSum by construction, see entry.cpp.in).
+//   * Allgather: each rank TPUTs (non-atomic) its finalized chunk
+//     send_idx = (my_rank - step + 1) % NR into the right neighbour's slot.
+//   * Ordering: pipe_barrier(PIPE_ALL) around every TPUT (drains the MTE DMA
+//     pipe) and dsb(DSB_DDR) before every TNOTIFY (orders the pushed writes
+//     ahead of the signal) — the exact allgather/all_to_all recipe.  No dcci
+//     cacheline flush is needed: the receiver reads data the sender wrote
+//     remotely via TPUT, never a locally-TSTORE'd cacheline.
+
+#include <cstdint>
+#include <pto/pto-inst.hpp>
+
+#include "platform_comm/comm_context.h"
+#include "pto/comm/comm_types.hpp"
+#include "pto/comm/pto_comm_inst.hpp"
+#include "tensor.h"
+
+#ifndef __gm__
+#define __gm__
+#endif
+
+#ifndef __aicore__
+#define __aicore__ [aicore]
+#endif
+
+namespace {
+
+static constexpr int kMaxSupportedRanks = 16;
+static constexpr int64_t kTileCount = 256;
+
+// Barrier selection for this build of the kernel.  RoundBarrier (O(P²)
+// notify-all → wait-all) is the NPU-safe baseline; the O(1) NeighborBarrier
+// (left/right only) is the end state — the same one as simpler #1383.
+// The TPUT push engine is verified on silicon at P=2/4 (both barriers pass);
+// NeighborBarrier is enabled by default since the push model provides the
+// ordering the pull model lacked.
+static constexpr bool kUseNeighborBarrier = true;
+
+// Balanced ragged segment start for chunk r: floor(numel * r / nranks).
+// The ring partitions the per-rank buffer into NR contiguous chunks with these
+// boundaries, so chunk lengths differ by at most one element and the trailing
+// chunk may be shorter (mirrors the InCore composite ring's floor(i * SIZE / NR)
+// segment boundaries — #2161).
+AICORE inline int64_t RingChunkStart(int64_t numel, int nranks, int r) {
+  return (numel * static_cast<int64_t>(r)) / static_cast<int64_t>(nranks);
+}
+
+template <typename T>
+AICORE inline __gm__ T *CommRemotePtr(__gm__ CommContext *ctx, __gm__ T *local_ptr, int pe) {
+  uint64_t local_base = ctx->windowsIn[ctx->rankId];
+  uint64_t offset = reinterpret_cast<uint64_t>(local_ptr) - local_base;
+  return reinterpret_cast<__gm__ T *>(ctx->windowsIn[pe] + offset);
+}
+
+// Per-round barrier row: AtomicAdd(0→1) / WaitGe(1), single-shot per row.
+//
+// With the TPUT push model the barrier's job is to make every rank's completed
+// step pushes (a) drained from the MTE pipe (pipe_barrier(PIPE_ALL) after the
+// push loop) and (b) globally visible ahead of the signal (dsb(DSB_DDR) before
+// TNOTIFY).  When a rank's wait completes, all peers' step pushes have landed,
+// so the rank's next-step read of its own slot observes the accumulated data.
+// The trailing pipe_barrier(PIPE_ALL) drains any in-flight TNOTIFY / TWAIT
+// traffic.  This mirrors allgather/all_to_all Phase-2 verbatim (NOT
+// pto.fence.barrier_all — a GM-scope fence does not drain MTE DMA).
+AICORE inline void RoundBarrier(__gm__ CommContext *ctx, __gm__ int32_t *signal_row, int my_rank,
+                                int nranks) {
+  pipe_barrier(PIPE_ALL);
+  dsb(DSB_DDR);
+  for (int peer = 0; peer < nranks; ++peer) {
+    if (peer == my_rank) {
+      continue;
+    }
+    __gm__ int32_t *remote_signal = CommRemotePtr(ctx, signal_row + my_rank, peer);
+    pto::comm::Signal sig(remote_signal);
+    pto::comm::TNOTIFY(sig, static_cast<int32_t>(1), pto::comm::NotifyOp::AtomicAdd);
+  }
+  for (int peer = 0; peer < nranks; ++peer) {
+    if (peer == my_rank) {
+      continue;
+    }
+    pto::comm::Signal sig(signal_row + peer);
+    pto::comm::TWAIT(sig, static_cast<int32_t>(1), pto::comm::WaitCmp::GE);
+  }
+  pipe_barrier(PIPE_ALL);
+}
+
+// O(1) per-round barrier: notify/wait the two ring neighbours only.  In the
+// push model each rank's data flows exclusively to its right neighbour and
+// arrives exclusively from its left neighbour, so waiting for the left
+// neighbour's drain is sufficient for the receiver's reads; the left/right
+// notify/wait cycle forms a valid ring barrier.
+//
+// This is the post-NPU-verification swap (see kUseNeighborBarrier).  The
+// pull-model NeighborBarrier failed on silicon (TSTORE + TLOAD do not order);
+// with TPUT the write pipeline provides the ordering — the canonical pattern
+// verified in simpler #1383 at P=2/4.
+//
+// For nranks == 2 both neighbours resolve to the same peer (left == right,
+// e.g. rank 0's neighbours are both rank 1), so each signal cell receives two
+// AtomicAdd notifies and is observed twice through the same GE 1 waits.  This
+// is safe because the signal buffer is freshly zeroed per allreduce call — the
+// two waits simply observe the shared cell again once the peer's pushed data
+// is visible.
+AICORE inline void NeighborBarrier(__gm__ CommContext *ctx, __gm__ int32_t *signal_row, int my_rank,
+                                   int nranks) {
+  const int left = (my_rank - 1 + nranks) % nranks;
+  const int right = (my_rank + 1) % nranks;
+
+  pipe_barrier(PIPE_ALL);
+  dsb(DSB_DDR);
+
+  __gm__ int32_t *remote_signal = CommRemotePtr(ctx, signal_row + my_rank, left);
+  pto::comm::Signal sig_left(remote_signal);
+  pto::comm::TNOTIFY(sig_left, static_cast<int32_t>(1), pto::comm::NotifyOp::AtomicAdd);
+
+  remote_signal = CommRemotePtr(ctx, signal_row + my_rank, right);
+  pto::comm::Signal sig_right(remote_signal);
+  pto::comm::TNOTIFY(sig_right, static_cast<int32_t>(1), pto::comm::NotifyOp::AtomicAdd);
+
+  pto::comm::Signal sig_wl(signal_row + left);
+  pto::comm::TWAIT(sig_wl, static_cast<int32_t>(1), pto::comm::WaitCmp::GE);
+
+  pto::comm::Signal sig_wr(signal_row + right);
+  pto::comm::TWAIT(sig_wr, static_cast<int32_t>(1), pto::comm::WaitCmp::GE);
+
+  pipe_barrier(PIPE_ALL);
+}
+
+// StepBarrier dispatches to the ring barrier selected by kUseNeighborBarrier.
+// With the TPUT push engine verified on silicon at P=2/4, the O(1)
+// NeighborBarrier (notify/wait the two ring neighbours only) is the default:
+// the TPUT write pipeline orders the pushed data ahead of the signal.  The
+// O(P²) RoundBarrier remains as a brute-force fallback — it notifies/waits
+// every peer and stays correct on any rail, at the cost of P−1 notifies per
+// round per rank.
+AICORE inline void StepBarrier(__gm__ CommContext *ctx, __gm__ int32_t *signal_row, int my_rank,
+                               int nranks) {
+  if (kUseNeighborBarrier) {
+    NeighborBarrier(ctx, signal_row, my_rank, nranks);
+  } else {
+    RoundBarrier(ctx, signal_row, my_rank, nranks);
+  }
+}
+
+}  // namespace
+
+extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ int64_t *args) {
+  __gm__ Tensor *data_tensor = reinterpret_cast<__gm__ Tensor *>(args[0]);
+  __gm__ Tensor *signal_tensor = reinterpret_cast<__gm__ Tensor *>(args[1]);
+  int nranks = static_cast<int>(args[2]);
+  __gm__ CommContext *comm_ctx = reinterpret_cast<__gm__ CommContext *>(args[3]);
+
+  int64_t numel = 1;
+  for (uint32_t dim = 0; dim < data_tensor->ndims; ++dim) {
+    numel *= static_cast<int64_t>(data_tensor->shapes[dim]);
+  }
+
+  __gm__ {{dtype_cpp}} *data =
+      reinterpret_cast<__gm__ {{dtype_cpp}} *>(data_tensor->buffer.addr) + data_tensor->start_offset;
+  __gm__ int32_t *signal_base =
+      reinterpret_cast<__gm__ int32_t *>(signal_tensor->buffer.addr) + signal_tensor->start_offset;
+
+  int signal_rows = 1;
+  int signal_cols = nranks;
+  if (signal_tensor->ndims >= 2) {
+    signal_rows = static_cast<int>(signal_tensor->shapes[0]);
+    signal_cols = static_cast<int>(signal_tensor->shapes[1]);
+  } else if (signal_tensor->ndims == 1) {
+    signal_cols = static_cast<int>(signal_tensor->shapes[0]);
+  }
+
+  // Soft guards: on any unsupported shape the kernel drains its pipes and
+  // returns without touching data. The host lowering pass and the builtin
+  // type deducer no longer enforce divisibility — ragged numel is handled by
+  // the balanced RingChunkStart geometry below — so these early returns exist
+  // only to keep the device kernel memory-safe if invoked directly.
+  if (nranks <= 1 || nranks > kMaxSupportedRanks || numel <= 0) {
+    pipe_barrier(PIPE_ALL);
+    return;
+  }
+
+  // Ragged chunk geometry: chunk r spans [RingChunkStart(numel, nranks, r),
+  // RingChunkStart(numel, nranks, r+1)).  The staging tile must cover the
+  // largest chunk (ceil(numel / nranks)) but no more.
+  const int64_t max_chunk_elems = (numel + nranks - 1) / nranks;
+
+  const int expected_rounds = 2 * (nranks - 1) + 1;
+  if (signal_rows < expected_rounds || signal_cols < nranks) {
+    pipe_barrier(PIPE_ALL);
+    return;
+  }
+
+  int my_rank = static_cast<int>(comm_ctx->rankId);
+  __gm__ {{dtype_cpp}} *chunks = data;
+
+  using ShapeDyn = pto::Shape<pto::DYNAMIC, pto::DYNAMIC, pto::DYNAMIC, pto::DYNAMIC, pto::DYNAMIC>;
+  using StrideDyn = pto::Stride<pto::DYNAMIC, pto::DYNAMIC, pto::DYNAMIC, pto::DYNAMIC, pto::DYNAMIC>;
+  using Global = pto::GlobalTensor<{{dtype_cpp}}, ShapeDyn, StrideDyn, pto::Layout::ND>;
+  using TileData = pto::Tile<pto::TileType::Vec, {{dtype_cpp}}, 1, kTileCount, pto::BLayout::RowMajor, -1,
+                             -1>;
+
+  static_assert(sizeof({{dtype_cpp}}) == 4,
+                "builtin.tensor.allreduce_ring currently only supports 4-byte element types");
+
+  // Single staging tile for the TPUT push path — the allgather/all_to_all
+  // recipe.  TPUT's single-shot path TLOADs/TSTOREs by Tile::GetValidCol()
+  // (ColMaskInternal), NOT the GlobalTensor shape, so the tile's column mask
+  // is narrowed to each chunk's exact extent below; a 256-col tile with a
+  // shorter transfer would over-read/overwrite adjacent chunk slots.
+  const int tile_cols = static_cast<int>(max_chunk_elems < kTileCount ? max_chunk_elems : kTileCount);
+  TileData send_tile(1, tile_cols);
+  TASSIGN(send_tile, 0x10000);
+
+  int round = 0;
+
+  // Phase 1: reduce-scatter — (NR-1) ring steps, TPUT<AtomicAdd> push right.
+  //
+  // Each rank pushes its current partial of chunk send_idx = (my_rank - step)
+  // % NR into the RIGHT neighbour's slot of the same index.  The remote
+  // atomic-add accumulates the receiver's own value with the sender's
+  // contribution, so a chunk's full sum walks the ring and lands in slot
+  // my_rank after the last step.  The per-step barrier (before this loop)
+  // guarantees the left neighbour's previous-step push has landed before this
+  // rank reads its own slot, and that every rank has drained its own pushes.
+  for (int step = 1; step < nranks; ++step) {
+    StepBarrier(comm_ctx, signal_base + round * signal_cols, my_rank, nranks);
+    ++round;
+
+    const int right = (my_rank + 1) % nranks;
+    const int send_idx = (my_rank - step + nranks) % nranks;
+    const int64_t send_base = RingChunkStart(numel, nranks, send_idx);
+    const int64_t send_end = RingChunkStart(numel, nranks, send_idx + 1);
+    const int64_t send_len = send_end - send_base;
+
+    for (int64_t tile_off = 0; tile_off < send_len; tile_off += tile_cols) {
+      int64_t remain64 = send_len - tile_off;
+      int tile_elems = static_cast<int>(remain64 < tile_cols ? remain64 : tile_cols);
+      send_tile.ColMaskInternal = tile_elems;
+
+      ShapeDyn tile_shape(1, 1, 1, 1, tile_elems);
+      StrideDyn tile_stride(tile_elems, tile_elems, tile_elems, tile_elems, 1);
+
+      __gm__ {{dtype_cpp}} *src_ptr = chunks + static_cast<size_t>(send_base + tile_off);
+      __gm__ {{dtype_cpp}} *dst_ptr = CommRemotePtr(comm_ctx, src_ptr, right);
+      Global src_g(src_ptr, tile_shape, tile_stride);
+      Global dst_g(dst_ptr, tile_shape, tile_stride);
+
+      pipe_barrier(PIPE_ALL);
+      pto::comm::TPUT<pto::AtomicType::AtomicAdd>(dst_g, src_g, send_tile);
+      pipe_barrier(PIPE_ALL);
+    }
+  }
+
+  // Phase 2: allgather — (NR-1) ring steps, TPUT (non-atomic) push right.
+  //
+  // Each rank TPUTs its finalized chunk send_idx = (my_rank - step + 1) % NR
+  // into the right neighbour's slot of the same index (a plain copy — the
+  // chunk value is already the fully reduced sum).  The receiver does nothing
+  // locally; the push performs the store.
+  for (int step = 1; step < nranks; ++step) {
+    StepBarrier(comm_ctx, signal_base + round * signal_cols, my_rank, nranks);
+    ++round;
+
+    const int right = (my_rank + 1) % nranks;
+    const int send_idx = (my_rank - step + 1 + nranks) % nranks;
+    const int64_t send_base = RingChunkStart(numel, nranks, send_idx);
+    const int64_t send_end = RingChunkStart(numel, nranks, send_idx + 1);
+    const int64_t send_len = send_end - send_base;
+
+    for (int64_t tile_off = 0; tile_off < send_len; tile_off += tile_cols) {
+      int64_t remain64 = send_len - tile_off;
+      int tile_elems = static_cast<int>(remain64 < tile_cols ? remain64 : tile_cols);
+      send_tile.ColMaskInternal = tile_elems;
+
+      ShapeDyn tile_shape(1, 1, 1, 1, tile_elems);
+      StrideDyn tile_stride(tile_elems, tile_elems, tile_elems, tile_elems, 1);
+
+      __gm__ {{dtype_cpp}} *src_ptr = chunks + static_cast<size_t>(send_base + tile_off);
+      __gm__ {{dtype_cpp}} *dst_ptr = CommRemotePtr(comm_ctx, src_ptr, right);
+      Global src_g(src_ptr, tile_shape, tile_stride);
+      Global dst_g(dst_ptr, tile_shape, tile_stride);
+
+      pipe_barrier(PIPE_ALL);
+      pto::comm::TPUT(dst_g, src_g, send_tile);
+      pipe_barrier(PIPE_ALL);
+    }
+  }
+
+  // Final cross-rank barrier: guarantee every rank's last pushes have landed
+  // (and drained) before any rank returns to the host — otherwise a fast rank
+  // could return, have its buffer reused by the next host statement, and
+  // corrupt a slow peer's pending read of the pushed data.
+  StepBarrier(comm_ctx, signal_base + round * signal_cols, my_rank, nranks);
+
+  // Self-clearing epilogue: restore every used barrier row to 0 so the signal is
+  // reusable across calls (the InCore credit-barrier protocol).  The credits a
+  // row carries depend on the barrier in use:
+  //   * NeighborBarrier (default, kUseNeighborBarrier): each round notifies
+  //     only the two ring neighbours, so only the left/right cells carry a +1
+  //     per row — and for nranks == 2 both neighbours are the same peer, so
+  //     that single cell carries +2 (two AtomicAdd notifies).  Undo each with
+  //     a local self-notify of -1 (the same st_atomic the remote path uses),
+  //     applied to both neighbours — twice on the shared cell when nranks == 2.
+  //   * RoundBarrier (fallback): notifies all P−1 peers, so every cell except
+  //     my own carries a single +1; undo with -1 per peer.
+  const int epilogue_left = (my_rank - 1 + nranks) % nranks;
+  const int epilogue_right = (my_rank + 1) % nranks;
+  for (int r = 0; r < expected_rounds; ++r) {
+    if (kUseNeighborBarrier) {
+      pto::comm::Signal self_sig_left(signal_base + static_cast<size_t>(r) * signal_cols + epilogue_left);
+      pto::comm::TNOTIFY(self_sig_left, static_cast<int32_t>(-1), pto::comm::NotifyOp::AtomicAdd);
+      pto::comm::Signal self_sig_right(signal_base + static_cast<size_t>(r) * signal_cols + epilogue_right);
+      pto::comm::TNOTIFY(self_sig_right, static_cast<int32_t>(-1), pto::comm::NotifyOp::AtomicAdd);
+    } else {
+      for (int peer = 0; peer < nranks; ++peer) {
+        if (peer == my_rank) continue;
+        pto::comm::Signal self_sig(signal_base + static_cast<size_t>(r) * signal_cols + peer);
+        pto::comm::TNOTIFY(self_sig, static_cast<int32_t>(-1), pto::comm::NotifyOp::AtomicAdd);
+      }
+    }
+  }
+
+  pipe_barrier(PIPE_ALL);
+}

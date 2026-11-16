@@ -1,0 +1,298 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+
+"""Unit tests for IRProperty and IRPropertySet."""
+
+import pytest
+from pypto import passes
+
+
+class TestIRProperty:
+    """Test IRProperty enum."""
+
+    def test_property_values_exist(self):
+        """Test that all IR properties exist."""
+        assert passes.IRProperty.SSAForm is not None
+        assert passes.IRProperty.TypeChecked is not None
+        assert passes.IRProperty.NoNestedCalls is not None
+        assert passes.IRProperty.NormalizedStmtStructure is not None
+        assert passes.IRProperty.NoRedundantBlocks is not None
+        assert passes.IRProperty.SplitIncoreOrch is not None
+        assert passes.IRProperty.HasMemRefs is not None
+
+    def test_property_values_are_different(self):
+        """Test that all property values are distinct."""
+        props = [
+            passes.IRProperty.SSAForm,
+            passes.IRProperty.TypeChecked,
+            passes.IRProperty.NoNestedCalls,
+            passes.IRProperty.NormalizedStmtStructure,
+            passes.IRProperty.NoRedundantBlocks,
+            passes.IRProperty.SplitIncoreOrch,
+            passes.IRProperty.HasMemRefs,
+        ]
+        assert len(props) == len(set(props))
+
+
+class TestIRPropertySet:
+    """Test IRPropertySet operations."""
+
+    def test_empty_set(self):
+        """Test creating an empty property set."""
+        ps = passes.IRPropertySet()
+        assert ps.empty()
+        assert ps.to_list() == []
+
+    def test_insert_and_contains(self):
+        """Test insert and contains."""
+        ps = passes.IRPropertySet()
+        ps.insert(passes.IRProperty.SSAForm)
+        assert ps.contains(passes.IRProperty.SSAForm)
+        assert not ps.contains(passes.IRProperty.TypeChecked)
+        assert not ps.empty()
+
+    def test_remove(self):
+        """Test removing a property."""
+        ps = passes.IRPropertySet()
+        ps.insert(passes.IRProperty.SSAForm)
+        ps.insert(passes.IRProperty.TypeChecked)
+        ps.remove(passes.IRProperty.SSAForm)
+        assert not ps.contains(passes.IRProperty.SSAForm)
+        assert ps.contains(passes.IRProperty.TypeChecked)
+
+    def test_contains_all(self):
+        """Test contains_all check."""
+        ps1 = passes.IRPropertySet()
+        ps1.insert(passes.IRProperty.SSAForm)
+        ps1.insert(passes.IRProperty.TypeChecked)
+        ps1.insert(passes.IRProperty.NoNestedCalls)
+
+        ps2 = passes.IRPropertySet()
+        ps2.insert(passes.IRProperty.SSAForm)
+        ps2.insert(passes.IRProperty.TypeChecked)
+
+        assert ps1.contains_all(ps2)
+        assert not ps2.contains_all(ps1)
+
+    def test_union(self):
+        """Test union operation."""
+        ps1 = passes.IRPropertySet()
+        ps1.insert(passes.IRProperty.SSAForm)
+
+        ps2 = passes.IRPropertySet()
+        ps2.insert(passes.IRProperty.TypeChecked)
+
+        result = ps1.union_with(ps2)
+        assert result.contains(passes.IRProperty.SSAForm)
+        assert result.contains(passes.IRProperty.TypeChecked)
+
+    def test_difference(self):
+        """Test difference operation."""
+        ps1 = passes.IRPropertySet()
+        ps1.insert(passes.IRProperty.SSAForm)
+        ps1.insert(passes.IRProperty.TypeChecked)
+
+        ps2 = passes.IRPropertySet()
+        ps2.insert(passes.IRProperty.SSAForm)
+
+        result = ps1.difference(ps2)
+        assert not result.contains(passes.IRProperty.SSAForm)
+        assert result.contains(passes.IRProperty.TypeChecked)
+
+    def test_intersection(self):
+        """Test intersection operation."""
+        ps1 = passes.IRPropertySet()
+        ps1.insert(passes.IRProperty.SSAForm)
+        ps1.insert(passes.IRProperty.TypeChecked)
+
+        ps2 = passes.IRPropertySet()
+        ps2.insert(passes.IRProperty.SSAForm)
+        ps2.insert(passes.IRProperty.NoNestedCalls)
+
+        result = ps1.intersection(ps2)
+        assert result.contains(passes.IRProperty.SSAForm)
+        assert not result.contains(passes.IRProperty.TypeChecked)
+        assert not result.contains(passes.IRProperty.NoNestedCalls)
+
+    def test_equality(self):
+        """Test equality comparison."""
+        ps1 = passes.IRPropertySet()
+        ps1.insert(passes.IRProperty.SSAForm)
+
+        ps2 = passes.IRPropertySet()
+        ps2.insert(passes.IRProperty.SSAForm)
+
+        ps3 = passes.IRPropertySet()
+        ps3.insert(passes.IRProperty.TypeChecked)
+
+        assert ps1 == ps2
+        assert ps1 != ps3
+
+    def test_to_list(self):
+        """Test converting to a list."""
+        ps = passes.IRPropertySet()
+        ps.insert(passes.IRProperty.SSAForm)
+        ps.insert(passes.IRProperty.TypeChecked)
+
+        props = ps.to_list()
+        assert len(props) == 2
+        assert passes.IRProperty.SSAForm in props
+        assert passes.IRProperty.TypeChecked in props
+
+    def test_to_string(self):
+        """Test string representation."""
+        ps = passes.IRPropertySet()
+        ps.insert(passes.IRProperty.SSAForm)
+        s = str(ps)
+        assert "SSAForm" in s
+
+    def test_empty_to_string(self):
+        """Test string representation of empty set."""
+        ps = passes.IRPropertySet()
+        assert str(ps) == "{}"
+
+
+class TestIRPropertySetUnhashable:
+    """IRPropertySet is mutable via insert/remove, so it must not be hashable.
+
+    Python's hash contract requires hashable objects to have a stable hash for
+    their entire lifetime. Allowing hash on a mutable type would silently break
+    set/dict invariants when the object is mutated after insertion.
+    """
+
+    def test_hash_raises_typeerror(self):
+        ps = passes.IRPropertySet()
+        with pytest.raises(TypeError, match="unhashable"):
+            hash(ps)
+
+    def test_use_as_set_member_raises(self):
+        ps = passes.IRPropertySet()
+        with pytest.raises(TypeError, match="unhashable"):
+            _ = {ps}
+
+    def test_use_as_dict_key_raises(self):
+        ps = passes.IRPropertySet()
+        with pytest.raises(TypeError, match="unhashable"):
+            _ = {ps: "value"}
+
+
+class TestPassPropertyAccessors:
+    """Test Pass property accessor methods."""
+
+    def test_convert_to_ssa_properties(self):
+        """Test ConvertToSSA produces SSAForm (TypeChecked is structural)."""
+        p = passes.convert_to_ssa()
+        assert p.get_name() == "ConvertToSSA"
+        assert p.get_produced_properties().contains(passes.IRProperty.SSAForm)
+
+    def test_init_memref_properties(self):
+        """Test InitMemRef produces HasMemRefs."""
+        p = passes.init_mem_ref()
+        assert p.get_name() == "InitMemRef"
+        assert p.get_produced_properties().contains(passes.IRProperty.HasMemRefs)
+
+    def test_memory_reuse_requires_memrefs(self):
+        """Test MemoryReuse requires HasMemRefs."""
+        p = passes.memory_reuse()
+        assert p.get_required_properties().contains(passes.IRProperty.HasMemRefs)
+
+    def test_flatten_call_expr_requires_and_produces_ssa(self):
+        """Test FlattenCallExpr requires SSAForm and produces SSAForm + NoNestedCalls."""
+        p = passes.flatten_call_expr()
+        assert p.get_required_properties().contains(passes.IRProperty.SSAForm)
+        assert p.get_produced_properties().contains(passes.IRProperty.SSAForm)
+        assert p.get_produced_properties().contains(passes.IRProperty.NoNestedCalls)
+
+    def test_outline_incore_requires_and_produces_ssa(self):
+        """Test OutlineIncoreScopes requires and produces SSAForm."""
+        p = passes.outline_incore_scopes()
+        assert p.get_required_properties().contains(passes.IRProperty.SSAForm)
+        assert p.get_produced_properties().contains(passes.IRProperty.SSAForm)
+        assert p.get_produced_properties().contains(passes.IRProperty.SplitIncoreOrch)
+
+    def test_outline_cluster_requires_and_produces_ssa(self):
+        """Test OutlineClusterScopes requires and produces SSAForm."""
+        p = passes.outline_cluster_scopes()
+        assert p.get_required_properties().contains(passes.IRProperty.SSAForm)
+        assert p.get_produced_properties().contains(passes.IRProperty.SSAForm)
+        assert p.get_produced_properties().contains(passes.IRProperty.ClusterOutlined)
+
+    def test_convert_tensor_to_tile_ops_requires_and_produces_ssa(self):
+        """Test ConvertTensorToTileOps requires and produces SSAForm."""
+        p = passes.convert_tensor_to_tile_ops()
+        assert p.get_required_properties().contains(passes.IRProperty.SSAForm)
+        assert p.get_produced_properties().contains(passes.IRProperty.SSAForm)
+
+    def test_expand_mixed_kernel_requires_and_produces_ssa(self):
+        """Test ExpandMixedKernel requires and produces SSAForm."""
+        p = passes.expand_mixed_kernel()
+        assert p.get_required_properties().contains(passes.IRProperty.SSAForm)
+        assert p.get_produced_properties().contains(passes.IRProperty.SSAForm)
+
+    def test_run_verifier_no_properties(self):
+        """Test RunVerifier has no property declarations."""
+        p = passes.run_verifier()
+        assert p.get_required_properties().empty()
+        assert p.get_produced_properties().empty()
+
+
+class TestIRPropertySetEnumeration:
+    """Every property a C++ set can hold must cast back into the Python enum.
+
+    ``IRPropertySet.to_list()`` casts each set bit to ``IRProperty``; a property the nanobind enum
+    does not declare raises ``ValueError: <n> is not a valid IRProperty``. ``str()`` is built in C++
+    from ``IRPropertyToString`` and keeps rendering the name either way, so such a set looks healthy
+    right up to the moment it is enumerated -- these tests hold the two views against each other.
+    """
+
+    @staticmethod
+    def names_from_str(ps: passes.IRPropertySet) -> list[str]:
+        """Parse ``{A, B}`` into ``["A", "B"]``, preserving the set's bit order."""
+        body = str(ps).strip("{}")
+        return body.split(", ") if body else []
+
+    @pytest.mark.parametrize(
+        "accessor",
+        [
+            passes.get_verified_properties,
+            passes.get_structural_properties,
+            passes.get_default_verify_properties,
+        ],
+        ids=["verified", "structural", "default_verify"],
+    )
+    def test_module_property_sets_enumerate(self, accessor):
+        """Each module-level set enumerates, and agrees with its own string form."""
+        ps = accessor()
+        assert not ps.empty()
+        assert [prop.name for prop in ps.to_list()] == self.names_from_str(ps)
+
+    def test_pass_declared_properties_enumerate(self):
+        """A pass's declared sets enumerate; ExpandMixedKernel produces HardSyncallOccupancyValid."""
+        p = passes.expand_mixed_kernel()
+        produced = p.get_produced_properties()
+        assert produced.contains(passes.IRProperty.HardSyncallOccupancyValid)
+        for ps in (p.get_required_properties(), produced, p.get_invalidated_properties()):
+            assert [prop.name for prop in ps.to_list()] == self.names_from_str(ps)
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])
+
+
+def test_aiv_split_property_handoff():
+    source = passes.IRProperty.AivSplitValid
+    lowered = passes.IRProperty.AivSplitLoweredValid
+    lower = passes.lower_auto_vector_split()
+    expand = passes.expand_mixed_kernel()
+    assert lower.get_required_properties().contains(source)
+    assert lower.get_invalidated_properties().contains(source)
+    assert lower.get_produced_properties().contains(lowered)
+    assert expand.get_required_properties().contains(lowered)
+    assert expand.get_invalidated_properties().contains(lowered)
+    assert passes.get_verified_properties().contains(lowered)

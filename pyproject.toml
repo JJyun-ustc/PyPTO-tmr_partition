@@ -1,0 +1,199 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+
+[build-system]
+# These are compatibility ranges, not the versions anything is built against:
+# build-constraints.txt pins those, and CI applies it through PIP_CONSTRAINT.
+#
+# nanobind is additionally capped below 3.0 because 3.0.0 stopped accepting the
+# null holder this project uses as an argument default (e.g. TileView's
+# `start_offset`, an unset ExprPtr), so `ir.TileView()` no longer matches its
+# own all-defaulted overload. Lift the cap together with the binding changes
+# 3.x needs; that cap is not a verdict on 3.x, only on migrating under a red CI.
+requires = ["scikit-build-core>=0.10.0", "nanobind>=2.0.0,<3", "ninja>=1.11.0", "cmake>=3.15"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "pypto"
+version = "0.1.0"
+authors = [{ name = "PyPTO Contributors" }]
+description = "A high-performance programming framework for tile-centric computing"
+readme = { file = "README.md", content-type = "text/markdown" }
+license = "LicenseRef-CANN-Open-Software-License-Agreement-Version-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+dependencies = ["numpy>=2.0", "torch>=2.0.0"]
+keywords = ["python", "pto", "tile", "tile-centric"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Topic :: Software Development :: Compilers",
+    "Programming Language :: C++",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13"
+]
+
+[project.scripts]
+pypto-ir-trace = "pypto.tools.ir_trace.cli:main"
+pypto-runtime-pin = "pypto.runtime.runtime_pin:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-forked>=1.0",
+    "pytest-xdist==3.8.0",
+    "PyYAML>=6.0",
+    "pyright==1.1.407",
+    "ruff==0.14.8",
+    "clang-tidy==21.1.0",
+]
+# The documentation site toolchain is NOT an extra: it lives in
+# `docs/requirements.txt`, so the docs CI job installs it with a plain
+# `pip install -r` instead of `pip install -e ".[docs]"`, which would trigger a
+# full C++ build the site does not need.
+
+[project.urls]
+Homepage = "https://github.com/hw-native-sys/pypto"
+Repository = "https://github.com/hw-native-sys/pypto"
+"Bug Tracker" = "https://github.com/hw-native-sys/pypto/issues"
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+required-version = "0.14.8"
+
+[tool.ruff.lint]
+select = [
+    "PL", # pylint, https://docs.astral.sh/ruff/rules/#pylint-pl
+    "I",  # isort, https://docs.astral.sh/ruff/rules/#isort-i
+    "E",  # pycodestyle errors, https://docs.astral.sh/ruff/rules/#error-e
+    "W",  # pycodestyle warnings, https://docs.astral.sh/ruff/rules/#warning-w
+    "F",  # pyflakes, https://docs.astral.sh/ruff/rules/#pyflakes-f
+    "UP", # pyupgrade, https://docs.astral.sh/ruff/rules/#pyupgrade-up
+]
+ignore = [
+  "ANN401",  # flake8-annotations: any-type
+  "PLR2004", # pylint: magic-value-comparison
+  "PLR0911", # too many return statements
+  "PLW2901", # pylint: redefined-loop-variable (DSL reassignment pattern)
+]
+fixable = ["ALL"]
+
+[tool.ruff.lint.per-file-ignores]
+# `check_runtime_pin()` must run before the simpler imports it guards, so the
+# imports in these two modules are deliberately not at the top of the file.
+"python/pypto/runtime/task_interface.py" = ["E402"]
+"python/pypto/runtime/kernel_compiler.py" = ["E402"]
+# Vendored boundary stubs: the nanobind-stubgen output interleaves the build
+# marker with imports and embeds unreflowed C++ docstrings.
+"typings/**" = ["E402", "E501"]
+# The unit suite must set PYPTO_SKIP_RUNTIME_PIN_CHECK before its first `pypto` import.
+"tests/ut/conftest.py" = ["E402"]
+# DSL type annotations (pl.Tile[..., pl.TileView(...)]) exceed line-length;
+# F841 suppressed where DSL assignments intentionally create IR nodes whose
+# Python binding is unused but structurally required by the pass output.
+"tests/ut/ir/transforms/test_expand_mixed_kernel.py" = ["E501"]
+"tests/ut/ir/transforms/test_flatten_tile_nd_to_2d.py" = ["F841"]
+"tests/ut/ir/transforms/test_canonicalize_tile_slice.py" = ["F841"]
+"tests/ut/ir/transforms/test_init_memref.py" = ["E501"]
+"tests/ut/ir/transforms/test_memory_reuse.py" = ["E501"]
+"tests/ut/ir/transforms/test_infer_tile_memory_space.py" = ["E501"]
+"tests/ut/ir/transforms/test_interchange_chunk_loops.py" = ["E501", "F841"]
+"tests/ut/ir/transforms/test_optimize_orch_tensors.py" = ["F841"]
+"tests/ut/ir/transforms/test_outline_incore_interleaved_ops.py" = ["E501"]
+"tests/ut/ir/transforms/test_outline_incore_scopes.py" = ["F841"]
+"tests/ut/ir/transforms/test_outline_cluster_scopes.py" = ["F841"]
+"tests/ut/ir/transforms/test_legalize_pto_buffer_reuse.py" = ["E501", "F841"]
+"tests/ut/ir/transforms/test_ctrl_flow_transform.py" = ["F841"]
+"tests/ut/ir/transforms/test_split_vector_kernel.py" = ["F841"]
+# `with pl.spmd(...) as tid:` / `with pl.at(...) as tid:` capture targets are
+# intentionally unused Python bindings — the capture records an IR scope attr.
+"tests/ut/language/parser/test_scope_parsing.py" = ["F841"]
+"tests/ut/codegen/test_spmd_scope_tid_codegen.py" = ["F841"]
+# Embedded DSL repro deliberately collapses `with pl.at(...)` onto one line to
+# mimic @pl.jit's ast.unparse output — load-bearing, cannot be wrapped.
+"tests/ut/language/parser/test_text_parser.py" = ["E501"]
+# IR dumps are formatted at 200-col for readability — suppress line-length lint
+"build_output/**" = ["E501"]
+# Embeds a verbatim pass dump as a fixture; tile annotations carry their MemRef
+# inline and cannot be wrapped without changing what is under test.
+"tests/ut/tools/test_memory_map.py" = ["E501"]
+
+[tool.ruff.lint.pylint]
+max-statements = 100
+max-args = 10
+max-branches = 15
+
+[tool.ruff.format]
+quote-style = "double"
+skip-magic-trailing-comma = false
+line-ending = "lf"
+
+[tool.scikit-build]
+# Specify where to find the Python package
+wheel.packages = ["python/pypto"]
+# Install the package data files (*.pyi, py.typed)
+wheel.install-dir = "pypto"
+# Set minimum CMake version (cmake.minimum-version was removed in scikit-build-core 1.0)
+cmake.version = ">=3.15"
+# Build type
+cmake.build-type = "RelWithDebInfo"
+# Build directory, better for incremental build
+build-dir = "build"
+# extra cmake arguments
+cmake.args = [
+    "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
+]
+
+[tool.pyright]
+# Strict typing is the default. Trees not yet carried to the strict fixed
+# point carry a relaxed profile below (basic-equivalent checking); the
+# profiles are the migration backlog — delete an entry when its tree goes
+# strict. New files in profiled trees are born basic; files outside the
+# profiles must be born strict.
+include = ["python/pypto", "tests"]
+exclude = ["**/__pycache__", "build", "dist", "tests/st", "tests/ut/jit/test_roundtrip.py"]
+extraPaths = ["python", "."]
+typeCheckingMode = "strict"
+pythonVersion = "3.10"
+reportMissingTypeStubs = false
+reportMissingModuleSource = false
+reportPrivateUsage = false
+reportUnnecessaryTypeIgnoreComment = true
+
+# The test tree is checked at basic equivalence: the strict-only rule family is
+# off for it (untyped fixtures and traced kernel bodies would otherwise bury
+# the signal under annotation labor and intentional-unused noise). The rules
+# that stay on are the bug-signal ones — attribute access, argument types,
+# return paths. This mirrors the migration line's end-state configuration.
+[[tool.pyright.executionEnvironments]]
+root = "tests"
+reportUnusedClass = false
+reportUnknownVariableType = false
+reportUnknownMemberType = false
+reportUnnecessaryIsInstance = false
+reportMissingTypeArgument = false
+reportUnnecessaryTypeIgnoreComment = false
+reportUnknownLambdaType = false
+reportUnnecessaryCast = false
+reportUnknownParameterType = false
+reportUnknownArgumentType = false
+reportUnusedFunction = false
+reportPossiblyUnboundVariable = false
+reportMissingParameterType = false
+reportUnusedVariable = false
+reportCallIssue = false
+reportAssignmentType = false
+reportRedeclaration = false
+reportGeneralTypeIssues = false

@@ -1,0 +1,2120 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+"""
+910B PTO Backend: Cross-Core Communication (TPUSH/TPOP) Codegen Test.
+
+This test validates code generation for the complete TPUSH/TPOP cross-core
+communication protocol. Elementwise ops (add, exp) run on Vector cores, while
+matmul runs on Cube cores — matching the hardware architecture.
+
+Protocol under test (V2C unidirectional):
+  1. Vector (producer): load + add, tpush_to_aic → Cube
+  2. Cube (consumer):   tpop_from_aiv, matmul, store
+
+Bidirectional:
+  1. Vector → Cube (V2C): Vector preprocesses (add), pushes to Cube
+  2. Cube → Vector (C2V): Cube does matmul, pushes result back to Vector for post-processing
+
+Multiple explicit pipes:
+  1. Vector → Cube (V2C): Vector pushes one tile on pipe id 0
+  2. Vector → Cube (V2C): Vector pushes another tile on pipe id 1
+"""
+
+import re
+
+import pypto.language as pl
+import pytest
+from pypto import backend, codegen, ir, passes
+from pypto.backend import BackendType
+from pypto.backend.pto_backend import _build_group_mapping
+from pypto.runtime import RunConfig
+
+
+def _extract_func_section(mlir_code: str, func_name: str) -> str:
+    """Return the MLIR slice for a single func.func body."""
+    start_token = f"func.func @{func_name}"
+    start = mlir_code.find(start_token)
+    assert start != -1, f"Expected function {func_name!r} in MLIR:\n{mlir_code}"
+    next_start = mlir_code.find("\n  func.func @", start + len(start_token))
+    if next_start == -1:
+        return mlir_code[start:]
+    return mlir_code[start:next_start]
+
+
+# ============================================================================
+# Test Program: Vector Producer + Cube Consumer (V2C unidirectional)
+# ============================================================================
+
+
+@pl.program
+class CrossCoreTpushTpopProgram:
+    """V2C unidirectional cross-core program with orchestration wrapper.
+
+    Vector producer: loads tiles a and b, computes add and sub, pushes both to Cube.
+    Cube consumer: pops tiles, performs matmul, stores result.
+    """
+
+    @pl.function(type=pl.FunctionType.AIV)
+    def vector_producer(
+        self,
+        a: pl.Tensor[[16, 16], pl.FP16],
+        b: pl.Tensor[[16, 16], pl.FP16],
+        output: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+    ):
+        v2c_peer = pl.import_peer_buffer(name="v2c_slot_buffer", peer_func="cube_consumer")
+        pl.aiv_initialize_pipe(dir_mask=2, slot_size=512, v2c_consumer_buf=v2c_peer)
+
+        tile_a: pl.Tile[[16, 16], pl.FP16] = pl.load(a, [0, 0], [16, 16])
+        tile_b: pl.Tile[[16, 16], pl.FP16] = pl.load(b, [0, 0], [16, 16])
+        result_add: pl.Tile[[16, 16], pl.FP16] = pl.add(tile_a, tile_b)
+        result_sub: pl.Tile[[16, 16], pl.FP16] = pl.sub(tile_a, tile_b)
+
+        pl.tpush_to_aic(result_add, split=1)
+        pl.tpush_to_aic(result_sub, split=1)
+
+    @pl.function(type=pl.FunctionType.AIC)
+    def cube_consumer(
+        self,
+        a: pl.Tensor[[16, 16], pl.FP16],
+        b: pl.Tensor[[16, 16], pl.FP16],
+        output: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+    ) -> pl.Tensor[[16, 16], pl.FP32]:
+        pipe_buf = pl.reserve_buffer(name="v2c_slot_buffer", size=4096, base=0x1000)
+        pl.aic_initialize_pipe(dir_mask=2, slot_size=512, v2c_consumer_buf=pipe_buf)
+
+        received_add: pl.Tile[[16, 16], pl.FP16, pl.MemorySpace.Mat] = pl.tpop_from_aiv(split=1)
+        received_sub: pl.Tile[[16, 16], pl.FP16, pl.MemorySpace.Mat] = pl.tpop_from_aiv(split=1)
+        received_add_left = pl.move(received_add, target_memory=pl.Mem.Left)
+        received_sub_right = pl.move(received_sub, target_memory=pl.Mem.Right)
+
+        mm_result: pl.Tile[[16, 16], pl.FP32] = pl.matmul(received_add_left, received_sub_right)
+
+        pl.tfree_to_aiv(received_add)
+        pl.tfree_to_aiv(received_sub)
+
+        updated: pl.Tensor[[16, 16], pl.FP32] = pl.store(mm_result, [0, 0], output)
+        return updated
+
+    @pl.function(type=pl.FunctionType.Group)
+    def group_func(
+        self,
+        a: pl.Tensor[[16, 16], pl.FP16],
+        b: pl.Tensor[[16, 16], pl.FP16],
+        output: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+    ):
+        updated = self.cube_consumer(a, b, output)
+        self.vector_producer(a, b, output)
+        return updated
+
+    @pl.function(type=pl.FunctionType.Orchestration)
+    def main(
+        self,
+        a: pl.Tensor[[16, 16], pl.FP16],
+        b: pl.Tensor[[16, 16], pl.FP16],
+        output: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+    ) -> pl.Tensor[[16, 16], pl.FP32]:
+        out = self.group_func(a, b, output)
+        return out
+
+
+# ============================================================================
+# Bidirectional Test Program
+# ============================================================================
+
+
+@pl.program
+class BidirectionalCrossCorProgram:
+    """Bidirectional cross-core: Vector preprocesses → Cube matmul → Vector post-processes.
+
+    vector_bidir: Loads + adds (V2C push), receives matmul result (C2V pop), applies exp, stores.
+    cube_bidir: Receives preprocessed data (V2C pop), does matmul, pushes result back (C2V push).
+    """
+
+    @pl.function(type=pl.FunctionType.InCore)
+    def vector_bidir(
+        self,
+        a: pl.Tensor[[16, 16], pl.FP16],
+        b: pl.Tensor[[16, 16], pl.FP16],
+        output: pl.Tensor[[16, 16], pl.FP32],
+    ) -> pl.Tensor[[16, 16], pl.FP32]:
+        # C2V consumer: reserve buffer for incoming data from Cube (explicit base)
+        c2v_buf = pl.reserve_buffer(name="c2v_slot_buffer", size=2048, base=0x2000)
+        # V2C producer: import cube's reserved buffer
+        v2c_peer = pl.import_peer_buffer(name="v2c_slot_buffer", peer_func="cube_bidir")
+        # Bidirectional init with consumer buffer addresses
+        pl.aiv_initialize_pipe(dir_mask=3, slot_size=512, c2v_consumer_buf=c2v_buf, v2c_consumer_buf=v2c_peer)
+
+        # Preprocess: elementwise add (Vector op)
+        tile_a: pl.Tile[[16, 16], pl.FP16] = pl.load(a, [0, 0], [16, 16])
+        tile_b: pl.Tile[[16, 16], pl.FP16] = pl.load(b, [0, 0], [16, 16])
+        sum_tile: pl.Tile[[16, 16], pl.FP16] = pl.add(tile_a, tile_b)
+
+        # Push preprocessed data to Cube for matmul (V2C direction)
+        pl.tpush_to_aic(sum_tile, split=0)
+
+        # Receive matmul result back from Cube (C2V direction)
+        mm_result: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec] = pl.tpop_from_aic(split=0)
+
+        # Post-process: apply exp (Vector op)
+        processed: pl.Tile[[16, 16], pl.FP32] = pl.exp(mm_result)
+
+        # Release C2V slot
+        pl.tfree_to_aic(mm_result)
+
+        # Store final result
+        updated: pl.Tensor[[16, 16], pl.FP32] = pl.store(processed, [0, 0], output)
+        return updated
+
+    @pl.function(type=pl.FunctionType.InCore)
+    def cube_bidir(
+        self,
+        weight: pl.Tensor[[16, 16], pl.FP16],
+    ):
+        # V2C consumer: reserve buffer for incoming data from Vector (explicit base)
+        v2c_buf = pl.reserve_buffer(name="v2c_slot_buffer", size=2048, base=0x1000)
+        # C2V producer: import vector's reserved buffer
+        c2v_peer = pl.import_peer_buffer(name="c2v_slot_buffer", peer_func="vector_bidir")
+        # Bidirectional init with explicit consumer buffer addresses
+        pl.aic_initialize_pipe(dir_mask=3, slot_size=512, c2v_consumer_buf=c2v_peer, v2c_consumer_buf=v2c_buf)
+
+        # Receive preprocessed tile from Vector (V2C direction)
+        received: pl.Tile[[16, 16], pl.FP16, pl.MemorySpace.Mat] = pl.tpop_from_aiv(split=0)
+
+        # Matmul (Cube op)
+        w_tile: pl.Tile[[16, 16], pl.FP16] = pl.load(weight, [0, 0], [16, 16])
+        mm_result: pl.Tile[[16, 16], pl.FP32] = pl.matmul(received, w_tile)
+
+        # Release V2C slot
+        pl.tfree_to_aiv(received)
+
+        # Push matmul result back to Vector for post-processing (C2V direction)
+        pl.tpush_to_aiv(mm_result, split=0)
+
+
+# ============================================================================
+# Multiple-Pipe Cross-Core Test Program
+# ============================================================================
+
+
+@pl.program
+class MultiPipeSameDirectionCrossCoreProgram:
+    """Two explicit V2C frontend pipes from Vector to Cube."""
+
+    @pl.function(type=pl.FunctionType.InCore)
+    def vector_multi_pipe(
+        self,
+        a: pl.Tensor[[16, 16], pl.FP16],
+        b: pl.Tensor[[16, 16], pl.FP16],
+    ):
+        v2c_peer_0 = pl.import_peer_buffer(name="v2c_slot_buffer_0", peer_func="cube_multi_pipe")
+        v2c_peer_1 = pl.import_peer_buffer(name="v2c_slot_buffer_1", peer_func="cube_multi_pipe")
+        pl.aiv_initialize_pipe(
+            pl.const(0, pl.INT32),
+            v2c_peer_0,
+            dir_mask=2,
+            slot_size=512,
+            id=0,
+        )
+        pl.aiv_initialize_pipe(
+            pl.const(0, pl.INT32),
+            v2c_peer_1,
+            dir_mask=2,
+            slot_size=512,
+            id=1,
+        )
+
+        tile_a: pl.Tile[[16, 16], pl.FP16] = pl.load(a, [0, 0], [16, 16])
+        tile_b: pl.Tile[[16, 16], pl.FP16] = pl.load(b, [0, 0], [16, 16])
+        sum_tile: pl.Tile[[16, 16], pl.FP16] = pl.add(tile_a, tile_b)
+        diff_tile: pl.Tile[[16, 16], pl.FP16] = pl.sub(tile_a, tile_b)
+        pl.tpush_to_aic(sum_tile, split=0, id=0)
+        pl.tpush_to_aic(diff_tile, split=0, id=1)
+
+    @pl.function(type=pl.FunctionType.InCore)
+    def cube_multi_pipe(self):
+        v2c_buf_0 = pl.reserve_buffer(name="v2c_slot_buffer_0", size=4096, base=0x1000)
+        v2c_buf_1 = pl.reserve_buffer(name="v2c_slot_buffer_1", size=4096, base=0x2000)
+        pl.aic_initialize_pipe(
+            pl.const(0, pl.INT32),
+            v2c_buf_0,
+            dir_mask=2,
+            slot_size=512,
+            id=0,
+        )
+        pl.aic_initialize_pipe(
+            pl.const(0, pl.INT32),
+            v2c_buf_1,
+            dir_mask=2,
+            slot_size=512,
+            id=1,
+        )
+
+        sum_tile: pl.Tile[[16, 16], pl.FP16, pl.MemorySpace.Mat] = pl.tpop_from_aiv(split=0, id=0)
+        diff_tile: pl.Tile[[16, 16], pl.FP16, pl.MemorySpace.Mat] = pl.tpop_from_aiv(split=0, id=1)
+        sum_left = pl.move(sum_tile, target_memory=pl.Mem.Left)
+        diff_right = pl.move(diff_tile, target_memory=pl.Mem.Right)
+        _ = pl.matmul(sum_left, diff_right)
+        pl.tfree_to_aiv(sum_tile)
+        pl.tfree_to_aiv(diff_tile)
+
+
+# ============================================================================
+# Explicit slot_num Test Program (V2C unidirectional)
+# ============================================================================
+
+
+@pl.program
+class CrossCoreExplicitSlotNumProgram:
+    """V2C unidirectional program that pins explicit slot_num and local_slot_num.
+
+    Mirrors CrossCoreTpushTpopProgram but passes slot_num=16 and local_slot_num=4
+    to both init pipes (a3 sizes the buffer slot_size * local_slot_num).
+    """
+
+    @pl.function(type=pl.FunctionType.AIV)
+    def vector_producer(
+        self,
+        a: pl.Tensor[[16, 16], pl.FP16],
+        b: pl.Tensor[[16, 16], pl.FP16],
+        output: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+    ):
+        v2c_peer = pl.import_peer_buffer(name="v2c_slot_buffer", peer_func="cube_consumer")
+        pl.aiv_initialize_pipe(
+            dir_mask=2, slot_size=512, slot_num=16, local_slot_num=4, v2c_consumer_buf=v2c_peer
+        )
+
+        tile_a: pl.Tile[[16, 16], pl.FP16] = pl.load(a, [0, 0], [16, 16])
+        tile_b: pl.Tile[[16, 16], pl.FP16] = pl.load(b, [0, 0], [16, 16])
+        result_add: pl.Tile[[16, 16], pl.FP16] = pl.add(tile_a, tile_b)
+
+        pl.tpush_to_aic(result_add, split=1)
+
+    @pl.function(type=pl.FunctionType.AIC)
+    def cube_consumer(
+        self,
+        a: pl.Tensor[[16, 16], pl.FP16],
+        b: pl.Tensor[[16, 16], pl.FP16],
+        output: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+    ) -> pl.Tensor[[16, 16], pl.FP32]:
+        pipe_buf = pl.reserve_buffer(name="v2c_slot_buffer", size=2048, base=0x1000)
+        pl.aic_initialize_pipe(
+            dir_mask=2, slot_size=512, slot_num=16, local_slot_num=4, v2c_consumer_buf=pipe_buf
+        )
+
+        received_add: pl.Tile[[16, 16], pl.FP16, pl.MemorySpace.Mat] = pl.tpop_from_aiv(split=1)
+        received_add_left = pl.move(received_add, target_memory=pl.Mem.Left)
+
+        mm_result: pl.Tile[[16, 16], pl.FP32] = pl.matmul(received_add_left, received_add_left)
+
+        pl.tfree_to_aiv(received_add)
+
+        updated: pl.Tensor[[16, 16], pl.FP32] = pl.store(mm_result, [0, 0], output)
+        return updated
+
+    @pl.function(type=pl.FunctionType.Group)
+    def group_func(
+        self,
+        a: pl.Tensor[[16, 16], pl.FP16],
+        b: pl.Tensor[[16, 16], pl.FP16],
+        output: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+    ):
+        updated = self.cube_consumer(a, b, output)
+        self.vector_producer(a, b, output)
+        return updated
+
+    @pl.function(type=pl.FunctionType.Orchestration)
+    def main(
+        self,
+        a: pl.Tensor[[16, 16], pl.FP16],
+        b: pl.Tensor[[16, 16], pl.FP16],
+        output: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+    ) -> pl.Tensor[[16, 16], pl.FP32]:
+        out = self.group_func(a, b, output)
+        return out
+
+
+# ============================================================================
+# Test Suite
+# ============================================================================
+
+
+class TestCrossCoreTpushTpopCodegen:
+    """Tests for cross-core TPUSH/TPOP PTO code generation."""
+
+    @staticmethod
+    def _compile_and_generate(program) -> dict[str, str]:
+        """Compile program and return dict of {func_name: mlir_code}.
+
+        Uses a custom pipeline matching the Default strategy but without
+        ExpandMixedKernel, since these programs already have manual cross-core
+        setup with explicit AIC/AIV tpush/tpop ops.
+        """
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910)
+        # backend.set_backend_type(BackendType.Ascend950)
+
+        pipeline = passes.PassPipeline()
+        for factory in [
+            passes.unroll_loops,
+            passes.convert_to_ssa,
+            passes.flatten_call_expr,
+            passes.outline_incore_scopes,
+            passes.outline_cluster_scopes,
+            passes.convert_tensor_to_tile_ops,
+            passes.flatten_tile_nd_to_2d,
+            passes.infer_tile_memory_space,
+            passes.resolve_backend_op_layouts,
+            passes.init_mem_ref,
+            passes.memory_reuse,
+            passes.allocate_memory_addr,
+            passes.stamp_tfree_split,
+        ]:
+            pipeline.add_pass(factory())
+        optimized = pipeline.run(program)
+
+        result = {}
+        codegen_instance = codegen.PTOCodegen()
+        groups, ungrouped = _build_group_mapping(optimized)
+
+        # Grouped: one module per group
+        for group_name, members in groups.items():
+            grouped_program = ir.Program(members, group_name, optimized.span)
+            mlir_code = codegen_instance.generate(grouped_program)
+            result[group_name] = mlir_code
+            for func in members:
+                result[func.name] = mlir_code
+
+        # Ungrouped: one module per function (existing behavior)
+        for func in ungrouped:
+            single = ir.Program([func], func.name, optimized.span)
+            mlir_code = codegen_instance.generate(single)
+            result[func.name] = mlir_code
+        return result
+
+    def test_unidirectional_v2c_vector_producer(self):
+        """Test Vector producer generates correct V2C cross-core PTO ops."""
+        codes = self._compile_and_generate(CrossCoreTpushTpopProgram)
+        vector_code = codes["vector_producer"]
+
+        assert vector_code, "Vector producer MLIR should not be empty"
+        assert "pto.import_reserved_buffer" in vector_code, "Should contain pto.import_reserved_buffer"
+        assert "peer_func = @cube_consumer" in vector_code, (
+            "Should reference cube_consumer with MLIR symbol syntax"
+        )
+        assert "-> i32" in vector_code, "import_reserved_buffer should return i32"
+        assert "pto.aiv_initialize_pipe" in vector_code, "Should contain pto.aiv_initialize_pipe"
+        assert "dir_mask = 2" in vector_code, "Should have dir_mask = 2 (V2C)"
+        assert "v2c_consumer_buf = " in vector_code, "Should have v2c_consumer_buf as SSA reference"
+        assert "c2v_consumer_buf = " in vector_code, "Should have c2v_consumer_buf as SSA reference"
+        assert "pto.tpush_to_aic" in vector_code, "Should contain pto.tpush_to_aic"
+        assert "pto.tadd" in vector_code, "Should contain elementwise add (Vector op)"
+
+    def test_unidirectional_v2c_cube_consumer(self):
+        """Test Cube consumer generates correct V2C cross-core PTO ops."""
+        codes = self._compile_and_generate(CrossCoreTpushTpopProgram)
+        cube_code = codes["cube_consumer"]
+
+        assert cube_code, "Cube consumer MLIR should not be empty"
+        assert "pto.reserve_buffer" in cube_code, "Should contain pto.reserve_buffer"
+        assert 'name = "v2c_slot_buffer"' in cube_code, "Should reference v2c_slot_buffer"
+        assert "auto = false" in cube_code, "Should have auto = false for explicit base address"
+        assert "base = 4096" in cube_code, "Should have explicit base address (0x1000 = 4096)"
+        assert "location = #pto.address_space<" in cube_code, "Should have location attribute"
+        assert "-> i32" in cube_code, "reserve_buffer should return i32"
+        assert "pto.aic_initialize_pipe" in cube_code, "Should contain pto.aic_initialize_pipe"
+        assert "dir_mask = 2" in cube_code, "Should have dir_mask = 2 (V2C)"
+        assert "v2c_consumer_buf = " in cube_code, "Should have v2c_consumer_buf as SSA reference"
+        assert "c2v_consumer_buf = " in cube_code, "Should have c2v_consumer_buf as SSA reference"
+        assert "arith.constant 0 : i32" in cube_code, "Should emit i32 constant for default consumer buf"
+        assert "pto.tpop_from_aiv" in cube_code, "Should contain pto.tpop_from_aiv"
+        assert "= pto.tpop_from_aiv" in cube_code, "tpop should produce SSA result"
+        assert "-> !pto.tile_buf<" in cube_code, "tpop should use -> result type syntax"
+        assert "pto.tfree_from_aiv" in cube_code, "Should contain pto.tfree_from_aiv"
+        tfree_line = next(line for line in cube_code.splitlines() if "pto.tfree_from_aiv" in line)
+        assert "{split = " in tfree_line, f"tfree should have split attribute: {tfree_line}"
+        assert "pto.tmatmul" in cube_code, "Should contain matmul (Cube op)"
+
+    def test_explicit_slot_num_emitted(self):
+        """Explicit slot_num / local_slot_num flow into both AIV and AIC init pipe PTO ops."""
+        codes = self._compile_and_generate(CrossCoreExplicitSlotNumProgram)
+
+        vector_code = codes["vector_producer"]
+        assert "pto.aiv_initialize_pipe" in vector_code, "Should contain pto.aiv_initialize_pipe"
+        assert "slot_num = 16" in vector_code, f"AIV init pipe should carry slot_num = 16:\n{vector_code}"
+        assert "local_slot_num = 4" in vector_code, (
+            f"AIV init pipe should carry local_slot_num = 4:\n{vector_code}"
+        )
+
+        cube_code = codes["cube_consumer"]
+        assert "pto.aic_initialize_pipe" in cube_code, "Should contain pto.aic_initialize_pipe"
+        assert "slot_num = 16" in cube_code, f"AIC init pipe should carry slot_num = 16:\n{cube_code}"
+        assert "local_slot_num = 4" in cube_code, (
+            f"AIC init pipe should carry local_slot_num = 4:\n{cube_code}"
+        )
+
+    def test_slot_num_omitted_by_default(self):
+        """A hand-written init pipe without the knobs emits no slot_num/local_slot_num.
+
+        Only hand-authored setup reaches PTOAS's own dir_mask-derived depth: pipes built by
+        ExpandMixedKernel always carry an explicit slot_num.
+        """
+        codes = self._compile_and_generate(CrossCoreTpushTpopProgram)
+        assert "slot_num" not in codes["vector_producer"], "Default path must not emit slot_num"
+        assert "slot_num" not in codes["cube_consumer"], "Default path must not emit slot_num"
+
+    def test_tpop_dynamic_valid_shape_operands(self):
+        """Dynamic tpop result valid_shape should emit PTOAS frontend operands."""
+        span = ir.Span.unknown()
+        valid_row = ir.Var("valid_row", ir.ScalarType(pl.INDEX), span)
+        valid_col = ir.Var("valid_col", ir.ScalarType(pl.INDEX), span)
+        tile_view = ir.TileView(valid_shape=[valid_row, valid_col])
+        # MemRef-less: a tpop result owns no general-pool buffer (InitMemRef leaves
+        # it MemRef-less); codegen must emit no alloc_tile from the op name alone.
+        tile_type = ir.TileType([16, 64], pl.FP32, None, tile_view, ir.MemorySpace.Vec)
+        recv_tile = ir.Var("recv_tile", tile_type, span)
+        tpop_call = ir.Call(ir.Op("tile.tpop_from_aic"), [], {"split": 2}, tile_type, span)
+        body = ir.SeqStmts([ir.AssignStmt(recv_tile, tpop_call, span)], span)
+        func = ir.Function(
+            "dynamic_tpop",
+            [(valid_row, ir.ParamDirection.In), (valid_col, ir.ParamDirection.In)],
+            [],
+            body,
+            span,
+            ir.FunctionType.AIV,
+        )
+
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910)
+        mlir_code = codegen.PTOCodegen().generate(ir.Program([func], "dynamic_tpop_program", span))
+        tpop_line = next(line.strip() for line in mlir_code.splitlines() if "pto.tpop_from_aic" in line)
+
+        assert "pto.tpop_from_aic(%arg0, %arg1) {split = 2}" in tpop_line
+        assert "v_row=?" in tpop_line
+        assert "v_col=?" in tpop_line
+        assert "pto.alloc_tile" not in mlir_code
+
+    def test_tpop_no_split_acc_to_vec_preserves_dynamic_valid_shape(self):
+        """A dynamic C2V valid shape stays on TPOP because treshape has no dynamic operands."""
+        span = ir.Span.unknown()
+        valid_col = ir.Var("valid_col", ir.ScalarType(pl.INDEX), span)
+        tile_view = ir.TileView(valid_shape=[ir.ConstInt(8, pl.INT64, span), valid_col])
+        # MemRef-less: a tpop result owns no general-pool buffer (InitMemRef leaves
+        # it MemRef-less); codegen must emit no alloc_tile from the op name alone.
+        tile_type = ir.TileType([16, 64], pl.FP32, None, tile_view, ir.MemorySpace.Vec)
+        recv_tile = ir.Var("recv_tile", tile_type, span)
+        tpop_call = ir.Call(ir.Op("tile.tpop_from_aic"), [], {"split": 0}, tile_type, span)
+        body = ir.SeqStmts([ir.AssignStmt(recv_tile, tpop_call, span)], span)
+        func = ir.Function(
+            "dynamic_tpop_static_row",
+            [(valid_col, ir.ParamDirection.In)],
+            [],
+            body,
+            span,
+            ir.FunctionType.AIV,
+        )
+
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910)
+        mlir_code = codegen.PTOCodegen().generate(ir.Program([func], "dynamic_tpop_static_row_program", span))
+        lines = [line.strip() for line in mlir_code.splitlines()]
+        tpop_line = next(line for line in lines if "pto.tpop_from_aic" in line)
+
+        assert "pto.tpop_from_aic(%c8_index, %arg0) {split = 0}" in tpop_line
+        assert "v_row=?" in tpop_line
+        assert "v_col=?" in tpop_line
+        assert "pto.treshape" not in mlir_code
+        assert "pto.subview" not in mlir_code
+        assert "pto.set_validshape" not in mlir_code
+
+    def test_tpop_static_non_full_valid_shape_operands(self):
+        """Static tpop valid_shape smaller than physical shape should emit explicit operands."""
+        span = ir.Span.unknown()
+        tile_view = ir.TileView(valid_shape=[ir.ConstInt(0, pl.INDEX, span), ir.ConstInt(0, pl.INDEX, span)])
+        # MemRef-less: a tpop result owns no general-pool buffer (InitMemRef leaves
+        # it MemRef-less); codegen must emit no alloc_tile from the op name alone.
+        tile_type = ir.TileType([16, 64], pl.FP32, None, tile_view, ir.MemorySpace.Vec)
+        recv_tile = ir.Var("recv_tile", tile_type, span)
+        tpop_call = ir.Call(ir.Op("tile.tpop_from_aic"), [], {"split": 0}, tile_type, span)
+        body = ir.SeqStmts([ir.AssignStmt(recv_tile, tpop_call, span)], span)
+        func = ir.Function("empty_tpop", [], [], body, span, ir.FunctionType.AIV)
+
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910)
+        mlir_code = codegen.PTOCodegen().generate(ir.Program([func], "empty_tpop_program", span))
+        tpop_line = next(line.strip() for line in mlir_code.splitlines() if "pto.tpop_from_aic" in line)
+
+        assert "pto.tpop_from_aic(%c0_index, %c0_index) {split = 0}" in tpop_line
+        assert "v_row=?" in tpop_line
+        assert "v_col=?" in tpop_line
+
+    def test_tpop_dynamic_valid_shape_rejects_bool_operand(self):
+        """Dynamic tpop valid_shape operands must be integer or index typed."""
+        span = ir.Span.unknown()
+        valid_row = ir.Var("valid_row", ir.ScalarType(pl.BOOL), span)
+        tile_view = ir.TileView(valid_shape=[valid_row, ir.ConstInt(64, pl.INT64, span)])
+        # MemRef-less: a tpop result owns no general-pool buffer (InitMemRef leaves
+        # it MemRef-less); codegen must emit no alloc_tile from the op name alone.
+        tile_type = ir.TileType([16, 64], pl.FP32, None, tile_view, ir.MemorySpace.Vec)
+        recv_tile = ir.Var("recv_tile", tile_type, span)
+        tpop_call = ir.Call(ir.Op("tile.tpop_from_aic"), [], {"split": 0}, tile_type, span)
+        body = ir.SeqStmts([ir.AssignStmt(recv_tile, tpop_call, span)], span)
+        func = ir.Function(
+            "dynamic_tpop_bool_row",
+            [(valid_row, ir.ParamDirection.In)],
+            [],
+            body,
+            span,
+            ir.FunctionType.AIV,
+        )
+
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910)
+        with pytest.raises(
+            ValueError, match="tpop valid_shape operand must be integer or index type, got i1"
+        ):
+            codegen.PTOCodegen().generate(ir.Program([func], "dynamic_tpop_bool_row_program", span))
+
+    @pytest.mark.parametrize(
+        ("tpush_op_name", "func_type", "memory_space"),
+        [
+            ("tile.tpush_to_aiv", ir.FunctionType.AIC, ir.MemorySpace.Acc),
+            ("tile.tpush_to_aic", ir.FunctionType.AIV, ir.MemorySpace.Vec),
+        ],
+    )
+    def test_tpush_uses_validshape_aliased_tile(self, tpush_op_name, func_type, memory_space):
+        """set_validshape + cross-core tpush should push the in-place validShape tile handle."""
+        span = ir.Span.unknown()
+
+        src = ir.Var("src", ir.TensorType([32, 32], pl.FP32), span)
+        valid_row = ir.Var("valid_row", ir.ScalarType(pl.INDEX), span)
+        valid_col = ir.Var("valid_col", ir.ScalarType(pl.INDEX), span)
+
+        zero = ir.ConstInt(0, pl.INDEX, span)
+        shape_32 = ir.ConstInt(32, pl.INDEX, span)
+        offsets = ir.MakeTuple([zero, zero], span)
+        shapes = ir.MakeTuple([shape_32, shape_32], span)
+
+        load_memref = ir.MemRef(memory_space, ir.ConstInt(0, pl.INT64, span), 32 * 32 * 4, 0)
+        load_view = ir.TileView(
+            valid_shape=[shape_32, shape_32],
+            blayout=ir.TileLayout.col_major,
+            slayout=ir.TileLayout.row_major,
+            fractal=1024,
+        )
+        load_type = ir.TileType([32, 32], pl.FP32, load_memref, load_view, memory_space)
+        src_tile = ir.Var("src_tile", load_type, span)
+
+        narrowed_memref = ir.MemRef(memory_space, ir.ConstInt(0, pl.INT64, span), 32 * 32 * 4, 0)
+        narrowed_view = ir.TileView(
+            valid_shape=[valid_row, valid_col],
+            blayout=ir.TileLayout.col_major,
+            slayout=ir.TileLayout.row_major,
+            fractal=1024,
+        )
+        narrowed_type = ir.TileType([32, 32], pl.FP32, narrowed_memref, narrowed_view, memory_space)
+        narrowed_tile = ir.Var("narrowed_tile", narrowed_type, span)
+
+        load_call = ir.Call(
+            ir.Op("tile.load"),
+            [src, offsets, shapes, shapes],
+            {"target_memory": memory_space},
+            load_type,
+            span,
+        )
+        set_validshape_call = ir.Call(
+            ir.Op("tile.set_validshape"),
+            [src_tile, valid_row, valid_col],
+            {},
+            narrowed_type,
+            span,
+        )
+        tpush_call = ir.Call(ir.Op(tpush_op_name), [narrowed_tile], {"split": 0}, ir.UnknownType(), span)
+
+        body = ir.SeqStmts(
+            [
+                ir.AssignStmt(src_tile, load_call, span),
+                ir.AssignStmt(narrowed_tile, set_validshape_call, span),
+                ir.EvalStmt(tpush_call, span),
+            ],
+            span,
+        )
+        func = ir.Function(
+            "narrow_then_push",
+            [
+                (src, ir.ParamDirection.In),
+                (valid_row, ir.ParamDirection.In),
+                (valid_col, ir.ParamDirection.In),
+            ],
+            [],
+            body,
+            span,
+            func_type,
+        )
+
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910)
+        mlir_code = codegen.PTOCodegen().generate(ir.Program([func], "narrow_then_push_program", span))
+
+        narrowed_alloc_lines = [
+            line.strip()
+            for line in mlir_code.splitlines()
+            if "%narrowed_tile" in line and "pto.alloc_tile" in line
+        ]
+        set_validshape_line = next(
+            line.strip() for line in mlir_code.splitlines() if "pto.set_validshape" in line
+        )
+        pto_tpush_op_name = tpush_op_name.replace("tile.", "pto.")
+        tpush_line = next(line.strip() for line in mlir_code.splitlines() if pto_tpush_op_name in line)
+
+        assert not narrowed_alloc_lines, (
+            "Expected set_validshape result to alias the payload tile without a second alloc_tile, got:\n"
+            + "\n".join(narrowed_alloc_lines)
+        )
+        assert "%src_tile" in set_validshape_line, (
+            f"Expected set_validshape to target source payload tile SSA, got:\n{set_validshape_line}"
+        )
+        assert "v_row=?" in set_validshape_line and "v_col=?" in set_validshape_line, (
+            f"Expected dynamic tile type on set_validshape, got:\n{set_validshape_line}"
+        )
+        assert "%src_tile" in tpush_line, (
+            f"Expected tpush to push the source tile after in-place set_validshape, got:\n{tpush_line}"
+        )
+        assert "%narrowed_tile" not in tpush_line, (
+            f"Expected tpush not to use a payload-less set_validshape alias alloc, got:\n{tpush_line}"
+        )
+        assert "v_row=?" in tpush_line and "v_col=?" in tpush_line, (
+            f"Expected tpush to follow main's always-dynamic alloc_tile type annotation, got:\n{tpush_line}"
+        )
+
+    def test_no_split_acc_to_vec_uses_full_box_for_tpush_and_tpop(self):
+        """A partial Acc payload crosses the no-split C2V FIFO as one full physical box."""
+        span = ir.Span.unknown()
+        zero = ir.ConstInt(0, pl.INDEX, span)
+        rows = ir.ConstInt(16, pl.INDEX, span)
+        cols = ir.ConstInt(32, pl.INDEX, span)
+        valid_cols = ir.ConstInt(24, pl.INDEX, span)
+        offsets = ir.MakeTuple([zero, zero], span)
+        shape = ir.MakeTuple([rows, cols], span)
+        valid_shape = ir.MakeTuple([rows, valid_cols], span)
+
+        src = ir.Var("src", ir.TensorType([16, 32], pl.FP32), span)
+        acc_memref = ir.MemRef(ir.MemorySpace.Acc, ir.ConstInt(0, pl.INT64, span), 16 * 32 * 4, 0)
+        acc_type = ir.TileType(
+            [rows, cols],
+            pl.FP32,
+            acc_memref,
+            ir.TileView(valid_shape=[rows, valid_cols]),
+            ir.MemorySpace.Acc,
+        )
+        acc_tile = ir.Var("acc_tile", acc_type, span)
+        load_call = ir.Call(
+            ir.Op("tile.load"),
+            [src, offsets, shape, valid_shape],
+            {"target_memory": ir.MemorySpace.Acc},
+            acc_type,
+            span,
+        )
+        push_call = ir.Call(
+            ir.Op("tile.tpush_to_aiv"),
+            [acc_tile],
+            {"split": 0},
+            ir.UnknownType(),
+            span,
+        )
+        producer = ir.Function(
+            "partial_acc_producer",
+            [(src, ir.ParamDirection.In)],
+            [],
+            ir.SeqStmts(
+                [ir.AssignStmt(acc_tile, load_call, span), ir.EvalStmt(push_call, span)],
+                span,
+            ),
+            span,
+            ir.FunctionType.AIC,
+        )
+
+        vec_type = ir.TileType(
+            [rows, cols],
+            pl.FP32,
+            None,
+            ir.TileView(valid_shape=[rows, valid_cols]),
+            ir.MemorySpace.Vec,
+        )
+        popped = ir.Var("popped", vec_type, span)
+        pop_call = ir.Call(ir.Op("tile.tpop_from_aic"), [], {"split": 0}, vec_type, span)
+        consumer = ir.Function(
+            "partial_vec_consumer",
+            [],
+            [],
+            ir.SeqStmts([ir.AssignStmt(popped, pop_call, span)], span),
+            span,
+            ir.FunctionType.AIV,
+        )
+
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910)
+        mlir_code = codegen.PTOCodegen().generate(
+            ir.Program([producer, consumer], "partial_acc_to_vec_program", span)
+        )
+        producer_code = _extract_func_section(mlir_code, "partial_acc_producer")
+        consumer_code = _extract_func_section(mlir_code, "partial_vec_consumer")
+
+        producer_lines = [line.strip() for line in producer_code.splitlines()]
+        push_index = next(i for i, line in enumerate(producer_lines) if "pto.tpush_to_aiv" in line)
+        producer_validshape = [
+            (i, line) for i, line in enumerate(producer_lines) if "pto.set_validshape" in line
+        ]
+        assert len(producer_validshape) == 2
+        assert producer_validshape[0][0] < push_index < producer_validshape[1][0]
+        assert ", %c16_index, %c32_index :" in producer_validshape[0][1]
+        assert ", %c16_index, %c24_index :" in producer_validshape[1][1]
+
+        consumer_lines = [line.strip() for line in consumer_code.splitlines()]
+        pop_index = next(i for i, line in enumerate(consumer_lines) if "pto.tpop_from_aic" in line)
+        reshape_index = next(i for i, line in enumerate(consumer_lines) if "pto.treshape" in line)
+        assert "pto.tpop_from_aic(%c16_index, %c32_index) {split = 0}" in consumer_lines[pop_index]
+        transport = re.search(r"^(%\w+) = pto\.tpop_from_aic", consumer_lines[pop_index])
+        assert transport is not None
+        assert pop_index < reshape_index
+        assert f"pto.treshape {transport.group(1)}" in consumer_lines[reshape_index]
+        assert "rows=16, cols=32, v_row=16, v_col=24" in consumer_lines[reshape_index]
+        assert "pto.set_validshape" not in consumer_code, (
+            "a frontend tpop result is not a locally bound PTOAS tile; logical shape "
+            f"restoration must use a metadata-only treshape:\n{consumer_code}"
+        )
+
+    def _row_narrowed_acc_push_program(
+        self, valid_rows, valid_cols, compact, split=0, rows=64, backend_type=BackendType.Ascend910
+    ):
+        """One AIC function that pushes a row-narrowed Acc tile into the C2V FIFO.
+
+        ``valid_rows=None`` makes the row extent a runtime ``INDEX`` parameter.
+        """
+        span = ir.Span.unknown()
+        zero = ir.ConstInt(0, pl.INDEX, span)
+        box_rows = rows
+        rows = ir.ConstInt(box_rows, pl.INDEX, span)
+        cols = ir.ConstInt(128, pl.INDEX, span)
+        runtime_rows = ir.Var("valid_row", ir.ScalarType(pl.INDEX), span) if valid_rows is None else None
+        v_rows = runtime_rows if runtime_rows is not None else ir.ConstInt(valid_rows, pl.INDEX, span)
+        v_cols = ir.ConstInt(valid_cols, pl.INDEX, span)
+        offsets = ir.MakeTuple([zero, zero], span)
+        shape = ir.MakeTuple([rows, cols], span)
+        valid_shape = ir.MakeTuple([v_rows, v_cols], span)
+
+        src = ir.Var("src", ir.TensorType([box_rows, 128], pl.INT32), span)
+        acc_memref = ir.MemRef(ir.MemorySpace.Acc, ir.ConstInt(0, pl.INT64, span), box_rows * 128 * 4, 0)
+        acc_type = ir.TileType(
+            [rows, cols],
+            pl.INT32,
+            acc_memref,
+            ir.TileView(valid_shape=[v_rows, v_cols], compact=compact),
+            ir.MemorySpace.Acc,
+        )
+        acc_tile = ir.Var("acc_tile", acc_type, span)
+        load_call = ir.Call(
+            ir.Op("tile.load"),
+            [src, offsets, shape, valid_shape],
+            {"target_memory": ir.MemorySpace.Acc},
+            acc_type,
+            span,
+        )
+        push_call = ir.Call(ir.Op("tile.tpush_to_aiv"), [acc_tile], {"split": split}, ir.UnknownType(), span)
+        producer = ir.Function(
+            "narrow_acc_producer",
+            [(src, ir.ParamDirection.In)]
+            + ([(runtime_rows, ir.ParamDirection.In)] if runtime_rows is not None else []),
+            [],
+            ir.SeqStmts([ir.AssignStmt(acc_tile, load_call, span), ir.EvalStmt(push_call, span)], span),
+            span,
+            ir.FunctionType.AIC,
+        )
+        backend.reset_for_testing()
+        backend.set_backend_type(backend_type)
+        mlir_code = codegen.PTOCodegen().generate(ir.Program([producer], "narrow_acc_push_program", span))
+        return _extract_func_section(mlir_code, "narrow_acc_producer")
+
+    def test_no_split_acc_to_vec_transport_keeps_the_producer_row_extent(self):
+        """A row-narrowed compact Acc must reach TPUSH at its own row extent.
+
+        ``mad`` lays the product out in L0C with an N-fractal stride taken from
+        the L0A operand's *valid* rows (pto-isa ``TMatmul.hpp``:
+        ``uint16_t m = aMatrix.GetValidRow()``), and ``TStoreAccNz2nd`` -- which
+        is what TPUSH runs -- recomputes that stride as
+        ``ceil(validRow/16)*16`` for a compact tile. Widening validRow to the
+        physical box before the push therefore makes the fix-pipe walk L0C at a
+        pitch ``mad`` never wrote at: with a 64-row box valid to 16 the push
+        picks up N-fractal 4j for every fractal j (issue #2510). Columns are a
+        different story and stay widened -- see the sibling test.
+        """
+        producer_code = self._row_narrowed_acc_push_program(16, 128, ir.CompactMode.normal)
+        assert "pto.set_validshape" not in producer_code, (
+            "a full-width row-narrowed Acc needs no transport widening at all; widening the rows "
+            f"desynchronizes TPUSH from the pitch mad wrote at:\n{producer_code}"
+        )
+
+    def test_no_split_acc_to_vec_transport_widens_columns_only(self):
+        """Columns still widen to the box; rows still do not.
+
+        The FIFO slot's row pitch is the producer's physical column count, so a
+        partially written column range leaves stale bytes *inside* the valid
+        rows. That is why the column half of the transport normalization stays.
+        """
+        producer_code = self._row_narrowed_acc_push_program(16, 96, ir.CompactMode.normal)
+        producer_lines = [line.strip() for line in producer_code.splitlines()]
+        push_index = next(i for i, line in enumerate(producer_lines) if "pto.tpush_to_aiv" in line)
+        validshape = [(i, line) for i, line in enumerate(producer_lines) if "pto.set_validshape" in line]
+        assert len(validshape) == 2, producer_code
+        assert validshape[0][0] < push_index < validshape[1][0]
+        assert ", %c16_index, %c128_index :" in validshape[0][1], (
+            f"transport must keep the producer's 16 valid rows and widen only the columns:\n{producer_code}"
+        )
+        assert ", %c16_index, %c96_index :" in validshape[1][1]
+
+    def test_split_acc_to_vec_transport_keeps_the_producer_row_extent(self):
+        """A compact narrowed Acc crosses a *split* boundary at its own row extent.
+
+        The no-split rule holds at a split too: the push reads L0C at the pitch
+        ``ceil(validRow/16)*16``, which matches what ``mad`` wrote only while
+        validRow is the matmul's own. No lane needs a row past it -- a lane's band
+        is ``clamp(V - lane * S, 0, S)`` rows from ``lane * S`` -- so widening the
+        rows to the box only skews the valid ones (on device: 1792 of 2048 wrong
+        for a 64-row box valid to 16 across ``pl.split(UP_DOWN)``).
+        """
+        for split in (1, 2):
+            producer_code = self._row_narrowed_acc_push_program(16, 128, ir.CompactMode.normal, split=split)
+            assert "pto.tpush_to_aiv" in producer_code
+            assert "pto.set_validshape" not in producer_code, (
+                f"a full-width compact Acc needs no transport widening at split={split}; widening its "
+                f"rows desynchronizes TPUSH from the pitch mad wrote at:\n{producer_code}"
+            )
+
+    def test_split_acc_to_vec_transport_widens_columns_only(self):
+        """At a split, columns still widen to the box while a compact Acc's rows do not."""
+        producer_code = self._row_narrowed_acc_push_program(40, 96, ir.CompactMode.normal, split=1)
+        producer_lines = [line.strip() for line in producer_code.splitlines()]
+        push_index = next(i for i, line in enumerate(producer_lines) if "pto.tpush_to_aiv" in line)
+        validshape = [(i, line) for i, line in enumerate(producer_lines) if "pto.set_validshape" in line]
+        assert len(validshape) == 2, producer_code
+        assert validshape[0][0] < push_index < validshape[1][0]
+        assert ", %c40_index, %c128_index :" in validshape[0][1], (
+            f"transport must keep the producer's 40 valid rows and widen only the columns:\n{producer_code}"
+        )
+        assert ", %c40_index, %c96_index :" in validshape[1][1]
+
+    def test_split_acc_to_vec_non_compact_transport_keeps_the_full_box(self):
+        """A non-compact Acc reads L0C at ``Rows`` whatever its validRow, so its box transport stays."""
+        producer_code = self._row_narrowed_acc_push_program(16, 128, ir.CompactMode.null, split=1)
+        validshape = [line.strip() for line in producer_code.splitlines() if "pto.set_validshape" in line]
+        assert len(validshape) == 2, producer_code
+        assert ", %c64_index, %c128_index :" in validshape[0], producer_code
+
+    def test_split_acc_to_vec_transport_keeps_a_runtime_row_extent(self):
+        """A runtime row extent crosses at its own value too; only the lanes' pops defer it."""
+        producer_code = self._row_narrowed_acc_push_program(None, 128, ir.CompactMode.normal, split=1)
+        assert "pto.tpush_to_aiv" in producer_code
+        assert "pto.set_validshape" not in producer_code, (
+            f"a runtime-extent compact Acc must not be widened to the box before TPUSH:\n{producer_code}"
+        )
+
+    def test_hardware_split_acc_to_vec_rejects_a_row_narrowed_compact_accumulator(self):
+        """Where the push splits its rows in hardware, the box and the compact pitch conflict.
+
+        Ascend950 hands each vector lane half of the TRANSPORTED rows (a dual-mode
+        TMOV), so a split push has to carry the box to put lane 1 at the box half,
+        and that re-derives the compact tile's L0C pitch from the box. The shape
+        is refused there rather than lowered into skewed data.
+        """
+        with pytest.raises(
+            ValueError, match="split push hands each vector lane half of the transported rows"
+        ):
+            self._row_narrowed_acc_push_program(
+                16, 128, ir.CompactMode.normal, split=1, backend_type=BackendType.Ascend950
+            )
+
+    def test_hardware_split_acc_to_vec_non_compact_transport_keeps_the_full_box(self):
+        """A non-compact Acc reads at ``Rows`` either way, so the hardware split keeps the box."""
+        producer_code = self._row_narrowed_acc_push_program(
+            16, 128, ir.CompactMode.null, split=1, backend_type=BackendType.Ascend950
+        )
+        validshape = [line.strip() for line in producer_code.splitlines() if "pto.set_validshape" in line]
+        assert len(validshape) == 2, producer_code
+        assert ", %c64_index, %c128_index :" in validshape[0], producer_code
+
+    def test_hardware_split_acc_to_vec_allows_a_single_fractal_block_accumulator(self):
+        """``ceil(validRow/16)*16 == Rows`` makes the box pitch the compact one, so it crosses."""
+        producer_code = self._row_narrowed_acc_push_program(
+            8, 128, ir.CompactMode.normal, split=1, rows=16, backend_type=BackendType.Ascend950
+        )
+        assert "pto.tpush_to_aiv" in producer_code
+
+    def test_split_acc_to_vec_allows_a_single_fractal_block_accumulator(self):
+        """``ceil(validRow/16)*16 == Rows`` leaves writer and reader agreeing anyway.
+
+        The refusal is gated on the pitches actually differing, so the shapes that
+        cross a split boundary correctly today — a `[16, N]` accumulator, whatever
+        its valid rows — keep doing so.
+        """
+        producer_code = self._row_narrowed_acc_push_program(8, 128, ir.CompactMode.normal, split=1, rows=16)
+        assert "pto.tpush_to_aiv" in producer_code
+
+    def test_split_acc_to_vec_pop_uses_full_box_for_tpop(self):
+        """A split C2V pop transports the full per-lane box, not the logical valid box.
+
+        pto-isa builds the GM slot view of a Cube->Vector pop from the popped
+        tile's compile-time rows/cols and the producer's box row pitch, but
+        strides it with the tile's runtime validCol
+        (``gmGap = gStride3 - gShape4``, ``lenBurst = validCol``). A narrowed
+        validCol therefore collapses the GM gap to zero and the lane reads one
+        contiguous run instead of one box row per burst — silent data loss in
+        the *valid* region, since the matching PTO_ASSERT is compiled out in
+        release. This is the consumer-side counterpart of the producer-side
+        widening already asserted by
+        ``test_split_tpush_uses_full_box_transport_dims``.
+        """
+        span = ir.Span.unknown()
+        zero = ir.ConstInt(0, pl.INDEX, span)
+        rows = ir.ConstInt(16, pl.INDEX, span)
+        cols = ir.ConstInt(32, pl.INDEX, span)
+        half_rows = ir.ConstInt(8, pl.INDEX, span)
+        valid_cols = ir.ConstInt(24, pl.INDEX, span)
+        offsets = ir.MakeTuple([zero, zero], span)
+        shape = ir.MakeTuple([rows, cols], span)
+        valid_shape = ir.MakeTuple([rows, valid_cols], span)
+
+        src = ir.Var("src", ir.TensorType([16, 32], pl.FP32), span)
+        acc_memref = ir.MemRef(ir.MemorySpace.Acc, ir.ConstInt(0, pl.INT64, span), 16 * 32 * 4, 0)
+        acc_type = ir.TileType(
+            [rows, cols],
+            pl.FP32,
+            acc_memref,
+            ir.TileView(valid_shape=[rows, valid_cols]),
+            ir.MemorySpace.Acc,
+        )
+        acc_tile = ir.Var("acc_tile", acc_type, span)
+        load_call = ir.Call(
+            ir.Op("tile.load"),
+            [src, offsets, shape, valid_shape],
+            {"target_memory": ir.MemorySpace.Acc},
+            acc_type,
+            span,
+        )
+        push_call = ir.Call(
+            ir.Op("tile.tpush_to_aiv"),
+            [acc_tile],
+            {"split": 1},
+            ir.UnknownType(),
+            span,
+        )
+        producer = ir.Function(
+            "split_acc_producer",
+            [(src, ir.ParamDirection.In)],
+            [],
+            ir.SeqStmts(
+                [ir.AssignStmt(acc_tile, load_call, span), ir.EvalStmt(push_call, span)],
+                span,
+            ),
+            span,
+            ir.FunctionType.AIC,
+        )
+
+        # Per-lane consumer half of an UP_DOWN split: [8, 32] box, logical [8, 24].
+        vec_type = ir.TileType(
+            [half_rows, cols],
+            pl.FP32,
+            None,
+            ir.TileView(valid_shape=[half_rows, valid_cols]),
+            ir.MemorySpace.Vec,
+        )
+        popped = ir.Var("popped", vec_type, span)
+        pop_call = ir.Call(ir.Op("tile.tpop_from_aic"), [], {"split": 1}, vec_type, span)
+        consumer = ir.Function(
+            "split_vec_consumer",
+            [],
+            [],
+            ir.SeqStmts([ir.AssignStmt(popped, pop_call, span)], span),
+            span,
+            ir.FunctionType.AIV,
+        )
+
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910)
+        mlir_code = codegen.PTOCodegen().generate(
+            ir.Program([producer, consumer], "split_acc_to_vec_program", span)
+        )
+        consumer_code = _extract_func_section(mlir_code, "split_vec_consumer")
+        consumer_lines = [line.strip() for line in consumer_code.splitlines()]
+
+        pop_index = next(i for i, line in enumerate(consumer_lines) if "pto.tpop_from_aic" in line)
+        assert any("pto.treshape" in line for line in consumer_lines), (
+            "a full-box split pop must expose its logical valid shape through pto.treshape:\n" + consumer_code
+        )
+        reshape_index = next(i for i, line in enumerate(consumer_lines) if "pto.treshape" in line)
+        assert "pto.tpop_from_aic(%c8_index, %c32_index) {split = 1}" in consumer_lines[pop_index], (
+            "a split C2V pop must transport the full per-lane box; a narrowed valid_col "
+            f"mis-strides the GM slot read:\n{consumer_code}"
+        )
+        transport = re.search(r"^(%\w+) = pto\.tpop_from_aic", consumer_lines[pop_index])
+        assert transport is not None
+        assert pop_index < reshape_index
+        assert f"pto.treshape {transport.group(1)}" in consumer_lines[reshape_index]
+        assert "rows=8, cols=32, v_row=8, v_col=24" in consumer_lines[reshape_index], (
+            f"the logical per-lane valid shape must be restored by treshape:\n{consumer_code}"
+        )
+
+    @pytest.mark.parametrize(
+        (
+            "tpush_op_name",
+            "func_type",
+            "memory_space",
+            "split",
+        ),
+        [
+            ("tile.tpush_to_aiv", ir.FunctionType.AIC, ir.MemorySpace.Acc, 1),
+            ("tile.tpush_to_aic", ir.FunctionType.AIV, ir.MemorySpace.Vec, 2),
+        ],
+    )
+    def test_split_tpush_uses_full_box_transport_dims(self, tpush_op_name, func_type, memory_space, split):
+        """Split tpush transports the full producer box on BOTH axes.
+
+        Narrowing the split axis to the user's logical valid_shape on the
+        producer side leaves consumer subblocks reading uninitialised slot
+        memory — especially on LEFT_RIGHT splits, where the partial
+        producer write fails to populate the slot column range subblock 0
+        reads. The transport set_validshape must therefore reset both axes
+        to the box shape; consumer-side localisation through
+        LocalizeValidDimForSplit clamps the logical valid_shape back to
+        the truthful per-subblock extent. See
+        src/backend/common/pto_ops_common.cpp::EmitSplitTpushTransportValidShape.
+        """
+        transport_valid_shape = ", %c16_index, %c16_index :"
+        span = ir.Span.unknown()
+
+        src = ir.Var("src", ir.TensorType([16, 16], pl.FP32), span)
+        valid_row = ir.Var("valid_row", ir.ScalarType(pl.INDEX), span)
+        valid_col = ir.Var("valid_col", ir.ScalarType(pl.INDEX), span)
+
+        zero = ir.ConstInt(0, pl.INDEX, span)
+        shape_16 = ir.ConstInt(16, pl.INDEX, span)
+        offsets = ir.MakeTuple([zero, zero], span)
+        shapes = ir.MakeTuple([shape_16, shape_16], span)
+
+        src_memref = ir.MemRef(memory_space, ir.ConstInt(0, pl.INT64, span), 16 * 16 * 4, 0)
+        src_view = ir.TileView(
+            valid_shape=[shape_16, shape_16],
+            blayout=ir.TileLayout.col_major,
+            slayout=ir.TileLayout.row_major,
+            fractal=1024,
+        )
+        src_type = ir.TileType([16, 16], pl.FP32, src_memref, src_view, memory_space)
+        src_tile = ir.Var("src_tile", src_type, span)
+
+        narrowed_memref = ir.MemRef(memory_space, ir.ConstInt(0, pl.INT64, span), 16 * 16 * 4, 0)
+        narrowed_view = ir.TileView(
+            valid_shape=[valid_row, valid_col],
+            blayout=ir.TileLayout.col_major,
+            slayout=ir.TileLayout.row_major,
+            fractal=1024,
+        )
+        narrowed_type = ir.TileType([16, 16], pl.FP32, narrowed_memref, narrowed_view, memory_space)
+        narrowed_tile = ir.Var("narrowed_tile", narrowed_type, span)
+
+        body = ir.SeqStmts(
+            [
+                ir.AssignStmt(
+                    src_tile,
+                    ir.Call(
+                        ir.Op("tile.load"),
+                        [src, offsets, shapes, shapes],
+                        {"target_memory": memory_space},
+                        src_type,
+                        span,
+                    ),
+                    span,
+                ),
+                ir.AssignStmt(
+                    narrowed_tile,
+                    ir.Call(
+                        ir.Op("tile.set_validshape"),
+                        [src_tile, valid_row, valid_col],
+                        {},
+                        narrowed_type,
+                        span,
+                    ),
+                    span,
+                ),
+                ir.EvalStmt(
+                    ir.Call(
+                        ir.Op(tpush_op_name),
+                        [narrowed_tile],
+                        {"split": split},
+                        ir.UnknownType(),
+                        span,
+                    ),
+                    span,
+                ),
+            ],
+            span,
+        )
+        func = ir.Function(
+            "split_narrow_then_push",
+            [
+                (src, ir.ParamDirection.In),
+                (valid_row, ir.ParamDirection.In),
+                (valid_col, ir.ParamDirection.In),
+            ],
+            [],
+            body,
+            span,
+            func_type,
+        )
+
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910)
+        mlir_code = codegen.PTOCodegen().generate(ir.Program([func], "split_narrow_then_push_program", span))
+
+        set_validshape_lines = [
+            line.strip() for line in mlir_code.splitlines() if "pto.set_validshape" in line
+        ]
+        tpush_line = next(
+            line.strip() for line in mlir_code.splitlines() if tpush_op_name.replace("tile.", "pto.") in line
+        )
+
+        assert len(set_validshape_lines) == 3, (
+            "Expected logical set_validshape, transport normalization, and logical restore, got:\n"
+            + "\n".join(set_validshape_lines)
+        )
+        assert ", %arg1, %arg2 :" in set_validshape_lines[0], (
+            f"Expected the initial logical validShape update, got:\n{set_validshape_lines[0]}"
+        )
+        assert transport_valid_shape in set_validshape_lines[1], (
+            "Expected split tpush to normalize the non-split transport dimension, got:\n"
+            f"{set_validshape_lines[1]}"
+        )
+        assert ", %arg1, %arg2 :" in set_validshape_lines[2], (
+            f"Expected the logical validShape restore after tpush, got:\n{set_validshape_lines[2]}"
+        )
+        assert "%src_tile" in tpush_line and "%narrowed_tile" not in tpush_line, (
+            f"Expected tpush to use the aliased source tile, got:\n{tpush_line}"
+        )
+
+    def test_no_split_dual_aiv_tpush_widens_cols_preserves_rows(self):
+        """No-split dual-AIV tpush widens COLUMNS to the box but PRESERVES rows.
+
+        On 910B the no-split dual-AIV dispatch runs a mixed root's producer on
+        two AIV subblocks that share one FIFO slot while the single cube
+        consumer pops the full slot. A producer that narrowed its valid_shape
+        (e.g. set_validshape on a partial attention block) would otherwise leave
+        the slot columns >= valid_col stale and feed garbage into the consumer
+        matmul. So for split==0 functions carrying ``dual_aiv_dispatch`` the
+        transport set_validshape widens the COLUMN axis to the box while
+        PRESERVING the producer's row valid_shape -- so subblock 0's real push
+        carries the full column box and subblock 1's valid_shape=(0, 0) replay
+        stays a true 0-row no-op instead of racing garbage rows into subblock
+        0's slot. Genuine split==1/2 paths widen both axes; plain split==0
+        without ``dual_aiv_dispatch`` emits no transport at all. See
+        src/backend/common/pto_ops_common.cpp::EmitSplitTpushTransportValidShape.
+        """
+        span = ir.Span.unknown()
+        memory_space = ir.MemorySpace.Vec
+
+        src = ir.Var("src", ir.TensorType([16, 16], pl.FP32), span)
+        valid_row = ir.Var("valid_row", ir.ScalarType(pl.INDEX), span)
+        valid_col = ir.Var("valid_col", ir.ScalarType(pl.INDEX), span)
+
+        zero = ir.ConstInt(0, pl.INDEX, span)
+        shape_16 = ir.ConstInt(16, pl.INDEX, span)
+        offsets = ir.MakeTuple([zero, zero], span)
+        shapes = ir.MakeTuple([shape_16, shape_16], span)
+
+        src_memref = ir.MemRef(memory_space, ir.ConstInt(0, pl.INT64, span), 16 * 16 * 4, 0)
+        src_view = ir.TileView(
+            valid_shape=[shape_16, shape_16],
+            blayout=ir.TileLayout.col_major,
+            slayout=ir.TileLayout.row_major,
+            fractal=1024,
+        )
+        src_type = ir.TileType([16, 16], pl.FP32, src_memref, src_view, memory_space)
+        src_tile = ir.Var("src_tile", src_type, span)
+
+        narrowed_memref = ir.MemRef(memory_space, ir.ConstInt(0, pl.INT64, span), 16 * 16 * 4, 0)
+        narrowed_view = ir.TileView(
+            valid_shape=[valid_row, valid_col],
+            blayout=ir.TileLayout.col_major,
+            slayout=ir.TileLayout.row_major,
+            fractal=1024,
+        )
+        narrowed_type = ir.TileType([16, 16], pl.FP32, narrowed_memref, narrowed_view, memory_space)
+        narrowed_tile = ir.Var("narrowed_tile", narrowed_type, span)
+
+        body = ir.SeqStmts(
+            [
+                ir.AssignStmt(
+                    src_tile,
+                    ir.Call(
+                        ir.Op("tile.load"),
+                        [src, offsets, shapes, shapes],
+                        {"target_memory": memory_space},
+                        src_type,
+                        span,
+                    ),
+                    span,
+                ),
+                ir.AssignStmt(
+                    narrowed_tile,
+                    ir.Call(
+                        ir.Op("tile.set_validshape"),
+                        [src_tile, valid_row, valid_col],
+                        {},
+                        narrowed_type,
+                        span,
+                    ),
+                    span,
+                ),
+                ir.EvalStmt(
+                    ir.Call(
+                        ir.Op("tile.tpush_to_aic"),
+                        [narrowed_tile],
+                        {"split": 0},
+                        ir.UnknownType(),
+                        span,
+                    ),
+                    span,
+                ),
+            ],
+            span,
+        )
+        func = ir.Function(
+            "dual_aiv_narrow_then_push",
+            [
+                (src, ir.ParamDirection.In),
+                (valid_row, ir.ParamDirection.In),
+                (valid_col, ir.ParamDirection.In),
+            ],
+            [],
+            body,
+            span,
+            ir.FunctionType.AIV,
+            attrs={"dual_aiv_dispatch": True},
+        )
+
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910)
+        mlir_code = codegen.PTOCodegen().generate(
+            ir.Program([func], "dual_aiv_narrow_then_push_program", span)
+        )
+
+        set_validshape_lines = [
+            line.strip() for line in mlir_code.splitlines() if "pto.set_validshape" in line
+        ]
+        tpush_line = next(line.strip() for line in mlir_code.splitlines() if "pto.tpush_to_aic" in line)
+
+        assert len(set_validshape_lines) == 3, (
+            "Expected logical set_validshape, transport normalization, and logical restore, got:\n"
+            + "\n".join(set_validshape_lines)
+        )
+        assert ", %arg1, %arg2 :" in set_validshape_lines[0], (
+            f"Expected the initial logical validShape update, got:\n{set_validshape_lines[0]}"
+        )
+        # Column widened to the box (%c16_index); ROW preserved at the
+        # producer's valid_row (%arg1) so the subblock-1 replay stays a 0-row
+        # no-op rather than racing garbage rows into subblock 0's slot.
+        assert ", %arg1, %c16_index :" in set_validshape_lines[1], (
+            "Expected no-split dual-AIV transport to widen cols but preserve rows, got:\n"
+            f"{set_validshape_lines[1]}"
+        )
+        assert ", %arg1, %arg2 :" in set_validshape_lines[2], (
+            f"Expected the logical validShape restore after tpush, got:\n{set_validshape_lines[2]}"
+        )
+        assert "%src_tile" in tpush_line and "%narrowed_tile" not in tpush_line, (
+            f"Expected tpush to use the aliased source tile, got:\n{tpush_line}"
+        )
+
+    def test_no_split_dual_aiv_zero_row_replay_emits_no_transport(self):
+        """The subblock-1 replay (statically 0 rows) emits NO transport.
+
+        BuildNoSplitLane1ReplayStmts zeroes the replay tile's valid_shape to
+        (0, 0). A col-widening transport for a 0-row push moves no data yet
+        (on 910B) perturbs the shared-slot dual-AIV merge -- emitting one
+        regressed the cross_core_v2c_nosplit golden. So when the producer's
+        transport rows are statically 0, EmitSplitTpushTransportValidShape
+        skips the transport entirely; only the real, non-zero-row subblock-0
+        push gets it. See
+        src/backend/common/pto_ops_common.cpp::EmitSplitTpushTransportValidShape.
+        """
+        span = ir.Span.unknown()
+        memory_space = ir.MemorySpace.Vec
+        zero = ir.ConstInt(0, pl.INDEX, span)
+        shape_16 = ir.ConstInt(16, pl.INDEX, span)
+
+        src = ir.Var("src", ir.TensorType([16, 16], pl.FP32), span)
+        valid_col = ir.Var("valid_col", ir.ScalarType(pl.INDEX), span)
+        offsets = ir.MakeTuple([zero, zero], span)
+        shapes = ir.MakeTuple([shape_16, shape_16], span)
+
+        src_memref = ir.MemRef(memory_space, ir.ConstInt(0, pl.INT64, span), 16 * 16 * 4, 0)
+        src_view = ir.TileView(
+            valid_shape=[shape_16, shape_16],
+            blayout=ir.TileLayout.col_major,
+            slayout=ir.TileLayout.row_major,
+            fractal=1024,
+        )
+        src_type = ir.TileType([16, 16], pl.FP32, src_memref, src_view, memory_space)
+        src_tile = ir.Var("src_tile", src_type, span)
+
+        # Replay tile: statically 0 rows (as BuildNoSplitLane1ReplayStmts zeroes it).
+        zeroed_memref = ir.MemRef(memory_space, ir.ConstInt(0, pl.INT64, span), 16 * 16 * 4, 0)
+        zeroed_view = ir.TileView(
+            valid_shape=[zero, valid_col],
+            blayout=ir.TileLayout.col_major,
+            slayout=ir.TileLayout.row_major,
+            fractal=1024,
+        )
+        zeroed_type = ir.TileType([16, 16], pl.FP32, zeroed_memref, zeroed_view, memory_space)
+        zeroed_tile = ir.Var("zeroed_tile", zeroed_type, span)
+
+        body = ir.SeqStmts(
+            [
+                ir.AssignStmt(
+                    src_tile,
+                    ir.Call(
+                        ir.Op("tile.load"),
+                        [src, offsets, shapes, shapes],
+                        {"target_memory": memory_space},
+                        src_type,
+                        span,
+                    ),
+                    span,
+                ),
+                ir.AssignStmt(
+                    zeroed_tile,
+                    ir.Call(
+                        ir.Op("tile.set_validshape"),
+                        [src_tile, zero, valid_col],
+                        {},
+                        zeroed_type,
+                        span,
+                    ),
+                    span,
+                ),
+                ir.EvalStmt(
+                    ir.Call(
+                        ir.Op("tile.tpush_to_aic"),
+                        [zeroed_tile],
+                        {"split": 0},
+                        ir.UnknownType(),
+                        span,
+                    ),
+                    span,
+                ),
+            ],
+            span,
+        )
+        func = ir.Function(
+            "dual_aiv_zero_row_replay",
+            [(src, ir.ParamDirection.In), (valid_col, ir.ParamDirection.In)],
+            [],
+            body,
+            span,
+            ir.FunctionType.AIV,
+            attrs={"dual_aiv_dispatch": True},
+        )
+
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910)
+        mlir_code = codegen.PTOCodegen().generate(
+            ir.Program([func], "dual_aiv_zero_row_replay_program", span)
+        )
+
+        set_validshape_lines = [
+            line.strip() for line in mlir_code.splitlines() if "pto.set_validshape" in line
+        ]
+        # No transport normalization / restore -- the 0-row replay push is
+        # skipped, so the only set_validshape is the user's logical update and
+        # none widen a column to the box constant (%c16_index).
+        assert all("%c16_index" not in line for line in set_validshape_lines), (
+            "Expected NO col-widening transport for the 0-row replay, got:\n"
+            + "\n".join(set_validshape_lines)
+        )
+        assert len(set_validshape_lines) <= 1, (
+            "Expected at most the logical set_validshape (no transport+restore pair), got:\n"
+            + "\n".join(set_validshape_lines)
+        )
+
+    def test_tfree_stays_after_nested_control_flow_use(self):
+        """Nested control-flow users of a tpop result must stay before tfree."""
+
+        @pl.program
+        class ConditionalTpopProgram:
+            @pl.function(type=pl.FunctionType.AIC)
+            def cube_consumer(
+                self,
+                flag: pl.Scalar[pl.INDEX],
+                output: pl.Out[pl.Tensor[[16, 16], pl.FP16]],
+            ) -> pl.Tensor[[16, 16], pl.FP16]:
+                pipe_buf = pl.reserve_buffer(name="v2c_slot_buffer", size=4096, base=0x1000)
+                pl.aic_initialize_pipe(dir_mask=2, slot_size=512, v2c_consumer_buf=pipe_buf)
+
+                received: pl.Tile[[16, 16], pl.FP16, pl.MemorySpace.Mat] = pl.tpop_from_aiv(split=1)
+                if flag == 0:
+                    received_left = pl.move(received, target_memory=pl.MemorySpace.Left)
+                    received_mat = pl.move(received_left, target_memory=pl.MemorySpace.Mat)
+                    _: pl.Tensor[[16, 16], pl.FP16] = pl.store(received_mat, [0, 0], output)
+                else:
+                    received_right = pl.move(received, target_memory=pl.MemorySpace.Right)
+                    received_mat_else = pl.move(received_right, target_memory=pl.MemorySpace.Mat)
+                    _: pl.Tensor[[16, 16], pl.FP16] = pl.store(received_mat_else, [0, 0], output)
+
+                pl.tfree_to_aiv(received)
+                return output
+
+        codes = self._compile_and_generate(ConditionalTpopProgram)
+        aic_body = _extract_func_section(codes["cube_consumer"], "cube_consumer")
+
+        assert aic_body.index("pto.tpop_from_aiv") < aic_body.index("scf.if"), (
+            "The nested control-flow user should remain after the tpop"
+        )
+        assert aic_body.index("scf.if") < aic_body.index("pto.tfree_from_aiv"), (
+            "tfree must remain after nested control-flow uses of the popped tile"
+        )
+
+    def test_tfree_rejects_mismatched_tpop_direction(self):
+        """tfree must validate that its tile came from the matching tpop direction."""
+
+        @pl.program
+        class MismatchedTfreeProgram:
+            @pl.function(type=pl.FunctionType.AIV)
+            def vector_consumer(self):
+                pipe_buf = pl.reserve_buffer(name="c2v_slot_buffer", size=4096, base=0x1000)
+                pl.aiv_initialize_pipe(dir_mask=1, slot_size=512, c2v_consumer_buf=pipe_buf)
+                received: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec] = pl.tpop_from_aic(split=0)
+                pl.tfree_to_aiv(received)
+
+        with pytest.raises(
+            ValueError,
+            match=re.escape(
+                "system.tfree_to_aiv requires its tile argument to come from tile.tpop_from_aiv, "
+                "got tile.tpop_from_aic"
+            ),
+        ):
+            self._compile_and_generate(MismatchedTfreeProgram)
+
+    def test_tfree_rejects_mismatched_pipe_id(self):
+        """Explicit tfree id must match the originating tpop pipe id."""
+
+        @pl.program
+        class MismatchedTfreeIdProgram:
+            @pl.function(type=pl.FunctionType.AIC)
+            def cube_consumer(self):
+                pipe_buf = pl.reserve_buffer(name="v2c_slot_buffer", size=4096, base=0x1000)
+                pl.aic_initialize_pipe(
+                    pl.const(0, pl.INT32),
+                    pipe_buf,
+                    dir_mask=2,
+                    slot_size=512,
+                    id=1,
+                )
+                received: pl.Tile[[16, 16], pl.FP16, pl.MemorySpace.Mat] = pl.tpop_from_aiv(
+                    split=0,
+                    id=1,
+                )
+                pl.tfree_to_aiv(received, id=0)
+
+        with pytest.raises(
+            ValueError,
+            match=re.escape(
+                "system.tfree_to_aiv pipe id 0 does not match originating tile.tpop_from_aiv pipe id 1"
+            ),
+        ):
+            self._compile_and_generate(MismatchedTfreeIdProgram)
+
+    def test_tpop_user_stays_after_if_defined_scalar_dependency(self):
+        """A tpop user that depends on an if-defined scalar must not be hoisted before the if."""
+
+        @pl.program
+        class IfDefinedScalarProgram:
+            @pl.function(type=pl.FunctionType.AIV)
+            def vector_consumer(
+                self,
+                flag: pl.Scalar[pl.INDEX],
+                output: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                pipe_buf = pl.reserve_buffer(name="c2v_slot_buffer", size=4096, base=0x1000)
+                pl.aiv_initialize_pipe(dir_mask=1, slot_size=512, c2v_consumer_buf=pipe_buf)
+
+                received: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec] = pl.tpop_from_aic(split=0)
+                if flag == 0:
+                    scale = 1.0
+                else:
+                    scale = 2.0
+                scaled = pl.tile.muls(received, scale)
+                updated: pl.Tensor[[16, 16], pl.FP32] = pl.store(scaled, [0, 0], output)
+                pl.tfree_to_aic(received)
+                return updated
+
+        codes = self._compile_and_generate(IfDefinedScalarProgram)
+        aiv_body = _extract_func_section(codes["vector_consumer"], "vector_consumer")
+
+        assert aiv_body.index("pto.tpop_from_aic") < aiv_body.index("scf.if"), (
+            "The scalar-defining if should remain after the tpop"
+        )
+        assert aiv_body.index("scf.if") < aiv_body.index("pto.tmuls"), (
+            "The tpop user must remain after the if-defined scalar dependency"
+        )
+
+    def test_bidirectional_vector(self):
+        """Test Vector kernel keeps bidirectional communication on one default pipe."""
+        codes = self._compile_and_generate(BidirectionalCrossCorProgram)
+        vector_code = codes["vector_bidir"]
+
+        assert vector_code, "Vector bidir MLIR should not be empty"
+        # Buffer setup: C2V consumer reserves buffer, V2C producer imports peer buffer
+        assert "pto.reserve_buffer" in vector_code, "Should reserve buffer for C2V"
+        assert 'name = "c2v_slot_buffer"' in vector_code, "Should reference c2v_slot_buffer"
+        assert "auto = false" in vector_code, "Should have auto = false for explicit base"
+        assert "base = 8192" in vector_code, "Should have explicit base address (0x2000 = 8192)"
+        assert "-> i32" in vector_code, "Buffer ops should return i32"
+        assert "pto.import_reserved_buffer" in vector_code, "Should import peer buffer for V2C"
+        assert "peer_func = @cube_bidir" in vector_code, "Should reference cube_bidir"
+        # Bidirectional init
+        assert "pto.aiv_initialize_pipe" in vector_code, "Should contain aiv_initialize_pipe"
+        assert "dir_mask = 3" in vector_code, "Should have dir_mask = 3 (bidirectional)"
+        assert "{id =" not in vector_code, "Legacy bidirectional default pipe should not emit explicit id"
+        assert "c2v_consumer_buf = " in vector_code, "Should have c2v_consumer_buf as SSA reference"
+        assert "v2c_consumer_buf = " in vector_code, "Should have v2c_consumer_buf as SSA reference"
+        # V2C producer side: preprocess + push
+        assert "pto.tadd" in vector_code, "Should do elementwise add (Vector op)"
+        assert "pto.tpush_to_aic" in vector_code, "Should push to AIC"
+        # C2V consumer side: receive matmul result + post-process
+        assert "pto.tpop_from_aic" in vector_code, "Should pop from AIC"
+        assert "pto.texp" in vector_code, "Should do exp post-processing (Vector op)"
+        assert "pto.tfree_from_aic" in vector_code, "Should free C2V slot"
+
+    def test_bidirectional_cube(self):
+        """Test Cube kernel keeps bidirectional communication on one default pipe."""
+        codes = self._compile_and_generate(BidirectionalCrossCorProgram)
+        cube_code = codes["cube_bidir"]
+
+        assert cube_code, "Cube bidir MLIR should not be empty"
+        # Buffer setup: V2C consumer reserves buffer with explicit base, C2V producer imports peer buffer
+        assert "pto.reserve_buffer" in cube_code, "Should reserve buffer for V2C"
+        assert 'name = "v2c_slot_buffer"' in cube_code, "Should reference v2c_slot_buffer"
+        assert "auto = false" in cube_code, "Should have auto = false for explicit base"
+        assert "base = 4096" in cube_code, "Should have explicit base address (0x1000 = 4096)"
+        assert "-> i32" in cube_code, "Buffer ops should return i32"
+        assert "pto.import_reserved_buffer" in cube_code, "Should import peer buffer for C2V"
+        assert "peer_func = @vector_bidir" in cube_code, "Should reference vector_bidir"
+        # Bidirectional init with SSA consumer buffer references
+        assert "pto.aic_initialize_pipe" in cube_code, "Should contain aic_initialize_pipe"
+        assert "dir_mask = 3" in cube_code, "Should have dir_mask = 3 (bidirectional)"
+        assert "{id =" not in cube_code, "Legacy bidirectional default pipe should not emit explicit id"
+        assert "c2v_consumer_buf = " in cube_code, "Should have c2v_consumer_buf as SSA reference"
+        assert "v2c_consumer_buf = " in cube_code, "Should have v2c_consumer_buf as SSA reference"
+        # V2C consumer side: receive preprocessed data
+        assert "pto.tpop_from_aiv" in cube_code, "Should pop from AIV"
+        assert "pto.tfree_from_aiv" in cube_code, "Should free V2C slot"
+        # C2V producer side: matmul + push back
+        assert "pto.tpush_to_aiv" in cube_code, "Should push to AIV"
+        assert "pto.tmatmul" in cube_code, "Should do matmul (Cube op)"
+
+    def test_multiple_pipe_vector(self):
+        """Test Vector kernel with two explicit V2C frontend pipes."""
+        codes = self._compile_and_generate(MultiPipeSameDirectionCrossCoreProgram)
+        vector_code = codes["vector_multi_pipe"]
+
+        assert vector_code, "Vector multi-pipe MLIR should not be empty"
+        # Buffer setup: V2C producer imports two peer buffers
+        assert vector_code.count("pto.import_reserved_buffer") == 2
+        assert 'name = "v2c_slot_buffer_0"' in vector_code
+        assert 'name = "v2c_slot_buffer_1"' in vector_code
+        assert "peer_func = @cube_multi_pipe" in vector_code, "Should reference cube_multi_pipe"
+        # Multiple explicit V2C init ops
+        assert "pto.aiv_initialize_pipe" in vector_code, "Should contain aiv_initialize_pipe"
+        assert "dir_mask = 3" not in vector_code, "Explicit multi-pipe program should not combine dirs"
+        assert "dir_mask = 1" not in vector_code
+        assert "pto.aiv_initialize_pipe {id = 0, dir_mask = 2" in vector_code
+        assert "pto.aiv_initialize_pipe {id = 1, dir_mask = 2" in vector_code
+        assert "v2c_consumer_buf = " in vector_code, "Should have v2c_consumer_buf as SSA reference"
+        # V2C producer side: preprocess + push
+        assert "pto.tadd" in vector_code, "Should do elementwise add (Vector op)"
+        assert "pto.tsub" in vector_code, "Should do elementwise sub (Vector op)"
+        assert "pto.tpush_to_aic" in vector_code, "Should push to AIC"
+        assert "pto.tpop_from_aic" not in vector_code
+        assert "pto.tfree_from_aic" not in vector_code
+        assert vector_code.count("{id = 0, split = 0}") == 1
+        assert vector_code.count("{id = 1, split = 0}") == 1
+
+    def test_multiple_pipe_cube(self):
+        """Test Cube kernel with two explicit V2C frontend pipes."""
+        codes = self._compile_and_generate(MultiPipeSameDirectionCrossCoreProgram)
+        cube_code = codes["cube_multi_pipe"]
+
+        assert cube_code, "Cube multi-pipe MLIR should not be empty"
+        # Buffer setup: V2C consumer reserves two buffers with explicit bases
+        assert cube_code.count("pto.reserve_buffer") == 2
+        assert 'name = "v2c_slot_buffer_0"' in cube_code
+        assert 'name = "v2c_slot_buffer_1"' in cube_code
+        assert "auto = false" in cube_code, "Should have auto = false for explicit base"
+        assert "base = 4096" in cube_code, "Should have explicit base address (0x1000 = 4096)"
+        assert "base = 8192" in cube_code, "Should have explicit base address (0x2000 = 8192)"
+        assert "-> i32" in cube_code, "Buffer ops should return i32"
+        assert "pto.import_reserved_buffer" not in cube_code
+        # Multiple explicit V2C init ops with SSA consumer buffer references
+        assert "pto.aic_initialize_pipe" in cube_code, "Should contain aic_initialize_pipe"
+        assert "dir_mask = 3" not in cube_code, "Explicit multi-pipe program should not combine dirs"
+        assert "dir_mask = 1" not in cube_code
+        assert "pto.aic_initialize_pipe {id = 0, dir_mask = 2" in cube_code
+        assert "pto.aic_initialize_pipe {id = 1, dir_mask = 2" in cube_code
+        assert "v2c_consumer_buf = " in cube_code, "Should have v2c_consumer_buf as SSA reference"
+        # V2C consumer side: receive preprocessed data
+        assert "pto.tpop_from_aiv" in cube_code, "Should pop from AIV"
+        assert "pto.tfree_from_aiv" in cube_code, "Should free V2C slot"
+        assert "pto.tmatmul" in cube_code, "Should do matmul (Cube op)"
+        assert "pto.tpush_to_aiv" not in cube_code
+        # tpop ids are inherited by tfree even when user code omits tfree id.
+        assert cube_code.count("{id = 0, split = 0}") == 2
+        assert cube_code.count("{id = 1, split = 0}") == 2
+
+    def test_all_cross_core_pto_ops_covered(self):
+        """Verify all 10 cross-core PTO operations are exercised across both test programs."""
+        unidir_codes = self._compile_and_generate(CrossCoreTpushTpopProgram)
+        bidir_codes = self._compile_and_generate(BidirectionalCrossCorProgram)
+        all_code = "\n".join(unidir_codes.values()) + "\n" + "\n".join(bidir_codes.values())
+
+        expected_ops = [
+            "pto.tpush_to_aiv",
+            "pto.tpush_to_aic",
+            "pto.tpop_from_aic",
+            "pto.tpop_from_aiv",
+            "pto.tfree_from_aic",
+            "pto.tfree_from_aiv",
+            "pto.aic_initialize_pipe",
+            "pto.aiv_initialize_pipe",
+            "pto.reserve_buffer",
+            "pto.import_reserved_buffer",
+        ]
+        for op in expected_ops:
+            assert op in all_code, f"Expected PTO op '{op}' not found in generated MLIR"
+
+
+class TestExpandMixedKernelCodegen:
+    """Tests that PTO codegen works on AIC/AIV functions produced by expand_mixed_kernel."""
+
+    @pytest.mark.parametrize("tile_polling", [False, True], ids=["scalar", "tile"])
+    @pytest.mark.parametrize("keep_result", [False, True], ids=["unused-result", "used-result"])
+    def test_while_condition_only_iter_arg_codegen(self, tmp_path, tile_polling, keep_result):
+        """Mixed SPMD polling must retain condition-only state even with an unused result (#3009)."""
+
+        @pl.jit
+        def mixed_while_poll(
+            a: pl.Tensor[[32, 16], pl.FP16],
+            b: pl.Tensor[[16, 16], pl.FP16],
+            scratch: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+            flags: pl.InOut[pl.Tensor[[16], pl.INT32]],
+            cube_out: pl.Out[pl.Tensor[[32, 16], pl.FP32]],
+            vector_out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            TILE_POLLING: pl.constexpr,
+            KEEP_RESULT: pl.constexpr,
+        ):
+            # Matmul makes this a mixed kernel; the nested AIV branches retain
+            # the producer/consumer shape without requiring device execution.
+            for worker in pl.spmd(2, sync_start=True, name_hint="mixed_while_poll"):
+                ac = pl.load(a, [worker * 16, 0], [16, 16], target_memory=pl.MemorySpace.Mat)
+                bc = pl.load(b, [0, 0], [16, 16], target_memory=pl.MemorySpace.Mat)
+                pl.store(pl.matmul(ac, bc, out_dtype=pl.FP32), [worker * 16, 0], cube_out)
+                for lane in pl.split_aiv(2, mode=pl.SplitMode.NONE):
+                    if lane == 0:
+                        if worker == 0:
+                            av = pl.load(a, [0, 0], [16, 16], target_memory=pl.MemorySpace.Vec)
+                            pl.store(pl.add(pl.cast(av, pl.FP32), 1.0), [0, 0], scratch)
+                            pl.system.cacheinvalid()
+                            pl.system.fence()
+                            pl.write(flags, [0], pl.const(1, pl.INT32))
+                        elif worker == 1:
+                            if TILE_POLLING:
+                                initial_tile = pl.load(flags, [0], [16], target_memory=pl.MemorySpace.Vec)
+                                initial_ready = pl.tile.read(initial_tile, [0])
+                            else:
+                                initial_ready = pl.read(flags, [0])
+                            for (ready,) in pl.while_(init_values=(initial_ready,)):
+                                pl.cond(ready != 1)
+                                pl.system.cacheinvalid()
+                                if TILE_POLLING:
+                                    flag_tile = pl.load(flags, [0], [16], target_memory=pl.MemorySpace.Vec)
+                                    next_ready = pl.tile.read(flag_tile, [0])
+                                else:
+                                    next_ready = pl.read(flags, [0])
+                                final_ready = pl.yield_(next_ready)
+                            if KEEP_RESULT:
+                                # This control used to hide the bug by making
+                                # the loop result live independently of its condition.
+                                pl.write(flags, [1], final_ready)
+                            pl.system.cacheinvalid()
+                            received = pl.load(scratch, [0, 0], [16, 16], target_memory=pl.MemorySpace.Vec)
+                            pl.store(pl.mul(received, 2.0), [0, 0], vector_out)
+            return cube_out, vector_out
+
+        mixed_while_poll.compile(
+            TILE_POLLING=tile_polling,
+            KEEP_RESULT=keep_result,
+            config=RunConfig(
+                backend_type=BackendType.Ascend910,
+                codegen_only=True,
+                save_kernels=True,
+                save_kernels_dir=str(tmp_path),
+                dump_passes=True,
+            ),
+        )
+        dumps = list((tmp_path / "passes_dump").glob("*after_ExpandMixedKernel.py"))
+        assert dumps, "Expected an ExpandMixedKernel pass dump"
+        expanded = "\n".join(path.read_text() for path in dumps)
+        assert "__FREE_VAR" not in expanded, expanded
+        assert "pl.while_(init_values=" in expanded, expanded
+
+        pto_files = list(tmp_path.rglob("*.pto"))
+        assert pto_files, "Expected generated PTO MLIR"
+        pto = "\n".join(path.read_text() for path in pto_files)
+        loop = re.search(
+            r"scf\.while \([^\n]+\) : \(i32\) -> \(i32\) \{.*?scf\.condition\(.*?"
+            r"\} do \{(?P<body>.*?)scf\.yield (?P<yielded>%\w+) : i32",
+            pto,
+            re.DOTALL,
+        )
+        assert loop is not None, pto
+        # The backedge must yield the freshly read flag, so retaining a reload
+        # while yielding stale state cannot satisfy this polling regression.
+        body = loop.group("body")
+        yielded = loop.group("yielded")
+        reload_op = "pto.tgetval" if tile_polling else "pto.load"
+        assert re.search(rf"^\s*{re.escape(yielded)} = {re.escape(reload_op)} ", body, re.MULTILINE), body
+        if tile_polling:
+            assert "pto.tload " in body, body
+
+    @staticmethod
+    def _expand_and_generate(program) -> dict[str, str]:
+        """Apply full PTOAS passes with expand_mixed_kernel, then generate PTO MLIR per function.
+
+        Uses all PTOAS strategy passes with expand_mixed_kernel inserted after
+        ConvertTensorToTileOps (its intended pipeline position).
+
+        Returns:
+            dict mapping function name to generated MLIR code for InCore-variant functions.
+        """
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend950)
+
+        # Full PTOAS pipeline with expand_mixed_kernel at its intended position
+        pipeline = passes.PassPipeline()
+        pipeline.add_pass(passes.unroll_loops())
+        pipeline.add_pass(passes.convert_to_ssa())
+        pipeline.add_pass(passes.flatten_call_expr())
+        pipeline.add_pass(passes.outline_incore_scopes())
+        pipeline.add_pass(passes.outline_cluster_scopes())
+        pipeline.add_pass(passes.convert_tensor_to_tile_ops())
+        pipeline.add_pass(passes.lower_composite_ops())
+        pipeline.add_pass(passes.flatten_tile_nd_to_2d())
+        pipeline.add_pass(passes.infer_tile_memory_space())
+        pipeline.add_pass(passes.expand_mixed_kernel())
+        pipeline.add_pass(passes.stamp_tfree_split())
+        pipeline.add_pass(passes.init_mem_ref())
+        pipeline.add_pass(passes.memory_reuse())
+        pipeline.add_pass(passes.allocate_memory_addr())
+        optimized = pipeline.run(program)
+
+        result = {}
+        codegen_instance = codegen.PTOCodegen()
+        groups, ungrouped = _build_group_mapping(optimized)
+
+        # Grouped: one module per group
+        for group_name, members in groups.items():
+            grouped_program = ir.Program(members, group_name, optimized.span)
+            mlir_code = codegen_instance.generate(grouped_program)
+            result[group_name] = mlir_code
+            for func in members:
+                result[func.name] = mlir_code
+
+        # Ungrouped: one module per function
+        for func in ungrouped:
+            if not ir.is_incore_type(func.func_type):
+                continue
+            single = ir.Program([func], func.name, optimized.span)
+            mlir_code = codegen_instance.generate(single)
+            result[func.name] = mlir_code
+        return result
+
+    def test_tile_sub_is_vector_codegen(self):
+        """tile.sub in mixed kernel should generate pto.tsub in AIV, pto.tmatmul in AIC."""
+
+        @pl.program
+        class MixedSubMatmul:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                x: pl.Tensor[[16, 128], pl.BF16],
+                y: pl.Tensor[[128, 128], pl.BF16],
+                out_0: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+            ) -> pl.Tensor[[16, 128], pl.FP32]:
+                x_tile: pl.Tile[[16, 128], pl.BF16] = pl.load(x, [0, 0], [16, 128])
+                x_sub: pl.Tile[[16, 128], pl.BF16] = pl.sub(x_tile, x_tile)
+                x_sub_l1: pl.Tile[[16, 128], pl.BF16] = pl.move(x_sub, target_memory=pl.MemorySpace.Mat)
+                s_sub_l0a: pl.Tile[[16, 128], pl.BF16] = pl.move(x_sub_l1, target_memory=pl.MemorySpace.Left)
+                y_tile: pl.Tile[[128, 128], pl.BF16] = pl.load(
+                    y, [0, 0], [128, 128], target_memory=pl.MemorySpace.Mat
+                )
+                z_tile: pl.Tile[[16, 128], pl.FP32] = pl.matmul(s_sub_l0a, y_tile)
+                out_0: pl.Tensor[[16, 128], pl.FP32] = pl.store(z_tile, [0, 0], out_0)
+                return out_0
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                x: pl.Tensor[[16, 128], pl.BF16],
+                y: pl.Tensor[[128, 128], pl.BF16],
+            ) -> pl.Tensor[[16, 128], pl.FP32]:
+                out_0: pl.Tensor[[16, 128], pl.FP32] = pl.create_tensor([16, 128], dtype=pl.FP32)
+                z: pl.Tensor[[16, 128], pl.FP32] = self.main_incore_0(x, y, out_0)
+                return z
+
+        codes = self._expand_and_generate(MixedSubMatmul)
+
+        # AIV function should contain pto.tsub (vector op)
+        assert "main_incore_0_aiv" in codes, "AIV function should be generated"
+        aiv_code = codes["main_incore_0_aiv"]
+        assert "pto.tsub" in aiv_code, "AIV should contain pto.tsub for tile.sub"
+        assert "pto.import_reserved_buffer" in aiv_code, "AIV should import the peer V2C buffer"
+        assert "pto.aiv_initialize_pipe" in aiv_code, "AIV should initialize cross-core pipe"
+
+        # AIC function should contain pto.tmatmul (cube op)
+        assert "main_incore_0_aic" in codes, "AIC function should be generated"
+        aic_code = codes["main_incore_0_aic"]
+        aic_body = _extract_func_section(aic_code, "main_incore_0_aic")
+        assert "pto.tmatmul" in aic_code, "AIC should contain pto.tmatmul for tile.matmul"
+        assert "pto.reserve_buffer" in aic_code, "AIC should reserve the V2C consumer buffer"
+        assert "auto = false" in aic_code, "Auto reserve_buffer should be resolved before PTO emission"
+        assert "base = 0" in aic_code, "The first auto reserve_buffer should start from base 0"
+        assert "pto.aic_initialize_pipe" in aic_code, "AIC should initialize cross-core pipe"
+        assert aic_body.index("pto.aic_initialize_pipe") < aic_body.index("pto.tpop_from_aiv"), (
+            "AIC initialize_pipe should be emitted before the first V2C tpop"
+        )
+        assert "pto.tfree_from_aiv" in aic_body, "AIC consumer should free the V2C slot"
+        assert aic_body.index("pto.tpop_from_aiv") < aic_body.index("pto.tmov"), (
+            "AIC should move the popped tile before freeing it"
+        )
+        assert aic_body.index("pto.tmov") < aic_body.index("pto.tfree_from_aiv"), (
+            "AIC should free the popped tile after its direct use"
+        )
+
+        # tile.sub should NOT be in AIC
+        assert "pto.tsub" not in aic_body, "AIC should not contain pto.tsub"
+
+    def test_acc_slice_before_c2v_boundary_codegen(self):
+        """Cube-side tile.slice feeding C2V boundary must survive mixed-kernel expansion."""
+
+        @pl.program
+        class SliceBeforeC2V:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                x: pl.Tensor[[16, 128], pl.BF16],
+                y: pl.Tensor[[128, 128], pl.BF16],
+                out_0: pl.Out[pl.Tensor[[1, 128], pl.FP32]],
+            ) -> pl.Tensor[[1, 128], pl.FP32]:
+                x_mat: pl.Tile[[16, 128], pl.BF16] = pl.load(
+                    x, [0, 0], [16, 128], target_memory=pl.MemorySpace.Mat
+                )
+                x_left: pl.Tile[[16, 128], pl.BF16] = pl.move(x_mat, target_memory=pl.MemorySpace.Left)
+                y_mat: pl.Tile[[128, 128], pl.BF16] = pl.load(
+                    y, [0, 0], [128, 128], target_memory=pl.MemorySpace.Mat
+                )
+                y_right: pl.Tile[[128, 128], pl.BF16] = pl.move(y_mat, target_memory=pl.MemorySpace.Right)
+                acc: pl.Tile[[16, 128], pl.FP32] = pl.matmul(x_left, y_right)
+                row: pl.Tile[[1, 128], pl.FP32] = pl.slice(acc, [1, 128], [0, 0])
+                row_vec: pl.Tile[[1, 128], pl.FP32] = pl.move(
+                    row,
+                    target_memory=pl.MemorySpace.Vec,
+                    blayout=pl.TileLayout.row_major,
+                    slayout=pl.TileLayout.none_box,
+                )
+                out_0: pl.Tensor[[1, 128], pl.FP32] = pl.store(row_vec, [0, 0], out_0)
+                return out_0
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                x: pl.Tensor[[16, 128], pl.BF16],
+                y: pl.Tensor[[128, 128], pl.BF16],
+            ) -> pl.Tensor[[1, 128], pl.FP32]:
+                out_0: pl.Tensor[[1, 128], pl.FP32] = pl.create_tensor([1, 128], dtype=pl.FP32)
+                z: pl.Tensor[[1, 128], pl.FP32] = self.main_incore_0(x, y, out_0)
+                return z
+
+        codes = self._expand_and_generate(SliceBeforeC2V)
+
+        assert "main_incore_0_aic" in codes, "AIC function should be generated"
+        aic_body = _extract_func_section(codes["main_incore_0_aic"], "main_incore_0_aic")
+        assert "pto.subview" in aic_body, "AIC should keep the tile.slice producer before C2V push"
+        assert "pto.tpush_to_aiv" in aic_body, "AIC should push the sliced row to AIV"
+        assert aic_body.index("pto.subview") < aic_body.index("pto.tpush_to_aiv"), (
+            "AIC should subview the row tile before pushing it across cores"
+        )
+
+        assert "main_incore_0_aiv" in codes, "AIV function should be generated"
+        aiv_body = _extract_func_section(codes["main_incore_0_aiv"], "main_incore_0_aiv")
+        assert "pto.tpop_from_aic" in aiv_body, "AIV should pop the sliced row from AIC"
+        assert "pto.tstore" in aiv_body, "AIV should store the popped row to the output tensor"
+
+    def test_partial_mx_scale_v2c_materializes_before_widening(self):
+        """Partial MX slice carriers must reach PTO codegen without set_validshape on a view."""
+
+        @pl.program
+        class PartialMxScaleV2C:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                src: pl.Tensor[[16, 64], pl.FP32],
+                out: pl.Out[pl.Tensor[[16, 64], pl.FP8E4M3FN]],
+            ) -> pl.Tensor[[16, 64], pl.FP8E4M3FN]:
+                quant, scale = pl.quant_mx(pl.load(src, [0, 0], [16, 64]), group_axis=1)
+                partial_scale = pl.slice(scale, [16, 2], [0, 0], valid_shape=[16, 1])
+                _scale_mat = pl.move(
+                    partial_scale,
+                    target_memory=pl.Mem.Mat,
+                    blayout=pl.TileLayout.row_major,
+                    slayout=pl.TileLayout.row_major,
+                )
+                return pl.store(quant, [0, 0], out)
+
+        codes = self._expand_and_generate(PartialMxScaleV2C)
+        aiv_body = _extract_func_section(codes["main_incore_0_aiv"], "main_incore_0_aiv")
+        subview_pos = aiv_body.index("pto.subview")
+        materialize_pos = aiv_body.index("pto.tmov", subview_pos)
+        widen_pos = aiv_body.index("pto.set_validshape")
+        push_pos = aiv_body.index("pto.tpush_to_aic")
+        assert subview_pos < materialize_pos < widen_pos < push_pos, aiv_body
+
+    def test_bidirectional_mixed_kernel_keeps_combined_pipe(self):
+        """Automatic bidirectional mixed kernels keep the legacy combined pipe."""
+
+        @pl.program
+        class BidirectionalMixed:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                x: pl.Tensor[[16, 128], pl.BF16],
+                y: pl.Tensor[[128, 64], pl.BF16],
+                out_0: pl.Out[pl.Tensor[[16, 64], pl.FP32]],
+            ) -> pl.Tensor[[16, 64], pl.FP32]:
+                x_tile = pl.load(x, [0, 0], [16, 128])
+                x_sum = pl.add(x_tile, x_tile)
+                x_sum_mat = pl.move(
+                    x_sum,
+                    target_memory=pl.MemorySpace.Mat,
+                    blayout=pl.TileLayout.col_major,
+                    slayout=pl.TileLayout.row_major,
+                )
+                x_left = pl.move(x_sum_mat, target_memory=pl.MemorySpace.Left)
+                y_mat = pl.load(y, [0, 0], [128, 64], target_memory=pl.MemorySpace.Mat)
+                y_right = pl.move(y_mat, target_memory=pl.MemorySpace.Right)
+                z_tile = pl.matmul(x_left, y_right)
+                z_vec = pl.move(
+                    z_tile,
+                    target_memory=pl.MemorySpace.Vec,
+                    blayout=pl.TileLayout.row_major,
+                    slayout=pl.TileLayout.none_box,
+                )
+                out_0 = pl.store(z_vec, [0, 0], out_0)
+                return out_0
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                x: pl.Tensor[[16, 128], pl.BF16],
+                y: pl.Tensor[[128, 64], pl.BF16],
+            ) -> pl.Tensor[[16, 64], pl.FP32]:
+                out_0: pl.Tensor[[16, 64], pl.FP32] = pl.create_tensor([16, 64], dtype=pl.FP32)
+                z: pl.Tensor[[16, 64], pl.FP32] = self.main_incore_0(x, y, out_0)
+                return z
+
+        codes = self._expand_and_generate(BidirectionalMixed)
+        aic_body = _extract_func_section(codes["main_incore_0_aic"], "main_incore_0_aic")
+        aiv_body = _extract_func_section(codes["main_incore_0_aiv"], "main_incore_0_aiv")
+
+        # Automatic setup always pins the ring depth explicitly (default 2), so PTOAS cannot
+        # fall back to its own dir_mask-derived depth and overrun the reserved buffer.
+        assert "pto.aic_initialize_pipe {dir_mask = 3, slot_size = 4096, slot_num = 2}" in aic_body
+        assert "pto.aiv_initialize_pipe {dir_mask = 3, slot_size = 4096, slot_num = 2}" in aiv_body
+        assert "{id =" not in aic_body
+        assert "{id =" not in aiv_body
+        assert "pto.tpush_to_aiv" in aic_body and "{split = 0}" in aic_body
+        assert "pto.tpop_from_aiv {split = 0}" in aic_body
+        assert "pto.tfree_from_aiv {split = 0}" in aic_body
+        assert "pto.tpush_to_aic" in aiv_body and "{split = 0}" in aiv_body
+        assert "pto.tpop_from_aic {split = 0}" in aiv_body
+        assert "pto.tfree_from_aic {split = 0}" in aiv_body
+
+    def test_multiple_pipe_ids_offset_gm_buffers_on_a2a3(self):
+        """Explicit pipe ids share one GM workspace but point at disjoint regions."""
+
+        @pl.program
+        class MultiplePipeSetup:
+            @pl.function(type=pl.FunctionType.AIC)
+            def cube_kernel(self):
+                c2v_peer = pl.import_peer_buffer(name="c2v_slot_buffer", peer_func="vector_kernel")
+                v2c_buf = pl.reserve_buffer(name="v2c_slot_buffer", size=32768, base=0x1000)
+                pl.aic_initialize_pipe(c2v_peer, pl.const(0, pl.INT32), dir_mask=1, slot_size=8192, id=0)
+                pl.aic_initialize_pipe(pl.const(0, pl.INT32), v2c_buf, dir_mask=2, slot_size=4096, id=1)
+
+            @pl.function(type=pl.FunctionType.AIV)
+            def vector_kernel(self):
+                c2v_buf = pl.reserve_buffer(name="c2v_slot_buffer", size=65536, base=0x2000)
+                v2c_peer = pl.import_peer_buffer(name="v2c_slot_buffer", peer_func="cube_kernel")
+                pl.aiv_initialize_pipe(c2v_buf, pl.const(0, pl.INT32), dir_mask=1, slot_size=8192, id=0)
+                pl.aiv_initialize_pipe(pl.const(0, pl.INT32), v2c_peer, dir_mask=2, slot_size=4096, id=1)
+
+            @pl.function(type=pl.FunctionType.Group)
+            def group_func(self):
+                self.cube_kernel()
+                self.vector_kernel()
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(self):
+                self.group_func()
+
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910)
+        try:
+            transformed = ir.PassManager.get_strategy(ir.OptimizationStrategy.Default).run_passes(
+                MultiplePipeSetup
+            )
+            codegen_instance = codegen.PTOCodegen()
+            groups, _ = _build_group_mapping(transformed)
+            group_funcs = next(iter(groups.values()))
+            mlir_code = codegen_instance.generate(
+                ir.Program(group_funcs, "multiple_pipe_a2a3", transformed.span)
+            )
+        finally:
+            backend.reset_for_testing()
+
+        aic_body = _extract_func_section(mlir_code, "cube_kernel")
+        aiv_body = _extract_func_section(mlir_code, "vector_kernel")
+
+        for body in (aic_body, aiv_body):
+            assert "pto.aic_initialize_pipe {id = 0, dir_mask = 1" in body or (
+                "pto.aiv_initialize_pipe {id = 0, dir_mask = 1" in body
+            )
+            assert "id = 1, dir_mask = 2" in body
+            assert re.search(r"pto.addptr %arg\d+", body)
+            assert "arith.constant 16384 : index" in body
+            assert re.search(r"gm_slot_buffer = %arg\d+ : !pto.ptr<f32>", body)
+            assert body.count("gm_slot_buffer = %") == 2
+            assert "dir_mask = 3" not in body
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

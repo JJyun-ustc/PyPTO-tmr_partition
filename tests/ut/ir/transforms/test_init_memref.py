@@ -1,0 +1,1872 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+
+"""Tests for InitMemRefPass.
+
+Hand-written expectations normalize inferred Call result MemRefs explicitly.
+Exact comparison still checks all variable storage fields and allocation alias
+patterns. Roundtrip instruments compare the original IR without normalization.
+DefFields always alpha-map; open references retain their identity by default.
+
+Two tests are kept as raw-IR / diagnostic tests because the inputs cannot be
+expressed via the DSL:
+  * ``test_rejects_dynamic_tile_shape`` — verifies ``pytest.raises`` on B3.
+  * ``test_if_phi_preserves_dynamic_valid_shape_vars`` — a regression test for
+    issue #870 that constructs a ``TileView`` with dynamic ``valid_shape``
+    Vars; this has no DSL syntax.
+"""
+
+import re
+from typing import cast
+
+import pypto
+import pypto.language as pl
+import pytest
+from pypto import backend as _backend
+from pypto import ir, passes
+from pypto.backend import BackendType
+from pypto.ir import MemorySpace
+from pypto.ir.op import tile as tile_ops
+
+from .storage_test_utils import without_call_memrefs
+
+
+class TestBasic:
+    """Basic MemRef creation, memory space assignment, and alloc generation."""
+
+    def test_simple_load_add_store(self):
+        """load-add-store sequence: Vec tiles get unique MemRefs, params get DDR."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                input_a: pl.Tensor[[64, 64], pl.FP32],
+                input_b: pl.Tensor[[64, 64], pl.FP32],
+                output: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
+            ) -> pl.Tensor[[64, 64], pl.FP32]:
+                tile_a: pl.Tile[[64, 64], pl.FP32, pl.MemorySpace.Vec] = pl.load(
+                    input_a, [0, 0], [64, 64], target_memory=pl.Mem.Vec
+                )
+                tile_b: pl.Tile[[64, 64], pl.FP32, pl.MemorySpace.Vec] = pl.load(
+                    input_b, [0, 0], [64, 64], target_memory=pl.Mem.Vec
+                )
+                tile_sum: pl.Tile[[64, 64], pl.FP32, pl.MemorySpace.Vec] = pl.add(tile_a, tile_b)
+                result: pl.Tensor[[64, 64], pl.FP32] = pl.store(tile_sum, [0, 0], output)
+                return result
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(
+                self,
+                input_a: pl.Tensor[[64, 64], pl.FP32, pl.MemRef("mem_ddr_0", 0, 16384)],
+                input_b: pl.Tensor[[64, 64], pl.FP32, pl.MemRef("mem_ddr_1", 0, 16384)],
+                output: pl.Out[pl.Tensor[[64, 64], pl.FP32, pl.MemRef("mem_ddr_2", 0, 16384)]],
+            ) -> pl.Tensor[[64, 64], pl.FP32]:
+                mem_vec_3: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384)
+                mem_vec_4: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384)
+                mem_vec_5: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384)
+                tile_a: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_3, 0, 16384), pl.Mem.Vec] = pl.tile.load(
+                    input_a, [0, 0], [64, 64], [64, 64], target_memory=pl.Mem.Vec
+                )
+                tile_b: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_4, 0, 16384), pl.Mem.Vec] = pl.tile.load(
+                    input_b, [0, 0], [64, 64], [64, 64], target_memory=pl.Mem.Vec
+                )
+                tile_sum: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_5, 0, 16384), pl.Mem.Vec] = (
+                    pl.tile.add(tile_a, tile_b)
+                )
+                result: pl.Tensor[[64, 64], pl.FP32, pl.MemRef("mem_ddr_2", 0, 16384)] = pl.tile.store(
+                    tile_sum, [0, 0], output
+                )
+                return result
+
+        After = passes.init_mem_ref()(Before)
+        ir.assert_structural_equal(without_call_memrefs(After), without_call_memrefs(Expected))
+
+    def test_matmul_pipeline(self):
+        """load→move→matmul→store: Vec/Mat/Left/Right/Acc memory spaces each get their own MemRef."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                input_a: pl.Tensor[[32, 32], pl.FP16],
+                input_b: pl.Tensor[[32, 32], pl.FP16],
+                output: pl.Out[pl.Tensor[[32, 32], pl.FP32]],
+            ) -> pl.Tensor[[32, 32], pl.FP32]:
+                tile_a_ub: pl.Tile[[32, 32], pl.FP16, pl.MemorySpace.Vec] = pl.load(
+                    input_a, [0, 0], [32, 32], target_memory=pl.Mem.Vec
+                )
+                tile_b_l1: pl.Tile[[32, 32], pl.FP16, pl.MemorySpace.Mat] = pl.load(
+                    input_b, [0, 0], [32, 32], target_memory=pl.MemorySpace.Mat
+                )
+                tile_a_l0a: pl.Tile[[32, 32], pl.FP16, pl.MemorySpace.Left] = pl.move(
+                    tile_a_ub, target_memory=pl.MemorySpace.Left
+                )
+                tile_b_l0b: pl.Tile[[32, 32], pl.FP16, pl.MemorySpace.Right] = pl.move(
+                    tile_b_l1, target_memory=pl.MemorySpace.Right
+                )
+                tile_result: pl.Tile[[32, 32], pl.FP32, pl.MemorySpace.Acc] = pl.matmul(
+                    tile_a_l0a, tile_b_l0b
+                )
+                result: pl.Tensor[[32, 32], pl.FP32] = pl.store(tile_result, [0, 0], output)
+                return result
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(
+                self,
+                input_a: pl.Tensor[[32, 32], pl.FP16, pl.MemRef("mem_ddr_0", 0, 2048)],
+                input_b: pl.Tensor[[32, 32], pl.FP16, pl.MemRef("mem_ddr_1", 0, 2048)],
+                output: pl.Out[pl.Tensor[[32, 32], pl.FP32, pl.MemRef("mem_ddr_2", 0, 4096)]],
+            ) -> pl.Tensor[[32, 32], pl.FP32]:
+                mem_vec_3: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 2048)
+                mem_mat_4: pl.Ptr = pl.tile.alloc(pl.Mem.Mat, 2048)
+                mem_left_5: pl.Ptr = pl.tile.alloc(pl.Mem.Left, 2048)
+                mem_right_6: pl.Ptr = pl.tile.alloc(pl.Mem.Right, 2048)
+                mem_acc_7: pl.Ptr = pl.tile.alloc(pl.Mem.Acc, 4096)
+                tile_a_ub: pl.Tile[[32, 32], pl.FP16, pl.MemRef(mem_vec_3, 0, 2048), pl.Mem.Vec] = (
+                    pl.tile.load(input_a, [0, 0], [32, 32], [32, 32], target_memory=pl.Mem.Vec)
+                )
+                tile_b_l1: pl.Tile[[32, 32], pl.FP16, pl.MemRef(mem_mat_4, 0, 2048), pl.Mem.Mat] = (
+                    pl.tile.load(input_b, [0, 0], [32, 32], [32, 32], target_memory=pl.Mem.Mat)
+                )
+                tile_a_l0a: pl.Tile[[32, 32], pl.FP16, pl.MemRef(mem_left_5, 0, 2048), pl.Mem.Left] = (
+                    pl.tile.move(tile_a_ub, target_memory=pl.Mem.Left)
+                )
+                tile_b_l0b: pl.Tile[[32, 32], pl.FP16, pl.MemRef(mem_right_6, 0, 2048), pl.Mem.Right] = (
+                    pl.tile.move(tile_b_l1, target_memory=pl.Mem.Right)
+                )
+                tile_result: pl.Tile[[32, 32], pl.FP32, pl.MemRef(mem_acc_7, 0, 4096), pl.Mem.Acc] = (
+                    pl.tile.matmul(tile_a_l0a, tile_b_l0b)
+                )
+                result: pl.Tensor[[32, 32], pl.FP32, pl.MemRef("mem_ddr_2", 0, 4096)] = pl.tile.store(
+                    tile_result, [0, 0], output
+                )
+                return result
+
+        After = passes.init_mem_ref()(Before)
+        ir.assert_structural_equal(without_call_memrefs(After), without_call_memrefs(Expected))
+
+    @pytest.mark.parametrize(
+        ("backend_type", "expected_acc_bytes"),
+        [
+            pytest.param(None, 16384, id="unconfigured-safe-fallback"),
+            pytest.param(BackendType.Ascend910, 16384, id="ascend910b"),
+            pytest.param(BackendType.Ascend950, 8192, id="ascend950"),
+        ],
+    )
+    def test_int32_acc_allocation_uses_backend_physical_m_rows(self, backend_type, expected_acc_bytes):
+        """A logical 16x128 INT32 accumulator occupies 32 physical M rows on
+        910B, while 950 retains the ordinary 16-row footprint. An unconfigured
+        bare pass uses the larger current-backend footprint rather than
+        underallocating."""
+        _backend.reset_for_testing()
+        if backend_type is not None:
+            _backend.set_backend_type(backend_type)
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                input_a: pl.Tensor[[16, 32], pl.INT8],
+                input_b: pl.Tensor[[32, 128], pl.INT8],
+                output: pl.Out[pl.Tensor[[16, 128], pl.INT32]],
+            ) -> pl.Tensor[[16, 128], pl.INT32]:
+                a_mat: pl.Tile[[16, 32], pl.INT8, pl.Mem.Mat] = pl.tile.load(
+                    input_a, [0, 0], [16, 32], target_memory=pl.Mem.Mat
+                )
+                b_mat: pl.Tile[[32, 128], pl.INT8, pl.Mem.Mat] = pl.tile.load(
+                    input_b, [0, 0], [32, 128], target_memory=pl.Mem.Mat
+                )
+                a_l0: pl.Tile[[16, 32], pl.INT8, pl.Mem.Left] = pl.tile.move(a_mat, target_memory=pl.Mem.Left)
+                b_l0: pl.Tile[[32, 128], pl.INT8, pl.Mem.Right] = pl.tile.move(
+                    b_mat, target_memory=pl.Mem.Right
+                )
+                acc: pl.Tile[[16, 128], pl.INT32, pl.Mem.Acc] = pl.tile.matmul(a_l0, b_l0)
+                output = pl.tile.store(acc, [0, 0], output)
+                return output
+
+        printed = ir.python_print(passes.init_mem_ref()(Before))
+        assert f"pl.tile.alloc(pl.Mem.Acc, {expected_acc_bytes})" in printed
+        assert f", pl.const(0, pl.INT64), {expected_acc_bytes}), pl.Mem.Acc]" in printed
+
+    def test_acc_slice_span_does_not_reapply_root_row_padding(self):
+        """A lower-half view of a padded INT32 Acc ends at its root boundary.
+
+        The root [32,128] owns 16 KiB. Its [16,128] slice at row 16 starts at
+        byte 8192 and spans the remaining 8192 bytes; treating the view like a
+        fresh 32-row allocation would incorrectly record [8192,24576).
+
+        This is a *row* window, so it keeps the row-major-dense arithmetic: it
+        narrows the parent's row extent, and a narrowed L0C window has no correct
+        standalone base address at all (its box columns are strided by the
+        parent's row count, its own descriptor's by its own). The NZ path
+        deliberately declines it rather than swapping one wrong number for
+        another — see `GetSliceAccumulatorGeometry`.
+        """
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910)
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                input_a: pl.Tensor[[32, 32], pl.INT8],
+                input_b: pl.Tensor[[32, 128], pl.INT8],
+                output: pl.Out[pl.Tensor[[16, 128], pl.INT32]],
+            ) -> pl.Tensor[[16, 128], pl.INT32]:
+                a_mat: pl.Tile[[32, 32], pl.INT8, pl.Mem.Mat] = pl.tile.load(
+                    input_a, [0, 0], [32, 32], target_memory=pl.Mem.Mat
+                )
+                b_mat: pl.Tile[[32, 128], pl.INT8, pl.Mem.Mat] = pl.tile.load(
+                    input_b, [0, 0], [32, 128], target_memory=pl.Mem.Mat
+                )
+                a_l0: pl.Tile[[32, 32], pl.INT8, pl.Mem.Left] = pl.tile.move(a_mat, target_memory=pl.Mem.Left)
+                b_l0: pl.Tile[[32, 128], pl.INT8, pl.Mem.Right] = pl.tile.move(
+                    b_mat, target_memory=pl.Mem.Right
+                )
+                acc: pl.Tile[[32, 128], pl.INT32, pl.Mem.Acc] = pl.tile.matmul(a_l0, b_l0)
+                lower: pl.Tile[[16, 128], pl.INT32, pl.Mem.Acc] = pl.tile.slice(acc, [16, 128], [16, 0])
+                output = pl.tile.store(lower, [0, 0], output)
+                return output
+
+        printed = ir.python_print(passes.init_mem_ref()(Before))
+        assert "pl.tile.alloc(pl.Mem.Acc, 16384)" in printed
+        root = re.search(
+            r"acc: .*pl\.MemRef\((mem_acc_\d+), pl\.const\(0, pl\.INT64\), 16384\), pl\.Mem\.Acc",
+            printed,
+        )
+        view = re.search(
+            r"lower: .*pl\.MemRef\((mem_acc_\d+), pl\.const\(8192, pl\.INDEX\), 8192\), "
+            r"pl\.Mem\.Acc",
+            printed,
+        )
+        assert root and view and root.group(1) == view.group(1), printed
+
+
+class TestMemRefSharing:
+    """MemRef sharing: tile.store shares with output param, view ops share with input."""
+
+    def test_store_shares_memref_with_output_param(self):
+        """tile.store result shares MemRef with the output tensor parameter."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                input_a: pl.Tensor[[64, 64], pl.FP32],
+                output: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
+            ) -> pl.Tensor[[64, 64], pl.FP32]:
+                tile_a: pl.Tile[[64, 64], pl.FP32, pl.MemorySpace.Vec] = pl.load(
+                    input_a, [0, 0], [64, 64], target_memory=pl.Mem.Vec
+                )
+                result: pl.Tensor[[64, 64], pl.FP32] = pl.store(tile_a, [0, 0], output)
+                return result
+
+        # ``output`` and ``result`` share the same "mem_ddr_1" pointer — this is
+        # the store-shares-with-output relationship the test verifies.
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(
+                self,
+                input_a: pl.Tensor[[64, 64], pl.FP32, pl.MemRef("mem_ddr_0", 0, 16384)],
+                output: pl.Out[pl.Tensor[[64, 64], pl.FP32, pl.MemRef("mem_ddr_1", 0, 16384)]],
+            ) -> pl.Tensor[[64, 64], pl.FP32]:
+                mem_vec_2: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384)
+                tile_a: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_2, 0, 16384), pl.Mem.Vec] = pl.tile.load(
+                    input_a, [0, 0], [64, 64], [64, 64], target_memory=pl.Mem.Vec
+                )
+                result: pl.Tensor[[64, 64], pl.FP32, pl.MemRef("mem_ddr_1", 0, 16384)] = pl.tile.store(
+                    tile_a, [0, 0], output
+                )
+                return result
+
+        After = passes.init_mem_ref()(Before)
+        ir.assert_structural_equal(without_call_memrefs(After), without_call_memrefs(Expected))
+
+    def test_view_op_shares_memref_with_input(self):
+        """tile.reshape chain shares a single MemRef (only 1 alloc needed)."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                input_a: pl.Tensor[[64, 64], pl.FP32],
+                output: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
+            ) -> pl.Tensor[[64, 64], pl.FP32]:
+                tile_a: pl.Tile[[64, 64], pl.FP32, pl.MemorySpace.Vec] = pl.load(
+                    input_a, [0, 0], [64, 64], target_memory=pl.Mem.Vec
+                )
+                reshaped: pl.Tile[[4096, 1], pl.FP32, pl.MemorySpace.Vec] = pl.tile.reshape(tile_a, [4096, 1])
+                flat: pl.Tile[[64, 64], pl.FP32, pl.MemorySpace.Vec] = pl.tile.reshape(reshaped, [64, 64])
+                result: pl.Tensor[[64, 64], pl.FP32] = pl.store(flat, [0, 0], output)
+                return result
+
+        # All three tiles share ``mem_vec_2`` — reshape is a view op.
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(
+                self,
+                input_a: pl.Tensor[[64, 64], pl.FP32, pl.MemRef("mem_ddr_0", 0, 16384)],
+                output: pl.Out[pl.Tensor[[64, 64], pl.FP32, pl.MemRef("mem_ddr_1", 0, 16384)]],
+            ) -> pl.Tensor[[64, 64], pl.FP32]:
+                mem_vec_2: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384)
+                tile_a: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_2, 0, 16384), pl.Mem.Vec] = pl.tile.load(
+                    input_a, [0, 0], [64, 64], [64, 64], target_memory=pl.Mem.Vec
+                )
+                reshaped: pl.Tile[[4096, 1], pl.FP32, pl.MemRef(mem_vec_2, 0, 16384), pl.Mem.Vec] = (
+                    pl.tile.reshape(tile_a, [4096, 1])
+                )
+                flat: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_2, 0, 16384), pl.Mem.Vec] = (
+                    pl.tile.reshape(reshaped, [64, 64])
+                )
+                result: pl.Tensor[[64, 64], pl.FP32, pl.MemRef("mem_ddr_1", 0, 16384)] = pl.tile.store(
+                    flat, [0, 0], output
+                )
+                return result
+
+        After = passes.init_mem_ref()(Before)
+        ir.assert_structural_equal(without_call_memrefs(After), without_call_memrefs(Expected))
+
+    def test_view_over_tpop_result_is_memref_less(self):
+        """A cross-core tpop result and any view chained off it stay MemRef-less.
+
+        The tpop's data lives in the reserved C2V slot (no general-pool buffer),
+        so InitMemRef must NOT give the tpop result or a reshape view of it a
+        MemRef (which would become a disconnected alloc_tile at codegen). A normal
+        consumer of the view still gets its own MemRef.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.AIV)
+            def consumer(self):
+                buf = pl.reserve_buffer(name="c2v_slot_buffer", size=4096, base=0x1000)
+                pl.aiv_initialize_pipe(dir_mask=1, slot_size=512, c2v_consumer_buf=buf)
+                t: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec] = pl.tpop_from_aic(split=0)
+                v: pl.Tile[[8, 32], pl.FP32, pl.MemorySpace.Vec] = pl.tile.reshape(t, [8, 32])
+                pl.tfree_to_aic(t)
+                out: pl.Tile[[8, 32], pl.FP32, pl.MemorySpace.Vec] = pl.exp(v)
+                _ = out
+
+        after = passes.init_mem_ref()(Before)
+        func = next(iter(after.functions.values()))
+
+        memref_by_name: dict[str, object] = {}
+        for stmt in cast(ir.SeqStmts, func.body).stmts:
+            if isinstance(stmt, ir.AssignStmt) and isinstance(stmt.var.type, ir.TileType):
+                memref_by_name[stmt.var.name_hint] = stmt.var.type.memref
+
+        assert memref_by_name["t"] is None, "tpop result must be MemRef-less"
+        assert memref_by_name["v"] is None, "reshape over a tpop result must be MemRef-less"
+        assert memref_by_name["out"] is not None, "a normal consumer still gets a MemRef"
+
+    def test_plain_alias_of_tpop_result_is_memref_less(self):
+        """A plain tile alias `a = t` of a MemRef-less tpop result stays MemRef-less.
+
+        Without this, `ShareMemRefFrom` returns null for the MemRef-less tpop and
+        the alias falls through to a fresh, disconnected buffer — which ``Expected``
+        pins by giving only ``out`` a MemRef.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.AIV)
+            def main(self) -> pl.Tile[[16, 16], pl.FP32, pl.Mem.Vec]:
+                t: pl.Tile[[16, 16], pl.FP32, pl.Mem.Vec] = pl.tile.tpop_from_aic(split=0)
+                a: pl.Tile[[16, 16], pl.FP32, pl.Mem.Vec] = t
+                out: pl.Tile[[16, 16], pl.FP32, pl.Mem.Vec] = pl.tile.muls(a, 1.0)
+                return out
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.AIV)
+            def main(self) -> pl.Tile[[16, 16], pl.FP32, pl.Mem.Vec]:
+                mem_vec_0: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 1024)
+                # `t` (tpop result) and its alias `a` stay MemRef-less; only the
+                # ordinary consumer `out` is given a buffer.
+                t: pl.Tile[[16, 16], pl.FP32, pl.Mem.Vec] = pl.tile.tpop_from_aic(split=0)
+                a: pl.Tile[[16, 16], pl.FP32, pl.Mem.Vec] = t
+                out: pl.Tile[
+                    [16, 16], pl.FP32, pl.MemRef(mem_vec_0, pl.const(0, pl.INT64), 1024), pl.Mem.Vec
+                ] = pl.tile.muls(a, 1.0)
+                return out
+
+        with passes.PassContext(
+            [passes.VerificationInstrument(passes.VerificationMode.BEFORE_AND_AFTER)],
+        ):
+            After = passes.init_mem_ref()(Before)
+        ir.assert_structural_equal(without_call_memrefs(After), without_call_memrefs(Expected))
+
+    def test_matmul_acc_shares_memref_with_accumulator(self):
+        """tile.matmul_acc output shares MemRef with its accumulator input (arg[0])."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                input_a: pl.Tensor[[32, 32], pl.FP16],
+                input_b: pl.Tensor[[32, 32], pl.FP16],
+                output: pl.Out[pl.Tensor[[32, 32], pl.FP32]],
+            ) -> pl.Tensor[[32, 32], pl.FP32]:
+                tile_a_ub: pl.Tile[[32, 32], pl.FP16, pl.MemorySpace.Vec] = pl.load(
+                    input_a, [0, 0], [32, 32], target_memory=pl.Mem.Vec
+                )
+                tile_b_l1: pl.Tile[[32, 32], pl.FP16, pl.MemorySpace.Mat] = pl.load(
+                    input_b, [0, 0], [32, 32], target_memory=pl.MemorySpace.Mat
+                )
+                tile_a_l0a: pl.Tile[[32, 32], pl.FP16, pl.MemorySpace.Left] = pl.move(
+                    tile_a_ub, target_memory=pl.MemorySpace.Left
+                )
+                tile_b_l0b: pl.Tile[[32, 32], pl.FP16, pl.MemorySpace.Right] = pl.move(
+                    tile_b_l1, target_memory=pl.MemorySpace.Right
+                )
+                acc: pl.Tile[[32, 32], pl.FP32, pl.MemorySpace.Acc] = pl.matmul(tile_a_l0a, tile_b_l0b)
+                acc_next: pl.Tile[[32, 32], pl.FP32, pl.MemorySpace.Acc] = pl.matmul_acc(
+                    acc, tile_a_l0a, tile_b_l0b
+                )
+                result: pl.Tensor[[32, 32], pl.FP32] = pl.store(acc_next, [0, 0], output)
+                return result
+
+        # ``acc`` and ``acc_next`` share ``mem_acc_7`` — matmul_acc reuses the
+        # accumulator's storage.
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(
+                self,
+                input_a: pl.Tensor[[32, 32], pl.FP16, pl.MemRef("mem_ddr_0", 0, 2048)],
+                input_b: pl.Tensor[[32, 32], pl.FP16, pl.MemRef("mem_ddr_1", 0, 2048)],
+                output: pl.Out[pl.Tensor[[32, 32], pl.FP32, pl.MemRef("mem_ddr_2", 0, 4096)]],
+            ) -> pl.Tensor[[32, 32], pl.FP32]:
+                mem_vec_3: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 2048)
+                mem_mat_4: pl.Ptr = pl.tile.alloc(pl.Mem.Mat, 2048)
+                mem_left_5: pl.Ptr = pl.tile.alloc(pl.Mem.Left, 2048)
+                mem_right_6: pl.Ptr = pl.tile.alloc(pl.Mem.Right, 2048)
+                mem_acc_7: pl.Ptr = pl.tile.alloc(pl.Mem.Acc, 4096)
+                tile_a_ub: pl.Tile[[32, 32], pl.FP16, pl.MemRef(mem_vec_3, 0, 2048), pl.Mem.Vec] = (
+                    pl.tile.load(input_a, [0, 0], [32, 32], [32, 32], target_memory=pl.Mem.Vec)
+                )
+                tile_b_l1: pl.Tile[[32, 32], pl.FP16, pl.MemRef(mem_mat_4, 0, 2048), pl.Mem.Mat] = (
+                    pl.tile.load(input_b, [0, 0], [32, 32], [32, 32], target_memory=pl.Mem.Mat)
+                )
+                tile_a_l0a: pl.Tile[[32, 32], pl.FP16, pl.MemRef(mem_left_5, 0, 2048), pl.Mem.Left] = (
+                    pl.tile.move(tile_a_ub, target_memory=pl.Mem.Left)
+                )
+                tile_b_l0b: pl.Tile[[32, 32], pl.FP16, pl.MemRef(mem_right_6, 0, 2048), pl.Mem.Right] = (
+                    pl.tile.move(tile_b_l1, target_memory=pl.Mem.Right)
+                )
+                acc: pl.Tile[[32, 32], pl.FP32, pl.MemRef(mem_acc_7, 0, 4096), pl.Mem.Acc] = pl.tile.matmul(
+                    tile_a_l0a, tile_b_l0b
+                )
+                acc_next: pl.Tile[[32, 32], pl.FP32, pl.MemRef(mem_acc_7, 0, 4096), pl.Mem.Acc] = (
+                    pl.tile.matmul_acc(acc, tile_a_l0a, tile_b_l0b)
+                )
+                result: pl.Tensor[[32, 32], pl.FP32, pl.MemRef("mem_ddr_2", 0, 4096)] = pl.tile.store(
+                    acc_next, [0, 0], output
+                )
+                return result
+
+        After = passes.init_mem_ref()(Before)
+        ir.assert_structural_equal(without_call_memrefs(After), without_call_memrefs(Expected))
+
+
+class TestSliceView:
+    """tile.slice is a view op: output shares the input's base Ptr with an
+    accumulated byte offset and a smaller view size."""
+
+    @pytest.mark.parametrize("run_simplify", [False, True])
+    def test_nested_constant_origin_folds_without_freezing_loop_metadata(self, run_simplify):
+        """Constant SSA origins fold while loop-carried and indexed origins stay dynamic."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.AIC)
+            def main(
+                self,
+                output: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                pool = pl.tile.create([128, 16], dtype=pl.FP32, target_memory=pl.Mem.Acc)
+                row: pl.Scalar[pl.INDEX] = 16
+                for iteration in pl.range(2):
+                    base: pl.Scalar[pl.INDEX] = 32
+                    fixed_row = base * 2
+                    constant_view = pl.tile.slice(pool, [16, 16], [fixed_row, 0])
+                    carried_view = pl.tile.slice(pool, [16, 16], [row, 0])
+                    indexed_view = pl.tile.slice(pool, [16, 16], [iteration * 16, 0])
+                    _first = pl.tile.store(constant_view, [0, 0], output)
+                    _second = pl.tile.store(carried_view, [0, 0], output)
+                    _third = pl.tile.store(indexed_view, [0, 0], output)
+                    row = row + 16
+                return output
+
+        after = passes.convert_to_ssa()(Before)
+        if run_simplify:
+            after = passes.simplify()(after)
+        after = passes.init_mem_ref()(after)
+        found = {}
+
+        class Origins(ir.IRVisitor):
+            def visit_assign_stmt(self, op):
+                for name in ("constant_view", "carried_view", "indexed_view"):
+                    if op.var.name_hint.startswith(name):
+                        assert isinstance(op.var.type, ir.TileType)
+                        assert op.var.type.memref is not None
+                        assert isinstance(op.value, ir.Call)
+                        origins = op.value.args[2]
+                        assert isinstance(origins, ir.MakeTuple)
+                        found[name] = (op.var.type.memref.byte_offset_, origins.elements[0])
+                super().visit_assign_stmt(op)
+
+        Origins().visit_stmt(next(iter(after.functions.values())).body)
+        assert set(found) == {"constant_view", "carried_view", "indexed_view"}
+        constant_offset, constant_origin = found["constant_view"]
+        assert isinstance(constant_offset, ir.ConstInt), str(constant_offset)
+        assert constant_offset.value == 64 * 16 * 4
+        assert isinstance(constant_origin, ir.ConstInt)
+        assert constant_origin.value == 64
+        for name in ("carried_view", "indexed_view"):
+            offset, origin = found[name]
+            assert not isinstance(offset, ir.ConstInt)
+            assert not isinstance(origin, ir.ConstInt)
+
+    @pytest.mark.parametrize(
+        ("column", "expected_offset", "expected_size"), [(128, 8192, 8192), (8, 32, 15872)]
+    )
+    def test_named_origins_use_the_same_acc_layout_as_literals(self, column, expected_offset, expected_size):
+        """Constant origins must reach both NZ layout selection and byte-offset computation."""
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.AIC)
+            def main(self, output: pl.Out[pl.Tensor[[16, 128], pl.FP32]]):
+                pool = pl.tile.create([16, 256], dtype=pl.FP32, target_memory=pl.Mem.Acc)
+                for _iteration in pl.range(2):
+                    zero: pl.Scalar[pl.INDEX] = 0
+                    col: pl.Scalar[pl.INDEX] = column
+                    window = pl.tile.slice(pool, [16, 128], [zero, col])
+                    _stored = pl.tile.store(window, [0, 0], output)
+
+        after = passes.init_mem_ref()(passes.convert_to_ssa()(Before))
+        windows = []
+
+        class Windows(ir.IRVisitor):
+            def visit_assign_stmt(self, op):
+                if op.var.name_hint.startswith("window"):
+                    windows.append(op)
+                super().visit_assign_stmt(op)
+
+        Windows().visit_stmt(next(iter(after.functions.values())).body)
+        assert len(windows) == 1
+        memref = windows[0].var.type.memref
+        assert isinstance(memref.byte_offset_, ir.ConstInt)
+        assert memref.byte_offset_.value == expected_offset
+        assert memref.size_ == expected_size
+        origins = windows[0].value.args[2].elements
+        assert all(isinstance(origin, ir.ConstInt) for origin in origins)
+        assert [origin.value for origin in origins] == [0, column]
+
+    def test_slice_nonzero_byte_offset_and_alloc_dedup(self):
+        """tile.slice views share the source's base Ptr; only one alloc per base.
+
+        ``tile.slice`` is registered with ``set_output_memory_inherit_input()``
+        (src/ir/op/tile_ops/transform.cpp:380), so InitMemRef routes it through
+        ``ShareMemRefFrom`` (init_memref.cpp:291-303). That helper:
+          * computes the slice byte offset via ``ComputeViewByteOffset`` /
+            ``ComputeSliceByteOffset`` (memref_utils.h:292-343):
+            byte_offset = (o0 * cols + o1) * elem_bytes;
+          * sizes the view from the slice OUTPUT shape (init_memref.cpp:241-255).
+
+        For an FP32 [8, 16] parent (512 bytes, base ``mem_vec_2``):
+          * ``s0 = slice([1,16], [0,0])`` -> offset 0, view size 1*16*4 = 64.
+            Size differs from the parent (512) so it is NOT a pure alias
+            (init_memref.cpp:260-267): a fresh MemRef over the SAME base, off 0.
+          * ``s1 = slice([1,16], [1,0])`` -> offset (1*16 + 0)*4 = 64, size 64.
+
+        Alloc dedup is by base Ptr (init_memref.cpp:543-550); all three tiles
+        share base ``mem_vec_2``, so exactly one ``tile.alloc`` is emitted, sized
+        from the first MemRef seen for that base in traversal order — the root
+        ``tile_a`` (512 bytes).
+        """
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                input_a: pl.Tensor[[8, 16], pl.FP32],
+                out0: pl.Out[pl.Tensor[[1, 16], pl.FP32]],
+                out1: pl.Out[pl.Tensor[[1, 16], pl.FP32]],
+            ) -> pl.Tensor[[1, 16], pl.FP32]:
+                tile_a: pl.Tile[[8, 16], pl.FP32, pl.MemorySpace.Vec] = pl.load(
+                    input_a, [0, 0], [8, 16], target_memory=pl.Mem.Vec
+                )
+                s0: pl.Tile[[1, 16], pl.FP32, pl.MemorySpace.Vec] = pl.tile.slice(tile_a, [1, 16], [0, 0])
+                s1: pl.Tile[[1, 16], pl.FP32, pl.MemorySpace.Vec] = pl.tile.slice(tile_a, [1, 16], [1, 0])
+                r0: pl.Tensor[[1, 16], pl.FP32] = pl.store(s0, [0, 0], out0)
+                _r1: pl.Tensor[[1, 16], pl.FP32] = pl.store(s1, [0, 0], out1)
+                return r0
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(
+                self,
+                input_a: pl.Tensor[[8, 16], pl.FP32, pl.MemRef("mem_ddr_0", 0, 512)],
+                out0: pl.Out[pl.Tensor[[1, 16], pl.FP32, pl.MemRef("mem_ddr_1", 0, 64)]],
+                out1: pl.Out[pl.Tensor[[1, 16], pl.FP32, pl.MemRef("mem_ddr_2", 0, 64)]],
+            ) -> pl.Tensor[[1, 16], pl.FP32]:
+                mem_vec_3: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 512)
+                tile_a: pl.Tile[[8, 16], pl.FP32, pl.MemRef(mem_vec_3, 0, 512), pl.Mem.Vec] = pl.tile.load(
+                    input_a, [0, 0], [8, 16], [8, 16], target_memory=pl.Mem.Vec
+                )
+                s0: pl.Tile[[1, 16], pl.FP32, pl.MemRef(mem_vec_3, pl.const(0, pl.INDEX), 64), pl.Mem.Vec] = (
+                    pl.tile.slice(tile_a, [1, 16], [0, 0])
+                )
+                s1: pl.Tile[
+                    [1, 16], pl.FP32, pl.MemRef(mem_vec_3, pl.const(64, pl.INDEX), 64), pl.Mem.Vec
+                ] = pl.tile.slice(tile_a, [1, 16], [1, 0])
+                r0: pl.Tensor[[1, 16], pl.FP32, pl.MemRef("mem_ddr_1", 0, 64)] = pl.tile.store(
+                    s0, [0, 0], out0
+                )
+                _r1: pl.Tensor[[1, 16], pl.FP32, pl.MemRef("mem_ddr_2", 0, 64)] = pl.tile.store(
+                    s1, [0, 0], out1
+                )
+                return r0
+
+        After = passes.init_mem_ref()(Before)
+        ir.assert_structural_equal(without_call_memrefs(After), without_call_memrefs(Expected))
+
+    @pytest.mark.parametrize("dtype", [pl.INT4, pl.UINT4, pl.HF4])
+    def test_four_bit_dtypes_share_packed_allocation_accounting(self, dtype):
+        """All semantic 4-bit dtypes occupy one byte per two logical elements."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                input_a: pl.Tensor[[8, 16], dtype],
+                output: pl.Out[pl.Tensor[[8, 16], dtype]],
+            ) -> pl.Tensor[[8, 16], dtype]:
+                tile_a = pl.load(input_a, [0, 0], [8, 16], target_memory=pl.Mem.Vec)
+                return pl.store(tile_a, [0, 0], output)
+
+        printed = ir.python_print(passes.init_mem_ref()(Before))
+        zero = r"pl\.const\(0, pl\.INT64\)"
+        assert re.search(rf'input_a: .*pl\.MemRef\("mem_ddr_0", {zero}, 64\)', printed), printed
+        assert re.search(rf'output: .*pl\.MemRef\("mem_ddr_1", {zero}, 64\)', printed), printed
+        assert re.search(rf"tile_a: .*pl\.MemRef\(mem_vec_\d+, {zero}, 64\)", printed), printed
+        assert "pl.tile.alloc(pl.Mem.Vec, 64)" in printed
+
+    @pytest.mark.parametrize("dtype", [pl.fp4e2m1x2, pl.fp4e1m2x2])
+    def test_fp4_slice_uses_carrier_byte_offset_and_span(self, dtype):
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                input_a: pl.Tensor[[8, 16], dtype],
+                output: pl.Out[pl.Tensor[[1, 16], dtype]],
+            ) -> pl.Tensor[[1, 16], dtype]:
+                tile_a = pl.load(input_a, [0, 0], [8, 16], target_memory=pl.Mem.Vec)
+                row = pl.tile.slice(tile_a, [1, 16], [1, 0])
+                return pl.store(row, [0, 0], output)
+
+        printed = ir.python_print(passes.init_mem_ref()(Before))
+        assert "pl.tile.alloc(pl.Mem.Vec, 128)" in printed
+        assert re.search(
+            r"row: .*pl\.MemRef\(mem_vec_\d+, pl\.const\(16, pl\.INDEX\), 16\)",
+            printed,
+        ), printed
+
+    @pytest.mark.parametrize("dtype", [pl.fp4e2m1x2, pl.fp4e1m2x2])
+    def test_fp4_slice_accepts_odd_carrier_origin(self, dtype):
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                input_a: pl.Tensor[[8, 16], dtype],
+                output: pl.Out[pl.Tensor[[1, 14], dtype]],
+            ) -> pl.Tensor[[1, 14], dtype]:
+                tile_a = pl.load(input_a, [0, 0], [8, 16], target_memory=pl.Mem.Vec)
+                tail = pl.tile.slice(tile_a, [1, 14], [0, 1])
+                return pl.store(tail, [0, 0], output)
+
+        printed = ir.python_print(passes.init_mem_ref()(Before))
+        assert re.search(r"tail: .*pl\.MemRef\(mem_vec_\d+, pl\.const\(1, pl\.INDEX\), 14\)", printed), (
+            printed
+        )
+
+    @staticmethod
+    def _acc_column_window_program(col_offset: int, window_cols: int = 128):
+        """A BF16 matmul producing an Acc [16, 256] FP32, sliced to one column window."""
+
+        @pl.program
+        class AccColumnWindow:
+            @pl.function
+            def main(
+                self,
+                input_a: pl.Tensor[[16, 128], pl.BF16],
+                input_b: pl.Tensor[[128, 256], pl.BF16],
+                output: pl.Out[pl.Tensor[[16, window_cols], pl.FP32]],
+            ) -> pl.Tensor[[16, window_cols], pl.FP32]:
+                a_mat: pl.Tile[[16, 128], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    input_a, [0, 0], [16, 128], target_memory=pl.Mem.Mat
+                )
+                b_mat: pl.Tile[[128, 256], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    input_b, [0, 0], [128, 256], target_memory=pl.Mem.Mat
+                )
+                a_l0: pl.Tile[[16, 128], pl.BF16, pl.Mem.Left] = pl.tile.move(
+                    a_mat, target_memory=pl.Mem.Left
+                )
+                b_l0: pl.Tile[[128, 256], pl.BF16, pl.Mem.Right] = pl.tile.move(
+                    b_mat, target_memory=pl.Mem.Right
+                )
+                acc: pl.Tile[[16, 256], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(a_l0, b_l0)
+                win: pl.Tile[[16, window_cols], pl.FP32, pl.Mem.Acc] = pl.tile.slice(
+                    acc, [16, window_cols], [0, col_offset]
+                )
+                output = pl.tile.store(win, [0, 0], output)
+                return output
+
+        return AccColumnWindow
+
+    def test_acc_column_window_uses_nz_box_byte_offset(self):
+        """An Acc column window is addressed in NZ boxes, not row-major elements.
+
+        L0C stores 16x16 boxes column of boxes first, so column 128 of a
+        [16, 256] FP32 accumulator is box column 8 of a 1x16 box grid and begins
+        at (8 * 16/16 + 0) * 1024 = 8192 bytes. Its boxes are consecutive, so the
+        envelope is the contiguous 8 * 1024 = 8192 bytes it actually occupies.
+
+        The row-major-dense formula would report (0 * 256 + 128) * 4 = 512 with a
+        15872-byte envelope. That number is not an L0C address: PTO rejects it
+        outright when it is not 512-aligned, and silently reads the wrong data
+        when it is (a ``tile.reshape`` stacked on this slice inherits the offset
+        without going through ``pto.subview``).
+        """
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910)
+
+        printed = ir.python_print(passes.init_mem_ref()(self._acc_column_window_program(128)))
+        assert "pl.tile.alloc(pl.Mem.Acc, 16384)" in printed
+        root = re.search(
+            r"acc: .*pl\.MemRef\((mem_acc_\d+), pl\.const\(0, pl\.INT64\), 16384\), pl\.Mem\.Acc",
+            printed,
+        )
+        view = re.search(
+            r"win: .*pl\.MemRef\((mem_acc_\d+), pl\.const\(8192, pl\.INDEX\), 8192\), "
+            r"pl\.Mem\.Acc",
+            printed,
+        )
+        assert root and view and root.group(1) == view.group(1), printed
+
+    def test_acc_zero_offset_column_window_spans_only_its_boxes(self):
+        """At offset 0 the NZ envelope still narrows to the window's own boxes.
+
+        The row-major envelope of a [16, 128] window of a [16, 256] parent runs
+        to the last element of the last row (15872 bytes) even though the window
+        physically occupies only its first 8 boxes. In NZ those boxes are
+        contiguous, so the view records 8192 — which is what makes two disjoint
+        column windows read as disjoint by lifetime/overlap analysis.
+        """
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910)
+
+        printed = ir.python_print(passes.init_mem_ref()(self._acc_column_window_program(0)))
+        assert re.search(
+            r"win: .*pl\.MemRef\(mem_acc_\d+, pl\.const\(0, pl\.INDEX\), 8192\), pl\.Mem\.Acc",
+            printed,
+        ), printed
+
+    def test_two_acc_column_windows_get_disjoint_byte_ranges(self):
+        """Two halves of an Acc row are physically disjoint and must record so.
+
+        In NZ the two [16, 128] halves of a [16, 256] FP32 accumulator occupy
+        [0, 8192) and [8192, 16384) — adjacent, non-overlapping. The row-major
+        model reported [0, 15872) and [512, 16384), which overlap heavily and
+        made lifetime/overlap analysis treat two disjoint buffers as aliasing
+        (MemoryReuse rejects two such windows carried through one loop).
+        """
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910)
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                input_a: pl.Tensor[[16, 128], pl.BF16],
+                input_b: pl.Tensor[[128, 256], pl.BF16],
+                out0: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+                out1: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+            ) -> pl.Tensor[[16, 128], pl.FP32]:
+                a_mat: pl.Tile[[16, 128], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    input_a, [0, 0], [16, 128], target_memory=pl.Mem.Mat
+                )
+                b_mat: pl.Tile[[128, 256], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    input_b, [0, 0], [128, 256], target_memory=pl.Mem.Mat
+                )
+                a_l0: pl.Tile[[16, 128], pl.BF16, pl.Mem.Left] = pl.tile.move(
+                    a_mat, target_memory=pl.Mem.Left
+                )
+                b_l0: pl.Tile[[128, 256], pl.BF16, pl.Mem.Right] = pl.tile.move(
+                    b_mat, target_memory=pl.Mem.Right
+                )
+                acc: pl.Tile[[16, 256], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(a_l0, b_l0)
+                w0: pl.Tile[[16, 128], pl.FP32, pl.Mem.Acc] = pl.tile.slice(acc, [16, 128], [0, 0])
+                w1: pl.Tile[[16, 128], pl.FP32, pl.Mem.Acc] = pl.tile.slice(acc, [16, 128], [0, 128])
+                r0: pl.Tensor[[16, 128], pl.FP32] = pl.tile.store(w0, [0, 0], out0)
+                _r1: pl.Tensor[[16, 128], pl.FP32] = pl.tile.store(w1, [0, 0], out1)
+                return r0
+
+        printed = ir.python_print(passes.init_mem_ref()(Before))
+        ranges = {}
+        for name in ("w0", "w1"):
+            match = re.search(
+                rf"{name}: .*pl\.MemRef\(mem_acc_\d+, (?:pl\.const\()?(\d+)(?:, pl\.INDEX\))?, (\d+)\), "
+                r"pl\.Mem\.Acc",
+                printed,
+            )
+            assert match, f"{name} MemRef not found in:\n{printed}"
+            start = int(match.group(1))
+            ranges[name] = (start, start + int(match.group(2)))
+
+        assert ranges["w0"] == (0, 8192), printed
+        assert ranges["w1"] == (8192, 16384), printed
+        assert ranges["w0"][1] <= ranges["w1"][0], f"windows overlap: {ranges}"
+
+    def test_acc_sub_box_column_origin_keeps_row_major_offset(self):
+        """A column origin inside a 16x16 box stays on the row-major arithmetic.
+
+        The NZ form ``c * rows`` only describes a whole box column, so an origin
+        at column 8 is outside what it can express. It must NOT become an error
+        here: CanonicalizeTileSlice explicitly whitelists exactly this window as a
+        legal MAD destination (it lies entirely inside box column 0, so there is
+        no second box column for the MAD's compact write to mis-stride), and on
+        that path the slice lowers to ``pto.subview`` and this byte offset is
+        dead. So the guard declines and the pre-existing row-major numbers stand:
+        (0 * 256 + 8) * 4 = 32, envelope (15 * 256 + 15 + 1) * 4 = 15424.
+        """
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910)
+
+        printed = ir.python_print(passes.init_mem_ref()(self._acc_column_window_program(8, window_cols=16)))
+        assert re.search(
+            r"win: .*pl\.MemRef\(mem_acc_\d+, pl\.const\(32, pl\.INDEX\), 15424\), pl\.Mem\.Acc",
+            printed,
+        ), printed
+
+    def test_acc_dynamic_column_origin_uses_nz_stride(self):
+        """A run-time column origin is scaled by the NZ stride, not the row pitch.
+
+        This is the shape the split-K accumulator window actually has in
+        ``tests/st/runtime/ops/test_matmul_acc_init_cond.py``:
+        ``pl.tile.slice(acc, [M, NT], [0, t * NT])``. Nothing static can be
+        checked, so the guard admits it on the strength of PTO lowering the very
+        same linear form at run time: one logical column step is ``rows`` physical
+        elements, giving ``t * 64 * 16 * 4``. The row-major model would emit
+        ``t * 64 * 256 * 4`` — a different address for every non-zero ``t``.
+        """
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910)
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                input_a: pl.Tensor[[16, 128], pl.BF16],
+                input_b: pl.Tensor[[128, 256], pl.BF16],
+                output: pl.Out[pl.Tensor[[16, 256], pl.FP32]],
+            ) -> pl.Tensor[[16, 256], pl.FP32]:
+                a_mat: pl.Tile[[16, 128], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    input_a, [0, 0], [16, 128], target_memory=pl.Mem.Mat
+                )
+                b_mat: pl.Tile[[128, 256], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    input_b, [0, 0], [128, 256], target_memory=pl.Mem.Mat
+                )
+                a_l0: pl.Tile[[16, 128], pl.BF16, pl.Mem.Left] = pl.tile.move(
+                    a_mat, target_memory=pl.Mem.Left
+                )
+                b_l0: pl.Tile[[128, 256], pl.BF16, pl.Mem.Right] = pl.tile.move(
+                    b_mat, target_memory=pl.Mem.Right
+                )
+                acc: pl.Tile[[16, 256], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(a_l0, b_l0)
+                for t in pl.range(4):
+                    win: pl.Tile[[16, 64], pl.FP32, pl.Mem.Acc] = pl.tile.slice(acc, [16, 64], [0, t * 64])
+                    _sq: pl.Tile[[16, 64], pl.FP32, pl.Mem.Acc] = pl.tile.mul(win, win)
+                output = pl.tile.store(acc, [0, 0], output)
+                return output
+
+        printed = ir.python_print(passes.init_mem_ref()(Before))
+        assert re.search(
+            r"win: .*pl\.MemRef\(mem_acc_\d+, t \* pl\.const\(64, pl\.INDEX\) \* pl\.const\(16, pl\.INDEX\) \* pl\.const\(4, pl\.INDEX\), 4096\), pl\.Mem\.Acc",
+            printed,
+        ), printed
+        assert "* 64 * 256 * 4" not in printed, printed
+
+    def test_vec_column_window_keeps_row_major_byte_offset(self):
+        """The NZ path is Acc-only: a Vec parent keeps its row-major arithmetic.
+
+        Same [16, 256] FP32 shape and same [16, 128] column window as the Acc
+        cases above, but ``Mem.Vec`` is ``none_box`` row-major dense, so the
+        offset stays (0 * 256 + 128) * 4 = 512 and the envelope stays the
+        row-major 15872 bytes.
+        """
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910)
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                input_a: pl.Tensor[[16, 256], pl.FP32],
+                output: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+            ) -> pl.Tensor[[16, 128], pl.FP32]:
+                tile_a: pl.Tile[[16, 256], pl.FP32, pl.MemorySpace.Vec] = pl.load(
+                    input_a, [0, 0], [16, 256], target_memory=pl.Mem.Vec
+                )
+                win: pl.Tile[[16, 128], pl.FP32, pl.MemorySpace.Vec] = pl.tile.slice(
+                    tile_a, [16, 128], [0, 128]
+                )
+                return pl.store(win, [0, 0], output)
+
+        printed = ir.python_print(passes.init_mem_ref()(Before))
+        assert "pl.tile.alloc(pl.Mem.Vec, 16384)" in printed
+        assert re.search(
+            r"win: .*pl\.MemRef\(mem_vec_\d+, pl\.const\(512, pl\.INDEX\), 15872\), "
+            r"pl\.Mem\.Vec",
+            printed,
+        ), printed
+
+
+class TestYieldMemRef:
+    """MemRef propagation through yield in ForStmt and IfStmt."""
+
+    def test_for_loop_carry_memref_relationships(self):
+        """ForStmt: initValue, iter_arg and return_var share the carry MemRef.
+
+        The carry uses ``mem_vec_2`` and the yielded producer uses ``mem_vec_4``.
+        Downstream alias materialization resolves the yield-to-carry mismatch.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                input_tensor: pl.Tensor[[64, 64], pl.FP32],
+                output: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
+            ) -> pl.Tensor[[64, 64], pl.FP32]:
+                init_tile: pl.Tile[[64, 64], pl.FP32, pl.MemorySpace.Vec] = pl.load(
+                    input_tensor, [0, 0], [64, 64], target_memory=pl.Mem.Vec
+                )
+                other_tile: pl.Tile[[64, 64], pl.FP32, pl.MemorySpace.Vec] = pl.load(
+                    input_tensor, [0, 0], [64, 64], target_memory=pl.Mem.Vec
+                )
+                for _i, (acc,) in pl.range(0, 4, init_values=(init_tile,)):
+                    acc_next: pl.Tile[[64, 64], pl.FP32, pl.MemorySpace.Vec] = pl.add(acc, other_tile)
+                    acc_out = pl.yield_(acc_next)
+                result: pl.Tensor[[64, 64], pl.FP32] = pl.store(acc_out, [0, 0], output)
+                return result
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(
+                self,
+                input_tensor: pl.Tensor[[64, 64], pl.FP32, pl.MemRef("mem_ddr_0", 0, 16384)],
+                output: pl.Out[pl.Tensor[[64, 64], pl.FP32, pl.MemRef("mem_ddr_1", 0, 16384)]],
+            ) -> pl.Tensor[[64, 64], pl.FP32]:
+                mem_vec_2: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384)
+                mem_vec_3: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384)
+                mem_vec_4: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384)
+                init_tile: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_2, 0, 16384), pl.Mem.Vec] = (
+                    pl.tile.load(input_tensor, [0, 0], [64, 64], [64, 64], target_memory=pl.Mem.Vec)
+                )
+                other_tile: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_3, 0, 16384), pl.Mem.Vec] = (
+                    pl.tile.load(input_tensor, [0, 0], [64, 64], [64, 64], target_memory=pl.Mem.Vec)
+                )
+                for _i, (acc,) in pl.range(0, 4, init_values=(init_tile,)):
+                    acc_next: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_4, 0, 16384), pl.Mem.Vec] = (
+                        pl.tile.add(acc, other_tile)
+                    )
+                    acc_out: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_2, 0, 16384), pl.Mem.Vec] = (
+                        pl.yield_(acc_next)
+                    )
+                result: pl.Tensor[[64, 64], pl.FP32, pl.MemRef("mem_ddr_1", 0, 16384)] = pl.tile.store(
+                    acc_out, [0, 0], output
+                )
+                return result
+
+        After = passes.init_mem_ref()(Before)
+        ir.assert_structural_equal(without_call_memrefs(After), without_call_memrefs(Expected))
+
+    def test_for_multi_iter_arg_each_carry_independent_memref(self):
+        """ForStmt with two iter_args: each carry group resolves independently.
+
+        ``VisitStmt_(ForStmt)`` processes ``iter_args_`` and ``return_vars_`` as
+        parallel vectors (init_memref.cpp:350-359, 377-385) and
+        ``PatchReturnVarsFromYield`` pairs return_var[i] with yield value[i]
+        (init_memref.cpp:452-475). So with init_values=(init_a, init_b):
+          * Group A0: init_a / iter_arg ``a`` share ``mem_vec_2`` (initValue).
+          * Group A1: init_b / iter_arg ``b`` share ``mem_vec_3`` (initValue).
+          * yield ``a_next`` (mem_vec_4) -> return_var ``a_out`` shares mem_vec_4.
+          * yield ``b_next`` (mem_vec_5) -> return_var ``b_out`` shares mem_vec_5.
+
+        The two carry chains never cross — each return_var inherits ONLY its own
+        positional yield's MemRef.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                input_tensor: pl.Tensor[[64, 64], pl.FP32],
+                output: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
+            ) -> pl.Tensor[[64, 64], pl.FP32]:
+                init_a: pl.Tile[[64, 64], pl.FP32, pl.MemorySpace.Vec] = pl.load(
+                    input_tensor, [0, 0], [64, 64], target_memory=pl.Mem.Vec
+                )
+                init_b: pl.Tile[[64, 64], pl.FP32, pl.MemorySpace.Vec] = pl.load(
+                    input_tensor, [0, 0], [64, 64], target_memory=pl.Mem.Vec
+                )
+                for _i, (a, b) in pl.range(0, 4, init_values=(init_a, init_b)):
+                    a_next: pl.Tile[[64, 64], pl.FP32, pl.MemorySpace.Vec] = pl.add(a, b)
+                    b_next: pl.Tile[[64, 64], pl.FP32, pl.MemorySpace.Vec] = pl.add(b, a)
+                    a_out, b_out = pl.yield_(a_next, b_next)
+                result: pl.Tensor[[64, 64], pl.FP32] = pl.store(a_out, [0, 0], output)
+                return result
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(
+                self,
+                input_tensor: pl.Tensor[[64, 64], pl.FP32, pl.MemRef("mem_ddr_0", 0, 16384)],
+                output: pl.Out[pl.Tensor[[64, 64], pl.FP32, pl.MemRef("mem_ddr_1", 0, 16384)]],
+            ) -> pl.Tensor[[64, 64], pl.FP32]:
+                mem_vec_2: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384)
+                mem_vec_3: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384)
+                mem_vec_4: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384)
+                mem_vec_5: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384)
+                init_a: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_2, 0, 16384), pl.Mem.Vec] = pl.tile.load(
+                    input_tensor, [0, 0], [64, 64], [64, 64], target_memory=pl.Mem.Vec
+                )
+                init_b: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_3, 0, 16384), pl.Mem.Vec] = pl.tile.load(
+                    input_tensor, [0, 0], [64, 64], [64, 64], target_memory=pl.Mem.Vec
+                )
+                for _i, (a, b) in pl.range(0, 4, init_values=(init_a, init_b)):
+                    a_next: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_4, 0, 16384), pl.Mem.Vec] = (
+                        pl.tile.add(a, b)
+                    )
+                    b_next: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_5, 0, 16384), pl.Mem.Vec] = (
+                        pl.tile.add(b, a)
+                    )
+                    a_out, b_out = pl.yield_(a_next, b_next)
+                result: pl.Tensor[[64, 64], pl.FP32, pl.MemRef("mem_ddr_1", 0, 16384)] = pl.tile.store(
+                    a_out, [0, 0], output
+                )
+                return result
+
+        After = passes.init_mem_ref()(Before)
+        ir.assert_structural_equal(without_call_memrefs(After), without_call_memrefs(Expected))
+
+    def test_if_yield_return_var_shares_memref(self):
+        """IfStmt: return_var shares MemRef with the then-branch yield value."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                input_tensor: pl.Tensor[[64, 64], pl.FP32],
+                cond: pl.Scalar[pl.INDEX],
+                output: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
+            ) -> pl.Tensor[[64, 64], pl.FP32]:
+                if cond < 2:
+                    tile_a: pl.Tile[[64, 64], pl.FP32, pl.MemorySpace.Vec] = pl.load(
+                        input_tensor, [0, 0], [64, 64], target_memory=pl.Mem.Vec
+                    )
+                    if_result = pl.yield_(tile_a)
+                else:
+                    tile_b: pl.Tile[[64, 64], pl.FP32, pl.MemorySpace.Vec] = pl.load(
+                        input_tensor, [0, 0], [64, 64], target_memory=pl.Mem.Vec
+                    )
+                    if_result = pl.yield_(tile_b)
+                result: pl.Tensor[[64, 64], pl.FP32] = pl.store(if_result, [0, 0], output)
+                return result
+
+        # then-yield (tile_a) uses mem_vec_2; return_var (if_result) also uses
+        # mem_vec_2 — shared per InitMemRef's phi-resolution rule. The else-
+        # branch yield (tile_b) uses a separate mem_vec_3 — it's a distinct
+        # temporary that MemoryReuse will later merge.
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(
+                self,
+                input_tensor: pl.Tensor[[64, 64], pl.FP32, pl.MemRef("mem_ddr_0", 0, 16384)],
+                cond: pl.Scalar[pl.INDEX],
+                output: pl.Out[pl.Tensor[[64, 64], pl.FP32, pl.MemRef("mem_ddr_1", 0, 16384)]],
+            ) -> pl.Tensor[[64, 64], pl.FP32]:
+                mem_vec_2: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384)
+                mem_vec_3: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384)
+                if cond < 2:
+                    tile_a: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_2, 0, 16384), pl.Mem.Vec] = (
+                        pl.tile.load(
+                            input_tensor,
+                            [0, 0],
+                            [64, 64],
+                            [64, 64],
+                            target_memory=pl.Mem.Vec,
+                        )
+                    )
+                    if_result: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_2, 0, 16384), pl.Mem.Vec] = (
+                        pl.yield_(tile_a)
+                    )
+                else:
+                    tile_b: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_3, 0, 16384), pl.Mem.Vec] = (
+                        pl.tile.load(
+                            input_tensor,
+                            [0, 0],
+                            [64, 64],
+                            [64, 64],
+                            target_memory=pl.Mem.Vec,
+                        )
+                    )
+                    if_result: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_2, 0, 16384), pl.Mem.Vec] = (
+                        pl.yield_(tile_b)
+                    )
+                result: pl.Tensor[[64, 64], pl.FP32, pl.MemRef("mem_ddr_1", 0, 16384)] = pl.tile.store(
+                    if_result, [0, 0], output
+                )
+                return result
+
+        After = passes.init_mem_ref()(Before)
+        ir.assert_structural_equal(without_call_memrefs(After), without_call_memrefs(Expected))
+
+    def test_tile_alias_shares_source_memref(self):
+        """Tile alias (``a = b``) shares MemRef with source tile, not a fresh one."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                input_tensor: pl.Tensor[[64, 64], pl.FP32],
+                cond: pl.Scalar[pl.INDEX],
+                output: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
+            ) -> pl.Tensor[[64, 64], pl.FP32]:
+                tile_a: pl.Tile[[64, 64], pl.FP32, pl.MemorySpace.Vec] = pl.load(
+                    input_tensor, [0, 0], [64, 64], target_memory=pl.Mem.Vec
+                )
+                if cond < 2:
+                    alias_a: pl.Tile[[64, 64], pl.FP32, pl.MemorySpace.Vec] = tile_a
+                    if_result = pl.yield_(alias_a)
+                else:
+                    tile_b: pl.Tile[[64, 64], pl.FP32, pl.MemorySpace.Vec] = pl.add(tile_a, tile_a)
+                    if_result = pl.yield_(tile_b)
+                result: pl.Tensor[[64, 64], pl.FP32] = pl.store(if_result, [0, 0], output)
+                return result
+
+        # tile_a → alias_a → then-yield all share mem_vec_2 (alias chain).
+        # The else-branch computation (tile_b) uses a fresh mem_vec_3.
+        # The phi return_var (if_result) picks up the then-branch's mem_vec_2.
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(
+                self,
+                input_tensor: pl.Tensor[[64, 64], pl.FP32, pl.MemRef("mem_ddr_0", 0, 16384)],
+                cond: pl.Scalar[pl.INDEX],
+                output: pl.Out[pl.Tensor[[64, 64], pl.FP32, pl.MemRef("mem_ddr_1", 0, 16384)]],
+            ) -> pl.Tensor[[64, 64], pl.FP32]:
+                mem_vec_2: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384)
+                mem_vec_3: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384)
+                tile_a: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_2, 0, 16384), pl.Mem.Vec] = pl.tile.load(
+                    input_tensor, [0, 0], [64, 64], [64, 64], target_memory=pl.Mem.Vec
+                )
+                if cond < 2:
+                    alias_a: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_2, 0, 16384), pl.Mem.Vec] = tile_a
+                    if_result: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_2, 0, 16384), pl.Mem.Vec] = (
+                        pl.yield_(alias_a)
+                    )
+                else:
+                    tile_b: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_3, 0, 16384), pl.Mem.Vec] = (
+                        pl.tile.add(tile_a, tile_a)
+                    )
+                    if_result: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_2, 0, 16384), pl.Mem.Vec] = (
+                        pl.yield_(tile_b)
+                    )
+                result: pl.Tensor[[64, 64], pl.FP32, pl.MemRef("mem_ddr_1", 0, 16384)] = pl.tile.store(
+                    if_result, [0, 0], output
+                )
+                return result
+
+        After = passes.init_mem_ref()(Before)
+        ir.assert_structural_equal(without_call_memrefs(After), without_call_memrefs(Expected))
+
+
+class TestDynamicValidShape:
+    """Regression tests for dynamic valid_shape Var handling in phi-node return vars."""
+
+    @pytest.mark.parametrize("run_simplify", [False, True])
+    def test_nested_valid_shape_propagates_through_transpose_view(self, run_simplify):
+        """Load/view metadata folds constants while retaining runtime extents and storage aliases."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                source: pl.Tensor[[16, 32], pl.FP32],
+                runtime_rows: pl.Scalar[pl.INDEX],
+                output: pl.Out[pl.Tensor[[32, 16], pl.FP32]],
+            ) -> pl.Tensor[[32, 16], pl.FP32]:
+                for _iteration in pl.range(2):
+                    base: pl.Scalar[pl.INDEX] = 4
+                    valid_rows = base * 2
+                    constant_tile = pl.tile.load(
+                        source, [0, 0], [16, 32], valid_shape=[valid_rows, 32], target_memory=pl.Mem.Vec
+                    )
+                    constant_view = pl.tile.transpose_view(constant_tile)
+                    _constant_store = pl.tile.store(constant_view, [0, 0], output)
+                    runtime_tile = pl.tile.load(
+                        source, [0, 0], [16, 32], valid_shape=[runtime_rows, 32], target_memory=pl.Mem.Vec
+                    )
+                    runtime_view = pl.tile.transpose_view(runtime_tile)
+                    _runtime_store = pl.tile.store(runtime_view, [0, 0], output)
+                return output
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(
+                self,
+                source: pl.Tensor[[16, 32], pl.FP32],
+                runtime_rows: pl.Scalar[pl.INDEX],
+                output: pl.Out[pl.Tensor[[32, 16], pl.FP32]],
+            ) -> pl.Tensor[[32, 16], pl.FP32]:
+                for _iteration in pl.range(2):
+                    constant_tile = pl.tile.load(
+                        source, [0, 0], [16, 32], valid_shape=[8, 32], target_memory=pl.Mem.Vec
+                    )
+                    constant_view = pl.tile.transpose_view(constant_tile)
+                    _constant_store = pl.tile.store(constant_view, [0, 0], output)
+                    runtime_tile = pl.tile.load(
+                        source, [0, 0], [16, 32], valid_shape=[runtime_rows, 32], target_memory=pl.Mem.Vec
+                    )
+                    runtime_view = pl.tile.transpose_view(runtime_tile)
+                    _runtime_store = pl.tile.store(runtime_view, [0, 0], output)
+                return output
+
+        after = passes.convert_to_ssa()(Before)
+        expected = passes.convert_to_ssa()(Expected)
+        if run_simplify:
+            after = passes.simplify()(after)
+            expected = passes.simplify()(expected)
+        after = passes.init_mem_ref()(after)
+        expected = passes.init_mem_ref()(expected)
+        ir.assert_structural_equal(without_call_memrefs(after), without_call_memrefs(expected))
+
+        function = next(iter(after.functions.values()))
+        runtime_rows = function.params[1]
+        found: dict[str, ir.AssignStmt] = {}
+        names = (
+            "constant_tile",
+            "constant_view",
+            "_constant_store",
+            "runtime_tile",
+            "runtime_view",
+            "_runtime_store",
+        )
+
+        class Assignments(ir.IRVisitor):
+            def visit_assign_stmt(self, op: ir.AssignStmt) -> None:
+                for name in names:
+                    if op.var.name_hint.startswith(name):
+                        found[name] = op
+                super().visit_assign_stmt(op)
+
+        Assignments().visit_stmt(function.body)
+        assert set(found) == set(names)
+        for prefix, valid_rows in (("constant", 8), ("runtime", runtime_rows)):
+            loaded = found[f"{prefix}_tile"]
+            viewed = found[f"{prefix}_view"]
+            stored = found[f"_{prefix}_store"]
+            for assignment, shape, valid in (
+                (loaded, [16, 32], [valid_rows, 32]),
+                (viewed, [32, 16], [32, valid_rows]),
+            ):
+                assert isinstance(assignment.value, ir.Call)
+                for tile_type in (assignment.var.type, assignment.value.type):
+                    assert isinstance(tile_type, ir.TileType)
+                    assert all(isinstance(dim, ir.ConstInt) for dim in tile_type.shape)
+                    assert [cast(ir.ConstInt, dim).value for dim in tile_type.shape] == shape
+                    assert tile_type.tile_view is not None
+                    for extent, expected_extent in zip(tile_type.tile_view.valid_shape, valid, strict=True):
+                        if isinstance(expected_extent, int):
+                            assert isinstance(extent, ir.ConstInt) and extent.value == expected_extent
+                        else:
+                            assert extent.same_as(expected_extent), "runtime valid_shape lost its definition"
+            assert isinstance(loaded.var.type, ir.TileType)
+            assert isinstance(viewed.var.type, ir.TileType)
+            assert loaded.var.type.memref is not None
+            assert viewed.var.type.memref is loaded.var.type.memref
+            assert isinstance(viewed.value, ir.Call) and viewed.value.args[0].same_as(loaded.var)
+            assert isinstance(stored.value, ir.Call) and stored.value.args[0].same_as(viewed.var)
+
+    def test_if_phi_preserves_dynamic_valid_shape_vars(self):
+        """IfStmt phi return vars must not clone Vars in TileView.valid_shape (issue #870).
+
+        When PatchReturnVarsFromYield updates the return var's MemRef, it must not
+        re-remap expressions that were already remapped by the base IRMutator visit.
+        Double-remapping creates a fresh, undefined Var clone that fails UseAfterDef.
+
+        Kept as raw-IR construction because ``TileView`` with dynamic ``valid_shape``
+        Vars has no DSL syntax — cannot be expressed in the Before/Expected pattern.
+        """
+        span = ir.Span.unknown()
+        idx = ir.DataType.INDEX
+
+        # Params: flag (condition) and ctx_len (used to compute valid_len)
+        flag = ir.Var("flag", ir.ScalarType(idx), span)
+        ctx_len = ir.Var("ctx_len", ir.ScalarType(idx), span)
+
+        # valid_len = ctx_len + 0  (defined before IfStmt)
+        valid_len = ir.Var("valid_len", ir.ScalarType(idx), span)
+        assign_valid_len = ir.AssignStmt(
+            valid_len, ir.Add(ctx_len, ir.ConstInt(0, idx, span), idx, span), span
+        )
+
+        # TileType with dynamic valid_shape=[1, valid_len]
+        tile_view = ir.TileView(
+            [ir.ConstInt(1, idx, span), valid_len],
+            [ir.ConstInt(1, idx, span), ir.ConstInt(120, idx, span)],
+            ir.ConstInt(0, idx, span),
+        )
+        tile_type = ir.TileType([1, 120], ir.DataType.FP32, None, tile_view, MemorySpace.Vec)
+
+        # Two tile vars: seed and updated
+        seed = ir.Var("seed", tile_type, span)
+        updated = ir.Var("updated", tile_type, span)
+        tpop_call = ir.Call(ir.Op("tile.tpop_from_aic"), [], {"split": 0}, tile_type, span)
+        muls_call = ir.Call(ir.Op("tile.muls"), [seed], {"scalar": 1.0}, tile_type, span)
+
+        # Phi return var
+        phi_var = ir.Var("result_phi", tile_type, span)
+
+        # IfStmt: if flag == 0 then yield seed else yield updated
+        condition = ir.Eq(flag, ir.ConstInt(0, idx, span), ir.DataType.BOOL, span)
+        if_stmt = ir.IfStmt(
+            condition,
+            ir.YieldStmt([seed], span),
+            ir.YieldStmt([updated], span),
+            [phi_var],
+            span,
+        )
+
+        body = ir.SeqStmts(
+            [
+                assign_valid_len,
+                ir.AssignStmt(seed, tpop_call, span),
+                ir.AssignStmt(updated, muls_call, span),
+                if_stmt,
+                ir.ReturnStmt([phi_var], span),
+            ],
+            span,
+        )
+        func = ir.Function("repro", [flag, ctx_len], [tile_type], body, span, type=ir.FunctionType.AIV)
+        program = ir.Program([func], "test_program", span)
+
+        # Run InitMemRef with verification but without roundtrip (raw IR may not
+        # survive print→parse because TileView with dynamic Vars has no DSL syntax).
+        with passes.PassContext(
+            [passes.VerificationInstrument(passes.VerificationMode.BEFORE_AND_AFTER)],
+        ):
+            after = passes.init_mem_ref()(program)
+
+        # Explicitly verify UseAfterDef — the bug caused this property to fail
+        props = passes.IRPropertySet()
+        props.insert(passes.IRProperty.UseAfterDef)
+        diagnostics = passes.PropertyVerifierRegistry.verify(props, after)
+        errors = [d for d in diagnostics if d.severity == passes.DiagnosticSeverity.Error]
+        assert not errors, f"UseAfterDef errors after InitMemRef: {[d.message for d in errors]}"
+
+        # Double-check: return var's valid_shape must reference a defined Var
+        func_after = next(iter(after.functions.values()))
+        if_after = next(
+            stmt for stmt in cast(ir.SeqStmts, func_after.body).stmts if isinstance(stmt, ir.IfStmt)
+        )
+        rv = if_after.return_vars[0]
+        assert isinstance(rv.type, ir.TileType)
+        assert rv.type.tile_view is not None
+        vs = rv.type.tile_view.valid_shape
+        assert len(vs) == 2
+        assert isinstance(vs[1], ir.Var), "valid_shape[1] should be a Var, not a fresh clone"
+
+
+class TestPtoLevel3Scratch:
+    """Compiler-owned level3 scratch enters the ordinary MemRef pipeline here."""
+
+    @staticmethod
+    def _calls(program: ir.Program, op_name: str) -> list[ir.Call]:
+        calls: list[ir.Call] = []
+
+        class _Collector(ir.IRVisitor):
+            def visit_call(self, op: ir.Call) -> None:
+                if op.op.name == op_name:
+                    calls.append(op)
+                super().visit_call(op)
+
+        _Collector().visit_program(program)
+        return calls
+
+    @staticmethod
+    def _run(
+        program: ir.Program, backend_type: BackendType, planner=passes.MemoryPlanner.PYPTO
+    ) -> ir.Program:
+        _backend.reset_for_testing()
+        _backend.set_backend_type(backend_type)
+        try:
+            with passes.PassContext([], memory_planner=planner):
+                return passes.init_mem_ref()(program)
+        finally:
+            _backend.reset_for_testing()
+
+    @staticmethod
+    def _ci_program(dtype=pl.INT32):
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(self) -> pl.Tile[[1, 64], dtype, pl.Mem.Vec]:
+                seq: pl.Tile[[1, 64], dtype, pl.Mem.Vec] = pl.tile.ci(0, [1, 64], dtype=dtype)
+                return seq
+
+        return Before
+
+    @pytest.mark.parametrize(
+        ("dtype", "expected_cols"),
+        [(pl.INT32, 192), (pl.UINT32, 192), (pl.INT16, 448), (pl.UINT16, 448)],
+    )
+    def test_a2a3_ci_scratch_is_allocated_by_width(self, dtype, expected_cols):
+        after = self._run(self._ci_program(dtype), BackendType.Ascend910)
+        ci = self._calls(after, ir.get_op("tile.ci").name)
+        assert len(ci) == 1 and len(ci[0].args) == 3
+        tmp = cast(ir.TileType, ci[0].args[2].type)
+        assert tmp.shape == [1, expected_cols]
+        assert tmp.dtype == ir.DataType.FP32
+        assert tmp.memref is not None
+
+    def test_a5_and_ptoas_planner_keep_ci_implicit(self):
+        a5 = self._run(self._ci_program(), BackendType.Ascend950)
+        ptoas = self._run(self._ci_program(), BackendType.Ascend910, planner=passes.MemoryPlanner.PTOAS)
+        assert len(self._calls(a5, ir.get_op("tile.ci").name)[0].args) == 2
+        assert len(self._calls(ptoas, ir.get_op("tile.ci").name)[0].args) == 2
+
+    def test_explicit_ci_scratch_is_preserved(self):
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(self) -> pl.Tile[[1, 64], pl.INT32, pl.Mem.Vec]:
+                tmp: pl.Tile[[1, 192], pl.FP32, pl.Mem.Vec] = pl.tile.create(
+                    [1, 192], dtype=pl.FP32, target_memory=pl.Mem.Vec
+                )
+                seq: pl.Tile[[1, 64], pl.INT32, pl.Mem.Vec] = pl.tile.ci(0, [1, 64], dtype=pl.INT32, tmp=tmp)
+                return seq
+
+        after = self._run(Before, BackendType.Ascend910)
+        ci = self._calls(after, ir.get_op("tile.ci").name)[0]
+        creates = self._calls(after, ir.get_op("tile.create").name)
+        assert len(ci.args) == 3
+        assert len(creates) == 1
+
+    @staticmethod
+    def _cast_program(src_dtype, dst_dtype):
+        """A narrowing cast that opts out of saturation — the only shape that needs scratch.
+
+        The scratch backs PTOAS's non-saturating helper, and saturating is the
+        default, so a cast has to ask for the non-saturating lowering before this
+        pass has anything to materialize.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[16, 16], src_dtype],
+            ) -> pl.Tile[[16, 16], dst_dtype, pl.Mem.Vec]:
+                tile: pl.Tile[[16, 16], src_dtype, pl.Mem.Vec] = pl.tile.load(
+                    src, [0, 0], [16, 16], target_memory=pl.Mem.Vec
+                )
+                result: pl.Tile[[16, 16], dst_dtype, pl.Mem.Vec] = pl.tile.cast(
+                    tile, target_type=dst_dtype, mode="round", saturation_mode="off"
+                )
+                return result
+
+        return Before
+
+    @pytest.mark.parametrize(
+        ("src_dtype", "dst_dtype", "expected_bytes"),
+        [(pl.FP32, pl.INT16, 1024), (pl.FP16, pl.INT16, 64), (pl.FP16, pl.INT8, 160)],
+    )
+    def test_a2a3_narrowing_cast_scratch(self, src_dtype, dst_dtype, expected_bytes):
+        after = self._run(self._cast_program(src_dtype, dst_dtype), BackendType.Ascend910)
+        cast_call = self._calls(after, ir.get_op("tile.cast").name)[0]
+        assert len(cast_call.args) == 2
+        tmp = cast(ir.TileType, cast_call.args[1].type)
+        assert tmp.shape == [1, expected_bytes]
+        assert tmp.dtype == ir.DataType.INT8
+        assert tmp.memref is not None
+
+    @pytest.mark.parametrize(
+        "src_dtype,dst_dtype",
+        [(pl.FP32, pl.INT16), (pl.FP16, pl.INT16), (pl.FP16, pl.INT8), (pl.FP16, pl.UINT8)],
+    )
+    def test_a2a3_ptoas_cast_leaves_scratch_to_plan_memory(self, src_dtype, dst_dtype):
+        """The static-view fix must keep level-2 scratch ownership in PTOAS."""
+        after = self._run(
+            self._cast_program(src_dtype, dst_dtype),
+            BackendType.Ascend910B,
+            planner=passes.MemoryPlanner.PTOAS,
+        )
+        cast_call = self._calls(after, ir.get_op("tile.cast").name)[0]
+        assert len(cast_call.args) == 1
+        assert not self._calls(after, ir.get_op("tile.create").name)
+
+    def test_non_narrowing_cast_has_no_scratch(self):
+        """FP32->FP16 narrows, but natively — no helper, so opting out changes nothing.
+
+        Only pairs selected by the registered cast scratch rule get the emulated lowering;
+        this one is a single native tcvt whichever saturation it carries.
+        """
+        after = self._run(self._cast_program(pl.FP32, pl.FP16), BackendType.Ascend910)
+        assert len(self._calls(after, ir.get_op("tile.cast").name)[0].args) == 1
+
+    def test_a5_narrowing_cast_keeps_implicit_tmp_abi(self):
+        after = self._run(self._cast_program(pl.FP32, pl.INT16), BackendType.Ascend950)
+        assert len(self._calls(after, ir.get_op("tile.cast").name)[0].args) == 1
+
+    def test_fp16_to_int4_has_no_level3_scratch(self):
+        """FP16->INT4 uses native vconv without PTOAS level-3 tcvt tmp."""
+        after = self._run(self._cast_program(pl.FP16, pl.INT4), BackendType.Ascend910)
+        assert len(self._calls(after, ir.get_op("tile.cast").name)[0].args) == 1
+
+    @staticmethod
+    def _saturating_cast_program(src_dtype, dst_dtype, saturation_mode):
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[16, 16], src_dtype],
+            ) -> pl.Tile[[16, 16], dst_dtype, pl.Mem.Vec]:
+                tile: pl.Tile[[16, 16], src_dtype, pl.Mem.Vec] = pl.tile.load(
+                    src, [0, 0], [16, 16], target_memory=pl.Mem.Vec
+                )
+                result: pl.Tile[[16, 16], dst_dtype, pl.Mem.Vec] = pl.tile.cast(
+                    tile, target_type=dst_dtype, mode="round", saturation_mode=saturation_mode
+                )
+                return result
+
+        return Before
+
+    @staticmethod
+    def _saturating_cast_program_with_tmp(src_dtype, dst_dtype, saturation_mode):
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[16, 16], src_dtype],
+            ) -> pl.Tile[[16, 16], dst_dtype, pl.Mem.Vec]:
+                tile: pl.Tile[[16, 16], src_dtype, pl.Mem.Vec] = pl.tile.load(
+                    src, [0, 0], [16, 16], target_memory=pl.Mem.Vec
+                )
+                tmp: pl.Tile[[1, 160], pl.INT8, pl.Mem.Vec] = pl.tile.create(
+                    [1, 160], dtype=pl.INT8, target_memory=pl.Mem.Vec
+                )
+                result: pl.Tile[[16, 16], dst_dtype, pl.Mem.Vec] = pl.tile.cast(
+                    tile,
+                    target_type=dst_dtype,
+                    mode="round",
+                    tmp=tmp,
+                    saturation_mode=saturation_mode,
+                )
+                return result
+
+        return Before
+
+    @pytest.mark.parametrize("saturation_mode", ["on", None], ids=["explicit-on", "default"])
+    def test_a2a3_saturating_narrowing_cast_gets_no_compiler_scratch(self, saturation_mode):
+        """A saturating cast -- which is the default -- must not allocate scratch.
+
+        Saturation selects PTOAS's native conversion, which reads no tmp;
+        synthesizing one would reserve Vec memory the emitted pto.tcvt never
+        touches. ``None`` and an explicit "on" are the same cast, so both check.
+        """
+        after = self._run(
+            self._saturating_cast_program(pl.FP16, pl.INT8, saturation_mode), BackendType.Ascend910
+        )
+        assert len(self._calls(after, ir.get_op("tile.cast").name)[0].args) == 1
+        assert not self._calls(after, ir.get_op("tile.create").name)
+
+    def test_a2a3_non_saturating_narrowing_cast_still_gets_scratch(self):
+        """Opting out keeps the compiler-owned scratch the non-saturating helper needs."""
+        after = self._run(self._saturating_cast_program(pl.FP16, pl.INT8, "off"), BackendType.Ascend910)
+        cast_call = self._calls(after, ir.get_op("tile.cast").name)[0]
+        assert len(cast_call.args) == 2
+        tmp = cast(ir.TileType, cast_call.args[1].type)
+        assert tmp.shape == [1, 160]
+        assert tmp.dtype == ir.DataType.INT8
+
+    def test_a2a3_saturating_cast_preserves_a_caller_supplied_scratch(self):
+        """Only the compiler-generated scratch is dropped; an explicit tmp is the author's."""
+        after = self._run(
+            self._saturating_cast_program_with_tmp(pl.FP16, pl.INT8, "on"),
+            BackendType.Ascend910,
+        )
+        cast_call = self._calls(after, ir.get_op("tile.cast").name)[0]
+        assert len(cast_call.args) == 2
+        assert len(self._calls(after, ir.get_op("tile.create").name)) == 1
+
+    @staticmethod
+    def _narrowing_cast_program(rows: int, cols: int, src_dtype, dst_dtype):
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[rows, cols], src_dtype],
+            ) -> pl.Tile[[rows, cols], dst_dtype, pl.Mem.Vec]:
+                tile: pl.Tile[[rows, cols], src_dtype, pl.Mem.Vec] = pl.tile.load(
+                    src, [0, 0], [rows, cols], target_memory=pl.Mem.Vec
+                )
+                result: pl.Tile[[rows, cols], dst_dtype, pl.Mem.Vec] = pl.tile.cast(
+                    tile, target_type=dst_dtype, mode="round", saturation_mode="off"
+                )
+                return result
+
+        return Before
+
+    @pytest.mark.parametrize(
+        ("rows", "cols", "expected_bytes"),
+        [
+            (1, 128, 512),  # head-only: 4*64*min(128/64,255)
+            (16, 80, 4864),  # tail-only: cols not aligned to 64
+        ],
+    )
+    def test_a2a3_narrowing_cast_scratch_branches(self, rows, cols, expected_bytes):
+        after = self._run(self._narrowing_cast_program(rows, cols, pl.FP32, pl.INT16), BackendType.Ascend910)
+        cast_call = self._calls(after, ir.get_op("tile.cast").name)[0]
+        assert len(cast_call.args) == 2
+        tmp = cast(ir.TileType, cast_call.args[1].type)
+        assert tmp.shape == [1, expected_bytes]
+        assert tmp.dtype == ir.DataType.INT8
+
+    def test_a2a3_narrowing_cast_scratch_rows_capped_at_255(self):
+        # FP32->INT16, cols=80 (tail-only): 32*((min(rows,255)-1)*(80/8)+ceil(16/8))
+        # => 32*(254*10+2) = 81344 under PTOAS v0.60 makeTCvtTmpType.
+        expected_bytes = 81344
+        after_255 = self._run(self._narrowing_cast_program(255, 80, pl.FP32, pl.INT16), BackendType.Ascend910)
+        after_400 = self._run(self._narrowing_cast_program(400, 80, pl.FP32, pl.INT16), BackendType.Ascend910)
+
+        def scratch_bytes(prog):
+            cast_call = self._calls(prog, ir.get_op("tile.cast").name)[0]
+            return cast(ir.TileType, cast_call.args[1].type).shape[1]
+
+        assert scratch_bytes(after_255) == expected_bytes
+        assert scratch_bytes(after_400) == expected_bytes
+
+    @staticmethod
+    def _sort_program(*, dynamic_valid_col: bool) -> ir.Program:
+        span = ir.Span.unknown()
+        ib = ir.IRBuilder()
+        with ib.function("kernel", type=ir.FunctionType.InCore) as f:
+            src = f.param("src", ir.TensorType([1, 64], ir.DataType.FP32))
+            idx = f.param("idx", ir.TensorType([1, 64], ir.DataType.UINT32))
+            if dynamic_valid_col:
+                valid_col = f.param("valid_col", ir.ScalarType(ir.DataType.INDEX))
+                valid_shape = [1, valid_col]
+            else:
+                valid_shape = [1, 64]
+            src_tile = ib.let(
+                "src_tile", tile_ops.load(src, [0, 0], [1, 64], valid_shape, target_memory=MemorySpace.Vec)
+            )
+            idx_tile = ib.let(
+                "idx_tile", tile_ops.load(idx, [0, 0], [1, 64], valid_shape, target_memory=MemorySpace.Vec)
+            )
+            result = ib.let("result", tile_ops.sort32(src_tile, idx_tile))
+            f.return_type(result.type)
+            ib.return_stmt(result)
+        return ir.Program([f.get_result()], "sort_program", span)
+
+    @pytest.mark.parametrize("backend_type", [BackendType.Ascend910, BackendType.Ascend950])
+    def test_sort32_dynamic_valid_col_gets_physical_shape_scratch(self, backend_type):
+        after = self._run(self._sort_program(dynamic_valid_col=True), backend_type)
+        sort32 = self._calls(after, ir.get_op("tile.sort32").name)[0]
+        assert len(sort32.args) == 3
+        tmp = cast(ir.TileType, sort32.args[2].type)
+        assert tmp.shape == [1, 64]
+        assert tmp.dtype == ir.DataType.FP32
+        assert tmp.memref is not None
+
+    @pytest.mark.parametrize("backend_type", [BackendType.Ascend910, BackendType.Ascend950])
+    def test_sort32_static_aligned_valid_col_needs_no_scratch(self, backend_type):
+        after = self._run(self._sort_program(dynamic_valid_col=False), backend_type)
+        assert len(self._calls(after, ir.get_op("tile.sort32").name)[0].args) == 2
+
+    def test_a5_ptoas_planner_leaves_sort32_scratch_to_plan_memory(self):
+        after = self._run(
+            self._sort_program(dynamic_valid_col=True),
+            BackendType.Ascend950,
+            planner=passes.MemoryPlanner.PTOAS,
+        )
+        assert len(self._calls(after, ir.get_op("tile.sort32").name)[0].args) == 2
+
+
+class TestEdgeCases:
+    """Edge cases requiring raw IR construction."""
+
+    def test_rejects_dynamic_tile_shape(self):
+        """InitMemRef must fail fast when allocation shape is still dynamic.
+
+        Kept as a ``pytest.raises`` test: dynamic shape error paths do not fit
+        the Before/Expected pattern.
+        """
+        span = ir.Span.unknown()
+
+        dynamic_len = ir.Var("dynamic_len", ir.ScalarType(ir.DataType.INDEX), span)
+        dynamic_tile_type = ir.TileType(
+            [ir.ConstInt(1, ir.DataType.INDEX, span), dynamic_len],
+            ir.DataType.FP32,
+            memory_space=MemorySpace.Vec,
+        )
+        dynamic_tile = ir.Var("dynamic_tile", dynamic_tile_type, span)
+
+        tpop_call = ir.Call(ir.Op("tile.tpop_from_aic"), [], {"split": 0}, dynamic_tile_type, span)
+        body = ir.SeqStmts(
+            [ir.AssignStmt(dynamic_tile, tpop_call, span), ir.ReturnStmt([dynamic_tile], span)], span
+        )
+        func = ir.Function("test_func", [], [dynamic_tile_type], body, span)
+        program = ir.Program([func], "test_program", span)
+
+        with pytest.raises(pypto.InternalError, match="InitMemRef requires static shape"):
+            passes.init_mem_ref()(program)
+
+
+class TestMultiOutputElements:
+    """Each element of a multi-output op's TupleType gets its own buffer.
+
+    A multi-output operator carries its results in a ``TupleType`` rather than in
+    destination arguments, so InitMemRef never sees them named in the call. It
+    allocates them through the ordinary per-Var path instead, off the
+    ``<var> = tuple[i]`` bindings the parser emitted — nothing in InitMemRef
+    knows about tuples at all. That the general path genuinely covers the
+    multi-output case is therefore an untested coincidence unless pinned here.
+
+    See ``docs/en/dev/ir/08-multi_output_ops.md``.
+    """
+
+    @staticmethod
+    def _tuple_element_memrefs(program) -> dict[str, ir.MemRef | None]:
+        """MemRef of every var bound to a tuple element, keyed by name hint."""
+        found: dict[str, ir.MemRef | None] = {}
+
+        class _Collector(ir.IRVisitor):
+            def visit_assign_stmt(self, stmt):  # type: ignore[override]
+                if isinstance(stmt.value, ir.TupleGetItemExpr):
+                    tile_type = stmt.var.type
+                    assert isinstance(tile_type, ir.TileType), (
+                        f"{stmt.var.name_hint} is bound to a tuple element but is not a tile"
+                    )
+                    found[stmt.var.name_hint] = tile_type.memref
+                super().visit_assign_stmt(stmt)
+
+        for func in program.functions.values():
+            _Collector().visit_stmt(func.body)
+        return found
+
+    @staticmethod
+    def _build(drop_second_output: bool = False):
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                src: pl.Tensor[[32, 64], pl.FP32],
+                kvalue: pl.Scalar[pl.FP32],
+                out_dst: pl.Out[pl.Tensor[[32, 8], pl.INT32]],
+                out_cdst: pl.Out[pl.Tensor[[1, 32], pl.INT32]],
+            ):
+                s: pl.Tile[[32, 64], pl.FP32, pl.MemorySpace.Vec] = pl.load(
+                    src, [0, 0], [32, 64], target_memory=pl.Mem.Vec
+                )
+                tmp: pl.Tile[[32, 64], pl.UINT8, pl.MemorySpace.Vec] = pl.tile.create(
+                    [32, 64], pl.UINT8, target_memory=pl.Mem.Vec
+                )
+                d, c = pl.tile.gather_compare(s, kvalue, tmp, cmp_mode="eq", out_cols=8)
+                pl.store(d, [0, 0], out_dst)
+                if not drop_second_output:
+                    pl.store(c, [0, 0], out_cdst)
+
+        return Before
+
+    def test_elements_get_distinct_memrefs(self):
+        after = passes.init_mem_ref()(self._build())
+        memrefs = self._tuple_element_memrefs(after)
+        assert len(memrefs) == 2, f"expected one binding per output, got {sorted(memrefs)}"
+        dst, cdst = memrefs.values()
+        assert dst is not None and cdst is not None, (
+            f"a destination reached codegen with no buffer behind it: {sorted(memrefs)}"
+        )
+        # A MemRef always overlaps itself: without this the negative assertion
+        # below would pass just as well against two objects may_alias cannot read.
+        assert ir.MemRef.may_alias(dst, dst)
+        assert not ir.MemRef.may_alias(dst, cdst), (
+            "the two destinations overlap; pto.tgather writes both in a single "
+            "instruction, so one would clobber the other"
+        )
+
+    def test_unread_element_still_gets_a_buffer(self):
+        """Dropping an output does not make its buffer optional.
+
+        ``pto.tgather`` writes both destinations whichever the program goes on to
+        read, so the unread one still needs an allocation of its own — otherwise
+        the instruction scribbles over whatever happens to sit at that address.
+        """
+        after = passes.init_mem_ref()(self._build(drop_second_output=True))
+        memrefs = self._tuple_element_memrefs(after)
+        assert len(memrefs) == 2, f"a dropped output lost its binding: {sorted(memrefs)}"
+        assert all(m is not None for m in memrefs.values())
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])
