@@ -1,0 +1,607 @@
+# dep_gen — Complete Per-Submit Dependency Graph (Tensor-Annotated)
+
+## 1. Background & Motivation
+
+The swimlane profiler used to expose a per-task `fanout[]` array — the
+obvious place to read "which tasks did task X feed into?" — but it was
+**structurally incomplete on real hardware**, so it has been removed from
+the record entirely. The device hot path no longer carries fanout;
+`deps.json` is now the sole source of truth for swimlane edges.
+
+When it existed, each producer task carried its own
+`ChipSwimlaneAicpuTaskRecord.fanout[]`, populated by the AICPU scheduler at the
+moment it wired a downstream consumer. If a producer had already finished and
+transitioned to `CHIP_TASK_COMPLETED` by the time a later submit wanted to
+register a dependency on it, the consumer's edge had nowhere to go — the
+record was sealed, the slot was closed, and the edge was silently dropped.
+This was not a bug in fanout itself; fanout is "successors known at runtime",
+not "successors discoverable from the orchestrator's input". Race window in
+[#599](https://github.com/hw-native-sys/simpler/issues/599); see also the
+PR #500 archive for the historical attempt to fix this in-place.
+
+`dep_gen` sidesteps the race by building the graph from the
+**orchestrator's** side of the dependency computation rather than the
+scheduler's, so a producer that has already retired is still an edge. How
+that is done depends on where the orchestrator runs — see §2 for the two
+shapes — but the output is the same `deps.json`, and either way it was a
+strict superset of the old fanout edges: every fanout edge appeared in
+deps.json, plus the edges fanout dropped due to the race — which is why
+deps.json now fully replaces the removed `fanout[]`.
+
+---
+
+## 2. Overview
+
+dep_gen has two shapes, chosen by where the orchestrator runs. Both emit the
+same `deps.json` (§4), so every consumer — deps viewer, swimlane join — reads
+either one the same way, with one documented exception: an edge's `flags`
+(WAIT/RETAIN) describes `tensormap_and_ringbuffer`'s own dependency computation,
+which `host_build_graph` has no equivalent of, so only the device-orchestrated
+shape emits it. A consumer must treat `flags` as optional.
+
+### 2.1 Device orchestration (`tensormap_and_ringbuffer`)
+
+The orchestrator runs on the AICPU, where the host cannot observe it, so the
+inputs to each submit are captured and the graph is reconstructed afterwards.
+
+- **Capture point.** `pto_orchestrator::submit_task` writes a
+  `DepGenRecord` (task_id, scope flag, tensor blobs, arg types,
+  explicit deps, kernel ids, and SPMD block num) into a per-thread
+  shared-memory ring buffer for every call when `enable_dep_gen` is on.
+- **In-memory drain.** The host `DepGenCollector` (background mgmt
+  thread, ProfilerBase machinery shared with PMU / L2 Perf / Tensor
+  Dump) drains the ring into a `std::vector<DepGenRecord>` resident on
+  the runner. No `submit_trace.bin` lands on disk — the host already
+  has the records once the run ends, and going through the filesystem
+  would just be extra I/O.
+- **Host replay (dual-pass, self-checking).** After `reconcile_counters()`
+  confirms a clean trace (no drops, no leftovers),
+  `dep_gen_replay_emit_deps_json` runs every record back through *two*
+  parallel host-resident `ChipTensorMap` instances that evolve in lockstep:
+  - **Oracle pass** drives the canonical `compute_task_fanin` template
+      from `dep_compute.h` and collects the producer-id → `DepFlags`
+      mapping the runtime would have emitted (flags OR-accumulated per
+      producer).
+  - **Annotated pass** runs an inlined mirror of STEP A
+      (creator retention) + STEP B (tensormap lookup) against the second
+      map, with a wider callback so each edge gets recorded with its
+      tensor metadata (producer/consumer shape + offset, dtype, version).
+  Per-record semantics mirror runtime `submit_task` exactly: STEP 1
+  (explicit deps), STEP 3 (creator retention + tensormap lookup),
+  STEP 4 (register outputs). Per-successor dedup matches
+  `FaninBuilder::append_fanin_or_fail`. After both passes finish per
+  record, the replay asserts the two producer-id → `DepFlags` mappings are
+  equal (same producers and same per-producer flags); if they diverge,
+  `deps.json` is not written and the function returns non-zero.
+  This is the guarantee against silent shotgun modifications — anyone
+  who changes `compute_task_fanin` semantics will trip the gate
+  immediately and know to update the annotated mirror.
+  Explicit deps are a common captured input to both passes, so this gate
+  cannot independently validate their recorded kind bytes. The a2a3/a5
+  dep_gen chain scene tests validate that capture/replay round-trip across
+  inline and overflow records.
+- **Output.** `<output_prefix>/deps.json` — strided-Tensor schema with
+  `tasks[]`, `tensors[]`, and tensor-annotated `edges[]` (see §4).
+- **Edges are as-constructed, not as-reduced.** Both passes replay the same
+  fanin construction, so `deps.json` records the pre-reduction edge set.
+  The `tensormap_and_ringbuffer` runtime's bounded bitmap transitive
+  reduction (`reduce_wait_edges`, applied when the builder flushes in
+  `submit_task_common`) runs *after* construction and clears the `wait`
+  flag on a direct edge already covered by a WAIT path through the
+  producer's own transitive ancestors. A diamond `A→B→C` + `A→C` still
+  shows `A→C` with its constructed flags. The differential gate is
+  unaffected — both passes replay the same construction. What the
+  reduction changes is the edge's flags: a redundant `WAIT|RETAIN` edge
+  demotes to RETAIN-only and a redundant `WAIT`-only edge drops to
+  `DEP_NONE`, with the entry kept either way, so retention and
+  pin-release accounting are preserved and only readiness enforcement
+  is relaxed.
+  [`wait_reduction_sim`](../../simpler_setup/tools/README.md#wait_reduction_sim)
+  replays the reduction offline over a capture to measure its coverage
+  against the full-DAG upper bound.
+
+### 2.2 Host orchestration (`host_build_graph`)
+
+The orchestrator runs on the host, to completion, before any scheduler thread
+starts. Every submit and every tensormap hit is therefore observable in-process
+and in order, so the graph is **recorded as the runtime builds it** — there is
+nothing to capture-then-reconstruct.
+
+- **Capture point.** `submit_task_common` opens the task's entry, and
+  `compute_task_fanin`'s `Annotate` hooks fire on each producer the runtime
+  actually wires: creator retention (Step A) and tensormap lookup (Step B), plus
+  the declared dependencies at STEP 1. The edges are the runtime's own, not a
+  replay's inference, so they cannot drift from `compute_task_fanin` semantics.
+- **No ring, no collector, no replay.** The device-side dep_gen writer, its
+  shared-memory ring, and the drain thread are all skipped
+  (`dep_gen_host_graph_active()` tells the runner). Nothing is dropped under
+  back-pressure because nothing is streamed.
+- **Output.** The same `deps.json`, written at the end of the run's own `bind` —
+  the point where host orchestration completes and the graph is final. The graph
+  is thread-local, so it is written on the thread that captured it rather than
+  waiting for the drain, which the run lane does not pin to that thread: it
+  serializes with a mutex, which gives mutual exclusion but not thread affinity.
+  A consequence worth knowing: a run whose device execution later fails still
+  leaves its `deps.json`, because its orchestration did happen.
+
+---
+
+## 3. How to Enable
+
+`dep_gen` is gated by `CallConfig.enable_dep_gen` (alongside
+`enable_chip_swimlane`, `enable_dump_args`, `enable_pmu`). The CLI flag
+is `--enable-dep-gen`:
+
+```bash
+# Standalone
+python test_my_case.py --platform <a2a3|a5> --enable-dep-gen --enable-chip-swimlane
+
+# Pytest
+pytest tests/st/... --platform <a2a3|a5> --enable-dep-gen --enable-chip-swimlane
+```
+
+The `--enable-chip-swimlane` flag is independent but recommended in pair
+because:
+
+- `deps.json` is the dep_gen artifact.
+- `chip_swimlane_records.json` (from swimlane) is the timing artifact;
+  `merged_swimlane.json` (the Perfetto trace) uses `deps.json` for
+  dependency arrows when both files exist (without it, the trace has no
+  dependency arrows — the record no longer carries `fanout[]`).
+
+For perf-sensitive runs where you'd rather measure each profiler in
+isolation, see the **split workflow** described in
+[chip-swimlane-profiling §3.5](chip-swimlane-profiling.md#35-dependency-arrows-from-dep_gen)
+— one dep_gen capture per topology, then any number of swimlane
+runs that the converter joins back to that captured graph.
+
+When `--enable-dep-gen` is on with any other diagnostic flag, an
+`output_prefix` directory must be set (the runtime throws otherwise).
+The standard SceneTest path
+(`outputs/<TestName>_<case>_<timestamp>/`) handles that automatically.
+
+---
+
+## 3.1 Background output (`collect_across_runs=True`)
+
+With `Worker(collect_across_runs=True)` on a level-3 worker, a
+`tensormap_and_ringbuffer` run keeps every step that touches the device on its
+own boundary — the receive drain and the terminal read — and hands the replay,
+the serialization and the file write to one background writer, so the host
+finishing run N can overlap run N+1's device execution. Device operators stay
+serial and diagnostic exclusivity is unchanged. Off by default.
+
+`host_build_graph` is covered too, by §3.2 — its graph is finished on the host
+inside `submit`, so what moves off the submit path there is the serialization and
+the write, not a device boundary.
+
+**`run()` returning no longer means `deps.json` exists.**
+`Worker.flush_diagnostics()` is the barrier that says the files up to that point
+are published, and `close()` publishes and joins. Both report a failed
+publication rather than reporting success over a missing file: the writer
+records a run's verdict before it makes that run's drained state observable, so
+a flush arriving between the two cannot see a settled collector with no error. Two runs may be unpublished at
+once, counting the one still collecting; a third is refused before anything is
+submitted, and the caller may flush first. Task ids are run-local, so two runs
+of the same callable repeat them — a graph is identified by the directory it is
+published under, never by its task ids.
+
+Publication is atomic: the graph is written to `deps.json.tmp` opened
+`O_CREAT|O_EXCL` and published with `link`, which never replaces an existing
+name. A destination already holding a `deps.json` therefore fails the run with
+that file untouched, and a partly written graph is never visible under the real
+name.
+
+### 3.2 Background output for the host-built graph
+
+`host_build_graph` builds the whole graph on the host, during `submit`, and the
+default path serializes and writes `deps.json` right there — before the run is
+even launched. With `collect_across_runs=True` on a level-3 worker the finished
+graph is instead **moved** out of the capturing thread's storage into an export
+the runner owns, and a background writer publishes it. The hand-off still happens
+on the thread that built the graph: capture lives in thread-local state, so that
+is the only thread that can hand it over (`test_dep_gen_thread_affinity.py`
+exists because an emit moved to drain produced no file at all).
+
+What authorizes publication is therefore **a completed host orchestration**, not
+a successful run: the device contributes nothing to this graph, and there is no
+device record to reconcile or terminal state to read. So a `deps.json` can exist
+for a run that later fails on the device, that was never launched because a
+later step of `prepare` failed, or whose device completion is unknown. That is
+what the default path already does, and it is deliberately **not** the
+`tensormap_and_ringbuffer` rule above, whose quarantine exists because its
+records live on the device.
+
+Three states are told apart, where the default path has one error code for all
+of them:
+
+| At hand-off | Result |
+| ----------- | ------ |
+| the orchestration ran on this thread and closed every task | published — an orchestration that submitted **no** tasks publishes a well-formed empty graph |
+| capture was never armed, or the orchestration ran on another thread | no file, and the flush reports it |
+| a task was opened and never closed | no file, and the flush reports it |
+
+**Retention bounds what is kept, not what may run.** At most two unpublished
+graphs, against the same 256 MiB per-exporter budget, charged from the actual
+capacity of the five vectors an export holds plus a 1 MiB serialization
+reservation and a fixed destination per slot. When both slots are taken, or a
+graph is larger than the budget can accept, **the calling thread publishes it
+immediately** rather than failing the run — that submit waits for the write, as
+it did before this existed, and nothing is dropped. A legitimately large graph
+can exceed the budget and take that route.
+
+The budget covers what is retained after the hand-off and nothing else: the
+capture's own peak during `submit`, an inline write's file buffering, thread
+stacks, allocator metadata and the file on disk are all outside it.
+
+Both routes publish the same way — an exclusive `deps.json.tmp`, the stream
+flushed and closed with its state checked afterwards, then `link`, which never
+replaces a name. So an occupied destination fails that run's diagnostic with the
+existing file untouched, and a partly written graph is never visible under the
+real name. A temporary left behind by something else makes the publication refuse
+rather than be deleted. The output directory plus the file name must fit 4096
+bytes; a longer one is refused by name.
+
+`flush_diagnostics()` waits for every publication already under way and reports
+sticky failures; `close()` closes admission, drains, and joins the writer. A
+flush does not wait for a `submit` racing it that has not yet declared a write —
+such a call finishes after the flush's linearization point, like any later
+submit. No bounded-`close()` promise on a slow disk.
+
+First step is local level 3 on a2a3/a5 (onboard and sim). Level 2 — which is
+what `tests/st/{a2a3,a5}/host_build_graph/dfx/dep_gen/test_dep_gen.py` uses —
+keeps the synchronous path, and so does every run with the option off.
+
+### One whole graph, or no file
+
+`deps.json` has no metadata line and no completeness field, so there is nowhere
+to mark a partial graph. Either the whole graph is published, or no new file is
+produced for that run and an error is reported — and any file already at the
+destination is left as it was, which is not the same as this run having produced
+a graph. The refusals are: a device drop, a buffer the device still held, a
+broken count identity, a device counter at its saturation sentinel, a failed
+device read, an unresolvable in-flight buffer, a host-side record clamp, a
+record stamped with a run this collector never admitted, a counter reset that
+did not reach the device, a record whose ring or local id is out of domain, a
+refused memory charge, and a failed replay or write. In background mode these
+are sticky for the runner's life and reported by `flush_diagnostics()` and
+`close()`; a run whose device completion is unproved reads nothing shared and
+publishes nothing.
+
+### Memory
+
+Each collector has its own 256 MiB host budget for retained records and output
+work — not shared with other collectors, and not a whole-Worker limit. It covers
+the record blocks, the two export slots and their bounded path storage, a 1 MiB
+serialization reservation, alignment, and the replay's actual working storage:
+the contiguous record layout the replay indexes, the two host tensormaps (about
+17.1 MiB of floor per replay), and the task, tensor and edge tables. One tensor
+can name several producers, so edges and indexes are charged as they actually
+grow, including a reallocation's old and new blocks at once. Record blocks are
+charged before they are allocated and credited only after they are freed. The
+writer asks for a publication's working storage only once it has taken that
+export, so there is one working set at a time however many exports are sealed.
+Over-budget, out-of-domain and arithmetic-overflow conditions all refuse the
+graph rather than allocating, and no wait is introduced for storage a future
+credit might supply.
+
+Outside that budget, and separately bounded: the fixed device buffer pool
+(about 18.5 MiB), its host shadow on non-SVM platforms, and the fixed control
+region — one of each per collector per device context. Thread stacks, allocator
+metadata and system file buffers are not accounted in the application budget,
+and the output file is disk rather than host memory.
+
+### Device counters
+
+The three device counters saturate at `UINT32_MAX` instead of wrapping, and a
+counter reading it means the run passed the countable limit: its counts are
+unknown and no graph is published. This costs a compare at each increment on
+every dep_gen-enabled run, and it changes bytes in the shared AICPU image that
+`host_build_graph` also links.
+
+### With background output off
+
+The default path is unchanged in filename, location, schema and the bytes a
+clean run produces, and it still writes at the original boundary. What changed
+is that the refusals listed above now withhold the file there too, reported on
+that path's existing log channel — no sticky error is added, the run's return
+code does not change, and no 256 MiB limit applies. The host-built graph's
+default path is unchanged in the same way, including its overwrite behaviour;
+what it gained is the write-error check the stream only reports at flush and
+close, which was previously read one step too early.
+
+## 4. Output: `deps.json`
+
+```json
+{
+  "runtime": "tensormap_and_ringbuffer",
+  "tasks": [
+    {"task_id": "0",          "scope": "auto", "kernel_ids": [-1,-1,-1], "block_num": 1, "args": []},
+    {"task_id": "4294967296", "scope": "auto", "kernel_ids": [7,-1,-1], "block_num": 4, "args": [
+      {"idx": 0, "type": "INPUT", "tensor_id": "13451765318376212391",
+       "dtype": "FLOAT32", "shape": [16384],
+       "start_offset": "0", "strides": [1]}
+    ]}
+  ],
+  "tensors": [
+    {"tensor_id": "13451765318376212391",
+     "buffer_addr": "29204938752", "version": 0,
+     "dtype": "FLOAT32", "buffer_numel": "16384"}
+  ],
+  "edges": [
+    {"pred": "0", "succ": "4294967296", "arg": 0, "source": "creator",
+     "flags": ["wait", "retain"],
+     "tensor_id": "13451765318376212391", "consumer_dtype": "FLOAT32",
+     "consumer_shape": [16384],
+     "consumer_start_offset": "0", "consumer_strides": [1]},
+    {"pred": "4294967296", "succ": "4294967298", "arg": 0, "source": "tensormap",
+     "flags": ["wait"],
+     "overlap": "covered",
+     "tensor_id": "9514117477438350967", "consumer_dtype": "FLOAT32",
+     "consumer_shape": [16384],
+     "consumer_start_offset": "0", "consumer_strides": [1],
+     "producer_shape": [16384],
+     "producer_start_offset": "0", "producer_strides": [1]}
+  ]
+}
+```
+
+All 64-bit unsigned fields (`task_id`, `tensor_id`, `pred`, `succ`,
+`buffer_addr`) are serialized as JSON **strings**, not numbers. Many
+JavaScript-based JSON parsers can only safely represent integers up to
+`Number.MAX_SAFE_INTEGER` (2^53 − 1); `tensor_id` (FNV-1a hash) and
+`buffer_addr` (hardware address) routinely exceed that limit and would
+silently lose precision if encoded as numbers. Python consumers pass
+these through `int(v)` which accepts either form, so the schema is
+JS-safe without burdening Python.
+
+Task ids are the handle's encoded word, as `TaskId::to_uint64` yields it. The low
+32 bits are a local id; the bits above it
+mean whatever the runtime that minted the record says they mean — a ring index
+in bits 39:32 (`tensormap_and_ringbuffer`, `0..CHIP_MAX_RING_DEPTH-1`), or an id
+space in bits 63:62 plus a parent task in bits 51:32 (`host_build_graph`,
+`0 = GLOBAL`, `1 = SUB_TASK`, `2 = PARAM`). See
+`src/common/{tensormap_and_ringbuffer,host_build_graph}/task_id.h`.
+
+Which one a record carries is a property of its runtime, not of the value, so
+the top-level **`runtime`** key names it. Decode against that key rather than
+guessing from the number — `deps_viewer` does, which is what makes a sub-task
+render as `g{parent}t{index}` instead of a ten-digit high field:
+
+```python
+runtime = data["runtime"]  # required; a capture without it is refused, not guessed
+local = raw & 0xFFFFFFFF
+if runtime == "host_build_graph":
+    space = (raw >> 62) & 0x3           # 0 GLOBAL, 1 SUB_TASK, 2 PARAM
+    parent = (raw >> 32) & 0xFFFFF      # meaningful for SUB_TASK only
+elif runtime == "tensormap_and_ringbuffer":
+    ring = (raw >> 32) & 0xFF
+else:
+    raise ValueError(f"unsupported runtime: {runtime!r}")
+```
+
+### `tasks[]`
+
+One entry per task observed in the trace. `scope` is `"manual"` when the
+submit happened inside a manual scope (no automatic dependency wiring)
+and `"auto"` otherwise. `kernel_ids` is the per-subslot
+`[aic,aiv0,aiv1]` kernel id triple, with inactive subslots encoded as
+`-1`. `block_num` is the SPMD logical block num for the submit; `1`
+means a normal single-block task and values greater than `1` identify
+SPMD tasks. Tools that only need task-pair edges can ignore this block.
+
+### `tensors[]`
+
+One entry per unique `(buffer_addr, version)` pair touched by the trace.
+`tensor_id` is a stable FNV-1a 64-bit hash of that pair — identical
+inputs across runs yield the same id, making `deps.json` files diffable.
+`buffer_numel` is the element count of the **underlying buffer**, not the
+slice; per-edge slice geometry (`shape` + `start_offset` + `strides`)
+lives in the `edges[]` entries.
+
+### `edges[]`
+
+Each edge is `{pred, succ}` plus annotation. Fields:
+
+| Field | Type | When present | Meaning |
+| ----- | ---- | ------------ | ------- |
+| `pred`, `succ` | uint64 (string) | always | Producer's and consumer's encoded task id (`TaskId::to_uint64`) |
+| `arg` | int32 | always | Consumer's arg-slot index; `-1` for `explicit` source |
+| `source` | string | always | `explicit` (from `explicit_deps[]`), `creator` (`owner_task_id` retention), or `tensormap` (overlap lookup hit) |
+| `flags` | string array | `tensormap_and_ringbuffer` | Subset of `["wait", "retain"]` — the edge's `DepFlags`. `wait` = ordering (readiness); `retain` = producer lifetime held until the consumer releases. `creator` edges are `["wait","retain"]`; `tensormap` edges `["wait"]`. `explicit` edges start with the per-dependency kind captured at submit time, so `CoreTaskArgsWithDeps::add_dep_wait()` emits `["wait"]` while the default dependency kind emits `["wait","retain"]`. When the same producer is also the creator of an input, replay matches runtime fanin dedup by OR-accumulating the creator's flags into the explicit edge. `DepFlags` is a `tensormap_and_ringbuffer` runtime concept — it does not exist in the host_build_graph tree — so the host-orchestrated writer omits the field rather than lagging behind it. Consumers must treat it as optional. |
+| `overlap` | string | `source=tensormap` | `covered` (producer slice fully contains consumer slice) or `other` |
+| `tensor_id` | uint64 (string) | not `explicit` | Identity of the underlying tensor; cross-references `tensors[]` |
+| `consumer_dtype` | string | not `explicit` | Element type the consumer reads as |
+| `consumer_shape` | uint32 array | not `explicit` | Per-dim element count of the consumer slice |
+| `consumer_start_offset` | uint64 (string) | not `explicit` | Element offset of the consumer slice into the buffer |
+| `consumer_strides` | uint32 array | not `explicit` | Per-dim stride (in elements) of the consumer slice; runtime invariant > 0 |
+| `producer_shape` | uint32 array | `source=tensormap` | Per-dim element count of the producer slice |
+| `producer_start_offset` | uint64 (string) | `source=tensormap` | Element offset of the producer slice |
+| `producer_strides` | uint32 array | `source=tensormap` | Per-dim stride of the producer slice; runtime invariant > 0 |
+
+A single `(pred, succ)` pair can appear in `edges[]` multiple times if
+the producer drives the consumer through multiple slots, multiple
+sources, or multiple tensormap matches (different slice / version). For
+"is task X a successor of task Y at all?" questions, project edges down
+to the `(pred, succ)` set; for "what specifically did Y feed into X?",
+keep the full annotation.
+
+`deps.json` can have `"edges":[]` when the workload's tasks have no
+inter-task data dependencies (e.g. embarrassingly parallel kernels
+under scope_end barriers). `tasks[]` and `tensors[]` still list every
+observed task and tensor — that is not an error.
+
+---
+
+## 5. Visualizing — `deps_viewer.py`
+
+`simpler_setup/tools/deps_viewer.py` turns `deps.json` into either a
+plain-text dependency view (default) or a self-contained pan/zoom HTML page
+(Graphviz SVG with inline vanilla-JS drag/scroll panning and Ctrl+scroll or
+pinch zooming). The text view is optimized for grep / diff / "what does task X
+depend on?" debugging; the HTML view stays available when you want a visual
+layout.
+
+```bash
+# Newest deps.json under outputs/ -> deps_viewer.txt
+python -m simpler_setup.tools.deps_viewer
+
+# Specific path -> deps_viewer.txt next to deps.json
+python -m simpler_setup.tools.deps_viewer outputs/.../deps.json
+
+# Explicit HTML output
+python -m simpler_setup.tools.deps_viewer outputs/.../deps.json --format html
+
+# HTML output with per-task tensor details
+python -m simpler_setup.tools.deps_viewer outputs/.../deps.json --format html --show-tensor-info
+
+# Big HTML graphs: use force-directed layout (recommended >1000 nodes)
+python -m simpler_setup.tools.deps_viewer deps.json --format html --engine sfdp
+
+```
+
+The default text output contains:
+
+- `SUMMARY` — input path plus task / edge / tensor counts.
+  - `tasks`: number of task ids rendered in the output
+  - `unique_task_edges`: number of unique `(pred, succ)` task pairs
+  - `annotated_edges`: number of annotated edge rows across all task pairs
+  - `perf_sidecar`: `yes` when `chip_swimlane_records.json` was successfully loaded
+  - `func_name_map`: `yes` when at least one task label resolved to a named `func_name`
+    from either an explicit `--func-names` file or an auto-discovered sibling
+    `name_map*.json`. When the `kernel_ids` fallback is used, `func_id=` shows an
+    aligned 3-slot integer array in `[aic,aiv0,aiv1]` order; inactive slots remain
+    `-1`. `func_name_map` stays `no` unless a real human-readable name was resolved.
+- `TASK INDEX` — one line per task with `kind=` + `func_id=` and unique
+  `fanin=` / `fanout=` counts for quick grep. SPMD tasks additionally carry
+  `SPMD block num = N`, where `N` is the captured logical block num.
+- `TASK DETAILS` — one block per task with `FANIN` / `FANOUT` peer task references
+  (task-adjacency-only, no tensor detail).
+
+In text mode, HTML-only flags such as `--engine` and `--direction` are
+rejected rather than silently ignored.
+
+Node visual encoding (legend top-right of the rendered HTML):
+
+| Shape + color | Meaning |
+| ------------- | ------- |
+| Blue rounded box | AIC (cube) — kernel ran on the matrix unit |
+| Orange ellipse | AIV (vector) — kernel ran on the vector unit |
+| Green diamond | mix — single `submit_task` with `MixedKernels` spanning both core types |
+| Gray dashed note | alloc — task from `alloc_tensors` (got a task_id, references downstream via `owner_task_id`, but never dispatched a kernel so has no perf record) |
+| Red border + right-side `xN` label | SPMD task with `block_num=N` |
+
+Node labels read as `(ring, local)` with a red border and right-side `xN` block num label for SPMD
+tasks. The text output (`deps_viewer.txt`) carries the full `kind=` +
+`func_id=` labels and adds `SPMD block num = N` only for SPMD tasks; the HTML
+view keeps the graph focused on structure and the SPMD marker.
+When you need per-task tensor rows (storage / shape / strides / start_offset)
+and arg-port edge routing, rerun the HTML export with `--show-tensor-info`.
+
+Browser controls in the HTML viewer:
+
+- **drag** → pan
+- **scroll / two-finger swipe** → pan
+- **Ctrl+scroll / trackpad pinch** → zoom about cursor
+- **`f` key** → fit to view
+- **`r` key** → reset to 1:1
+
+The HTML scales to graphs the browser's SVG renderer can handle — in
+practice, ~50k nodes with `--engine sfdp`. Past that, you want a
+canvas/WebGL viewer (Cytoscape.js, sigma.js), which is out of scope
+for this tool. The default text output does not depend on Graphviz and is the
+preferred mode for large graphs that need fast generation or grep-first
+inspection.
+
+---
+
+## 6. Relationship to `fanout[]` + Validation Gate
+
+When checking fanout coverage, project annotated edges down to a
+`{(pred, succ)}` set first — the per-edge annotation distinguishes
+sources / args / slices, so the raw `edges[]` count is a superset of the
+underlying task-pair count.
+
+`deps.json` (projected) was a **superset** of the now-removed `fanout[]`
+edges — which is exactly why it replaced them as the sole edge source:
+
+| Edge source | Captures | Drops on race? |
+| ----------- | -------- | -------------- |
+| `task.fanout[]` (removed; formerly on ChipSwimlaneAicpuTaskRecord) | Successors known at producer-retire time | **Yes** — sealed when producer retires |
+| `deps.json` (this feature) | Every consumer → producer reachable via tensormap / explicit_deps | No — replay sees every submit |
+
+`tests/st/{a2a3,a5}/tensormap_and_ringbuffer/dfx/dep_gen/test_dep_gen.py`
+enforces the 6-edge expectation against the `vector_example`
+orchestration as a validation gate: any edge missing from `deps.json`
+is a replay-side regression and fails the test. (The record no longer
+carries `fanout[]`, so there is no longer a `fanout ⊆ deps` cross-check —
+`deps.json` is the only edge source.) The
+`swimlane_converter.py` uses `deps.json` (when present) as the source
+of flow events in the Perfetto trace, and flags any edge whose
+`pred.end_time > succ.start_time` as `hb_violation` (rendered as a
+distinct flow event name so Perfetto colors it apart from regular
+dependencies). Dependency flows connect the source and destination
+bar starts; the completion timestamps are used only for the
+`hb_violation` classification, not for flow geometry.
+
+---
+
+## 7. Big-Fanin Submits: Overflow Chain
+
+A `DepGenRecord` carries up to **64** explicit_deps inline. Submits with
+more than 64 explicit deps spill into a chain of `DepGenOverflowRecord`
+slots that overlay normal record slots in the buffer.
+
+| Submit `explicit_dep_count` | Chain shape | Per-submit slots used |
+| --------------------------- | ----------- | --------------------- |
+| `0 ≤ dc ≤ 64` | base only — fast path, no chain bookkeeping | 1 |
+| `65 ≤ dc ≤ 588` | base (64 deps) + 1 overflow (up to 524 deps) | 2 |
+| `589 ≤ dc ≤ 1112` | base + 2 overflow | 3 |
+| general | base + `⌈(dc − 64) / 524⌉` overflow | `1 + ⌈(dc − 64) / 524⌉` |
+
+**Wire format.** An overflow record reinterprets the same 4736-byte slot
+as `{ task_id (8) + flags (4) + dep_count (2) + _reserved (2) +
+deps[524] + kinds[524] }`; `kinds[]` is a byte-for-byte parallel array of
+`DepFlags`. There are no tensor blobs (those live on the base record). Replay distinguishes
+the two views by `flags & DEP_GEN_FLAG_OVERFLOW`. Chain records always
+share the base's `task_id`, and the last one sets
+`DEP_GEN_FLAG_LAST_OVERFLOW` so replay knows the chain is complete
+without peeking ahead.
+
+**Atomicity.** The AICPU writer reserves *all* chain slots up front: if
+the current buffer can't hold the full chain, it switches buffer first.
+`buf->count` is published with a single store at the end, so the host
+either sees the old count (chain invisible) or the new count with the
+full chain committed. Chain records are therefore always contiguous
+within one buffer — replay scans linearly and ties them back to the
+base via `task_id`.
+
+**Truncation tail.** A submit whose chain exceeds the buffer's slot
+budget (`PLATFORM_DEP_GEN_RECORDS_PER_BUFFER = 1024` slots → roughly
+`64 + 1023 × 524 = 536116` deps max in the best case) is logged via
+`LOG_ERROR` and truncated to the largest dc that fits. Runtime
+correctness is unaffected — `CoreTaskArgs::set_dependencies` keeps the full dep
+list; only the dep_gen replay graph loses the tail.
+
+---
+
+## 8. Architecture Touchpoints
+
+| Layer | File | Role |
+| ----- | ---- | ---- |
+| Shared-mem layout | `src/common/platform/include/common/dep_gen.h` | `DepGenRecord` (4736 B base, cache-line aligned, ≤64 inline explicit deps and parallel kinds, per-task `block_num`) + `DepGenOverflowRecord` chain view (≤524 dep/kind pairs per slot) + SPSC ring + per-thread ready queue. The layout is shared across platforms. |
+| AICPU writer | `src/{a2a3,a5}/platform/include/aicpu/dep_gen_collector_aicpu.h`, `src/common/platform/shared/aicpu/dep_gen_collector_aicpu.cpp` | Single-instance write path; weak-fallback exported to host build. Both platforms share the same writer implementation — the writer accesses its own device-side view of shared memory, independent of how host↔device transport is implemented. |
+| Host collector | `src/common/platform/include/host/dep_gen_collector.h`, `src/common/platform/shared/host/dep_gen_collector.cpp` | `ProfilerBase<DepGenCollector, DepGenModule>` — drains ring → `records_` vector. On non-SVM platforms it uses the base `alloc_paired_buffer`, which malloc's a host shadow + `copy_to_device`'s it and registers it via `add_malloc_shadow` so teardown can free it; `reconcile_counters` explicitly `copy_from_device`'s the BufferState before reading, and `finalize` lets `BufferPoolManager::clear_mappings()` release all shadows as the single source of truth. |
+| Capture call site (device-orch) | `src/{a2a3,a5}/runtime/tensormap_and_ringbuffer/runtime/orchestrator.cpp` `submit_task_common` | One conditional block that snapshots inputs into the ring when `is_dep_gen_enabled()`; fires for both `submit_task` and `submit_dummy_task`. The schema carries `kernel_ids[3] = {aic, aiv0, aiv1}` so the swimlane post-processor can resolve `task_id → kernel` from `deps.json` at level=1 where the AICore record is the sole device-side identity source. Inactive subslots stay at `INVALID_KERNEL_ID = -1`. It also carries the SPMD logical block num from the launch spec as `tasks[].block_num`. |
+| Replay | `src/common/tensormap_and_ringbuffer/host/dep_gen_replay.{h,cpp}` | Pure CPU; runs dual-pass differential replay — `compute_task_fanin` (oracle) + inlined STEP A/B mirror (annotated) against two `ChipTensorMap` instances. Emits `deps.json` when both passes agree per record. One source for both platforms: it includes `dep_compute.h`, `tensormap.h` and `tensor.h` by bare name, so each architecture's host target compiles it against its own runtime headers. |
+| Host-direct capture (host-orch) | `src/common/host_build_graph/host/dep_gen_host_graph.h`, `src/common/host_build_graph/host/dep_gen_host_graph.cpp` | Task / tensor / edge tables filled from `submit_task_common` + `compute_task_fanin`'s `Annotate` hooks (`src/common/host_build_graph/host/dep_compute.h`), reset per orchestration by `run_host_orchestration`, serialized by the same `deps.json` writer. The runtime translation unit carries weak no-op fallbacks so the AICPU build links without it. |
+| Device-runner hookup | `src/{a2a3,a5}/platform/{onboard,sim}/host/device_runner.cpp` | `dep_gen_host_graph_active()` picks the shape: host-orch calls `dep_gen_host_graph_emit(deps_path)` at teardown — reading the thread-local graph its own orchestration built on the same child progress thread — and skips collector init/start/reconcile entirely; device-orch calls `dep_gen_replay_emit_deps_json(records.data(), records.size(), deps_path)` post-`reconcile_counters`. The c_api latches the CallConfig before the bind so host capture is armed before the orchestration it records. |
+| Viewer | `simpler_setup/tools/deps_viewer.py` | `deps.json` → text (default) or pan/zoom HTML |
+| Test | `tests/st/{a2a3,a5}/tensormap_and_ringbuffer/dfx/dep_gen/test_dep_gen.py` + `test_dep_gen_chain.py`, `tests/st/{a2a3,a5}/host_build_graph/dfx/dep_gen/test_dep_gen.py` | Smoke test + edge validation against a `vector_example`-shaped orchestration. Each `host_build_graph` case runs an orchestration through host-direct capture and asserts its declared edges, so a divergence between the two shapes fails a test. The orchestrations are not shared across the two cases — a2a3's dep_gen test carries its own 5-task / 6-edge copy, a5's reuses the 4-task / 4-edge `vector_example` scene test's — so each asserts its own graph. |
+
+The device-orch shape is supported on both a2a3 and a5. The a5 host collector differs from a2a3 only in its host↔device transport path (a5 has no SVM, so all transfers go through `profiling_copy_to_device` / `profiling_copy_from_device` instead of relying on `halHostRegister`'s shared mapping); the AICPU writer, shared-memory ABI, runtime call site, and replay are platform-agnostic.
+
+The host-direct shape is supported on both a2a3 and a5, and is what `host_build_graph`
+uses on either. Both architectures reach it through the same
+`src/common/host_build_graph/` sources — neither `src/a2a3/runtime/host_build_graph/`
+nor `src/a5/runtime/host_build_graph/` carries a dep_gen implementation of its own.

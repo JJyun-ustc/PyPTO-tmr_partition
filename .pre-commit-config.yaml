@@ -1,0 +1,155 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+
+repos:
+
+    # Common
+    - repo: local
+      hooks:
+        - id: check-headers
+          name: check-headers
+          entry: python tests/lint/check_headers.py
+          language: python
+          language_version: python3
+
+        - id: check-english-only
+          name: check-english-only
+          entry: python tests/lint/check_english_only.py
+          language: python
+          language_version: python3
+          exclude: ^(3rdparty/|docs/zh-cn/|README\.zh-CN\.md)|vendor/
+
+        - id: check-test-platform-literals
+          name: check-test-platform-literals
+          entry: python tests/lint/check_test_platform_literals.py
+          language: python
+          language_version: python3
+          files: ^(examples|tests/st)/(.*/)?test_[^/]*\.py$
+
+        - id: check-retired-names
+          name: check-retired-names
+          entry: python tests/lint/check_retired_names.py
+          language: python
+          language_version: python3
+          exclude: ^3rdparty/|vendor/
+
+        - id: check-kernel-wire-isolation
+          name: check-kernel-wire-isolation
+          entry: python tests/lint/check_kernel_wire_isolation.py
+          language: python
+          language_version: python3
+          files: \.(h|hpp|cpp|cc|cxx)$
+          exclude: ^3rdparty/
+
+        - id: check-ut-cpp-case-naming
+          name: check-ut-cpp-case-naming
+          entry: python tests/lint/check_ut_cpp_case_naming.py
+          language: python
+          language_version: python3
+          files: ^tests/ut/cpp/.*\.cpp$
+
+        # Every DFX tool, plus the scene tests that read their output.
+        # tools/{hbg,tmr}/ are excluded: each owns one runtime's layout, and stating
+        # it is their whole job.
+        #
+        # tests/st/**/dfx/ is covered whole rather than by one validator's name: a
+        # dep_gen scene test builds task ids for the same tools to read, so it is
+        # subject to the same rule.
+        #
+        # tests/ut/py/ is not covered, and the reason is its contents rather than
+        # its role: it is the home of every Python unit test, so the patterns here
+        # would also match an ELF section offset, a ctypes bit pattern and an ABI
+        # magic-number splice -- none of them task ids. A hook that reports those
+        # gets switched off. Nothing there needs covering either: no test states a
+        # task_id layout, because tests/ut/py/_task_ids.py mints ids through each
+        # runtime's own mirror under tools/{hbg,tmr}/, where the layout is declared.
+        - id: check-task-id-bits
+          name: check-task-id-bits
+          entry: python tests/lint/check_task_id_bits.py
+          language: python
+          language_version: python3
+          files: ^(simpler_setup/tools/.*\.py|tests/st/.*/dfx/.*\.py)$
+          exclude: ^simpler_setup/tools/(hbg|tmr)/
+
+    - repo: https://github.com/pre-commit/pre-commit-hooks
+      rev: v4.6.0
+      hooks:
+        # 750 kB so the harvested whole-network chip orchestration — one
+        # generated translation unit whose size is inherent to the 43-layer
+        # program — fits under the cap.
+        - id: check-added-large-files
+          args: [--maxkb=750]
+        - id: check-yaml
+        - id: end-of-file-fixer
+          exclude: ^3rdparty/|vendor/
+        - id: trailing-whitespace
+          exclude: ^3rdparty/|vendor/
+
+    # C++ linting
+    - repo: https://github.com/pre-commit/mirrors-clang-format
+      rev: v21.1.0
+      hooks:
+        - id: clang-format
+          types_or: [c++, c]
+          exclude: ^3rdparty/|vendor/
+
+    - repo: local
+      hooks:
+        # `language: system` (not `python`) is intentional: clang_tidy.py imports
+        # simpler_setup, which is the project itself. With `language: python`,
+        # pre-commit creates an isolated venv that doesn't see the project install
+        # and the hook fails with ModuleNotFoundError. `system` reuses whatever
+        # python is on PATH — in CI that's setup-python's interpreter (where
+        # `pip install .` ran in an earlier step); locally it's the activated
+        # `.venv` (where `pip install -e .` ran). Pre-installing the project in an
+        # isolated hook venv would technically work but triggers a full C++ build
+        # (cmake + ninja + nanobind + build_runtimes for all sim variants) and
+        # forces every Python-only contributor to install a C++ toolchain.
+        - id: clang-tidy
+          name: clang-tidy
+          entry: python tests/lint/clang_tidy.py
+          language: system
+          # clang_tidy_paths.py filters this hook before it imports the project;
+          # the pre-commit workflow uses the same policy to select its build.
+
+    - repo: https://github.com/cpplint/cpplint
+      rev:  2.0.0
+      hooks:
+        - id: cpplint
+          exclude: ^3rdparty/|vendor/
+          args:
+            - --root=include
+            - --linelength=120
+            - --filter=-whitespace,-build,-legal,-runtime,-readability,+readability/todo
+
+    # Markdown linting
+    - repo: https://github.com/DavidAnson/markdownlint-cli2
+      rev: v0.20.0
+      hooks:
+        - id: markdownlint-cli2
+          args:
+            - --fix
+            - --config
+            - tests/lint/.markdownlint.yaml
+
+    # Python linting
+    - repo: https://github.com/astral-sh/ruff-pre-commit
+      rev: v0.14.8
+      hooks:
+        - id: ruff-check
+          types_or: [python, pyi]
+          args: [--fix]
+        - id: ruff-format
+          types_or: [python, pyi]
+
+    - repo: https://github.com/RobertCraigie/pyright-python
+      rev: v1.1.407
+      hooks:
+      - id: pyright
+        additional_dependencies: [pytest==7.0.0]

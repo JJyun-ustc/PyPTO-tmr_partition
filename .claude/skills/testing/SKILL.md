@@ -1,0 +1,202 @@
+---
+name: testing
+description: Testing guide and pre-commit testing strategy for simpler. Use when running tests, adding tests, or deciding what to test before committing.
+---
+
+# Testing
+
+## Test Types
+
+1. **Python unit tests (ut-py)** (`tests/ut/`): Standard pytest tests for the Python compilation pipeline and nanobind bindings. Run with `pytest tests/ut`. Tests declaring `@pytest.mark.requires_hardware[("<platform>")]` auto-skip unless `--platform` points to a matching device.
+2. **C++ unit tests (ut-cpp)** (`tests/ut/cpp/`): GoogleTest-based tests for pure C++ modules. Run with `cmake -B tests/ut/cpp/build -S tests/ut/cpp && cmake --build tests/ut/cpp/build && ctest --test-dir tests/ut/cpp/build -LE requires_hardware --output-on-failure`. Hardware-required tests carry a `requires_hardware` or `requires_hardware_<platform>` ctest label and are filtered via `-LE`.
+3. **Scene tests** (`examples/{arch}/*/`, `tests/st/{arch}/*/`): End-to-end `@scene_test` classes declared inside `test_*.py`. Sim variants run cross-platform (Linux/macOS); hardware variants require the CANN toolkit and an Ascend device. Discovery is by pytest (batch) or `python test_*.py` (standalone); `#591`'s parallel orchestrator handles device bin-packing and ChipWorker reuse automatically.
+
+## Running Tests
+
+**Important**: Always read `.github/workflows/ci.yml` first for the current
+`--pto-session-timeout` values. Quarantines are marker-based, so mirror the
+a2a3 sweep with `-m "not sdma and not sdma_fault" --exclude-level 4` rather than
+copying a path list. PTO-ISA reproducibility comes from the repo-root `pto_isa.pin`.
+
+**CI does not run one flat sweep on a2a3.** Marked tests are quarantined out of
+the general onboard sweep and run in a step of their own, after it, because
+they are only correct in isolation. A5 runs the corpus below level 4, including
+SDMA tests, on both x86_64 and ARM64. Reproducing a2a3 CI means reproducing that
+shape — a bare `pytest examples tests/st --platform a2a3` is *not* what CI runs
+and will report failures that CI never sees:
+
+| Marker | Tests | CI behavior |
+| ------ | ----- | ----------- |
+| `@pytest.mark.manual` / `CASES[*]["manual"]` | Standalone pytest tests / individual scene-test cases; optionally scoped to a platform list | Per-PR main sweep: excluded by default on the selected platforms; dedicated DFX steps: included; `daily.yml`: full sweep with `--manual include` |
+| `@pytest.mark.sdma` | a2a3: SDMA demos; a5: `sdma_async_completion_demo` | a2a3: dedicated SDMA-demo task; a5: included in the non-network1 sweep |
+| `@pytest.mark.sdma_fault` | a2a3 `aicore_op_timeout` fault-injection case | a2a3: separate one-device task |
+
+The a2a3 SDMA demos provision 48 device-only STARS streams, which makes an
+AICore fault take ~306 s to tear down instead of ~0.3 s — so they must not
+share a task with the `aicore_op_timeout` fault-injection test
+([investigations/2026-07-a2a3-sdma-fault-teardown.md](../../../docs/investigations/2026-07-a2a3-sdma-fault-teardown.md),
+issue #1425).
+
+When an onboard test fails, **run it alone before calling it a regression**.
+Alone-passes plus sweep-fails is an isolation requirement, not a defect: check
+the test for a quarantine marker such as `@pytest.mark.sdma`. Do not "fix" such
+a test by reordering it earlier — that only moves the pollution onto whatever
+now runs after it.
+
+### Runtime rebuild decision
+
+Before running tests, determine whether runtime binaries need recompilation:
+
+| What changed | Rebuild needed? | How |
+| ------------ | --------------- | --- |
+| Runtime/platform C++ (`src/{arch}/runtime/`, `src/{arch}/platform/`) | Yes | Re-run `pip install --no-build-isolation -e .` (incremental via `build/cache/`) |
+| Nanobind bindings (`python/bindings/`) | Yes | Re-run `pip install -e .` |
+| Python-only code, examples, kernels | No | Just re-run the test |
+
+In CI, `pip install .` pre-builds all runtimes before tests run.
+
+```bash
+# Python unit tests (no hardware)
+pytest tests/ut
+
+# Python unit tests (a2a3 hardware)
+pytest tests/ut --platform a2a3
+
+# C++ unit tests (no hardware)
+cmake -B tests/ut/cpp/build -S tests/ut/cpp && cmake --build tests/ut/cpp/build
+ctest --test-dir tests/ut/cpp/build -LE requires_hardware --output-on-failure
+
+# C++ unit tests (a2a3 hardware)
+ctest --test-dir tests/ut/cpp/build -L "^requires_hardware(_a2a3)?$" --output-on-failure
+
+# All simulation scene tests (extract --pto-session-timeout from ci.yml)
+pytest examples tests/st --platform a2a3sim \
+    --pto-session-timeout <timeout>
+
+# All hardware scene tests — mirror ci.yml: deselect the quarantined marker, or
+# those tests fail here and nowhere else
+pytest examples tests/st -m "not sdma and not sdma_fault" --exclude-level 4 --platform a2a3 --device <range> \
+    --pto-session-timeout <timeout>
+
+# The quarantined tests, the way CI runs them — same corpus, selected by the
+# marker, run after the sweep rather than inside it. Never a path list: that is
+# what the marker replaced.
+pytest examples tests/st -m "sdma and not sdma_fault" \
+    --platform a2a3 --device <2 devs> --pto-session-timeout <timeout>
+# Run the a2a3 fault-injection case in its own task/device.
+pytest examples tests/st -m sdma_fault \
+    --platform a2a3 --device <1 dev> --pto-session-timeout <timeout>
+
+# A5 runs the corpus below level 4, including SDMA tests, on both host architectures.
+pytest examples tests/st --exclude-level 4 --platform a5 --device <range> \
+    --pto-session-timeout <timeout>
+
+# Single runtime
+pytest examples tests/st --platform a2a3sim --runtime host_build_graph
+
+# Single example (pytest, uses pre-built binaries)
+pytest tests/st/a2a3/host_build_graph/vector_example --platform a2a3sim --manual include
+
+# Single example (standalone; re-run `pip install --no-build-isolation -e .` first if runtime C++ changed)
+python tests/st/a2a3/host_build_graph/vector_example/test_vector_example.py \
+    -p a2a3sim --manual include
+```
+
+## Pre-Commit Testing Strategy
+
+When changed files require testing (C++, Python, or CMake), follow these steps to decide **what** to test and **how**.
+
+### Step 1 — Platform Availability and Detection
+
+```bash
+command -v npu-smi &>/dev/null
+```
+
+| Result | Platforms to test |
+| ------ | ----------------- |
+| Found | `<arch>sim` (simulation) **and** `<arch>` (hardware) |
+| Not found | Simulation only (default `a2a3sim`) |
+
+**When `npu-smi` is found**, detect the platform by parsing chip name from `npu-smi info` output. If that call fails, retry it as `task-submit --run "npu-smi info"` — some shared hosts restrict DCMI to root — and judge by exit status, not by whether output appeared (see [running-onboard.md](../../rules/running-onboard.md#why)):
+
+| Chip name contains | Platform |
+| ------------------ | -------- |
+| `910B` or `910C` | `a2a3` (sim: `a2a3sim`) |
+| `950` | `a5` (sim: `a5sim`) |
+
+Use the detected platform for all subsequent `--platform` flags.
+
+Two different failures hide behind an empty chip name, and only one of them is safe to guess past:
+
+- **Both the bare call and the `task-submit` retry exited non-zero** — the silicon was never identified. `command -v npu-smi` above only proves the binary exists, so this is the state on a DCMI-restricted host with no `task-submit`. Report the error and test **simulation only**; do not guess a hardware platform.
+- **The query succeeded but the chip name matches no row** — genuinely unrecognized silicon. Warn and default to `a2a3`.
+
+Guessing `a2a3` in the first case runs hardware tests against silicon nobody has identified, which is the `--platform` mismatch that [onboard-arch-precheck](../onboard-arch-precheck/SKILL.md) exists to refuse.
+
+### Step 2 — Test Scope
+
+Run `git diff --name-only` (or `git diff --cached --name-only` for staged changes) and match the **first** applicable rule:
+
+| Changed paths | Scope | Command pattern |
+| ------------- | ----- | --------------- |
+| `src/{arch}/platform/*` | Full (all runtimes) | `pytest examples tests/st --platform <platform>` |
+| `src/{arch}/runtime/<rt>/*` | Single runtime | `pytest examples tests/st --platform <platform> --runtime <rt>` |
+| `examples/{arch}/<rt>/<ex>/*` | Single example | `python <ex>/test_*.py -p <platform>` (or `pytest <ex> --platform <platform>`) |
+| `tests/ut/*` (Python) | Python UT only | `pytest tests/ut` (add `--platform <platform>` on a device runner) |
+| `tests/ut/cpp/*` | C++ UT only | `cmake -B tests/ut/cpp/build -S tests/ut/cpp && cmake --build tests/ut/cpp/build && ctest --test-dir tests/ut/cpp/build -LE requires_hardware` |
+| Mixed (spans multiple categories) | Escalate to the **widest** matching scope | — |
+
+> **Note on runtime C++ changes**: When changed paths include `src/{arch}/runtime/` or `src/{arch}/platform/`, re-run `pip install --no-build-isolation -e .` before testing to rebuild the runtime binaries in `build/lib/` (incremental via `build/cache/`). There is no rebuild-on-import — `editable.rebuild = false`.
+
+### Step 3 — Parallel Strategy
+
+Parallelism is handled by the `#591` scheduler (`simpler_setup/parallel_scheduler.py`) based on `--device` and `--max-parallel`:
+
+**Simulation (`a2a3sim`)**: `--max-parallel auto` = `min(nproc, len(--device))`. Pass `--device 0-15` for a big virtual pool; `auto` caps in-flight at the CPU count. Override with `--max-parallel N` on CPU-constrained runners.
+
+**Hardware (`a2a3`)**: `--max-parallel auto` = `len(--device)`. One in-flight subprocess per physical device — each device runs a dedicated ChipWorker (see `docs/ci.md`).
+
+### Step 4 — Device Detection (hardware only)
+
+When testing on `a2a3`, detect idle devices:
+
+```bash
+npu-smi info || task-submit --run "npu-smi info"
+```
+
+Pick devices whose **HBM-Usage is 0** and find the **longest consecutive sub-range** (at most 4). Pass as `--device <start>-<end>` (or `--device <id>` if only one idle device). If no idle device is found, skip hardware testing and warn.
+
+### Decision Tree
+
+```text
+git diff --name-only
+  │
+  ├─ Only docs/config? ──→ SKIP tests
+  │
+  └─ Code changed?
+       │
+       ├─ Determine SCOPE (Step 2)
+       │    ├─ platform   → full (pytest --platform ...)
+       │    ├─ runtime    → single runtime (--runtime ...)
+       │    └─ example    → single example (standalone test_*.py or pytest <ex>)
+       │
+       ├─ Runtime C++ changed (src/{arch}/)? ──→ pip install --no-build-isolation -e . first
+       │
+       └─ npu-smi found?
+            ├─ Yes → sim + hardware (idle devs, max 4)
+            └─ No  → sim only
+```
+
+## Adding a New Scene Test
+
+1. Create a directory under the appropriate arch and runtime:
+   - Examples: `examples/{arch}/<runtime>/<name>/`
+   - Device-only scene tests: `tests/st/{arch}/<runtime>/<name>/`
+2. Add `test_<name>.py` with a `@scene_test`-decorated class (see [docs/testing.md](../../docs/testing.md) for the full template: `CALLABLE`, `CASES`, `generate_args`, `compute_golden`). End with `if __name__ == "__main__": SceneTestCase.run_module(__name__)` so the file runs standalone.
+3. Omit `CASES[*]["config"]["aicpu_thread_num"]` unless the test specifically exercises a thread-count or scheduler-topology behavior. The default automatically selects the correct count for each architecture; do not copy or pin that default. When an override is necessary, add a nearby comment explaining the test dependency. The framework rejects unknown `config` keys at import time; the accepted keys are `aicpu_thread_num`, `runtime_env`, `device_count`, and `num_sub_workers`, with `ring_task_window`, `ring_heap`, and `ring_dep_pool` under `runtime_env`. Do not set `ring_heap` on a `host_build_graph` case — that runtime commits its graph heap to the size orchestration measured and warns that the knob reached nothing.
+4. Add kernel source files under `kernels/aic/`, `kernels/aiv/`, and/or `kernels/orchestration/` — referenced by `CALLABLE["orchestration"]["source"]` / `CALLABLE["incores"][*]["source"]` as paths relative to the test file.
+5. Pytest auto-discovers any `test_*.py` under `examples/` and `tests/st/`; no registration needed.
+
+## Related Skills
+
+- **`git-commit`** — Complete commit workflow (runs testing as a prerequisite)

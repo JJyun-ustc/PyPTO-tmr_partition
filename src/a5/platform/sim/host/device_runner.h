@@ -1,0 +1,140 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
+/**
+ * a5 sim DeviceRunner — thread-based simulation of the Ascend AICPU/AICore
+ * execution model. The shared base (`SimDeviceRunnerBase`) hosts the arena /
+ * tensor-copy / callable-registry / chip-callable-buffer pool. This subclass
+ * adds the a5-specific dlsym'd function-pointer table (different aicore_execute
+ * signature than a2a3 — extra aicore_pmu_ring_addrs arg) and the
+ * enqueue/poll/drain sequence wired to a5's contract.
+ */
+
+#pragma once
+
+#include <cstdint>
+#include <memory>
+#include <string>
+
+#include "common/core_type.h"
+#include "device_runner_base.h"
+#include "host/dep_gen_collector.h"
+#include "sim_run_completion.h"
+
+class DeviceRunner : public SimDeviceRunnerBase {
+public:
+    DeviceRunner();
+    ~DeviceRunner() override;
+
+    int prepare_execution(
+        Runtime &runtime, const CallConfig &config, uint32_t pipeline_slot, const NativeRunIdentity &identity,
+        std::unique_ptr<PreparedExecution> *prepared
+    ) override;
+    void abandon_prepared_execution(PreparedExecution &prepared) noexcept override;
+    int poll_execution(const ActiveExecution &active) override;
+    DrainOutcome drain_execution(ActiveExecution &active) override;
+    int finalize() override;
+    // a5 dep_gen enablement setter, overriding the base no-op (the c_api
+    // unconditionally calls it). Also arms the loaded runtime's host-side graph
+    // capture, which a host-orch runtime uses instead of the device collector.
+    // Defined in the .cpp so this header stays free of the runtime-provided
+    // capture symbols.
+    void arm_host_dep_gen_capture(bool enable) override;
+    void configure_dep_gen_retention(bool enabled, std::size_t budget_bytes) override;
+    bool dep_gen_retains_runs() const override;
+    int admit_dep_gen_run(const DfxRunConfig &dfx, uint64_t run_epoch) override;
+    void withdraw_dep_gen_run(uint64_t run_epoch) noexcept override;
+    bool dep_gen_flush_retained(int timeout_ms, std::string *error) override;
+    void dep_gen_finish_retained() override;
+
+private:
+    LaunchTransactionResult launch_execution_impl(PreparedExecution &prepared, LaunchPermit permit) override;
+
+    struct ActiveRun;
+
+    int ensure_binaries_loaded() override;
+    int invoke_device_register(const RegisterCallableArgs &reg_args) override;
+    void unload_executor_binaries();
+    void cleanup_active_run() noexcept;
+
+    /**
+     * Build this run's collector pools and profiling flag under the execution
+     * claim, before the arming below publishes their bases to the simulated
+     * device. Mirrors the onboard runner, where the claim is what keeps a
+     * shape-driven pool release off a live predecessor.
+     */
+    int arm_collectors_for_run(const Runtime &runtime, PreparedExecution &prepared);
+
+    int init_chip_swimlane(int num_aicore, int aicpu_thread_num, int device_id, ChipSwimlaneLevel chip_swimlane_level);
+    int init_args_dump(const Runtime &runtime, int device_id, DumpArgsLevel dump_args_level);
+    int init_pmu(int num_cores, int num_threads, int device_id);
+    int init_scope_stats(int num_threads);
+    int init_dep_gen(int num_threads, int device_id);
+
+    // Emit the device-orchestration dep_gen graph, on both the success and the
+    // error return of drain_execution: the AICPU threads are joined before
+    // either, so a failed run's records are as complete as the run made them.
+    // Its own reconcile is the completeness gate — see the definition.
+    /**
+     * Emit this run's dependency graph.
+     *
+     * `device_execution_complete` is the caller's own fence observation and the
+     * whole of the completion proof: without it the retained path reads nothing
+     * shared and publishes nothing.
+     */
+    void emit_device_dep_gen_graph(const DfxRunConfig &dfx, uint64_t run_epoch, bool device_execution_complete);
+
+    // Per-run collector teardown: stop + release shm so a session-scoped Worker
+    // can re-init collectors on the next enqueue. Matches a2a3 sim.
+    /**
+     * Release the diagnostics collectors' shared memory. Returns non-zero when
+     * a collector's own finalize reported a failure — today only retained
+     * ArgsDump, whose last host sealing happens there.
+     */
+    int finalize_collectors();
+
+    // a5 publishes runtime-derived swimlane metadata that the other arches do
+    // not have; the base calls this between the host-phase handoff and the
+    // export, the only point where the collector holds this run's records and
+    // has not yet serialized them.
+    void publish_chip_swimlane_runtime_extensions() override;
+
+    // a5 sim's dlsym'd function-pointer table. Loaded once via
+    // ensure_binaries_loaded(), nulled on unload_executor_binaries().
+    int (*aicpu_execute_func_)(Runtime *){nullptr};
+    // The runtime exports simpler_aicpu_register_callable(void*) directly (TMARB
+    // only; hbg does not export it). Optional dlsym: null on the hbg SO.
+    int (*aicpu_register_callable_func_)(void *){nullptr};
+    void (*aicore_execute_func_)(
+        Runtime *, int, CoreType, uint32_t, uint64_t, uint32_t, uint64_t, uint64_t, uint64_t, uint64_t
+    ){nullptr};
+    void (*set_platform_regs_func_)(uint64_t){nullptr};
+    void (*set_orch_device_id_func_)(int){nullptr};
+    void (*set_scheduler_timeout_ms_func_)(int){nullptr};
+    void (*set_platform_dump_base_func_)(uint64_t){nullptr};
+    void (*set_platform_phase_base_func_)(uint64_t){nullptr};
+    void (*set_platform_run_result_func_)(uint64_t, uint64_t){nullptr};
+    void (*set_platform_pmu_base_func_)(uint64_t){nullptr};
+    void (*set_dump_args_enabled_func_)(bool){nullptr};
+    void (*set_platform_chip_swimlane_base_func_)(uint64_t){nullptr};
+    void (*set_platform_chip_swimlane_run_terminal_bank_func_)(uint64_t){nullptr};
+    void (*set_platform_chip_swimlane_aicore_rotation_table_func_)(uint64_t){nullptr};
+    void (*set_chip_swimlane_enabled_func_)(bool){nullptr};
+    void (*set_pmu_enabled_func_)(bool){nullptr};
+    void (*set_platform_dep_gen_base_func_)(uint64_t){nullptr};
+    void (*set_dep_gen_enabled_func_)(bool){nullptr};
+    void (*set_scope_stats_enabled_func_)(bool){nullptr};
+    void (*set_platform_scope_stats_base_func_)(uint64_t){nullptr};
+
+    // dep_gen collector — captures orchestrator submit_task inputs for offline replay.
+    DepGenCollector dep_gen_collector_;
+    std::unique_ptr<ActiveRun> active_run_;
+    simpler::common::sim_host::SimRunCompletion run_completion_;
+};
