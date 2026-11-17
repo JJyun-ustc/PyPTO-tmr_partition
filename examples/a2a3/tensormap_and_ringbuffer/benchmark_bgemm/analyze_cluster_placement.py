@@ -36,13 +36,14 @@ def learning_summary(root):
             return result
 
         finals = [fields(line) for line in lines if "AICPU_ADAPTIVE_FINAL" in line]
-        if len(finals) != 1 or finals[0].get("version") not in (2, 3, 4):
+        if len(finals) != 1 or finals[0].get("version") not in (2, 3, 4, 5, 6):
             raise ValueError(f"expected one supported terminal report in {device}")
         final = finals[0]
         assert sum(final["decisions"]) == sum(final["started"]) == expected
-        assert final["cold"] + final["learned"] == expected and final["cold"] >= 256 and final["learned"] > 0
+        if final["version"] < 6:
+            assert final["cold"] + final["learned"] == expected and final["cold"] >= 256 and final["learned"] > 0
         updates = [fields(line) for line in lines if "AICPU_ADAPTIVE_UPDATES" in line]
-        max_updates = max(row[key] for row in updates for key in ("queue", "o0", "o1", "s0", "s1"))
+        max_updates = max((row[key] for row in updates for key in ("queue", "o0", "o1", "s0", "s1")), default=0)
         if final["version"] == 2:
             assert final["polls"] <= expected // 64
             for c in (0, 1):
@@ -52,7 +53,8 @@ def learning_summary(root):
             assert sum(row["s1"] if row["cluster"] == 0 else row["s0"] for row in active) > 0
             assert max_updates <= (expected - 1) // 256
         else:
-            assert final["cold"] == 256 and final["calibrations"] == 1
+            if final["version"] < 6:
+                assert final["cold"] == 256 and final["calibrations"] == 1
             assert max_updates <= 1
             if final["version"] == 3:
                 assert final["decisions"] == final["started"]
@@ -66,6 +68,8 @@ def learning_summary(root):
                     assert row["preferred"] == row["released"]
                     assert row["queued"] == row["taken"]
                     assert sum(row["preferred"]) == sum(row["queued"]) == sum(row["actual"])
+                    if final["version"] >= 5:
+                        assert row["queued"] == row["actual"]
         reports[family] = {
             "final": final,
             "channel_updates": updates,

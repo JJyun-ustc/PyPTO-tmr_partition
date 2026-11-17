@@ -90,13 +90,15 @@ python test_benchmark_bgemm.py -p a2a3 -d 0 --case ClusterScaleAdaptive --manual
 Run each case once with its golden check before using `--skip-golden` for
 repeated timing. See [AICPU cluster placement](../../../../docs/user/how-to/use-aicpu-cluster-placement.md)
 for the runtime behavior and measurement boundaries.
-The current controller retains a fixed 256-node calibration prefix and uses
-bounded dependency groups, ready-time final binding, 64-node summary epochs
-and restricted single-block cross-cluster pickup. See the
-[2026-11-16 investigation](../../../../docs/investigations/2026-11-aicpu-cluster-bgemm.md)
-for staged v6/v7 controls. The final Case0/Scale automatic medians are
-3.60%/18.79% below same-binary Shared controls in this unlocked-device suite;
-the results do not establish an independent benefit from cross-cluster pickup.
+The current controller retains bounded group preferences, ready-time binding,
+a fixed 256-node price calibration prefix and 64-node summary epochs. It uses
+handoff, queue and bounded future prices with weights 1, 0.5 and 0.25;
+resource and extra-edge penalties are disabled, and cross-cluster pickup is
+removed from the dispatch path. Separate local queues are retained.
+See the [experiment record](../../../../docs/investigations/2026-11-aicpu-cluster-bgemm.md)
+for weight sensitivity, an alternative capacity-wave model and rejected queue
+merging. In the archived-binary recheck, default automatic Case0/Scale medians
+were 0.9922/3.8154 ms versus same-binary Shared 1.0419/4.7954 ms.
 
 Tolerances are `RTOL = ATOL = 1e-3`, with inputs scaled by `0.01` to keep the
 `grid_k`-deep float32 accumulation inside them.
@@ -106,9 +108,10 @@ For turning a run into numbers rather than pass/fail, see
 scheduler-overhead model, which is the thing the task-count axis here is built
 to probe.
 
-### v7 控制成本分阶段实验
+### 控制成本与评分对照实验
 
-当前自动策略使用有界小组偏好、ready 时绑定、低频单写者摘要以及受限跨侧领取。
+当前自动策略使用有界小组偏好、ready 时绑定和低频单写者摘要；v8 禁用跨侧领取，
+默认保留本侧分队的三项评分。
 完整机制与压力记账见 [放置说明](../../../../docs/user/how-to/use-aicpu-cluster-placement.md)，
 结果见 [实验记录](../../../../docs/investigations/2026-11-aicpu-cluster-bgemm.md)。
 `reproduce_cluster_study.py` 执行四个独立黄金校验和两批反序的各 15 轮计时；

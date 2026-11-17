@@ -25,9 +25,9 @@ constexpr uint32_t PARTITION_STEAL_CHECK_LOOPS = 32;
 constexpr uint32_t PARTITION_STEAL_COOLDOWN_LOOPS = 128;
 constexpr uint64_t PARTITION_QUEUE_WEIGHT_NUM = 1;
 constexpr uint64_t PARTITION_QUEUE_WEIGHT_DEN = 2;
-constexpr uint64_t PARTITION_RESOURCE_WEIGHT_NUM = 1;
+constexpr uint64_t PARTITION_RESOURCE_WEIGHT_NUM = 0;
 constexpr uint64_t PARTITION_RESOURCE_WEIGHT_DEN = 4;
-constexpr uint64_t PARTITION_EXTRA_REMOTE_WAIT_NS = 128;
+constexpr uint64_t PARTITION_EXTRA_REMOTE_WAIT_NS = 0;
 constexpr uint64_t PARTITION_FUTURE_WEIGHT_DEN = 4;
 
 struct AdaptiveTaskState {

@@ -60,7 +60,7 @@ TEST(ClusterPartitioner, PublicationAndNotificationAreSeparatePaths) {
     EXPECT_EQ(model.choose(load, 0, none, 0, 1).cluster, 0);
     EXPECT_EQ(model.choose(load, 1, source0, 0, 1).cluster, 1);
 }
-TEST(ClusterPartitioner, QueueResourceAndExtraRemoteEdgesHaveSeparateWeights) {
+TEST(ClusterPartitioner, QueueAndFutureDoNotDoubleCountResourceAndExtraEdges) {
     ClusterPartitioner model;
     mature(model);
     auto load = idle_load();
@@ -69,15 +69,15 @@ TEST(ClusterPartitioner, QueueResourceAndExtraRemoteEdgesHaveSeparateWeights) {
     load.idle[0] = 10;
     uint32_t source0[2]{1, 0};
     auto decision = model.choose(load, 1, source0, 0, 1);
-    EXPECT_EQ(decision.score_ns[0], 2025u);
+    EXPECT_EQ(decision.score_ns[0], 1275u);
     EXPECT_EQ(decision.score_ns[1], 775u);
     uint32_t three_remote[2]{3, 0};
     auto multi = model.choose(load, 3, three_remote, 0, 1);
-    EXPECT_EQ(multi.score_ns[1], 1031u);
-    EXPECT_EQ(multi.score_ns[0], 2025u);
+    EXPECT_EQ(multi.score_ns[1], 775u);
+    EXPECT_EQ(multi.score_ns[0], 1275u);
     model.weights[0].dependency[1][1] = 1000;
     uint32_t mixed[2]{2, 1};
-    EXPECT_EQ(model.choose(load, 3, mixed, 0, 1).score_ns[1], 1281u);
+    EXPECT_EQ(model.choose(load, 3, mixed, 0, 1).score_ns[1], 1025u);
 }
 TEST(ClusterPartitioner, FutureReservationsNormalizeCapacityAndBoundDistantWork) {
     auto load = idle_load();
@@ -368,28 +368,30 @@ TEST(ClusterPartitioner, RacedSummaryRetainsLastCoherentLedgerWithoutDoubleReser
     EXPECT_EQ(final.ready[1], 16u);
 }
 
-TEST(ClusterPartitioner, BorrowingDebitsQueueSideIndependentlyOfExecutionSide) {
+TEST(ClusterPartitioner, FinalQueueAccountingIsIndependentOfPreference) {
     PartitionShared shared;
     shared.schedulers[0] = 2;
     shared.schedulers[1] = 3;
     ClusterPartitioner model;
     model.assigned[0][0] = 16;
-    // O prefers 0, a releasing S queues on 1, and a cluster-0 S borrows six.
+    // O prefers 0, readiness binds to 1, and a cluster-1 S dispatches six.
     auto &publisher = shared.threads[2].summary[0];
     publisher.released[0].store(16);
     publisher.queued[1].store(16);
-    shared.threads[0].summary[0].taken[1].store(6);
-    shared.threads[0].started[0].store(6);
+    shared.threads[2].summary[0].taken[1].store(6);
+    shared.threads[2].started[0].store(6);
     auto load = model.load(shared, 0);
     EXPECT_EQ(load.blocked[0] + load.blocked[1], 0u);
     EXPECT_EQ(load.ready[0], 0u);
     EXPECT_EQ(load.ready[1], 10u);
 }
 
-TEST(ClusterPartitioner, BorrowingRequiresIdleLocalQueueAndSubstantialRemoteBacklog) {
-    EXPECT_FALSE(partition_may_steal(0, 7, 2, 3));
-    EXPECT_TRUE(partition_may_steal(0, 8, 2, 3));
-    EXPECT_FALSE(partition_may_steal(1, 100, 2, 3));
-    EXPECT_FALSE(partition_may_steal(0, 100, 2, 0));
-    EXPECT_FALSE(partition_may_steal(0, 100, 0, 3));
+TEST(ClusterPartitioner, BusyHintAloneDoesNotOverrideHandoffWithEmptyQueues) {
+    ClusterPartitioner model;
+    mature(model);
+    auto load = idle_load();
+    uint32_t source0[2]{1, 0};
+    EXPECT_EQ(model.choose(load, 1, source0, 0, 1).cluster, 0);
+    load.free[0] = load.idle[0] = 0;
+    EXPECT_EQ(model.choose(load, 1, source0, 0, 1).cluster, 0);
 }

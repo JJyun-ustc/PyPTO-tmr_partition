@@ -795,38 +795,7 @@ void SchedulerContext::dispatch_ready_tasks(
         );
     }
     trace_stage(4);
-    if (!adaptive || entered_drain) return;
-    auto &clock = steal_clocks_[thread_idx];
-    ++clock.loop;
-    if ((clock.loop & (simpler::tmr::PARTITION_STEAL_CHECK_LOOPS - 1)) ||
-        static_cast<int32_t>(clock.loop - clock.next) < 0)
-        return;
-    auto &feedback = sched_->placement_feedback;
-    auto &stats = feedback.threads[thread_idx];
-    ++stats.steal_checks;
-    int other = 1 - cluster;
-    for (ResourceShape shape : {ResourceShape::MIX, ResourceShape::AIC, ResourceShape::AIV}) {
-        int i = static_cast<int>(shape);
-        if (!tracker.get_dispatchable_cores(shape, CoreTracker::DispatchPhase::IDLE).has_value()) continue;
-        uint64_t local = sched_->cluster_ready_queues[cluster][i].size() +
-                         sched_->auto_ready_queues[cluster][i].size() + sched_->ready_queues[i].size() +
-                         sched_->ready_sync_queues[i].size();
-        uint64_t remote_depth = sched_->auto_ready_queues[other][i].size();
-        if (!simpler::tmr::partition_may_steal(
-                local, remote_depth, feedback.schedulers[cluster], feedback.schedulers[other]
-            ))
-            continue;
-        ++stats.steal_attempts;
-        // One attempt per cooldown; a raced/empty pop is harmless. Popped work
-        // is dispatched directly and is never enqueued onto the borrowing side.
-        clock.next = clock.loop + simpler::tmr::PARTITION_STEAL_COOLDOWN_LOOPS;
-        dispatch_shape(
-            thread_idx, sched_->auto_ready_queues[other], shape, CoreTracker::DispatchPhase::IDLE, tracker,
-            entered_drain, made_progress, try_pushed, true
-        );
-        break;
-    }
-    trace_stage(7);
+
 }
 
 // Stage the ALREADY-CLAIMED range [start, start+count) of consumer `c` onto
