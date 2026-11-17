@@ -1,14 +1,15 @@
 # PyPTO TMR：AICPU cluster 二分放置实验
 
-本仓库保存基于完整 PyPTO 系统的 Ascend 910B2 AICPU cluster 放置研究。
-最新 v7 采用有界小组偏好复用、ready 时最终绑定、低频单写者摘要和受限跨侧领取。
+本仓库保存完整 PyPTO 系统上的 Ascend 910B2 AICPU cluster 放置研究。
+当前 v8 删除跨侧领取，采用小组偏好复用、ready 延迟绑定、低频摘要和三项评分。
 这里的 cluster 是 **AICPU cluster**，不是 AI Core 组。
 
-- [完整算法与状态记账](docs/zh/experiments/tmr-cluster/algorithm.md)
-- [中文实验说明](docs/zh/experiments/tmr-cluster/experiment.md)
+- [完整算法、队列和状态记账](docs/zh/experiments/tmr-cluster/algorithm.md)
+- [中文实验说明与历史比较](docs/zh/experiments/tmr-cluster/experiment.md)
+- [Paged Attention：等长与长短混合依赖负载](docs/zh/experiments/tmr-cluster/paged-attention.md)
 - [环境与复现步骤](docs/zh/experiments/tmr-cluster/environment.md)
-- [Python 环境版本记录](docs/zh/experiments/tmr-cluster/environment-observed.json)
-- [2026-11-16 原始结果与逐轮数据](official-results/v7-control-20261116/summary.json)
+- [BGEMM 权重消融原始结果](official-results/v8-no-pickup-20261117/summary.json)
+- [Paged Attention 全部逐轮数据](official-results/v9-paged-attention-20261117/paired/summary.json)
 - [源码来源与版本](docs/zh/experiments/tmr-cluster/source-provenance.json)
 
 ## 获取完整代码
@@ -18,28 +19,26 @@ git clone --recurse-submodules https://github.com/JJyun-ustc/PyPTO-tmr_partition
 cd PyPTO-tmr_partition
 ```
 
-`main` 保存 PyPTO；同一 GitHub 仓库的 `runtime-snapshot` 分支保存完整修改后的
-runtime。`main` 的 runtime 子模块固定引用该分支的具体提交。此布局保留 PyPTO
-原有 runtime 版本一致性检查，核心改动不会仅存在于无法取得的本地子模块里。
-第三方 libbacktrace、msgpack-c 保留各自上游及固定版本，许可证随源码保留。
+`main` 保存 PyPTO；同仓库 `runtime-snapshot` 分支保存完整修改后的 runtime。
+main 的 runtime 子模块固定引用其具体提交。第三方来源和许可证随源码保留。
 
-## 当前结论
+## 最新补充测试
 
-当前卡上重新配对测量，各策略 30 轮、两批反序，单位为 device_wall 中位数：
+Shared 也是六线程、两个 AICPU cluster、O=CPU7，普通任务使用全局共享队列。
+同二进制配对 Paged Attention，每策略 30 轮、两批反序，device_wall 中位数：
 
-| 规模 | v6 自动策略 | v7 自动策略 | v7 Shared | v7 自动相对 Shared |
-| --- | ---: | ---: | ---: | ---: |
-| Case0，1000 节点 | 1.199 ms | 1.013 ms | 1.050 ms | −3.60% |
-| Scale，4096 节点 | 5.783 ms | 3.915 ms | 4.820 ms | −18.79% |
+| 负载 | Shared | v8 Auto | Auto 变化 |
+| --- | ---: | ---: | ---: |
+| 等长，2048 节点 | 2.42840 ms | 2.15587 ms | −11.22% |
+| 长短混合，2720 节点 | 3.25837 ms | 2.88967 ms | −11.32% |
 
-v7 自动策略相对本轮新鲜 v6 基线降低 15.58% / 32.31%。分阶段结果显示主要改善
-出现在低频摘要组合；延迟绑定单独叠加未显示收益，跨侧领取尚无独立加速证据。
-190 个相关 C++ 测试、15 个板上回归通过；仿真场景因缺少 g++-15 未完成。
-实验未持有独占设备锁；不合并不同卡的历史数据，O 始终固定在 CPU 7。
+四个用例通过正确性检查。长短混合的 Auto p95 比 Shared 高约 2.47%，
+独立诊断 O submit 也更高；不能只凭中位数推断尾部或控制路径均已改善。
+BGEMM 消融、额外配置与 190 项 C++ / 15 项板上回归证据见实验说明。
+仿真场景因缺少 g++-15 未完成，设备实验未持有独占锁，未进行 O 位置对照。
 
-环境文件记录依赖、工具链和复现步骤，不是容器镜像或系统磁盘备份。
-虚拟环境、缓存、编译产物和凭据不随源码上传；驱动/CANN 需要在目标机器另行安装。
-研究代码沿用上游 CANN Open Software License Agreement Version 2.0，见 [LICENSE](LICENSE)。
+环境记录包含依赖与工具链版本，不是容器或磁盘镜像。虚拟环境、缓存、编译产物和
+凭据不上传；驱动/CANN 需在目标环境另行安装。许可证见 [LICENSE](LICENSE)。
 
 ---
 

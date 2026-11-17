@@ -1,0 +1,28 @@
+{
+  "reference": "no-pickup",
+  "primary_candidates": [
+    "queue-future",
+    "waves"
+  ],
+  "normalization": "automatic / same-binary Shared median",
+  "material_regression_guard": 1.02,
+  "heldout_families": [
+    "Heavy",
+    "Deep"
+  ],
+  "heldout_parameters": {
+    "Heavy": {
+      "matmul_add_task_num": 256,
+      "incore_data_size": 128,
+      "incore_loop": 8,
+      "grid_k": 2
+    },
+    "Deep": {
+      "matmul_add_task_num": 512,
+      "incore_data_size": 64,
+      "incore_loop": 2,
+      "grid_k": 8
+    }
+  },
+  "interpretation": "local engineering guard, not a statistical noninferiority claim or universal optimum"
+}

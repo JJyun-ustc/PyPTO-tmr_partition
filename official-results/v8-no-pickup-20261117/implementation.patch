@@ -1,0 +1,129 @@
+--- a/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/aicpu_cluster_partition.h
++++ b/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/aicpu_cluster_partition.h
+@@ -25,9 +25,9 @@
+ constexpr uint32_t PARTITION_STEAL_COOLDOWN_LOOPS = 128;
+ constexpr uint64_t PARTITION_QUEUE_WEIGHT_NUM = 1;
+ constexpr uint64_t PARTITION_QUEUE_WEIGHT_DEN = 2;
+-constexpr uint64_t PARTITION_RESOURCE_WEIGHT_NUM = 1;
++constexpr uint64_t PARTITION_RESOURCE_WEIGHT_NUM = 0;
+ constexpr uint64_t PARTITION_RESOURCE_WEIGHT_DEN = 4;
+-constexpr uint64_t PARTITION_EXTRA_REMOTE_WAIT_NS = 128;
++constexpr uint64_t PARTITION_EXTRA_REMOTE_WAIT_NS = 0;
+ constexpr uint64_t PARTITION_FUTURE_WEIGHT_DEN = 4;
+ 
+ struct AdaptiveTaskState {
+--- a/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler_dispatch.cpp
++++ b/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler_dispatch.cpp
+@@ -795,38 +795,7 @@
+         );
+     }
+     trace_stage(4);
+-    if (!adaptive || entered_drain) return;
+-    auto &clock = steal_clocks_[thread_idx];
+-    ++clock.loop;
+-    if ((clock.loop & (simpler::tmr::PARTITION_STEAL_CHECK_LOOPS - 1)) ||
+-        static_cast<int32_t>(clock.loop - clock.next) < 0)
+-        return;
+-    auto &feedback = sched_->placement_feedback;
+-    auto &stats = feedback.threads[thread_idx];
+-    ++stats.steal_checks;
+-    int other = 1 - cluster;
+-    for (ResourceShape shape : {ResourceShape::MIX, ResourceShape::AIC, ResourceShape::AIV}) {
+-        int i = static_cast<int>(shape);
+-        if (!tracker.get_dispatchable_cores(shape, CoreTracker::DispatchPhase::IDLE).has_value()) continue;
+-        uint64_t local = sched_->cluster_ready_queues[cluster][i].size() +
+-                         sched_->auto_ready_queues[cluster][i].size() + sched_->ready_queues[i].size() +
+-                         sched_->ready_sync_queues[i].size();
+-        uint64_t remote_depth = sched_->auto_ready_queues[other][i].size();
+-        if (!simpler::tmr::partition_may_steal(
+-                local, remote_depth, feedback.schedulers[cluster], feedback.schedulers[other]
+-            ))
+-            continue;
+-        ++stats.steal_attempts;
+-        // One attempt per cooldown; a raced/empty pop is harmless. Popped work
+-        // is dispatched directly and is never enqueued onto the borrowing side.
+-        clock.next = clock.loop + simpler::tmr::PARTITION_STEAL_COOLDOWN_LOOPS;
+-        dispatch_shape(
+-            thread_idx, sched_->auto_ready_queues[other], shape, CoreTracker::DispatchPhase::IDLE, tracker,
+-            entered_drain, made_progress, try_pushed, true
+-        );
+-        break;
+-    }
+-    trace_stage(7);
++
+ }
+ 
+ // Stage the ALREADY-CLAIMED range [start, start+count) of consumer `c` onto
+--- a/tests/ut/cpp/a2a3/runtime/test_cluster_partitioner.cpp
++++ b/tests/ut/cpp/a2a3/runtime/test_cluster_partitioner.cpp
+@@ -60,7 +60,7 @@
+     EXPECT_EQ(model.choose(load, 0, none, 0, 1).cluster, 0);
+     EXPECT_EQ(model.choose(load, 1, source0, 0, 1).cluster, 1);
+ }
+-TEST(ClusterPartitioner, QueueResourceAndExtraRemoteEdgesHaveSeparateWeights) {
++TEST(ClusterPartitioner, QueueAndFutureDoNotDoubleCountResourceAndExtraEdges) {
+     ClusterPartitioner model;
+     mature(model);
+     auto load = idle_load();
+@@ -69,15 +69,15 @@
+     load.idle[0] = 10;
+     uint32_t source0[2]{1, 0};
+     auto decision = model.choose(load, 1, source0, 0, 1);
+-    EXPECT_EQ(decision.score_ns[0], 2025u);
++    EXPECT_EQ(decision.score_ns[0], 1275u);
+     EXPECT_EQ(decision.score_ns[1], 775u);
+     uint32_t three_remote[2]{3, 0};
+     auto multi = model.choose(load, 3, three_remote, 0, 1);
+-    EXPECT_EQ(multi.score_ns[1], 1031u);
+-    EXPECT_EQ(multi.score_ns[0], 2025u);
++    EXPECT_EQ(multi.score_ns[1], 775u);
++    EXPECT_EQ(multi.score_ns[0], 1275u);
+     model.weights[0].dependency[1][1] = 1000;
+     uint32_t mixed[2]{2, 1};
+-    EXPECT_EQ(model.choose(load, 3, mixed, 0, 1).score_ns[1], 1281u);
++    EXPECT_EQ(model.choose(load, 3, mixed, 0, 1).score_ns[1], 1025u);
+ }
+ TEST(ClusterPartitioner, FutureReservationsNormalizeCapacityAndBoundDistantWork) {
+     auto load = idle_load();
+@@ -368,28 +368,30 @@
+     EXPECT_EQ(final.ready[1], 16u);
+ }
+ 
+-TEST(ClusterPartitioner, BorrowingDebitsQueueSideIndependentlyOfExecutionSide) {
++TEST(ClusterPartitioner, FinalQueueAccountingIsIndependentOfPreference) {
+     PartitionShared shared;
+     shared.schedulers[0] = 2;
+     shared.schedulers[1] = 3;
+     ClusterPartitioner model;
+     model.assigned[0][0] = 16;
+-    // O prefers 0, a releasing S queues on 1, and a cluster-0 S borrows six.
++    // O prefers 0, readiness binds to 1, and a cluster-1 S dispatches six.
+     auto &publisher = shared.threads[2].summary[0];
+     publisher.released[0].store(16);
+     publisher.queued[1].store(16);
+-    shared.threads[0].summary[0].taken[1].store(6);
+-    shared.threads[0].started[0].store(6);
++    shared.threads[2].summary[0].taken[1].store(6);
++    shared.threads[2].started[0].store(6);
+     auto load = model.load(shared, 0);
+     EXPECT_EQ(load.blocked[0] + load.blocked[1], 0u);
+     EXPECT_EQ(load.ready[0], 0u);
+     EXPECT_EQ(load.ready[1], 10u);
+ }
+ 
+-TEST(ClusterPartitioner, BorrowingRequiresIdleLocalQueueAndSubstantialRemoteBacklog) {
+-    EXPECT_FALSE(partition_may_steal(0, 7, 2, 3));
+-    EXPECT_TRUE(partition_may_steal(0, 8, 2, 3));
+-    EXPECT_FALSE(partition_may_steal(1, 100, 2, 3));
+-    EXPECT_FALSE(partition_may_steal(0, 100, 2, 0));
+-    EXPECT_FALSE(partition_may_steal(0, 100, 0, 3));
+-}
++TEST(ClusterPartitioner, BusyHintAloneDoesNotOverrideHandoffWithEmptyQueues) {
++    ClusterPartitioner model;
++    mature(model);
++    auto load = idle_load();
++    uint32_t source0[2]{1, 0};
++    EXPECT_EQ(model.choose(load, 1, source0, 0, 1).cluster, 0);
++    load.free[0] = load.idle[0] = 0;
++    EXPECT_EQ(model.choose(load, 1, source0, 0, 1).cluster, 0);
++}

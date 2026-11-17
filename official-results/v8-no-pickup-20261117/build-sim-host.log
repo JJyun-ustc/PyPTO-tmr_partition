@@ -1,0 +1,264 @@
+[1/7] Building CXX object CMakeFiles/host_runtime.dir/data/aicpu-cluster-study/official-worktree/runtime/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/shared/runtime.cpp.o
+[2/7] Building CXX object CMakeFiles/host_runtime.dir/data/aicpu-cluster-study/official-worktree/runtime/src/a2a3/runtime/tensormap_and_ringbuffer/host/runtime_maker.cpp.o
+In file included from /data/aicpu-cluster-study/official-worktree/runtime/src/a2a3/runtime/tensormap_and_ringbuffer/host/../../../../common/runtime_status/error_log.h:38,
+                 from /data/aicpu-cluster-study/official-worktree/runtime/src/a2a3/runtime/tensormap_and_ringbuffer/host/runtime_maker.cpp:56:
+/data/aicpu-cluster-study/official-worktree/runtime/src/a2a3/runtime/tensormap_and_ringbuffer/host/../../../../common/runtime_status/error_names.h: In function ‘const char* latched_error_field(int32_t, int32_t)’:
+/data/aicpu-cluster-study/official-worktree/runtime/src/a2a3/runtime/tensormap_and_ringbuffer/host/../../../../common/runtime_status/error_names.h:209:80: warning: unused parameter ‘sched_error_code’ [-Wunused-parameter]
+  209 | static inline const char *latched_error_field(int32_t orch_error_code, int32_t sched_error_code) {
+      |                                                                        ~~~~~~~~^~~~~~~~~~~~~~~~
+/data/aicpu-cluster-study/official-worktree/runtime/src/a2a3/runtime/tensormap_and_ringbuffer/host/runtime_maker.cpp: In function ‘int copy_back_run_outputs_impl(const Runtime*, const HostApi*, int, int)’:
+/data/aicpu-cluster-study/official-worktree/runtime/src/a2a3/runtime/tensormap_and_ringbuffer/host/runtime_maker.cpp:1034:11: warning: ‘void* memset(void*, int, size_t)’ clearing an object of type ‘struct SharedMemoryHeader’ with no trivial copy-assignment; use value-initialization instead [-Wclass-memaccess]
+ 1034 |     memset(&host_header, 0, sizeof(host_header));
+      |     ~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+In file included from /data/aicpu-cluster-study/official-worktree/runtime/src/a2a3/runtime/tensormap_and_ringbuffer/host/../runtime/runtime_core.h:40,
+                 from /data/aicpu-cluster-study/official-worktree/runtime/src/a2a3/runtime/tensormap_and_ringbuffer/host/runtime_maker.cpp:53:
+/data/aicpu-cluster-study/official-worktree/runtime/src/a2a3/runtime/tensormap_and_ringbuffer/host/../runtime/shared_memory.h:128:33: note: ‘struct SharedMemoryHeader’ declared here
+  128 | struct alignas(CHIP_ALIGN_SIZE) SharedMemoryHeader {
+      |                                 ^~~~~~~~~~~~~~~~~~
+[3/7] Building CXX object CMakeFiles/host_runtime.dir/data/aicpu-cluster-study/official-worktree/runtime/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/shared/runtime_init.cpp.o
+/data/aicpu-cluster-study/official-worktree/runtime/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/shared/runtime_init.cpp: In function ‘RuntimeContext* runtime_init_data_from_layout(DeviceArena&, const RuntimeArenaLayout&, RuntimeMode, void*, uint64_t, void*, const uint64_t*)’:
+/data/aicpu-cluster-study/official-worktree/runtime/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/shared/runtime_init.cpp:627:11: warning: ‘void* memset(void*, int, size_t)’ clearing an object of type ‘RuntimeContext’ {aka ‘struct RuntimeContext’} with no trivial copy-assignment; use value-initialization instead [-Wclass-memaccess]
+  627 |     memset(rt, 0, sizeof(*rt));
+      |     ~~~~~~^~~~~~~~~~~~~~~~~~~~
+In file included from /data/aicpu-cluster-study/official-worktree/runtime/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/shared/runtime_init.cpp:28:
+/data/aicpu-cluster-study/official-worktree/runtime/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/runtime_core.h:155:8: note: ‘RuntimeContext’ {aka ‘struct RuntimeContext’} declared here
+  155 | struct RuntimeContext {
+      |        ^~~~~~~~~~~~~~
+/data/aicpu-cluster-study/official-worktree/runtime/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/shared/runtime_init.cpp:653:11: warning: ‘void* memset(void*, int, size_t)’ clearing an object of type ‘struct AICoreCompletionMailbox’ with no trivial copy-assignment; use value-initialization instead [-Wclass-memaccess]
+  653 |     memset(mailbox, 0, sizeof(*mailbox));
+      |     ~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+In file included from /data/aicpu-cluster-study/official-worktree/runtime/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/runtime_types.h:37,
+                 from /data/aicpu-cluster-study/official-worktree/runtime/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/ring_buffer.h:41,
+                 from /data/aicpu-cluster-study/official-worktree/runtime/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/orchestrator.h:32,
+                 from /data/aicpu-cluster-study/official-worktree/runtime/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/shared/runtime_init.cpp:27:
+/data/aicpu-cluster-study/official-worktree/runtime/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/aicore_completion_mailbox.h:90:8: note: ‘struct AICoreCompletionMailbox’ declared here
+   90 | struct AICoreCompletionMailbox {
+      |        ^~~~~~~~~~~~~~~~~~~~~~~
+[4/7] Building CXX object CMakeFiles/host_runtime.dir/data/aicpu-cluster-study/official-worktree/runtime/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/shared/shared_memory.cpp.o
+[5/7] Building CXX object CMakeFiles/host_runtime.dir/data/aicpu-cluster-study/official-worktree/runtime/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/shared/tensormap.cpp.o
+[6/7] Building CXX object CMakeFiles/host_runtime.dir/data/aicpu-cluster-study/official-worktree/runtime/src/common/tensormap_and_ringbuffer/host/dep_gen_replay.cpp.o
+/data/aicpu-cluster-study/official-worktree/runtime/src/common/tensormap_and_ringbuffer/host/dep_gen_replay.cpp: In function ‘const char* {anonymous}::arg_type_str(TensorArgType)’:
+/data/aicpu-cluster-study/official-worktree/runtime/src/common/tensormap_and_ringbuffer/host/dep_gen_replay.cpp:500:12: warning: enumeration value ‘NO_DEP’ not handled in switch [-Wswitch]
+  500 |     switch (t) {
+      |            ^
+/data/aicpu-cluster-study/official-worktree/runtime/src/common/tensormap_and_ringbuffer/host/dep_gen_replay.cpp: In function ‘int {anonymous}::emit_deps_json_body(const DepGenRecord*, size_t, const char*, const Charger&)’:
+/data/aicpu-cluster-study/official-worktree/runtime/src/common/tensormap_and_ringbuffer/host/dep_gen_replay.cpp:815:16: warning: ‘void* memset(void*, int, size_t)’ clearing an object of non-trivial type ‘struct ChipTensorMap’; use assignment or value-initialization instead [-Wclass-memaccess]
+  815 |     std::memset(&tm_oracle, 0, sizeof(tm_oracle));
+      |     ~~~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+In file included from /data/aicpu-cluster-study/official-worktree/runtime/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/dep_compute.h:52,
+                 from /data/aicpu-cluster-study/official-worktree/runtime/src/common/tensormap_and_ringbuffer/host/dep_gen_replay.cpp:78:
+/data/aicpu-cluster-study/official-worktree/runtime/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/tensormap.h:346:8: note: ‘struct ChipTensorMap’ declared here
+  346 | struct ChipTensorMap {
+      |        ^~~~~~~~~~~~~
+/data/aicpu-cluster-study/official-worktree/runtime/src/common/tensormap_and_ringbuffer/host/dep_gen_replay.cpp:816:16: warning: ‘void* memset(void*, int, size_t)’ clearing an object of non-trivial type ‘struct ChipTensorMap’; use assignment or value-initialization instead [-Wclass-memaccess]
+  816 |     std::memset(&tm_annot, 0, sizeof(tm_annot));
+      |     ~~~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/data/aicpu-cluster-study/official-worktree/runtime/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/tensormap.h:346:8: note: ‘struct ChipTensorMap’ declared here
+  346 | struct ChipTensorMap {
+      |        ^~~~~~~~~~~~~
+In file included from /usr/include/c++/12/vector:64,
+                 from /data/aicpu-cluster-study/official-worktree/runtime/src/common/tensormap_and_ringbuffer/host/dep_gen_replay.cpp:73:
+In destructor ‘std::_Vector_base<_Tp, _Alloc>::~_Vector_base() [with _Tp = {anonymous}::TaskArgEntry; _Alloc = {anonymous}::ChargedAlloc<{anonymous}::TaskArgEntry>]’,
+    inlined from ‘std::vector<_Tp, _Alloc>::~vector() [with _Tp = {anonymous}::TaskArgEntry; _Alloc = {anonymous}::ChargedAlloc<{anonymous}::TaskArgEntry>]’ at /usr/include/c++/12/bits/stl_vector.h:733:7,
+    inlined from ‘{anonymous}::TaskTableEntry::~TaskTableEntry()’ at /data/aicpu-cluster-study/official-worktree/runtime/src/common/tensormap_and_ringbuffer/host/dep_gen_replay.cpp:490:8,
+    inlined from ‘constexpr void std::_Destroy(_Tp*) [with _Tp = {anonymous}::TaskTableEntry]’ at /usr/include/c++/12/bits/stl_construct.h:151:22,
+    inlined from ‘static constexpr void std::allocator_traits< <template-parameter-1-1> >::_S_destroy(_Alloc2&, _Tp*, ...) [with _Alloc2 = {anonymous}::ChargedAlloc<{anonymous}::TaskTableEntry>; _Tp = {anonymous}::TaskTableEntry; _Alloc = {anonymous}::ChargedAlloc<{anonymous}::TaskTableEntry>]’ at /usr/include/c++/12/bits/alloc_traits.h:278:17,
+    inlined from ‘static void std::allocator_traits< <template-parameter-1-1> >::destroy(_Alloc&, _Tp*) [with _Tp = {anonymous}::TaskTableEntry; _Alloc = {anonymous}::ChargedAlloc<{anonymous}::TaskTableEntry>]’ at /usr/include/c++/12/bits/alloc_traits.h:378:14,
+    inlined from ‘void std::_Destroy(_ForwardIterator, _ForwardIterator, _Allocator&) [with _ForwardIterator = {anonymous}::TaskTableEntry*; _Allocator = {anonymous}::ChargedAlloc<{anonymous}::TaskTableEntry>]’ at /usr/include/c++/12/bits/alloc_traits.h:839:39,
+    inlined from ‘std::vector<_Tp, _Alloc>::~vector() [with _Tp = {anonymous}::TaskTableEntry; _Alloc = {anonymous}::ChargedAlloc<{anonymous}::TaskTableEntry>]’ at /usr/include/c++/12/bits/stl_vector.h:730:15:
+/usr/include/c++/12/bits/stl_vector.h:367:49: warning: pointer may be used after ‘void operator delete(void*)’ [-Wuse-after-free]
+  367 |                       _M_impl._M_end_of_storage - _M_impl._M_start);
+      |                       ~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~~~~~
+In member function ‘void {anonymous}::ChargedAlloc<T>::deallocate(T*, size_t) [with T = {anonymous}::TaskArgEntry]’,
+    inlined from ‘static void std::allocator_traits< <template-parameter-1-1> >::deallocate(_Alloc&, pointer, size_type) [with _Alloc = {anonymous}::ChargedAlloc<{anonymous}::TaskArgEntry>]’ at /usr/include/c++/12/bits/alloc_traits.h:345:23,
+    inlined from ‘void std::_Vector_base<_Tp, _Alloc>::_M_deallocate(pointer, std::size_t) [with _Tp = {anonymous}::TaskArgEntry; _Alloc = {anonymous}::ChargedAlloc<{anonymous}::TaskArgEntry>]’ at /usr/include/c++/12/bits/stl_vector.h:387:19,
+    inlined from ‘std::_Vector_base<_Tp, _Alloc>::~_Vector_base() [with _Tp = {anonymous}::TaskArgEntry; _Alloc = {anonymous}::ChargedAlloc<{anonymous}::TaskArgEntry>]’ at /usr/include/c++/12/bits/stl_vector.h:366:15,
+    inlined from ‘std::vector<_Tp, _Alloc>::~vector() [with _Tp = {anonymous}::TaskArgEntry; _Alloc = {anonymous}::ChargedAlloc<{anonymous}::TaskArgEntry>]’ at /usr/include/c++/12/bits/stl_vector.h:733:7,
+    inlined from ‘{anonymous}::TaskTableEntry::~TaskTableEntry()’ at /data/aicpu-cluster-study/official-worktree/runtime/src/common/tensormap_and_ringbuffer/host/dep_gen_replay.cpp:490:8,
+    inlined from ‘constexpr void std::_Destroy(_Tp*) [with _Tp = {anonymous}::TaskTableEntry]’ at /usr/include/c++/12/bits/stl_construct.h:151:22,
+    inlined from ‘static constexpr void std::allocator_traits< <template-parameter-1-1> >::_S_destroy(_Alloc2&, _Tp*, ...) [with _Alloc2 = {anonymous}::ChargedAlloc<{anonymous}::TaskTableEntry>; _Tp = {anonymous}::TaskTableEntry; _Alloc = {anonymous}::ChargedAlloc<{anonymous}::TaskTableEntry>]’ at /usr/include/c++/12/bits/alloc_traits.h:278:17,
+    inlined from ‘static void std::allocator_traits< <template-parameter-1-1> >::destroy(_Alloc&, _Tp*) [with _Tp = {anonymous}::TaskTableEntry; _Alloc = {anonymous}::ChargedAlloc<{anonymous}::TaskTableEntry>]’ at /usr/include/c++/12/bits/alloc_traits.h:378:14,
+    inlined from ‘void std::_Destroy(_ForwardIterator, _ForwardIterator, _Allocator&) [with _ForwardIterator = {anonymous}::TaskTableEntry*; _Allocator = {anonymous}::ChargedAlloc<{anonymous}::TaskTableEntry>]’ at /usr/include/c++/12/bits/alloc_traits.h:839:39,
+    inlined from ‘std::vector<_Tp, _Alloc>::~vector() [with _Tp = {anonymous}::TaskTableEntry; _Alloc = {anonymous}::ChargedAlloc<{anonymous}::TaskTableEntry>]’ at /usr/include/c++/12/bits/stl_vector.h:730:15:
+/data/aicpu-cluster-study/official-worktree/runtime/src/common/tensormap_and_ringbuffer/host/dep_gen_replay.cpp:156:26: note: call to ‘void operator delete(void*)’ here
+  156 |         ::operator delete(static_cast<void *>(p));
+      |         ~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~
+In destructor ‘std::_Vector_base<_Tp, _Alloc>::~_Vector_base() [with _Tp = {anonymous}::TaskTableEntry; _Alloc = {anonymous}::ChargedAlloc<{anonymous}::TaskTableEntry>]’,
+    inlined from ‘std::vector<_Tp, _Alloc>::~vector() [with _Tp = {anonymous}::TaskTableEntry; _Alloc = {anonymous}::ChargedAlloc<{anonymous}::TaskTableEntry>]’ at /usr/include/c++/12/bits/stl_vector.h:733:7:
+/usr/include/c++/12/bits/stl_vector.h:367:49: warning: pointer may be used after ‘void operator delete(void*)’ [-Wuse-after-free]
+  367 |                       _M_impl._M_end_of_storage - _M_impl._M_start);
+      |                       ~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~~~~~
+In member function ‘void {anonymous}::ChargedAlloc<T>::deallocate(T*, size_t) [with T = {anonymous}::TaskTableEntry]’,
+    inlined from ‘static void std::allocator_traits< <template-parameter-1-1> >::deallocate(_Alloc&, pointer, size_type) [with _Alloc = {anonymous}::ChargedAlloc<{anonymous}::TaskTableEntry>]’ at /usr/include/c++/12/bits/alloc_traits.h:345:23,
+    inlined from ‘void std::_Vector_base<_Tp, _Alloc>::_M_deallocate(pointer, std::size_t) [with _Tp = {anonymous}::TaskTableEntry; _Alloc = {anonymous}::ChargedAlloc<{anonymous}::TaskTableEntry>]’ at /usr/include/c++/12/bits/stl_vector.h:387:19,
+    inlined from ‘std::_Vector_base<_Tp, _Alloc>::~_Vector_base() [with _Tp = {anonymous}::TaskTableEntry; _Alloc = {anonymous}::ChargedAlloc<{anonymous}::TaskTableEntry>]’ at /usr/include/c++/12/bits/stl_vector.h:366:15,
+    inlined from ‘std::vector<_Tp, _Alloc>::~vector() [with _Tp = {anonymous}::TaskTableEntry; _Alloc = {anonymous}::ChargedAlloc<{anonymous}::TaskTableEntry>]’ at /usr/include/c++/12/bits/stl_vector.h:733:7:
+/data/aicpu-cluster-study/official-worktree/runtime/src/common/tensormap_and_ringbuffer/host/dep_gen_replay.cpp:156:26: note: call to ‘void operator delete(void*)’ here
+  156 |         ::operator delete(static_cast<void *>(p));
+      |         ~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~
+In file included from /usr/include/c++/12/vector:70:
+In member function ‘void std::vector<_Tp, _Alloc>::_M_realloc_insert(iterator, _Args&& ...) [with _Args = {const {anonymous}::TensorTableEntry&}; _Tp = {anonymous}::TensorTableEntry; _Alloc = {anonymous}::ChargedAlloc<{anonymous}::TensorTableEntry>]’,
+    inlined from ‘void std::vector<_Tp, _Alloc>::push_back(const value_type&) [with _Tp = {anonymous}::TensorTableEntry; _Alloc = {anonymous}::ChargedAlloc<{anonymous}::TensorTableEntry>]’ at /usr/include/c++/12/bits/stl_vector.h:1287:21,
+    inlined from ‘uint64_t {anonymous}::register_tensor(ChargedMap<long unsigned int, long unsigned int>&, ChargedVec<TensorTableEntry>&, const simpler::tmr::Tensor&)’ at /data/aicpu-cluster-study/official-worktree/runtime/src/common/tensormap_and_ringbuffer/host/dep_gen_replay.cpp:554:20:
+/usr/include/c++/12/bits/vector.tcc:514:53: warning: pointer may be used after ‘void operator delete(void*)’ [-Wuse-after-free]
+  514 |                     this->_M_impl._M_end_of_storage - __old_start);
+      |                     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~
+In member function ‘void {anonymous}::ChargedAlloc<T>::deallocate(T*, size_t) [with T = {anonymous}::TensorTableEntry]’,
+    inlined from ‘static void std::allocator_traits< <template-parameter-1-1> >::deallocate(_Alloc&, pointer, size_type) [with _Alloc = {anonymous}::ChargedAlloc<{anonymous}::TensorTableEntry>]’ at /usr/include/c++/12/bits/alloc_traits.h:345:23,
+    inlined from ‘void std::_Vector_base<_Tp, _Alloc>::_M_deallocate(pointer, std::size_t) [with _Tp = {anonymous}::TensorTableEntry; _Alloc = {anonymous}::ChargedAlloc<{anonymous}::TensorTableEntry>]’ at /usr/include/c++/12/bits/stl_vector.h:387:19,
+    inlined from ‘void std::vector<_Tp, _Alloc>::_M_realloc_insert(iterator, _Args&& ...) [with _Args = {const {anonymous}::TensorTableEntry&}; _Tp = {anonymous}::TensorTableEntry; _Alloc = {anonymous}::ChargedAlloc<{anonymous}::TensorTableEntry>]’ at /usr/include/c++/12/bits/vector.tcc:513:20,
+    inlined from ‘void std::vector<_Tp, _Alloc>::push_back(const value_type&) [with _Tp = {anonymous}::TensorTableEntry; _Alloc = {anonymous}::ChargedAlloc<{anonymous}::TensorTableEntry>]’ at /usr/include/c++/12/bits/stl_vector.h:1287:21,
+    inlined from ‘uint64_t {anonymous}::register_tensor(ChargedMap<long unsigned int, long unsigned int>&, ChargedVec<TensorTableEntry>&, const simpler::tmr::Tensor&)’ at /data/aicpu-cluster-study/official-worktree/runtime/src/common/tensormap_and_ringbuffer/host/dep_gen_replay.cpp:554:20:
+/data/aicpu-cluster-study/official-worktree/runtime/src/common/tensormap_and_ringbuffer/host/dep_gen_replay.cpp:156:26: note: call to ‘void operator delete(void*)’ here
+  156 |         ::operator delete(static_cast<void *>(p));
+      |         ~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~
+In member function ‘void std::vector<_Tp, _Alloc>::reserve(size_type) [with _Tp = {anonymous}::EdgeAnnot; _Alloc = {anonymous}::ChargedAlloc<{anonymous}::EdgeAnnot>]’,
+    inlined from ‘int {anonymous}::emit_deps_json_body(const DepGenRecord*, size_t, const char*, const Charger&)’ at /data/aicpu-cluster-study/official-worktree/runtime/src/common/tensormap_and_ringbuffer/host/dep_gen_replay.cpp:858:73:
+/usr/include/c++/12/bits/vector.tcc:95:25: warning: pointer may be used after ‘void operator delete(void*)’ [-Wuse-after-free]
+   94 |                         this->_M_impl._M_end_of_storage
+      |                         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   95 |                         - this->_M_impl._M_start);
+      |                         ^~~~~~~~~~~~~~~~~~~~~~~~
+In member function ‘void {anonymous}::ChargedAlloc<T>::deallocate(T*, size_t) [with T = {anonymous}::EdgeAnnot]’,
+    inlined from ‘static void std::allocator_traits< <template-parameter-1-1> >::deallocate(_Alloc&, pointer, size_type) [with _Alloc = {anonymous}::ChargedAlloc<{anonymous}::EdgeAnnot>]’ at /usr/include/c++/12/bits/alloc_traits.h:345:23,
+    inlined from ‘void std::_Vector_base<_Tp, _Alloc>::_M_deallocate(pointer, std::size_t) [with _Tp = {anonymous}::EdgeAnnot; _Alloc = {anonymous}::ChargedAlloc<{anonymous}::EdgeAnnot>]’ at /usr/include/c++/12/bits/stl_vector.h:387:19,
+    inlined from ‘void std::vector<_Tp, _Alloc>::reserve(size_type) [with _Tp = {anonymous}::EdgeAnnot; _Alloc = {anonymous}::ChargedAlloc<{anonymous}::EdgeAnnot>]’ at /usr/include/c++/12/bits/vector.tcc:93:17,
+    inlined from ‘int {anonymous}::emit_deps_json_body(const DepGenRecord*, size_t, const char*, const Charger&)’ at /data/aicpu-cluster-study/official-worktree/runtime/src/common/tensormap_and_ringbuffer/host/dep_gen_replay.cpp:858:73:
+/data/aicpu-cluster-study/official-worktree/runtime/src/common/tensormap_and_ringbuffer/host/dep_gen_replay.cpp:156:26: note: call to ‘void operator delete(void*)’ here
+  156 |         ::operator delete(static_cast<void *>(p));
+      |         ~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~
+In member function ‘void std::vector<_Tp, _Alloc>::_M_realloc_insert(iterator, _Args&& ...) [with _Args = {const {anonymous}::TaskArgEntry&}; _Tp = {anonymous}::TaskArgEntry; _Alloc = {anonymous}::ChargedAlloc<{anonymous}::TaskArgEntry>]’,
+    inlined from ‘void std::vector<_Tp, _Alloc>::push_back(const value_type&) [with _Tp = {anonymous}::TaskArgEntry; _Alloc = {anonymous}::ChargedAlloc<{anonymous}::TaskArgEntry>]’ at /usr/include/c++/12/bits/stl_vector.h:1287:21,
+    inlined from ‘int {anonymous}::emit_deps_json_body(const DepGenRecord*, size_t, const char*, const Charger&)’ at /data/aicpu-cluster-study/official-worktree/runtime/src/common/tensormap_and_ringbuffer/host/dep_gen_replay.cpp:1035:38:
+/usr/include/c++/12/bits/vector.tcc:514:53: warning: pointer may be used after ‘void operator delete(void*)’ [-Wuse-after-free]
+  514 |                     this->_M_impl._M_end_of_storage - __old_start);
+      |                     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~
+In member function ‘void {anonymous}::ChargedAlloc<T>::deallocate(T*, size_t) [with T = {anonymous}::TaskArgEntry]’,
+    inlined from ‘static void std::allocator_traits< <template-parameter-1-1> >::deallocate(_Alloc&, pointer, size_type) [with _Alloc = {anonymous}::ChargedAlloc<{anonymous}::TaskArgEntry>]’ at /usr/include/c++/12/bits/alloc_traits.h:345:23,
+    inlined from ‘void std::_Vector_base<_Tp, _Alloc>::_M_deallocate(pointer, std::size_t) [with _Tp = {anonymous}::TaskArgEntry; _Alloc = {anonymous}::ChargedAlloc<{anonymous}::TaskArgEntry>]’ at /usr/include/c++/12/bits/stl_vector.h:387:19,
+    inlined from ‘void std::vector<_Tp, _Alloc>::_M_realloc_insert(iterator, _Args&& ...) [with _Args = {const {anonymous}::TaskArgEntry&}; _Tp = {anonymous}::TaskArgEntry; _Alloc = {anonymous}::ChargedAlloc<{anonymous}::TaskArgEntry>]’ at /usr/include/c++/12/bits/vector.tcc:513:20,
+    inlined from ‘void std::vector<_Tp, _Alloc>::push_back(const value_type&) [with _Tp = {anonymous}::TaskArgEntry; _Alloc = {anonymous}::ChargedAlloc<{anonymous}::TaskArgEntry>]’ at /usr/include/c++/12/bits/stl_vector.h:1287:21,
+    inlined from ‘int {anonymous}::emit_deps_json_body(const DepGenRecord*, size_t, const char*, const Charger&)’ at /data/aicpu-cluster-study/official-worktree/runtime/src/common/tensormap_and_ringbuffer/host/dep_gen_replay.cpp:1035:38:
+/data/aicpu-cluster-study/official-worktree/runtime/src/common/tensormap_and_ringbuffer/host/dep_gen_replay.cpp:156:26: note: call to ‘void operator delete(void*)’ here
+  156 |         ::operator delete(static_cast<void *>(p));
+      |         ~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~
+In member function ‘void std::vector<_Tp, _Alloc>::_M_realloc_insert(iterator, _Args&& ...) [with _Args = {{anonymous}::TaskTableEntry}; _Tp = {anonymous}::TaskTableEntry; _Alloc = {anonymous}::ChargedAlloc<{anonymous}::TaskTableEntry>]’,
+    inlined from ‘std::vector<_Tp, _Alloc>::reference std::vector<_Tp, _Alloc>::emplace_back(_Args&& ...) [with _Args = {{anonymous}::TaskTableEntry}; _Tp = {anonymous}::TaskTableEntry; _Alloc = {anonymous}::ChargedAlloc<{anonymous}::TaskTableEntry>]’ at /usr/include/c++/12/bits/vector.tcc:123:21,
+    inlined from ‘void std::vector<_Tp, _Alloc>::push_back(value_type&&) [with _Tp = {anonymous}::TaskTableEntry; _Alloc = {anonymous}::ChargedAlloc<{anonymous}::TaskTableEntry>]’ at /usr/include/c++/12/bits/stl_vector.h:1294:21,
+    inlined from ‘int {anonymous}::emit_deps_json_body(const DepGenRecord*, size_t, const char*, const Charger&)’ at /data/aicpu-cluster-study/official-worktree/runtime/src/common/tensormap_and_ringbuffer/host/dep_gen_replay.cpp:1037:29:
+/usr/include/c++/12/bits/vector.tcc:514:53: warning: pointer may be used after ‘void operator delete(void*)’ [-Wuse-after-free]
+  514 |                     this->_M_impl._M_end_of_storage - __old_start);
+      |                     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~
+In member function ‘void {anonymous}::ChargedAlloc<T>::deallocate(T*, size_t) [with T = {anonymous}::TaskTableEntry]’,
+    inlined from ‘static void std::allocator_traits< <template-parameter-1-1> >::deallocate(_Alloc&, pointer, size_type) [with _Alloc = {anonymous}::ChargedAlloc<{anonymous}::TaskTableEntry>]’ at /usr/include/c++/12/bits/alloc_traits.h:345:23,
+    inlined from ‘void std::_Vector_base<_Tp, _Alloc>::_M_deallocate(pointer, std::size_t) [with _Tp = {anonymous}::TaskTableEntry; _Alloc = {anonymous}::ChargedAlloc<{anonymous}::TaskTableEntry>]’ at /usr/include/c++/12/bits/stl_vector.h:387:19,
+    inlined from ‘void std::vector<_Tp, _Alloc>::_M_realloc_insert(iterator, _Args&& ...) [with _Args = {{anonymous}::TaskTableEntry}; _Tp = {anonymous}::TaskTableEntry; _Alloc = {anonymous}::ChargedAlloc<{anonymous}::TaskTableEntry>]’ at /usr/include/c++/12/bits/vector.tcc:513:20,
+    inlined from ‘std::vector<_Tp, _Alloc>::reference std::vector<_Tp, _Alloc>::emplace_back(_Args&& ...) [with _Args = {{anonymous}::TaskTableEntry}; _Tp = {anonymous}::TaskTableEntry; _Alloc = {anonymous}::ChargedAlloc<{anonymous}::TaskTableEntry>]’ at /usr/include/c++/12/bits/vector.tcc:123:21,
+    inlined from ‘void std::vector<_Tp, _Alloc>::push_back(value_type&&) [with _Tp = {anonymous}::TaskTableEntry; _Alloc = {anonymous}::ChargedAlloc<{anonymous}::TaskTableEntry>]’ at /usr/include/c++/12/bits/stl_vector.h:1294:21,
+    inlined from ‘int {anonymous}::emit_deps_json_body(const DepGenRecord*, size_t, const char*, const Charger&)’ at /data/aicpu-cluster-study/official-worktree/runtime/src/common/tensormap_and_ringbuffer/host/dep_gen_replay.cpp:1037:29:
+/data/aicpu-cluster-study/official-worktree/runtime/src/common/tensormap_and_ringbuffer/host/dep_gen_replay.cpp:156:26: note: call to ‘void operator delete(void*)’ here
+  156 |         ::operator delete(static_cast<void *>(p));
+      |         ~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~
+In destructor ‘std::_Vector_base<_Tp, _Alloc>::~_Vector_base() [with _Tp = unsigned char; _Alloc = {anonymous}::ChargedAlloc<unsigned char>]’,
+    inlined from ‘std::vector<_Tp, _Alloc>::~vector() [with _Tp = unsigned char; _Alloc = {anonymous}::ChargedAlloc<unsigned char>]’ at /usr/include/c++/12/bits/stl_vector.h:733:7,
+    inlined from ‘int {anonymous}::emit_deps_json_body(const DepGenRecord*, size_t, const char*, const Charger&)’ at /data/aicpu-cluster-study/official-worktree/runtime/src/common/tensormap_and_ringbuffer/host/dep_gen_replay.cpp:1196:1:
+/usr/include/c++/12/bits/stl_vector.h:367:49: warning: pointer may be used after ‘void operator delete(void*)’ [-Wuse-after-free]
+  367 |                       _M_impl._M_end_of_storage - _M_impl._M_start);
+      |                       ~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~~~~~
+In member function ‘void {anonymous}::ChargedAlloc<T>::deallocate(T*, size_t) [with T = unsigned char]’,
+    inlined from ‘static void std::allocator_traits< <template-parameter-1-1> >::deallocate(_Alloc&, pointer, size_type) [with _Alloc = {anonymous}::ChargedAlloc<unsigned char>]’ at /usr/include/c++/12/bits/alloc_traits.h:345:23,
+    inlined from ‘void std::_Vector_base<_Tp, _Alloc>::_M_deallocate(pointer, std::size_t) [with _Tp = unsigned char; _Alloc = {anonymous}::ChargedAlloc<unsigned char>]’ at /usr/include/c++/12/bits/stl_vector.h:387:19,
+    inlined from ‘std::_Vector_base<_Tp, _Alloc>::~_Vector_base() [with _Tp = unsigned char; _Alloc = {anonymous}::ChargedAlloc<unsigned char>]’ at /usr/include/c++/12/bits/stl_vector.h:366:15,
+    inlined from ‘std::vector<_Tp, _Alloc>::~vector() [with _Tp = unsigned char; _Alloc = {anonymous}::ChargedAlloc<unsigned char>]’ at /usr/include/c++/12/bits/stl_vector.h:733:7,
+    inlined from ‘int {anonymous}::emit_deps_json_body(const DepGenRecord*, size_t, const char*, const Charger&)’ at /data/aicpu-cluster-study/official-worktree/runtime/src/common/tensormap_and_ringbuffer/host/dep_gen_replay.cpp:1196:1:
+/data/aicpu-cluster-study/official-worktree/runtime/src/common/tensormap_and_ringbuffer/host/dep_gen_replay.cpp:156:26: note: call to ‘void operator delete(void*)’ here
+  156 |         ::operator delete(static_cast<void *>(p));
+      |         ~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~
+In destructor ‘std::_Vector_base<_Tp, _Alloc>::~_Vector_base() [with _Tp = simpler::tmr::TaskId; _Alloc = {anonymous}::ChargedAlloc<simpler::tmr::TaskId>]’,
+    inlined from ‘std::vector<_Tp, _Alloc>::~vector() [with _Tp = simpler::tmr::TaskId; _Alloc = {anonymous}::ChargedAlloc<simpler::tmr::TaskId>]’ at /usr/include/c++/12/bits/stl_vector.h:733:7,
+    inlined from ‘int {anonymous}::emit_deps_json_body(const DepGenRecord*, size_t, const char*, const Charger&)’ at /data/aicpu-cluster-study/official-worktree/runtime/src/common/tensormap_and_ringbuffer/host/dep_gen_replay.cpp:1196:1:
+/usr/include/c++/12/bits/stl_vector.h:367:49: warning: pointer may be used after ‘void operator delete(void*)’ [-Wuse-after-free]
+  367 |                       _M_impl._M_end_of_storage - _M_impl._M_start);
+      |                       ~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~~~~~
+In member function ‘void {anonymous}::ChargedAlloc<T>::deallocate(T*, size_t) [with T = simpler::tmr::TaskId]’,
+    inlined from ‘static void std::allocator_traits< <template-parameter-1-1> >::deallocate(_Alloc&, pointer, size_type) [with _Alloc = {anonymous}::ChargedAlloc<simpler::tmr::TaskId>]’ at /usr/include/c++/12/bits/alloc_traits.h:345:23,
+    inlined from ‘void std::_Vector_base<_Tp, _Alloc>::_M_deallocate(pointer, std::size_t) [with _Tp = simpler::tmr::TaskId; _Alloc = {anonymous}::ChargedAlloc<simpler::tmr::TaskId>]’ at /usr/include/c++/12/bits/stl_vector.h:387:19,
+    inlined from ‘std::_Vector_base<_Tp, _Alloc>::~_Vector_base() [with _Tp = simpler::tmr::TaskId; _Alloc = {anonymous}::ChargedAlloc<simpler::tmr::TaskId>]’ at /usr/include/c++/12/bits/stl_vector.h:366:15,
+    inlined from ‘std::vector<_Tp, _Alloc>::~vector() [with _Tp = simpler::tmr::TaskId; _Alloc = {anonymous}::ChargedAlloc<simpler::tmr::TaskId>]’ at /usr/include/c++/12/bits/stl_vector.h:733:7,
+    inlined from ‘int {anonymous}::emit_deps_json_body(const DepGenRecord*, size_t, const char*, const Charger&)’ at /data/aicpu-cluster-study/official-worktree/runtime/src/common/tensormap_and_ringbuffer/host/dep_gen_replay.cpp:1196:1:
+/data/aicpu-cluster-study/official-worktree/runtime/src/common/tensormap_and_ringbuffer/host/dep_gen_replay.cpp:156:26: note: call to ‘void operator delete(void*)’ here
+  156 |         ::operator delete(static_cast<void *>(p));
+      |         ~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~
+In destructor ‘std::_Vector_base<_Tp, _Alloc>::~_Vector_base() [with _Tp = {anonymous}::EdgeAnnot; _Alloc = {anonymous}::ChargedAlloc<{anonymous}::EdgeAnnot>]’,
+    inlined from ‘std::vector<_Tp, _Alloc>::~vector() [with _Tp = {anonymous}::EdgeAnnot; _Alloc = {anonymous}::ChargedAlloc<{anonymous}::EdgeAnnot>]’ at /usr/include/c++/12/bits/stl_vector.h:733:7,
+    inlined from ‘int {anonymous}::emit_deps_json_body(const DepGenRecord*, size_t, const char*, const Charger&)’ at /data/aicpu-cluster-study/official-worktree/runtime/src/common/tensormap_and_ringbuffer/host/dep_gen_replay.cpp:1196:1:
+/usr/include/c++/12/bits/stl_vector.h:367:49: warning: pointer may be used after ‘void operator delete(void*)’ [-Wuse-after-free]
+  367 |                       _M_impl._M_end_of_storage - _M_impl._M_start);
+      |                       ~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~~~~~
+In member function ‘void {anonymous}::ChargedAlloc<T>::deallocate(T*, size_t) [with T = {anonymous}::EdgeAnnot]’,
+    inlined from ‘static void std::allocator_traits< <template-parameter-1-1> >::deallocate(_Alloc&, pointer, size_type) [with _Alloc = {anonymous}::ChargedAlloc<{anonymous}::EdgeAnnot>]’ at /usr/include/c++/12/bits/alloc_traits.h:345:23,
+    inlined from ‘void std::_Vector_base<_Tp, _Alloc>::_M_deallocate(pointer, std::size_t) [with _Tp = {anonymous}::EdgeAnnot; _Alloc = {anonymous}::ChargedAlloc<{anonymous}::EdgeAnnot>]’ at /usr/include/c++/12/bits/stl_vector.h:387:19,
+    inlined from ‘std::_Vector_base<_Tp, _Alloc>::~_Vector_base() [with _Tp = {anonymous}::EdgeAnnot; _Alloc = {anonymous}::ChargedAlloc<{anonymous}::EdgeAnnot>]’ at /usr/include/c++/12/bits/stl_vector.h:366:15,
+    inlined from ‘std::vector<_Tp, _Alloc>::~vector() [with _Tp = {anonymous}::EdgeAnnot; _Alloc = {anonymous}::ChargedAlloc<{anonymous}::EdgeAnnot>]’ at /usr/include/c++/12/bits/stl_vector.h:733:7,
+    inlined from ‘int {anonymous}::emit_deps_json_body(const DepGenRecord*, size_t, const char*, const Charger&)’ at /data/aicpu-cluster-study/official-worktree/runtime/src/common/tensormap_and_ringbuffer/host/dep_gen_replay.cpp:1196:1:
+/data/aicpu-cluster-study/official-worktree/runtime/src/common/tensormap_and_ringbuffer/host/dep_gen_replay.cpp:156:26: note: call to ‘void operator delete(void*)’ here
+  156 |         ::operator delete(static_cast<void *>(p));
+      |         ~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~
+In destructor ‘std::_Vector_base<_Tp, _Alloc>::~_Vector_base() [with _Tp = {anonymous}::TensorTableEntry; _Alloc = {anonymous}::ChargedAlloc<{anonymous}::TensorTableEntry>]’,
+    inlined from ‘std::vector<_Tp, _Alloc>::~vector() [with _Tp = {anonymous}::TensorTableEntry; _Alloc = {anonymous}::ChargedAlloc<{anonymous}::TensorTableEntry>]’ at /usr/include/c++/12/bits/stl_vector.h:733:7,
+    inlined from ‘int {anonymous}::emit_deps_json_body(const DepGenRecord*, size_t, const char*, const Charger&)’ at /data/aicpu-cluster-study/official-worktree/runtime/src/common/tensormap_and_ringbuffer/host/dep_gen_replay.cpp:1196:1:
+/usr/include/c++/12/bits/stl_vector.h:367:49: warning: pointer may be used after ‘void operator delete(void*)’ [-Wuse-after-free]
+  367 |                       _M_impl._M_end_of_storage - _M_impl._M_start);
+      |                       ~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~~~~~
+In member function ‘void {anonymous}::ChargedAlloc<T>::deallocate(T*, size_t) [with T = {anonymous}::TensorTableEntry]’,
+    inlined from ‘static void std::allocator_traits< <template-parameter-1-1> >::deallocate(_Alloc&, pointer, size_type) [with _Alloc = {anonymous}::ChargedAlloc<{anonymous}::TensorTableEntry>]’ at /usr/include/c++/12/bits/alloc_traits.h:345:23,
+    inlined from ‘void std::_Vector_base<_Tp, _Alloc>::_M_deallocate(pointer, std::size_t) [with _Tp = {anonymous}::TensorTableEntry; _Alloc = {anonymous}::ChargedAlloc<{anonymous}::TensorTableEntry>]’ at /usr/include/c++/12/bits/stl_vector.h:387:19,
+    inlined from ‘std::_Vector_base<_Tp, _Alloc>::~_Vector_base() [with _Tp = {anonymous}::TensorTableEntry; _Alloc = {anonymous}::ChargedAlloc<{anonymous}::TensorTableEntry>]’ at /usr/include/c++/12/bits/stl_vector.h:366:15,
+    inlined from ‘std::vector<_Tp, _Alloc>::~vector() [with _Tp = {anonymous}::TensorTableEntry; _Alloc = {anonymous}::ChargedAlloc<{anonymous}::TensorTableEntry>]’ at /usr/include/c++/12/bits/stl_vector.h:733:7,
+    inlined from ‘int {anonymous}::emit_deps_json_body(const DepGenRecord*, size_t, const char*, const Charger&)’ at /data/aicpu-cluster-study/official-worktree/runtime/src/common/tensormap_and_ringbuffer/host/dep_gen_replay.cpp:1196:1:
+/data/aicpu-cluster-study/official-worktree/runtime/src/common/tensormap_and_ringbuffer/host/dep_gen_replay.cpp:156:26: note: call to ‘void operator delete(void*)’ here
+  156 |         ::operator delete(static_cast<void *>(p));
+      |         ~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~
+In destructor ‘std::_Vector_base<_Tp, _Alloc>::~_Vector_base() [with _Tp = {anonymous}::TaskArgEntry; _Alloc = {anonymous}::ChargedAlloc<{anonymous}::TaskArgEntry>]’,
+    inlined from ‘std::vector<_Tp, _Alloc>::~vector() [with _Tp = {anonymous}::TaskArgEntry; _Alloc = {anonymous}::ChargedAlloc<{anonymous}::TaskArgEntry>]’ at /usr/include/c++/12/bits/stl_vector.h:733:7,
+    inlined from ‘{anonymous}::TaskTableEntry::~TaskTableEntry()’ at /data/aicpu-cluster-study/official-worktree/runtime/src/common/tensormap_and_ringbuffer/host/dep_gen_replay.cpp:490:8,
+    inlined from ‘constexpr void std::_Destroy(_Tp*) [with _Tp = {anonymous}::TaskTableEntry]’ at /usr/include/c++/12/bits/stl_construct.h:151:22,
+    inlined from ‘static constexpr void std::allocator_traits< <template-parameter-1-1> >::_S_destroy(_Alloc2&, _Tp*, ...) [with _Alloc2 = {anonymous}::ChargedAlloc<{anonymous}::TaskTableEntry>; _Tp = {anonymous}::TaskTableEntry; _Alloc = {anonymous}::ChargedAlloc<{anonymous}::TaskTableEntry>]’ at /usr/include/c++/12/bits/alloc_traits.h:278:17,
+    inlined from ‘static void std::allocator_traits< <template-parameter-1-1> >::destroy(_Alloc&, _Tp*) [with _Tp = {anonymous}::TaskTableEntry; _Alloc = {anonymous}::ChargedAlloc<{anonymous}::TaskTableEntry>]’ at /usr/include/c++/12/bits/alloc_traits.h:378:14,
+    inlined from ‘void std::_Destroy(_ForwardIterator, _ForwardIterator, _Allocator&) [with _ForwardIterator = {anonymous}::TaskTableEntry*; _Allocator = {anonymous}::ChargedAlloc<{anonymous}::TaskTableEntry>]’ at /usr/include/c++/12/bits/alloc_traits.h:839:39,
+    inlined from ‘std::vector<_Tp, _Alloc>::~vector() [with _Tp = {anonymous}::TaskTableEntry; _Alloc = {anonymous}::ChargedAlloc<{anonymous}::TaskTableEntry>]’ at /usr/include/c++/12/bits/stl_vector.h:730:15,
+    inlined from ‘int {anonymous}::emit_deps_json_body(const DepGenRecord*, size_t, const char*, const Charger&)’ at /data/aicpu-cluster-study/official-worktree/runtime/src/common/tensormap_and_ringbuffer/host/dep_gen_replay.cpp:1196:1:
+/usr/include/c++/12/bits/stl_vector.h:367:49: warning: pointer may be used after ‘void operator delete(void*)’ [-Wuse-after-free]
+  367 |                       _M_impl._M_end_of_storage - _M_impl._M_start);
+      |                       ~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~~~~~
+In member function ‘void {anonymous}::ChargedAlloc<T>::deallocate(T*, size_t) [with T = {anonymous}::TaskArgEntry]’,
+    inlined from ‘static void std::allocator_traits< <template-parameter-1-1> >::deallocate(_Alloc&, pointer, size_type) [with _Alloc = {anonymous}::ChargedAlloc<{anonymous}::TaskArgEntry>]’ at /usr/include/c++/12/bits/alloc_traits.h:345:23,
+    inlined from ‘void std::_Vector_base<_Tp, _Alloc>::_M_deallocate(pointer, std::size_t) [with _Tp = {anonymous}::TaskArgEntry; _Alloc = {anonymous}::ChargedAlloc<{anonymous}::TaskArgEntry>]’ at /usr/include/c++/12/bits/stl_vector.h:387:19,
+    inlined from ‘std::_Vector_base<_Tp, _Alloc>::~_Vector_base() [with _Tp = {anonymous}::TaskArgEntry; _Alloc = {anonymous}::ChargedAlloc<{anonymous}::TaskArgEntry>]’ at /usr/include/c++/12/bits/stl_vector.h:366:15,
+    inlined from ‘std::vector<_Tp, _Alloc>::~vector() [with _Tp = {anonymous}::TaskArgEntry; _Alloc = {anonymous}::ChargedAlloc<{anonymous}::TaskArgEntry>]’ at /usr/include/c++/12/bits/stl_vector.h:733:7,
+    inlined from ‘{anonymous}::TaskTableEntry::~TaskTableEntry()’ at /data/aicpu-cluster-study/official-worktree/runtime/src/common/tensormap_and_ringbuffer/host/dep_gen_replay.cpp:490:8,
+    inlined from ‘constexpr void std::_Destroy(_Tp*) [with _Tp = {anonymous}::TaskTableEntry]’ at /usr/include/c++/12/bits/stl_construct.h:151:22,
+    inlined from ‘static constexpr void std::allocator_traits< <template-parameter-1-1> >::_S_destroy(_Alloc2&, _Tp*, ...) [with _Alloc2 = {anonymous}::ChargedAlloc<{anonymous}::TaskTableEntry>; _Tp = {anonymous}::TaskTableEntry; _Alloc = {anonymous}::ChargedAlloc<{anonymous}::TaskTableEntry>]’ at /usr/include/c++/12/bits/alloc_traits.h:278:17,
+    inlined from ‘static void std::allocator_traits< <template-parameter-1-1> >::destroy(_Alloc&, _Tp*) [with _Tp = {anonymous}::TaskTableEntry; _Alloc = {anonymous}::ChargedAlloc<{anonymous}::TaskTableEntry>]’ at /usr/include/c++/12/bits/alloc_traits.h:378:14,
+    inlined from ‘void std::_Destroy(_ForwardIterator, _ForwardIterator, _Allocator&) [with _ForwardIterator = {anonymous}::TaskTableEntry*; _Allocator = {anonymous}::ChargedAlloc<{anonymous}::TaskTableEntry>]’ at /usr/include/c++/12/bits/alloc_traits.h:839:39,
+    inlined from ‘std::vector<_Tp, _Alloc>::~vector() [with _Tp = {anonymous}::TaskTableEntry; _Alloc = {anonymous}::ChargedAlloc<{anonymous}::TaskTableEntry>]’ at /usr/include/c++/12/bits/stl_vector.h:730:15,
+    inlined from ‘int {anonymous}::emit_deps_json_body(const DepGenRecord*, size_t, const char*, const Charger&)’ at /data/aicpu-cluster-study/official-worktree/runtime/src/common/tensormap_and_ringbuffer/host/dep_gen_replay.cpp:1196:1:
+/data/aicpu-cluster-study/official-worktree/runtime/src/common/tensormap_and_ringbuffer/host/dep_gen_replay.cpp:156:26: note: call to ‘void operator delete(void*)’ here
+  156 |         ::operator delete(static_cast<void *>(p));
+      |         ~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~
+In destructor ‘std::_Vector_base<_Tp, _Alloc>::~_Vector_base() [with _Tp = {anonymous}::TaskTableEntry; _Alloc = {anonymous}::ChargedAlloc<{anonymous}::TaskTableEntry>]’,
+    inlined from ‘std::vector<_Tp, _Alloc>::~vector() [with _Tp = {anonymous}::TaskTableEntry; _Alloc = {anonymous}::ChargedAlloc<{anonymous}::TaskTableEntry>]’ at /usr/include/c++/12/bits/stl_vector.h:733:7,
+    inlined from ‘int {anonymous}::emit_deps_json_body(const DepGenRecord*, size_t, const char*, const Charger&)’ at /data/aicpu-cluster-study/official-worktree/runtime/src/common/tensormap_and_ringbuffer/host/dep_gen_replay.cpp:1196:1:
+/usr/include/c++/12/bits/stl_vector.h:367:49: warning: pointer may be used after ‘void operator delete(void*)’ [-Wuse-after-free]
+  367 |                       _M_impl._M_end_of_storage - _M_impl._M_start);
+      |                       ~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~~~~~
+In member function ‘void {anonymous}::ChargedAlloc<T>::deallocate(T*, size_t) [with T = {anonymous}::TaskTableEntry]’,
+    inlined from ‘static void std::allocator_traits< <template-parameter-1-1> >::deallocate(_Alloc&, pointer, size_type) [with _Alloc = {anonymous}::ChargedAlloc<{anonymous}::TaskTableEntry>]’ at /usr/include/c++/12/bits/alloc_traits.h:345:23,
+    inlined from ‘void std::_Vector_base<_Tp, _Alloc>::_M_deallocate(pointer, std::size_t) [with _Tp = {anonymous}::TaskTableEntry; _Alloc = {anonymous}::ChargedAlloc<{anonymous}::TaskTableEntry>]’ at /usr/include/c++/12/bits/stl_vector.h:387:19,
+    inlined from ‘std::_Vector_base<_Tp, _Alloc>::~_Vector_base() [with _Tp = {anonymous}::TaskTableEntry; _Alloc = {anonymous}::ChargedAlloc<{anonymous}::TaskTableEntry>]’ at /usr/include/c++/12/bits/stl_vector.h:366:15,
+    inlined from ‘std::vector<_Tp, _Alloc>::~vector() [with _Tp = {anonymous}::TaskTableEntry; _Alloc = {anonymous}::ChargedAlloc<{anonymous}::TaskTableEntry>]’ at /usr/include/c++/12/bits/stl_vector.h:733:7,
+    inlined from ‘int {anonymous}::emit_deps_json_body(const DepGenRecord*, size_t, const char*, const Charger&)’ at /data/aicpu-cluster-study/official-worktree/runtime/src/common/tensormap_and_ringbuffer/host/dep_gen_replay.cpp:1196:1:
+/data/aicpu-cluster-study/official-worktree/runtime/src/common/tensormap_and_ringbuffer/host/dep_gen_replay.cpp:156:26: note: call to ‘void operator delete(void*)’ here
+  156 |         ::operator delete(static_cast<void *>(p));
+      |         ~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~
+[7/7] Linking CXX shared library libhost_runtime.so

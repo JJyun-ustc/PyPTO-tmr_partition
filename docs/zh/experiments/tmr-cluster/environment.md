@@ -104,7 +104,7 @@ ctest --test-dir tests/ut/cpp/build \
   --parallel 2 --output-on-failure
 ```
 
-最新 v7 被测工作区通过 8 个 C++ 目标、190 项测试；上方命令只演示其中三个目标。
+v7/v8 被测工作区通过 8 个 C++ 目标、190 项测试；上方命令只演示其中三个目标。
 15 个板上回归用例通过，详细目标和原始输出见 v7 结果目录的 verified-unit.log、
 unit-counts.json 与 regressions/。仿真运行库构建通过，仿真场景因缺少 g++-15 未完成。额外回归源代码已从原工作区外围目录
 整理到 runtime/tests/st/a2a3/tensormap_and_ringbuffer/cluster_partition_study/，
@@ -112,12 +112,12 @@ unit-counts.json 与 regressions/。仿真运行库构建通过，仿真场景�
 原来的机器绝对路径没有作为复现依赖继续使用。
 
 上游 GitHub CI 文件原样保留；个人仓库没有上游的 self-hosted runner 和 secrets，
-不代表全部上游 CI 可以直接运行。本次发布没有重新构建完整 PyPTO 或重跑 NPU，
+不代表全部上游 CI 可以直接运行。本次发布没有重新构建完整 PyPTO；v8 沿用已测运行库，新增 Paged Attention 已在 NPU 测量，
 保留的是已测源码快照和原始证据，额外发布脚本会单独进行静态检查。
 
 ## v7 结果与阶段复现
 
-最新证据位于 `official-results/v7-control-20261116/`，包括 v6 基线、仅组复用、
+v7 历史证据位于 `official-results/v7-control-20261116/`，包括 v6 基线、仅组复用、
 延迟绑定、低频摘要、受限领取和最终复核的源码快照、原始计时与诊断 capture。
 阶段是累积改动，不是独立因素消融；不同构建使用各自同二进制 Shared 对照。
 驱动对当前板卡输出的完整名称 `910B2` 和拆分名称 `Ascend910` / `B2` 均作核验。
@@ -130,4 +130,22 @@ python examples/a2a3/tensormap_and_ringbuffer/benchmark_bgemm/run_control_stage.
 ```
 
 输出目录必须全新。二进制、虚拟环境和缓存不上传；历史绝对路径仅为采集记录。
-发布副本的代码与已测工作区核对一致，本次同步不重新执行设备实验。
+发布副本代码与被测工作区核对一致；新增实验直接使用同一套已测 v8 运行库。
+
+## 当前 v8 与 Paged Attention 复现
+
+v8 默认源码是已测 queue-future 三项评分，禁用跨侧领取；原始 v8 各阶段源码
+保留在 official-results/v8-no-pickup-20261117/，容量波数等候选不代表当前默认。
+新 benchmark 与原始 Paged Attention 共用算子源码，操作方式见
+[Paged Attention 说明](paged-attention.md)；从 runtime 目录执行：
+
+```bash
+source ../.claude/skills/testing/load-env.sh
+python examples/a2a3/tensormap_and_ringbuffer/benchmark_paged_attention/run_cluster_study.py \
+  ../official-results/new-paged-attention/paired
+python examples/a2a3/tensormap_and_ringbuffer/benchmark_paged_attention/analyze_cluster_study.py \
+  ../official-results/new-paged-attention/paired
+```
+
+v8 验证清单见对应 summary.json 的 validation；Paged Attention 运行与校验清单见
+v9-paged-attention-20261117/paired/validation.json。历史单轮诊断不作为普通计时样本。

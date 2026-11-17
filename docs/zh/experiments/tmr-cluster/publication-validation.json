@@ -1,31 +1,54 @@
 {
-  "sync_version": "v7",
-  "runtime_updated_files_byte_compared": 23,
+  "sync_version": "v8 implementation + v9 Paged Attention benchmark",
+  "runtime_updated_files_byte_compared": 19,
   "code_mismatches": [],
-  "publication_markdown_normalization": "trailing whitespace removed in publication copy",
-  "evidence_files": 800,
-  "secret_pattern_scan_files": 814,
+  "publication_markdown_normalization": "trailing whitespace removed in changed publication prose",
+  "secret_pattern_scan_files": 1440,
   "secret_pattern_matches": [],
-  "device_experiments_rerun_for_publication": false,
   "measured_worktree_validation": {
-    "cpp_test_targets": 8,
-    "cpp_tests": 190,
-    "hardware_regression_cases": 15,
-    "hardware_regression_suites": {
-      "placement-dummy": 0,
-      "placement-early": 0,
-      "placement-vector": 0,
-      "spmd_multiblock_aiv": 0,
-      "spmd_multiblock_mix": 0,
-      "spmd_sync_start": 0
+    "v8": {
+      "unit_counts": {
+        "cluster_partitioner": 22,
+        "scheduler_state": 35,
+        "wiring": 45,
+        "ready_queue": 22,
+        "task_state": 6,
+        "shared_memory": 22,
+        "orchestrator_fanin": 28,
+        "aicore_completion_mailbox": 10
+      },
+      "cpp_targets": 8,
+      "cpp_tests": 190,
+      "regression_suites": {
+        "placement-dummy": 0,
+        "placement-early": 0,
+        "placement-vector": 0,
+        "spmd_multiblock_aiv": 0,
+        "spmd_multiblock_mix": 0,
+        "spmd_sync_start": 0
+      },
+      "hardware_regression_cases": 15,
+      "ledger_rows_checked": 28,
+      "selected_source_mismatches": [],
+      "selected_binary_hashes_match": true,
+      "sim_runtime_build": "passed",
+      "sim_scene_limit": "g++-15 absent",
+      "full_runtime_scene_sweep": false
     },
-    "regression_ledgers": {
-      "rows_checked": 12,
-      "status": "passed"
-    },
-    "simulation_runtime_build": "passed",
-    "simulation_scene_tests": "not completed: g++-15 absent",
-    "local_binding_scale_golden": "passed",
-    "current_binaries_match_final_measurement": true
-  }
+    "v9": {
+      "ordinary_timing_samples": 120,
+      "golden_cases": 4,
+      "diagnostic_golden_cases": 4,
+      "ledger_rows": 8,
+      "ledger_check": "passed",
+      "compute_code_hashes_match": true,
+      "same_runtime_as_v8_selected": true,
+      "source_hashes_match": true,
+      "no_cross_pickup_checks_attempts_or_blocks": true,
+      "ruff": "passed",
+      "simulation_scene_not_run": "g++-15 absent"
+    }
+  },
+  "publication_rebuild_required": false,
+  "qualification": "Measured runtime code is unchanged; v9 uses the exact v8 selected binaries. New scene kernels and orchestration compiled by the scene test runner."
 }

@@ -1,0 +1,52 @@
+{
+  "date": "2026-11-17",
+  "stages": [
+    "baseline",
+    "no-pickup",
+    "queue-future",
+    "unit-prices",
+    "waves",
+    "queue-one",
+    "future-zero",
+    "waves-clean",
+    "merged-three-price"
+  ],
+  "rounds_per_policy_case": 30,
+  "primary_metric": "device_wall median and p95",
+  "controls": "fresh same-binary Shared; reverse 15-round batches",
+  "orchestrator_cpu": 7,
+  "exclusive_lock": false,
+  "selection": "prefer simpler policy only if performance and correctness support it; no claim of global optimum",
+  "weighted_candidates": {
+    "no-pickup": {
+      "Q": 0.5,
+      "R": 0.25,
+      "X_ns": 128,
+      "F": 0.25
+    },
+    "queue-future": {
+      "Q": 0.5,
+      "R": 0,
+      "X_ns": 0,
+      "F": 0.25
+    },
+    "queue-one": {
+      "Q": 1,
+      "R": 0,
+      "X_ns": 0,
+      "F": 0.25
+    },
+    "future-zero": {
+      "Q": 0.5,
+      "R": 0,
+      "X_ns": 0,
+      "F": 0
+    },
+    "unit-prices": {
+      "Q": 1,
+      "R": 0,
+      "X_ns": 0,
+      "F": 1
+    }
+  }
+}
