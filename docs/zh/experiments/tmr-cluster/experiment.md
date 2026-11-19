@@ -1,3 +1,5 @@
+> 本页保留 v6–v8 历史实验。独立重写的 v11 见 [ready亲和实验](ready-affinity.md)，累积A1–A4见 [block压力实验](block-pressure.md)。
+
 # v8 评分简化与补充依赖负载测试
 
 当前默认实现删除跨侧领取，保留有界小组、ready 延迟绑定与低频摘要；入口采用

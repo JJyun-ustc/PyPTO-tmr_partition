@@ -1,0 +1,84 @@
+diff --git a/data/aicpu-cluster-study/official-worktree/official-results/v10-block-pressure-20261117/A2-block-waves/source/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/aicpu_cluster_partition.h b/data/aicpu-cluster-study/official-worktree/official-results/v10-block-pressure-20261117/A3-guarded-groups/source/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/aicpu_cluster_partition.h
+index 75dbbcc2..87d245b3 100644
+--- a/data/aicpu-cluster-study/official-worktree/official-results/v10-block-pressure-20261117/A2-block-waves/source/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/aicpu_cluster_partition.h
++++ b/data/aicpu-cluster-study/official-worktree/official-results/v10-block-pressure-20261117/A3-guarded-groups/source/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/aicpu_cluster_partition.h
+@@ -243,6 +243,7 @@ struct PartitionWeights {
+ struct PartitionGroup {
+     uint64_t id{0}, scope{0}, born{0};
+     uint32_t members{0};
++    uint64_t blocks[PARTITION_SHAPES]{};
+ };
+ struct ClusterPartitioner {
+     PartitionSummarySample summary_cache[PARTITION_THREADS][PARTITION_SHAPES]{};
+@@ -254,7 +255,7 @@ struct ClusterPartitioner {
+         return g.id == producer.group && g.scope == scope && g.members < PARTITION_GROUP_LIMIT &&
+                decision_count() - g.born < PARTITION_GROUP_LIFETIME;
+     }
+-    void join_group(AdaptiveTaskState &task, uint64_t parent, uint64_t scope) {
++    void join_group(AdaptiveTaskState &task, uint64_t parent, uint64_t scope, int shape = 0, uint32_t units = 1) {
+         if (!parent) {
+             parent = ++next_group;
+             groups[parent % PARTITION_GROUP_SLOTS] = {parent, scope, decision_count(), 0};
+@@ -263,6 +264,7 @@ struct ClusterPartitioner {
+             ++inherited_decisions;
+         }
+         ++groups[parent % PARTITION_GROUP_SLOTS].members;
++        groups[parent % PARTITION_GROUP_SLOTS].blocks[shape] += units;
+         task.group = parent;
+     }
+     PartitionDecision inherit(int cluster) {
+diff --git a/data/aicpu-cluster-study/official-worktree/official-results/v10-block-pressure-20261117/A2-block-waves/source/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/orchestrator.cpp b/data/aicpu-cluster-study/official-worktree/official-results/v10-block-pressure-20261117/A3-guarded-groups/source/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/orchestrator.cpp
+index 5835d170..1354aa9d 100644
+--- a/data/aicpu-cluster-study/official-worktree/official-results/v10-block-pressure-20261117/A2-block-waves/source/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/orchestrator.cpp
++++ b/data/aicpu-cluster-study/official-worktree/official-results/v10-block-pressure-20261117/A3-guarded-groups/source/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/orchestrator.cpp
+@@ -1233,6 +1233,8 @@ static TaskOutputTensors submit_task_common(
+         if (!partitioner.scope_ids[depth]) partitioner.open_scope(depth);
+         uint64_t scope = partitioner.scope_ids[depth];
+         uint32_t units = shape == ResourceShape::DUMMY ? 1 : cur_slot_state.logical_block_num;
++        auto load = partitioner.load(feedback, shape_index);
++        trace_stage(3);
+         uint32_t pending = 0, sources[2]{};
+         uint64_t parent_group = 0;
+         int inherited = -1;
+@@ -1244,8 +1246,21 @@ static TaskOutputTensors submit_task_common(
+             if (partitioner.can_inherit(parent, scope)) {
+                 int actual = parent.dispatch_cluster.load(std::memory_order_acquire);
+                 inherited = actual >= 0 ? actual : parent.preferred_cluster;
+-                if (inherited >= 0 && feedback.schedulers[inherited]) parent_group = parent.group;
+-                else inherited = -1;
++                if (inherited >= 0 && feedback.schedulers[inherited]) {
++                    uint64_t cap = load.capacity[inherited] ? load.capacity[inherited] : load.schedulers[inherited];
++                    int other = 1 - inherited;
++                    uint64_t other_cap = load.capacity[other] ? load.capacity[other] : load.schedulers[other];
++                    const auto &group = partitioner.groups[parent.group % simpler::tmr::PARTITION_GROUP_SLOTS];
++                    uint64_t own = simpler::tmr::partition_wave(
++                        load.ready[inherited], load.inflight[inherited], load.blocked[inherited], units, cap
++                    );
++                    uint64_t remote = simpler::tmr::partition_wave(
++                        load.ready[other], load.inflight[other], load.blocked[other], units, other_cap
++                    );
++                    bool eligible = fanin_builder.wait_count == 1 && group.blocks[shape_index] + units <= 2 * cap;
++                    if (eligible && own <= remote + 64) parent_group = parent.group;
++                    else inherited = -1;
++                } else inherited = -1;
+             }
+             if (inherited >= 0 || producer->task_state.load(std::memory_order_acquire) != CHIP_TASK_PENDING) return;
+             ++pending;
+@@ -1259,8 +1274,6 @@ static TaskOutputTensors submit_task_common(
+             decision = partitioner.inherit(inherited);
+         } else {
+             trace_stage(1);
+-            auto load = partitioner.load(feedback, shape_index);
+-            trace_stage(3);
+             decision = partitioner.choose(load, pending, sources, shape_index, feedback.orchestrator_cluster, units);
+         }
+         if (decision.cluster >= 0) {
+@@ -1268,7 +1281,7 @@ static TaskOutputTensors submit_task_common(
+             task.target_aicpu_cluster = -1;
+             payload.placement.scope = scope;
+             payload.placement.preferred_cluster = decision.cluster;
+-            partitioner.join_group(payload.placement, parent_group, scope);
++            partitioner.join_group(payload.placement, parent_group, scope, shape_index, units);
+             if (tracing) {
+                 payload.placement.submit_tick = get_sys_cnt_aicpu();
+                 uint64_t ticks = payload.placement.submit_tick - decision_begin;

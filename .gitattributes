@@ -5,3 +5,10 @@ official-results/**/*.patch -whitespace
 
 # Markdown inside source snapshots is raw evidence, including hard line breaks.
 official-results/**/source/**/*.md -whitespace
+
+# Frozen benchmark inputs preserve the exact source bytes used for measurement.
+official-results/**/benchmark-source/** -whitespace
+official-results/**/official-benchmark-source/** -whitespace
+
+# CSV exports use the standard CRLF record delimiter.
+official-results/**/*.csv whitespace=cr-at-eol

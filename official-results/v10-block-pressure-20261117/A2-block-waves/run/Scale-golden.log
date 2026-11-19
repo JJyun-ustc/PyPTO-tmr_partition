@@ -1,0 +1,31 @@
+
+=== Runtime: tensormap_and_ringbuffer  Level: 2  Pipeline depth: default ===
+  TestBenchmarkBgemm::ClusterScaleAdaptive ...
+[mono_ns=6497093167957780][T0x3fffa2cb7420][TIMING] log_callable_image: Callable image: device=0 runner=0x2aaaf2e18740 chip_hash=0xabfac627087f2c9b chip_dev=0x12c0c001a000 upload_bytes=632464 children=2
+[mono_ns=6497093167978870][T0x3fffa2cb7420][TIMING] log_callable_image: Callable code: device=0 runner=0x2aaaf2e18740 chip_hash=0xabfac627087f2c9b chip_dev=0x12c0c001a000 func_id=0 code_begin=0x12c0c00b3e60 code_end_exclusive=0x12c0c00b42a4 code_bytes=1092 code_fnv1a64=0x212c407e5c39dda2
+[mono_ns=6497093167984190][T0x3fffa2cb7420][TIMING] log_callable_image: Callable code: device=0 runner=0x2aaaf2e18740 chip_hash=0xabfac627087f2c9b chip_dev=0x12c0c001a000 func_id=1 code_begin=0x12c0c00b43a0 code_end_exclusive=0x12c0c00b464c code_bytes=684 code_fnv1a64=0x4c0e49fc6b5f2f9f
+[mono_ns=6497093167997480][T0x3fffa2cb7420][TIMING] record_device_orch_callable: [device_runner_base.cpp:2425] Callable registration: device=0 runner=0x2aaaf2e18740 cid=0 chip_hash=0xabfac627087f2c9b aicore_image_hash=0xe01db861de7b5371 orch_hash=0x6acb701081860dc2 orch_bytes=612608
+[TIMING] torch_backend_autoload setting=unset raw=null raw_truncated=false effective=enabled torch_imported=true torch_npu_loaded=false
+[mono_ns=6497093706723190][T0x3fffa2cb7420][TIMING] emit_host_span: [STRACE] v=1 pid=1491665 tid=1491665 inv=1 hid=6acb701081860dc2 depth=2 name=chip.run.bind.args ts=6497093706713930 dur=1850 
+[mono_ns=6497093777147510][T0x3fffa2cb7420][TIMING] emit_host_span: [STRACE] v=1 pid=1491665 tid=1491665 inv=1 hid=6acb701081860dc2 depth=2 name=chip.run.bind.prebuilt ts=6497093706739970 dur=70393840 
+[mono_ns=6497093777170260][T0x3fffa2cb7420][TIMING] emit_host_span: [STRACE] v=1 pid=1491665 tid=1491665 inv=1 hid=6acb701081860dc2 depth=1 name=chip.run.bind ts=6497093706491750 dur=70675950 
+[mono_ns=6497093777175910][T0x3fffa2cb7420][TIMING] emit_host_span: [STRACE] v=1 pid=1491665 tid=1491665 inv=1 hid=6acb701081860dc2 depth=1 name=chip.run.publish_image ts=6497093777173390 dur=550 
+[mono_ns=6497093784103050][T0x3fffa2cb7420][TIMING] emit_host_span: [STRACE] v=1 pid=1491665 tid=1491665 inv=1 hid=6acb701081860dc2 depth=1 name=chip.run.stage_inputs ts=6497093777179050 dur=6918890 
+[mono_ns=6497093784584840][T0x3fffa2cb7420][TIMING] emit_host_span: [STRACE] v=1 pid=1491665 tid=1491665 inv=1 hid=6acb701081860dc2 depth=1 name=chip.run.prepare_execution ts=6497093784114270 dur=466130 
+[mono_ns=6497093787133200][T0x3fffa2cb7420][TIMING] emit_host_span: [STRACE] v=1 pid=1491665 tid=1491665 inv=1 hid=6acb701081860dc2 depth=2 name=chip.run.runner_run.aicpu_launch ts=6497093787128140 dur=0 
+[mono_ns=6497093791374630][T0x3fffa2cb7420][TIMING] emit_host_span: [STRACE] v=1 pid=1491665 tid=1491665 inv=1 hid=6acb701081860dc2 depth=1 name=chip.run.runner_run ts=6497093784610290 dur=6760020 
+[mono_ns=6497093792197710][T0x3fffa2cb7420][TIMING] emit_host_span: [STRACE] v=1 pid=1491665 tid=1491665 inv=1 hid=6acb701081860dc2 depth=1 name=chip.run.validate ts=6497093791394540 dur=799380 
+[mono_ns=6497093792210360][T0x3fffa2cb7420][TIMING] emit_host_span: [STRACE] v=1 pid=1491665 tid=1491665 inv=1 hid=6acb701081860dc2 depth=2 name=chip.run.runner_run.device_wall ts=0 dur=4022220 clk=dev dev_id=0 dev_start_cycle=324859757947440 dev_end_cycle=324859758148551 dev_cnt_hz=50000000
+[mono_ns=6497093792215010][T0x3fffa2cb7420][TIMING] emit_host_span: [STRACE] v=1 pid=1491665 tid=1491665 inv=1 hid=6acb701081860dc2 depth=3 name=chip.run.runner_run.device_wall.preamble ts=0 dur=186920 clk=dev
+[mono_ns=6497093792219830][T0x3fffa2cb7420][TIMING] emit_host_span: [STRACE] v=1 pid=1491665 tid=1491665 inv=1 hid=6acb701081860dc2 depth=3 name=chip.run.runner_run.device_wall.graph_build ts=44800 dur=3945599 clk=dev
+[mono_ns=6497093792227010][T0x3fffa2cb7420][TIMING] emit_host_span: [STRACE] v=1 pid=1491665 tid=1491665 inv=1 hid=6acb701081860dc2 depth=3 name=chip.run.runner_run.device_wall.config_validate ts=50260 dur=6680 clk=dev
+[mono_ns=6497093792230590][T0x3fffa2cb7420][TIMING] emit_host_span: [STRACE] v=1 pid=1491665 tid=1491665 inv=1 hid=6acb701081860dc2 depth=3 name=chip.run.runner_run.device_wall.arena_wire ts=56980 dur=12799 clk=dev
+[mono_ns=6497093792234000][T0x3fffa2cb7420][TIMING] emit_host_span: [STRACE] v=1 pid=1491665 tid=1491665 inv=1 hid=6acb701081860dc2 depth=3 name=chip.run.runner_run.device_wall.sm_reset ts=70040 dur=22700 clk=dev
+[mono_ns=6497093792237600][T0x3fffa2cb7420][TIMING] emit_host_span: [STRACE] v=1 pid=1491665 tid=1491665 inv=1 hid=6acb701081860dc2 depth=3 name=chip.run.runner_run.device_wall.post_orch ts=3990820 dur=22720 clk=dev
+[mono_ns=6497093792240930][T0x3fffa2cb7420][TIMING] emit_host_span: [STRACE] v=1 pid=1491665 tid=1491665 inv=1 hid=6acb701081860dc2 depth=3 name=chip.run.runner_run.device_wall.orch ts=94400 dur=3844880 clk=dev
+[mono_ns=6497093792244300][T0x3fffa2cb7420][TIMING] emit_host_span: [STRACE] v=1 pid=1491665 tid=1491665 inv=1 hid=6acb701081860dc2 depth=3 name=chip.run.runner_run.device_wall.sched ts=189780 dur=3757940 clk=dev
+[mono_ns=6497093792259280][T0x3fffa2cb7420][TIMING] emit_host_span: [STRACE] v=1 pid=1491665 tid=1491665 inv=1 hid=6acb701081860dc2 depth=2 name=chip.run.runner_run.device_boundaries ts=6497093792256980 dur=0 clk=dev dev_id=0 aic_start=6497195158440 aic_rc=0 wo_end=0 wo_rc=-1000 ts_hz=1000000
+[mono_ns=6497093792265010][T0x3fffa2cb7420][TIMING] emit_host_span: [STRACE] v=1 pid=1491665 tid=1491665 inv=1 hid=6acb701081860dc2 depth=1 name=chip.run.claim_release ts=6497093792263090 dur=330 
+[mono_ns=6497093792271090][T0x3fffa2cb7420][TIMING] emit_host_span: [STRACE] v=1 pid=1491665 tid=1491665 inv=1 hid=6acb701081860dc2 depth=0 name=chip.run ts=6497093706402630 dur=85866280 run_id=0 dispatch_id=0 slot_id=0 generation=1 run_epoch=1
+[mono_ns=6497093815031580][T0x3fffa2cb7420][TIMING] finalize_common_impl: [device_runner_base.cpp:3012] Callable image freed: device=0 runner=0x2aaaf2e18740 chip_hash=0xabfac627087f2c9b chip_dev=0x12c0c001a000 upload_bytes=632464
+  TestBenchmarkBgemm::ClusterScaleAdaptive PASSED

@@ -1,0 +1,199 @@
+diff --git a/data/aicpu-cluster-study/official-worktree/official-results/v10-block-pressure-20261117/A1-ledger/source/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/aicpu_cluster_partition.h b/data/aicpu-cluster-study/official-worktree/official-results/v10-block-pressure-20261117/A2-block-waves/source/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/aicpu_cluster_partition.h
+index 8a2fdc57..75dbbcc2 100644
+--- a/data/aicpu-cluster-study/official-worktree/official-results/v10-block-pressure-20261117/A1-ledger/source/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/aicpu_cluster_partition.h
++++ b/data/aicpu-cluster-study/official-worktree/official-results/v10-block-pressure-20261117/A2-block-waves/source/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/aicpu_cluster_partition.h
+@@ -170,6 +170,8 @@ struct PartitionShared {
+     // Only the lowest-index S on each side writes its queue hint.
+     // Low 32 bits: entries; high bits: that leader has idle resource.
+     PartitionReadyCounter side_queue[2][PARTITION_SHAPES]{};
++    PartitionReadyCounter side_work[2][PARTITION_SHAPES]{};
++    PartitionReadyCounter side_capacity[2][PARTITION_SHAPES]{};
+     PartitionThread threads[PARTITION_THREADS];
+     void reset() {
+         enabled.store(false, std::memory_order_relaxed);
+@@ -181,12 +183,37 @@ struct PartitionShared {
+                 hint.store(0, std::memory_order_relaxed);
+         for (auto &thread : threads)
+             thread.reset();
++        for (int c = 0; c < 2; ++c)
++            for (int s = 0; s < PARTITION_SHAPES; ++s) {
++                side_work[c][s].store(0, std::memory_order_relaxed);
++                side_capacity[c][s].store(0, std::memory_order_relaxed);
++            }
+     }
+ };
+ struct PartitionLoad {
+-    uint64_t blocked[2]{}, ready[2]{};
++    uint64_t blocked[2]{}, ready[2]{}, inflight[2]{};
+     uint32_t capacity[2]{}, free[2]{}, idle[2]{}, schedulers[2]{};
+ };
++// Work is in logical-block equivalents; one capacity wave is 256 units.
++inline uint64_t partition_future_wave(uint64_t waiting, uint64_t capacity) {
++    return 64 * (waiting < capacity ? waiting : capacity) / capacity;
++}
++inline uint64_t partition_wave(uint64_t ready, uint64_t inflight, uint64_t waiting, uint64_t units, uint64_t capacity) {
++    if (!capacity) return UINT64_MAX / 4;
++    return 256 * (ready + inflight + units) / capacity + partition_future_wave(waiting, capacity);
++}
++inline int partition_block_ready_side(
++    int preferred, int source, const uint64_t work[2], const uint64_t capacity[2], uint64_t units
++) {
++    int c = source >= 0 && source < 2 ? source : preferred;
++    if (c < 0 || c > 1) c = capacity[0] ? 0 : 1;
++    if (!capacity[c]) return capacity[1 - c] ? 1 - c : c;
++    int other = 1 - c;
++    if (capacity[other] && partition_wave(work[c], 0, 0, units, capacity[c]) >
++                               partition_wave(work[other], 0, 0, units, capacity[other]) + 64)
++        return other;
++    return c;
++}
+ inline int partition_ready_side(int preferred, int source, const uint64_t depth[2], const int32_t schedulers[2]) {
+     int c = source >= 0 && source < 2 ? source : preferred;
+     if (c < 0 || c > 1) c = schedulers[0] ? 0 : 1;
+@@ -327,7 +354,7 @@ struct ClusterPartitioner {
+         if (needs_snapshot(shape)) {
+             auto &cached = cached_load[shape];
+             cached = PartitionLoad{};
+-            uint64_t released[2]{}, queued[2]{}, taken[2]{};
++            uint64_t released[2]{}, queued[2]{}, taken[2]{}, claimed[2]{}, retired[2]{};
+             for (int t = 0; t < PARTITION_THREADS; ++t) {
+                 const auto &thread = shared.threads[t];
+                 const auto &row = thread.summary[shape];
+@@ -338,6 +365,8 @@ struct ClusterPartitioner {
+                     released[side] += sample.released[side];
+                     queued[side] += sample.queued[side];
+                     taken[side] += sample.taken[side];
++                    claimed[side] += sample.claimed[side];
++                    retired[side] += sample.retired[side];
+                 }
+                 int c = thread.cluster.load(std::memory_order_relaxed);
+                 if (c < 0 || c > 1) continue;
+@@ -349,9 +378,8 @@ struct ClusterPartitioner {
+             for (int c = 0; c < 2; ++c) {
+                 cached.schedulers[c] = shared.schedulers[c];
+                 cached.blocked[c] = assigned[c][shape] > released[c] ? assigned[c][shape] - released[c] : 0;
+-                uint64_t waiting = queued[c] > taken[c] ? queued[c] - taken[c] : 0;
+-                uint64_t depth = shared.side_queue[c][shape].load(std::memory_order_relaxed) & 0xffffffffu;
+-                cached.ready[c] = waiting > depth ? waiting : depth;
++                cached.ready[c] = queued[c] > claimed[c] ? queued[c] - claimed[c] : 0;
++                cached.inflight[c] = claimed[c] > retired[c] ? claimed[c] - retired[c] : 0;
+             }
+             load_batch[shape] = decision_count() / PARTITION_BATCH_NODES;
+             ++snapshots;
+@@ -385,44 +413,31 @@ struct ClusterPartitioner {
+         PartitionDecision out;
+         out.learned = decision_count() >= PARTITION_CALIBRATION_NODES;
+         auto &w = weights[shape];
++        uint64_t handoff[2]{};
+         for (int c = 0; c < 2; ++c) {
+             if (!load.schedulers[c]) continue;
+-            if (!out.learned) {
+-                uint64_t capacity = load.capacity[c] ? load.capacity[c] : load.schedulers[c];
+-                out.score_ns[c] = 1024 * (load.blocked[c] + load.ready[c] + units) / capacity;
++            if (count) {
++                for (int source = 0; source < 2; ++source)
++                    if ((sources[source] || sources[0] + sources[1] < count) && w.dependency[source][c] > handoff[c])
++                        handoff[c] = w.dependency[source][c];
+             } else {
+-                uint64_t cap = load.capacity[c];
+-                uint64_t free = load.free[c] < cap ? load.free[c] : cap;
+-                uint64_t idle = load.idle[c] < cap ? load.idle[c] : cap;
+-                uint64_t resource = cap ? w.queue[c] * (2 * (cap - free) + cap - idle) / cap : w.queue[c];
+-                uint64_t dependency = 0;
+-                if (count) {
+-                    for (int p = 0; p < 2; ++p)
+-                        if (sources[p] && w.dependency[p][c] > dependency) dependency = w.dependency[p][c];
+-                    if (sources[0] + sources[1] < count)
+-                        for (int p = 0; p < 2; ++p)
+-                            if (w.dependency[p][c] > dependency) dependency = w.dependency[p][c];
+-                } else {
+-                    int source = o_cluster >= 0 && o_cluster < 2 ? o_cluster : c;
+-                    dependency = w.publish[source][c];
+-                }
+-                uint64_t queue = w.queue[c] * load.ready[c] / load.schedulers[c];
+-                uint64_t extra_remote = count ? sources[1 - c] : 0;
+-                if (extra_remote && dependency == w.dependency[1 - c][c]) --extra_remote;
+-                uint64_t future = future_reservation_cost(load, c, count ? units : 0, w.queue[c]);
+-                out.score_ns[c] = dependency + PARTITION_QUEUE_WEIGHT_NUM * queue / PARTITION_QUEUE_WEIGHT_DEN +
+-                                  PARTITION_RESOURCE_WEIGHT_NUM * resource / PARTITION_RESOURCE_WEIGHT_DEN +
+-                                  PARTITION_EXTRA_REMOTE_WAIT_NS * extra_remote + future;
++                int source = o_cluster >= 0 && o_cluster < 2 ? o_cluster : c;
++                handoff[c] = w.publish[source][c];
+             }
+-            if (out.cluster < 0 || out.score_ns[c] < out.score_ns[out.cluster] ||
+-                (out.score_ns[c] == out.score_ns[out.cluster] &&
+-                 decisions[c] * load.schedulers[out.cluster] < decisions[out.cluster] * load.schedulers[c]))
++            uint64_t cap = load.capacity[c] ? load.capacity[c] : load.schedulers[c];
++            out.score_ns[c] = partition_wave(load.ready[c], load.inflight[c], load.blocked[c], units, cap);
++            if (out.cluster < 0) {
+                 out.cluster = c;
+-        }
+-        if (!out.learned && out.cluster >= 0 && sources[0] != sources[1]) {
+-            int affinity = sources[1] > sources[0] ? 1 : 0;
+-            if (load.schedulers[affinity] && out.score_ns[affinity] <= out.score_ns[out.cluster] + 256)
+-                out.cluster = affinity;
++                continue;
++            }
++            int previous = out.cluster;
++            uint64_t previous_cap = load.capacity[previous] ? load.capacity[previous] : load.schedulers[previous];
++            bool much_lighter = out.score_ns[c] + 64 < out.score_ns[previous];
++            bool close =
++                out.score_ns[c] <= out.score_ns[previous] + 64 && out.score_ns[previous] <= out.score_ns[c] + 64;
++            bool tie =
++                handoff[c] == handoff[previous] && assigned[c][shape] * previous_cap < assigned[previous][shape] * cap;
++            if (much_lighter || (close && (handoff[c] < handoff[previous] || tie))) out.cluster = c;
+         }
+         if (out.cluster >= 0) {
+             ++decisions[out.cluster];
+diff --git a/data/aicpu-cluster-study/official-worktree/official-results/v10-block-pressure-20261117/A1-ledger/source/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler.h b/data/aicpu-cluster-study/official-worktree/official-results/v10-block-pressure-20261117/A2-block-waves/source/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler.h
+index d694548f..8b216860 100644
+--- a/data/aicpu-cluster-study/official-worktree/official-results/v10-block-pressure-20261117/A1-ledger/source/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler.h
++++ b/data/aicpu-cluster-study/official-worktree/official-results/v10-block-pressure-20261117/A2-block-waves/source/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler.h
+@@ -591,14 +591,18 @@ struct SchedulerState {
+             if (!(metadata.reserved & simpler::tmr::PARTITION_READY)) {
+                 int pref = metadata.preferred_cluster;
+                 if (pref < 0) pref = slot_state.task->target_aicpu_cluster;
+-                uint64_t depth[2]{};
+-                for (int side = 0; side < 2; ++side)
+-                    depth[side] =
+-                        placement_feedback.side_queue[side][static_cast<int>(shape)].load(std::memory_order_relaxed) &
+-                        0xffffffffu;
++                uint64_t work[2]{}, capacity[2]{};
++                for (int side = 0; side < 2; ++side) {
++                    work[side] =
++                        placement_feedback.side_work[side][static_cast<int>(shape)].load(std::memory_order_relaxed);
++                    capacity[side] =
++                        placement_feedback.side_capacity[side][static_cast<int>(shape)].load(std::memory_order_relaxed);
++                    if (!capacity[side]) capacity[side] = placement_feedback.schedulers[side];
++                }
+                 int source = metadata.reserved & simpler::tmr::PARTITION_FROM_O ? -1 : metadata.release_cluster;
+-                slot_state.task->target_aicpu_cluster =
+-                    simpler::tmr::partition_ready_side(pref, source, depth, placement_feedback.schedulers);
++                slot_state.task->target_aicpu_cluster = simpler::tmr::partition_block_ready_side(
++                    pref, source, work, capacity, shape == ResourceShape::DUMMY ? 1 : slot_state.logical_block_num
++                );
+                 uint64_t units = shape == ResourceShape::DUMMY ? 1 : slot_state.logical_block_num;
+                 auto &row = placement_feedback.threads[metadata.ready_writer].summary[static_cast<int>(shape)];
+                 row.begin_write();
+diff --git a/data/aicpu-cluster-study/official-worktree/official-results/v10-block-pressure-20261117/A1-ledger/source/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler_dispatch.cpp b/data/aicpu-cluster-study/official-worktree/official-results/v10-block-pressure-20261117/A2-block-waves/source/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler_dispatch.cpp
+index dd5f60c1..4e30d6cd 100644
+--- a/data/aicpu-cluster-study/official-worktree/official-results/v10-block-pressure-20261117/A1-ledger/source/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler_dispatch.cpp
++++ b/data/aicpu-cluster-study/official-worktree/official-results/v10-block-pressure-20261117/A2-block-waves/source/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler_dispatch.cpp
+@@ -147,6 +147,17 @@ void SchedulerContext::publish_partition_resources(int32_t thread_idx) {
+             capacity | ((idle + pending) << 8) | (idle << 16), std::memory_order_relaxed
+         );
+         if (leader) {
++            uint64_t queued = 0, retired = 0, side_capacity = 0;
++            for (const auto &publisher : sched_->placement_feedback.threads) {
++                queued += publisher.summary[i].queued[side].load(std::memory_order_relaxed);
++                retired += publisher.summary[i].retired[side].load(std::memory_order_relaxed);
++                if (publisher.cluster.load(std::memory_order_relaxed) == side)
++                    side_capacity += publisher.summary[i].resources.load(std::memory_order_relaxed) & 255u;
++            }
++            sched_->placement_feedback.side_work[side][i].store(
++                queued > retired ? queued - retired : 0, std::memory_order_relaxed
++            );
++            sched_->placement_feedback.side_capacity[side][i].store(side_capacity, std::memory_order_relaxed);
+             uint64_t depth = shape == ResourceShape::DUMMY ? sched_->cluster_dummy_queues[side].size() :
+                                                              sched_->cluster_ready_queues[side][i].size() +
+                                                                  sched_->auto_ready_queues[side][i].size();

@@ -1,3 +1,5 @@
+> 本页保留原环境记录。v11 在独立worktree构建，物理卡5/逻辑设备0；依赖版本见 main 的 `official-results/v11-ready-affinity-20261119/python-packages.json`，新复现步骤见 [v11实验](ready-affinity.md)。
+
 # 环境记录与复现步骤
 
 ## 环境范围

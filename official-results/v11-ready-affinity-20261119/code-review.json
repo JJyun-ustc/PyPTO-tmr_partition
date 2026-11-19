@@ -1,0 +1,21 @@
+{
+  "review": "primary-agent manual code review",
+  "blocking_findings": [],
+  "checked": [
+    "single-writer counter ownership and reset/init ordering",
+    "first-ready once guard and same-side multiblock requeue",
+    "successful-range claim debit before prepare/publish",
+    "remote pickup uses only Auto single-block queues and queue-side accounting",
+    "strict/DUMMY/sync exclusion from remote pickup",
+    "actual first dispatch side overrides stale affinity preference",
+    "finite scope-local inferred preference propagation",
+    "single-attempt snapshot read and inclusion-cut local corrections",
+    "DFX-off build and byte-identical normal-build annotations"
+  ],
+  "limitations": [
+    "R excludes claimed/in-flight work and kernel duration",
+    "other publishers remain stale until hint refresh",
+    "multiblock stays single-side; no remote rescue",
+    "Shared sync-start first pickup cannot express a multi-side execution set"
+  ]
+}

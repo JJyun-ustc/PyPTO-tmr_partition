@@ -1,0 +1,191 @@
+diff --git a/data/aicpu-cluster-study/official-worktree/official-results/v10-block-pressure-20261117/A3-guarded-groups/source/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/aicpu_cluster_partition.h b/data/aicpu-cluster-study/official-worktree/official-results/v10-block-pressure-20261117/A4-future-shadow/source/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/aicpu_cluster_partition.h
+index 87d245b3..bb90327b 100644
+--- a/data/aicpu-cluster-study/official-worktree/official-results/v10-block-pressure-20261117/A3-guarded-groups/source/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/aicpu_cluster_partition.h
++++ b/data/aicpu-cluster-study/official-worktree/official-results/v10-block-pressure-20261117/A4-future-shadow/source/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/aicpu_cluster_partition.h
+@@ -163,6 +163,33 @@ struct alignas(64) PartitionReadyCounter {
+     void store(uint64_t n, std::memory_order order = std::memory_order_seq_cst) { value.store(n, order); }
+ };
+ static_assert(sizeof(PartitionReadyCounter) == 64);
++// Each side leader publishes work plus per-writer inclusion watermarks.
++struct alignas(128) PartitionPressure {
++    std::atomic<uint64_t> version{0}, work{0};
++    std::atomic<uint64_t> queued_cut[PARTITION_THREADS]{}, retired_cut[PARTITION_THREADS]{};
++    void reset() {
++        version.store(0);
++        work.store(0);
++        for (int t = 0; t < PARTITION_THREADS; ++t) {
++            queued_cut[t].store(0);
++            retired_cut[t].store(0);
++        }
++    }
++    bool read(int writer, uint64_t &value, uint64_t &q, uint64_t &x) const {
++        uint64_t v = version.load(std::memory_order_acquire);
++        if (v & 1) return false;
++        uint64_t w = work.load(std::memory_order_relaxed);
++        uint64_t qc = queued_cut[writer].load(std::memory_order_relaxed);
++        uint64_t xc = retired_cut[writer].load(std::memory_order_relaxed);
++        std::atomic_thread_fence(std::memory_order_acquire);
++        if (v != version.load(std::memory_order_relaxed)) return false;
++        value = w;
++        q = qc;
++        x = xc;
++        return true;
++    }
++};
++static_assert(sizeof(PartitionPressure) == 128);
+ struct PartitionShared {
+     std::atomic<bool> enabled{false};
+     std::atomic<bool> calibration_done{false};
+@@ -172,6 +199,7 @@ struct PartitionShared {
+     PartitionReadyCounter side_queue[2][PARTITION_SHAPES]{};
+     PartitionReadyCounter side_work[2][PARTITION_SHAPES]{};
+     PartitionReadyCounter side_capacity[2][PARTITION_SHAPES]{};
++    PartitionPressure side_pressure[2][PARTITION_SHAPES]{};
+     PartitionThread threads[PARTITION_THREADS];
+     void reset() {
+         enabled.store(false, std::memory_order_relaxed);
+@@ -185,6 +213,7 @@ struct PartitionShared {
+             thread.reset();
+         for (int c = 0; c < 2; ++c)
+             for (int s = 0; s < PARTITION_SHAPES; ++s) {
++                side_pressure[c][s].reset();
+                 side_work[c][s].store(0, std::memory_order_relaxed);
+                 side_capacity[c][s].store(0, std::memory_order_relaxed);
+             }
+@@ -196,7 +225,9 @@ struct PartitionLoad {
+ };
+ // Work is in logical-block equivalents; one capacity wave is 256 units.
+ inline uint64_t partition_future_wave(uint64_t waiting, uint64_t capacity) {
+-    return 64 * (waiting < capacity ? waiting : capacity) / capacity;
++    uint64_t near = waiting < capacity ? waiting : capacity;
++    uint64_t far = waiting - near;
++    return (128 * near + 32 * far) / capacity;
+ }
+ inline uint64_t partition_wave(uint64_t ready, uint64_t inflight, uint64_t waiting, uint64_t units, uint64_t capacity) {
+     if (!capacity) return UINT64_MAX / 4;
+@@ -277,6 +308,19 @@ struct ClusterPartitioner {
+         return out;
+     }
+ 
++    bool can_inherit_work(
++        const AdaptiveTaskState &parent, uint64_t scope, int shape, uint32_t units, uint32_t waits,
++        const PartitionLoad &load, int side
++    ) const {
++        if (waits != 1 || side < 0 || side > 1 || !load.schedulers[side] || !can_inherit(parent, scope)) return false;
++        uint64_t cap = load.capacity[side] ? load.capacity[side] : load.schedulers[side];
++        const auto &g = groups[parent.group % PARTITION_GROUP_SLOTS];
++        if (g.blocks[shape] + units > 2 * cap) return false;
++        int other = 1 - side;
++        uint64_t other_cap = load.capacity[other] ? load.capacity[other] : load.schedulers[other];
++        return partition_wave(load.ready[side], load.inflight[side], load.blocked[side], units, cap) <=
++               partition_wave(load.ready[other], load.inflight[other], load.blocked[other], units, other_cap) + 64;
++    }
+     PartitionTrace trace;
+     PartitionWeights weights[PARTITION_SHAPES];
+     uint64_t assigned[2][PARTITION_SHAPES]{};
+@@ -395,19 +439,6 @@ struct ClusterPartitioner {
+         // Refresh rebuilds from totals; it never adds the old local delta again.
+         load.blocked[cluster] += units;
+     }
+-    // Future reservations are block units, capped at one capacity wave per side.
+-    // They do not consume free/idle slots. Pending new tasks include their own
+-    // blocks before assignment; ready publication removes existing preferences
+-    // through assigned - released, independently of dispatch snapshots.
+-    static uint64_t
+-    future_reservation_cost(const PartitionLoad &load, int c, uint32_t pending_units, uint64_t queue_ns) {
+-        uint64_t budget = load.capacity[c] ? load.capacity[c] : load.schedulers[c];
+-        if (!budget) return 0;
+-        uint64_t reserved = load.blocked[c] < budget ? load.blocked[c] : budget;
+-        uint64_t room = budget - reserved;
+-        reserved += pending_units < room ? pending_units : room;
+-        return queue_ns * reserved / budget / PARTITION_FUTURE_WEIGHT_DEN;
+-    }
+     PartitionDecision choose(
+         const PartitionLoad &load, uint32_t count, const uint32_t sources[2], int shape, int o_cluster,
+         uint32_t units = 1
+diff --git a/data/aicpu-cluster-study/official-worktree/official-results/v10-block-pressure-20261117/A3-guarded-groups/source/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/orchestrator.cpp b/data/aicpu-cluster-study/official-worktree/official-results/v10-block-pressure-20261117/A4-future-shadow/source/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/orchestrator.cpp
+index 1354aa9d..29da4df2 100644
+--- a/data/aicpu-cluster-study/official-worktree/official-results/v10-block-pressure-20261117/A3-guarded-groups/source/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/orchestrator.cpp
++++ b/data/aicpu-cluster-study/official-worktree/official-results/v10-block-pressure-20261117/A4-future-shadow/source/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/orchestrator.cpp
+@@ -1246,21 +1246,11 @@ static TaskOutputTensors submit_task_common(
+             if (partitioner.can_inherit(parent, scope)) {
+                 int actual = parent.dispatch_cluster.load(std::memory_order_acquire);
+                 inherited = actual >= 0 ? actual : parent.preferred_cluster;
+-                if (inherited >= 0 && feedback.schedulers[inherited]) {
+-                    uint64_t cap = load.capacity[inherited] ? load.capacity[inherited] : load.schedulers[inherited];
+-                    int other = 1 - inherited;
+-                    uint64_t other_cap = load.capacity[other] ? load.capacity[other] : load.schedulers[other];
+-                    const auto &group = partitioner.groups[parent.group % simpler::tmr::PARTITION_GROUP_SLOTS];
+-                    uint64_t own = simpler::tmr::partition_wave(
+-                        load.ready[inherited], load.inflight[inherited], load.blocked[inherited], units, cap
+-                    );
+-                    uint64_t remote = simpler::tmr::partition_wave(
+-                        load.ready[other], load.inflight[other], load.blocked[other], units, other_cap
+-                    );
+-                    bool eligible = fanin_builder.wait_count == 1 && group.blocks[shape_index] + units <= 2 * cap;
+-                    if (eligible && own <= remote + 64) parent_group = parent.group;
+-                    else inherited = -1;
+-                } else inherited = -1;
++                if (partitioner.can_inherit_work(
++                        parent, scope, shape_index, units, fanin_builder.wait_count, load, inherited
++                    ))
++                    parent_group = parent.group;
++                else inherited = -1;
+             }
+             if (inherited >= 0 || producer->task_state.load(std::memory_order_acquire) != CHIP_TASK_PENDING) return;
+             ++pending;
+diff --git a/data/aicpu-cluster-study/official-worktree/official-results/v10-block-pressure-20261117/A3-guarded-groups/source/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler.h b/data/aicpu-cluster-study/official-worktree/official-results/v10-block-pressure-20261117/A4-future-shadow/source/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler.h
+index 8b216860..47d3948b 100644
+--- a/data/aicpu-cluster-study/official-worktree/official-results/v10-block-pressure-20261117/A3-guarded-groups/source/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler.h
++++ b/data/aicpu-cluster-study/official-worktree/official-results/v10-block-pressure-20261117/A4-future-shadow/source/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler.h
+@@ -595,6 +595,18 @@ struct SchedulerState {
+                 for (int side = 0; side < 2; ++side) {
+                     work[side] =
+                         placement_feedback.side_work[side][static_cast<int>(shape)].load(std::memory_order_relaxed);
++                    uint64_t acknowledged_q = 0, acknowledged_x = 0, snapshot_work = 0;
++                    const auto &view = placement_feedback.side_pressure[side][static_cast<int>(shape)];
++                    if (view.read(metadata.ready_writer, snapshot_work, acknowledged_q, acknowledged_x)) {
++                        const auto &own =
++                            placement_feedback.threads[metadata.ready_writer].summary[static_cast<int>(shape)];
++                        uint64_t q = own.queued[side].load(std::memory_order_relaxed);
++                        uint64_t x = own.retired[side].load(std::memory_order_relaxed);
++                        uint64_t added = q >= acknowledged_q ? q - acknowledged_q : 0;
++                        uint64_t removed = x >= acknowledged_x ? x - acknowledged_x : 0;
++                        uint64_t outstanding = snapshot_work + added;
++                        work[side] = outstanding > removed ? outstanding - removed : 0;
++                    }
+                     capacity[side] =
+                         placement_feedback.side_capacity[side][static_cast<int>(shape)].load(std::memory_order_relaxed);
+                     if (!capacity[side]) capacity[side] = placement_feedback.schedulers[side];
+diff --git a/data/aicpu-cluster-study/official-worktree/official-results/v10-block-pressure-20261117/A3-guarded-groups/source/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler_dispatch.cpp b/data/aicpu-cluster-study/official-worktree/official-results/v10-block-pressure-20261117/A4-future-shadow/source/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler_dispatch.cpp
+index 4e30d6cd..b4daa121 100644
+--- a/data/aicpu-cluster-study/official-worktree/official-results/v10-block-pressure-20261117/A3-guarded-groups/source/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler_dispatch.cpp
++++ b/data/aicpu-cluster-study/official-worktree/official-results/v10-block-pressure-20261117/A4-future-shadow/source/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler_dispatch.cpp
+@@ -148,12 +148,24 @@ void SchedulerContext::publish_partition_resources(int32_t thread_idx) {
+         );
+         if (leader) {
+             uint64_t queued = 0, retired = 0, side_capacity = 0;
+-            for (const auto &publisher : sched_->placement_feedback.threads) {
+-                queued += publisher.summary[i].queued[side].load(std::memory_order_relaxed);
+-                retired += publisher.summary[i].retired[side].load(std::memory_order_relaxed);
++            uint64_t qcut[simpler::tmr::PARTITION_THREADS]{}, xcut[simpler::tmr::PARTITION_THREADS]{};
++            for (int t = 0; t < simpler::tmr::PARTITION_THREADS; ++t) {
++                const auto &publisher = sched_->placement_feedback.threads[t];
++                qcut[t] = publisher.summary[i].queued[side].load(std::memory_order_relaxed);
++                xcut[t] = publisher.summary[i].retired[side].load(std::memory_order_relaxed);
++                queued += qcut[t];
++                retired += xcut[t];
+                 if (publisher.cluster.load(std::memory_order_relaxed) == side)
+                     side_capacity += publisher.summary[i].resources.load(std::memory_order_relaxed) & 255u;
+             }
++            auto &view = sched_->placement_feedback.side_pressure[side][i];
++            view.version.fetch_add(1, std::memory_order_acq_rel);
++            view.work.store(queued > retired ? queued - retired : 0, std::memory_order_relaxed);
++            for (int t = 0; t < simpler::tmr::PARTITION_THREADS; ++t) {
++                view.queued_cut[t].store(qcut[t], std::memory_order_relaxed);
++                view.retired_cut[t].store(xcut[t], std::memory_order_relaxed);
++            }
++            view.version.fetch_add(1, std::memory_order_release);
+             sched_->placement_feedback.side_work[side][i].store(
+                 queued > retired ? queued - retired : 0, std::memory_order_relaxed
+             );

@@ -1,0 +1,30 @@
+{
+  "physical_card": 3,
+  "logical_device": 0,
+  "exclusive_lock": false,
+  "official_source_commit": "d8f997fabd1b6988b69a94feef61ab669dda0eea",
+  "official_runtime_delta": "PLATFORM_MAX_AICPU_THREADS 4 -> 6 only",
+  "stages": {
+    "A0-v8": "fresh current v8 Auto on this card",
+    "A1-ledger": "claimed and retired-equivalent counters, original policy",
+    "A2-block-waves": "R=queued-claimed; I=claimed-retired; block/capacity pressure with own incoming size; affinity only within quarter-wave band; hardcapped future",
+    "A3-guarded-groups": "single reduced WAIT predecessor, per-shape group block budget 2K, local pressure guard",
+    "A4-future-shadow": "future half-weight first wave + eighth-weight distant work; ready local delta corrected by publisher watermarks"
+  },
+  "mixed_retirement": "one equivalent block per active_subslots completions using existing task counter; not a per-block completion bitmap",
+  "stage_cases": [
+    "Bgemm",
+    "Scale",
+    "Uniform",
+    "Skew",
+    "Multi16",
+    "MultiSkew",
+    "Fanout",
+    "Burst"
+  ],
+  "initial_official_cases": "first seven; Burst added to all Auto stages and final frozen official recheck",
+  "timing": "30 rounds per stage/case, 15 forward + 15 reverse; separate golden and diagnostic; include process-first rounds",
+  "thread_limits": "explicit cmake --parallel 2; test driver caps multiprocessing cpu_count to 2 and torch threads to 2; initial official RuntimeBuilder exposed hardcoded --parallel32, see KNOWN_ISSUES",
+  "cross_side_pickup": false,
+  "normal_compute_mix": "all Auto or all Shared in separate runs; no mixed policy computation"
+}

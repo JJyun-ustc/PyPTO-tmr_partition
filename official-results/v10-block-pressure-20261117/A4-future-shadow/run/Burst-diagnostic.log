@@ -1,0 +1,26 @@
+[mono_ns=6498247603994040][T0x3fffb7502420][INFO] configure_aicore_op_timeout: [device_runner_base.cpp:1666] aclrtSetOpExecuteTimeOutV2: requested=45000000 us, actual=47244640 us
+[mono_ns=6498247609369410][T0x3fffb7502420][INFO] ensure_device_initialized: [device_runner_base.cpp:1724] DeviceRunner: device=0 set, streams created
+[mono_ns=6498247609444180][T0x3fffb7502420][INFO] ensure_device_initialized: [device_runner_base.cpp:1731] DeviceRunner: device=0 max_block_dim=24 (cube=24, vector=48)
+[mono_ns=6498247635376170][T0x3fffb7502420][INFO] BootstrapDispatcher: [load_aicpu_op.cpp:214] BootstrapDispatcher: bundled dispatcher (14472 B) + inner SO (4450184 B) uploaded; inner SO at simpler_inner_37a3ea6cbb9cc5ee_0.so
+[mono_ns=6498247635467270][T0x3fffb7502420][INFO] ensure_binaries_loaded: [device_runner_base.cpp:1926] DeviceRunner: inner SO uploaded to preinstall via dispatcher bootstrap
+[mono_ns=6498247635924440][T0x3fffb7502420][INFO] Init: [load_aicpu_op.cpp:382] LoadAicpuOp::Init: JSON=/tmp/simpler_inner_37a3ea6cbb9cc5ee_2964587.json inner_basename=simpler_inner_37a3ea6cbb9cc5ee_0.so
+[mono_ns=6498247636165210][T0x3fffb7502420][INFO] Init: [load_aicpu_op.cpp:390] LoadAicpuOp: Loaded inner SO via JSON, handle=0x2aab0923c790
+[mono_ns=6498247636352120][T0x3fffb7502420][INFO] Init: [load_aicpu_op.cpp:407] LoadAicpuOp: resolved handle for simpler_aicpu_exec (opType=simpler_aicpu_exec_37a3ea6cbb9cc5ee): 0x2aab0923fa60
+[mono_ns=6498247636370690][T0x3fffb7502420][INFO] Init: [load_aicpu_op.cpp:407] LoadAicpuOp: resolved handle for simpler_aicpu_init (opType=simpler_aicpu_init_37a3ea6cbb9cc5ee): 0x2aab0923ff50
+[mono_ns=6498247636383960][T0x3fffb7502420][INFO] Init: [load_aicpu_op.cpp:407] LoadAicpuOp: resolved handle for simpler_aicpu_register_callable (opType=simpler_aicpu_register_callable_37a3ea6cbb9cc5ee): 0x2aab09240440
+[mono_ns=6498247636391470][T0x3fffb7502420][INFO] ensure_binaries_loaded: [device_runner_base.cpp:1942] DeviceRunner: inner SO registered (runtime entry handles ready)
+[mono_ns=6498247636398240][T0x3fffb7502420][INFO] ensure_binaries_loaded: [device_runner_base.cpp:1955] DeviceRunner: binaries loaded
+[mono_ns=6498247636438810][T0x3fffb7502420][INFO] fill_init_arch_fields: [device_runner.cpp:155] fill_init_arch_fields: device 0 nocache alias offset=0x80000000000
+[mono_ns=6498247636447080][T0x3fffb7502420][INFO] ensure_aicpu_init_launched: [device_runner_base.cpp:1871] === launch_aicpu_payload simpler_aicpu_init ===
+
+=== Runtime: tensormap_and_ringbuffer  Level: 2  Pipeline depth: default ===
+  TestReadyBurst::BurstAuto ...
+[mono_ns=6498248019341010][T0x3fffb7502420][INFO] register_callable_impl: [runtime_maker.cpp:313] Registering 1 kernel(s) in register_callable_impl
+[mono_ns=6498248022045820][T0x3fffb7502420][TIMING] log_callable_image: Callable image: device=0 runner=0x2aab067ea640 chip_hash=0x14fcfad27b6ad8c6 chip_dev=0x12c0c001a000 upload_bytes=620808 children=1
+[mono_ns=6498248022059000][T0x3fffb7502420][TIMING] log_callable_image: Callable code: device=0 runner=0x2aab067ea640 chip_hash=0x14fcfad27b6ad8c6 chip_dev=0x12c0c001a000 func_id=0 code_begin=0x12c0c00b1820 code_end_exclusive=0x12c0c00b18cc code_bytes=172 code_fnv1a64=0xc6f36b166dcf4811
+[mono_ns=6498248022069350][T0x3fffb7502420][INFO] register_callable_impl: [runtime_maker.cpp:339] Orchestration SO: 602816 bytes uploaded (host-only)
+[mono_ns=6498248022076520][T0x3fffb7502420][TIMING] record_device_orch_callable: [device_runner_base.cpp:2425] Callable registration: device=0 runner=0x2aab067ea640 cid=0 chip_hash=0x14fcfad27b6ad8c6 aicore_image_hash=0xd9aec2920b2bda7c orch_hash=0xe2ce3bac2340b64c orch_bytes=602816
+[mono_ns=6498248022116750][T0x3fffb7502420][INFO] register_callable_on_device: [device_runner_base.cpp:2340] === launch_aicpu_payload simpler_aicpu_register_callable ===
+[mono_ns=6498248023340440][T0x3fffb7502420][INFO] commit_device_register: [device_runner_base.cpp:2291] AICPU callable load committed cid=0 (count=1)
+[TIMING] torch_backend_autoload setting=unset raw=null raw_truncated=false effective=enabled torch_imported=true torch_npu_loaded=false
+  TestReadyBurst::BurstAuto PASSED

@@ -1,0 +1,11 @@
+--- no-pickup/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/ready_affinity.h
++++ pickup/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/ready_affinity.h
+@@ -21,7 +21,7 @@
+ constexpr uint32_t READY_FEEDBACK_LOOPS = 64;
+ constexpr uint32_t READY_PROBE_LOOPS = 32;
+ constexpr uint32_t READY_PROBE_COOLDOWN = 128;
+-constexpr bool READY_REMOTE_PICKUP = false;
++constexpr bool READY_REMOTE_PICKUP = true;
+ 
+ enum class AffinityStrength : uint8_t { NEUTRAL, WEAK, STRONG };
+ struct ReadyTaskState {

@@ -1,0 +1,4681 @@
+{
+  "Bgemm": {
+    "device_log": "device-logs/debug/device-0/device-2963490_20261117125102136.log",
+    "stages": {
+      "O": {
+        "poll": {
+          "calls": 1000,
+          "ns": 21160
+        },
+        "queue_depth": {
+          "calls": 752,
+          "ns": 12900
+        },
+        "fanin": {
+          "calls": 1000,
+          "ns": 48240
+        },
+        "load": {
+          "calls": 1000,
+          "ns": 36480
+        },
+        "choose_commit": {
+          "calls": 1000,
+          "ns": 59440
+        },
+        "wire_ready": {
+          "calls": 1000,
+          "ns": 230020
+        }
+      },
+      "S0": {
+        "resource_feedback": {
+          "calls": 19,
+          "ns": 33480
+        },
+        "observe": {
+          "calls": 202,
+          "ns": 47680
+        },
+        "auto_dispatch": {
+          "calls": 1159,
+          "ns": 443040
+        },
+        "strict_dispatch": {
+          "calls": 1159,
+          "ns": 23600
+        },
+        "shared_dispatch": {
+          "calls": 1159,
+          "ns": 20620
+        },
+        "sync_dispatch": {
+          "calls": 1159,
+          "ns": 204520
+        },
+        "ready_binding": {
+          "calls": 114,
+          "ns": 61640
+        },
+        "cross_pickup": {
+          "calls": 0,
+          "ns": 0
+        }
+      },
+      "S1": {
+        "resource_feedback": {
+          "calls": 15,
+          "ns": 1120
+        },
+        "observe": {
+          "calls": 168,
+          "ns": 35360
+        },
+        "auto_dispatch": {
+          "calls": 918,
+          "ns": 421940
+        },
+        "strict_dispatch": {
+          "calls": 918,
+          "ns": 29060
+        },
+        "shared_dispatch": {
+          "calls": 918,
+          "ns": 15960
+        },
+        "sync_dispatch": {
+          "calls": 918,
+          "ns": 403960
+        },
+        "ready_binding": {
+          "calls": 83,
+          "ns": 43100
+        },
+        "cross_pickup": {
+          "calls": 0,
+          "ns": 0
+        }
+      },
+      "S2": {
+        "resource_feedback": {
+          "calls": 20,
+          "ns": 29700
+        },
+        "observe": {
+          "calls": 171,
+          "ns": 29460
+        },
+        "auto_dispatch": {
+          "calls": 1233,
+          "ns": 299280
+        },
+        "strict_dispatch": {
+          "calls": 1233,
+          "ns": 66680
+        },
+        "shared_dispatch": {
+          "calls": 1233,
+          "ns": 27800
+        },
+        "sync_dispatch": {
+          "calls": 1233,
+          "ns": 196500
+        },
+        "ready_binding": {
+          "calls": 84,
+          "ns": 21000
+        },
+        "cross_pickup": {
+          "calls": 0,
+          "ns": 0
+        }
+      },
+      "S3": {
+        "resource_feedback": {
+          "calls": 22,
+          "ns": 1900
+        },
+        "observe": {
+          "calls": 228,
+          "ns": 34140
+        },
+        "auto_dispatch": {
+          "calls": 1388,
+          "ns": 349740
+        },
+        "strict_dispatch": {
+          "calls": 1388,
+          "ns": 75140
+        },
+        "shared_dispatch": {
+          "calls": 1388,
+          "ns": 25720
+        },
+        "sync_dispatch": {
+          "calls": 1388,
+          "ns": 204280
+        },
+        "ready_binding": {
+          "calls": 118,
+          "ns": 33940
+        },
+        "cross_pickup": {
+          "calls": 0,
+          "ns": 0
+        }
+      },
+      "S4": {
+        "resource_feedback": {
+          "calls": 22,
+          "ns": 2060
+        },
+        "observe": {
+          "calls": 231,
+          "ns": 39180
+        },
+        "auto_dispatch": {
+          "calls": 1361,
+          "ns": 379800
+        },
+        "strict_dispatch": {
+          "calls": 1361,
+          "ns": 72220
+        },
+        "shared_dispatch": {
+          "calls": 1361,
+          "ns": 34140
+        },
+        "sync_dispatch": {
+          "calls": 1361,
+          "ns": 208060
+        },
+        "ready_binding": {
+          "calls": 101,
+          "ns": 26120
+        },
+        "cross_pickup": {
+          "calls": 0,
+          "ns": 0
+        }
+      }
+    },
+    "final": [
+      {
+        "version": 4,
+        "decisions": [
+          322,
+          678
+        ],
+        "started": [
+          370,
+          630
+        ],
+        "cold": 256,
+        "learned": 744,
+        "calibrations": 1,
+        "updates": [
+          4,
+          5
+        ],
+        "batch_size": 64,
+        "snapshots": 32
+      }
+    ],
+    "groups": [
+      {
+        "full": 752,
+        "inherited": 248
+      }
+    ],
+    "placement": [
+      {
+        "shape": 0,
+        "preferred": [
+          132,
+          368
+        ],
+        "released": [
+          132,
+          368
+        ],
+        "queued": [
+          179,
+          321
+        ],
+        "taken": [
+          179,
+          321
+        ],
+        "actual": [
+          179,
+          321
+        ]
+      },
+      {
+        "shape": 1,
+        "preferred": [
+          190,
+          310
+        ],
+        "released": [
+          190,
+          310
+        ],
+        "queued": [
+          191,
+          309
+        ],
+        "taken": [
+          191,
+          309
+        ],
+        "actual": [
+          191,
+          309
+        ]
+      },
+      {
+        "shape": 2,
+        "preferred": [
+          0,
+          0
+        ],
+        "released": [
+          0,
+          0
+        ],
+        "queued": [
+          0,
+          0
+        ],
+        "taken": [
+          0,
+          0
+        ],
+        "actual": [
+          0,
+          0
+        ]
+      },
+      {
+        "shape": 3,
+        "preferred": [
+          0,
+          0
+        ],
+        "released": [
+          0,
+          0
+        ],
+        "queued": [
+          0,
+          0
+        ],
+        "taken": [
+          0,
+          0
+        ],
+        "actual": [
+          0,
+          0
+        ]
+      }
+    ],
+    "blocks": [
+      {
+        "shape": 0,
+        "queued": [
+          179,
+          321
+        ],
+        "claimed": [
+          179,
+          321
+        ],
+        "published": [
+          179,
+          321
+        ],
+        "retired": [
+          179,
+          321
+        ]
+      },
+      {
+        "shape": 1,
+        "queued": [
+          191,
+          309
+        ],
+        "claimed": [
+          191,
+          309
+        ],
+        "published": [
+          191,
+          309
+        ],
+        "retired": [
+          191,
+          309
+        ]
+      },
+      {
+        "shape": 2,
+        "queued": [
+          0,
+          0
+        ],
+        "claimed": [
+          0,
+          0
+        ],
+        "published": [
+          0,
+          0
+        ],
+        "retired": [
+          0,
+          0
+        ]
+      },
+      {
+        "shape": 3,
+        "queued": [
+          0,
+          0
+        ],
+        "claimed": [
+          0,
+          0
+        ],
+        "published": [
+          0,
+          0
+        ],
+        "retired": [
+          0,
+          0
+        ]
+      }
+    ],
+    "prices": [
+      {
+        "shape": 0,
+        "queue": [
+          2000,
+          1977
+        ],
+        "publish": [
+          250,
+          750,
+          1500,
+          500
+        ],
+        "dependency": [
+          250,
+          750,
+          750,
+          250
+        ],
+        "observed": [
+          44,
+          84
+        ]
+      },
+      {
+        "shape": 1,
+        "queue": [
+          2000,
+          2000
+        ],
+        "publish": [
+          250,
+          750,
+          750,
+          250
+        ],
+        "dependency": [
+          500,
+          750,
+          750,
+          500
+        ],
+        "observed": [
+          49,
+          71
+        ]
+      },
+      {
+        "shape": 2,
+        "queue": [
+          2000,
+          2000
+        ],
+        "publish": [
+          250,
+          750,
+          750,
+          250
+        ],
+        "dependency": [
+          250,
+          750,
+          750,
+          250
+        ],
+        "observed": [
+          0,
+          0
+        ]
+      },
+      {
+        "shape": 3,
+        "queue": [
+          2000,
+          2000
+        ],
+        "publish": [
+          250,
+          750,
+          750,
+          250
+        ],
+        "dependency": [
+          250,
+          750,
+          750,
+          250
+        ],
+        "observed": [
+          0,
+          0
+        ]
+      }
+    ],
+    "price_updates": [
+      {
+        "shape": 0,
+        "cluster": 0,
+        "queue": 0,
+        "o0": 0,
+        "o1": 1,
+        "s0": 0,
+        "s1": 0
+      },
+      {
+        "shape": 0,
+        "cluster": 1,
+        "queue": 1,
+        "o0": 0,
+        "o1": 1,
+        "s0": 0,
+        "s1": 0
+      },
+      {
+        "shape": 1,
+        "cluster": 0,
+        "queue": 0,
+        "o0": 0,
+        "o1": 0,
+        "s0": 1,
+        "s1": 0
+      },
+      {
+        "shape": 1,
+        "cluster": 1,
+        "queue": 0,
+        "o0": 0,
+        "o1": 0,
+        "s0": 0,
+        "s1": 1
+      },
+      {
+        "shape": 2,
+        "cluster": 0,
+        "queue": 0,
+        "o0": 0,
+        "o1": 0,
+        "s0": 0,
+        "s1": 0
+      },
+      {
+        "shape": 2,
+        "cluster": 1,
+        "queue": 0,
+        "o0": 0,
+        "o1": 0,
+        "s0": 0,
+        "s1": 0
+      },
+      {
+        "shape": 3,
+        "cluster": 0,
+        "queue": 0,
+        "o0": 0,
+        "o1": 0,
+        "s0": 0,
+        "s1": 0
+      },
+      {
+        "shape": 3,
+        "cluster": 1,
+        "queue": 0,
+        "o0": 0,
+        "o1": 0,
+        "s0": 0,
+        "s1": 0
+      }
+    ],
+    "tasks": 1000,
+    "logical_blocks": 1000,
+    "captured_execution_records": 1000,
+    "O_submit_ms": 1.5206000000000008,
+    "O_placement_and_wire_ms": 0.40824,
+    "S_ready_binding_sum_ms": 0.1858,
+    "S_phase_sum_ms": {
+      "complete": 1.2360600000000008,
+      "dispatch": 2.0909399999999994,
+      "resolve": 0.1382600000000014
+    },
+    "compute_hashes": {
+      "0": "0x212c407e5c39dda2",
+      "1": "0x4c0e49fc6b5f2f9f"
+    }
+  },
+  "Uniform": {
+    "device_log": "device-logs/debug/device-0/device-2963799_20261117125122170.log",
+    "stages": {
+      "O": {
+        "poll": {
+          "calls": 2048,
+          "ns": 38640
+        },
+        "queue_depth": {
+          "calls": 1082,
+          "ns": 12740
+        },
+        "fanin": {
+          "calls": 2048,
+          "ns": 123200
+        },
+        "load": {
+          "calls": 2048,
+          "ns": 87140
+        },
+        "choose_commit": {
+          "calls": 2048,
+          "ns": 124180
+        },
+        "wire_ready": {
+          "calls": 2048,
+          "ns": 600420
+        }
+      },
+      "S0": {
+        "resource_feedback": {
+          "calls": 63,
+          "ns": 107680
+        },
+        "observe": {
+          "calls": 422,
+          "ns": 70780
+        },
+        "auto_dispatch": {
+          "calls": 3995,
+          "ns": 825060
+        },
+        "strict_dispatch": {
+          "calls": 3995,
+          "ns": 75000
+        },
+        "shared_dispatch": {
+          "calls": 3995,
+          "ns": 66520
+        },
+        "sync_dispatch": {
+          "calls": 3995,
+          "ns": 650960
+        },
+        "ready_binding": {
+          "calls": 332,
+          "ns": 207720
+        },
+        "cross_pickup": {
+          "calls": 0,
+          "ns": 0
+        }
+      },
+      "S1": {
+        "resource_feedback": {
+          "calls": 44,
+          "ns": 3160
+        },
+        "observe": {
+          "calls": 325,
+          "ns": 56320
+        },
+        "auto_dispatch": {
+          "calls": 2756,
+          "ns": 838220
+        },
+        "strict_dispatch": {
+          "calls": 2756,
+          "ns": 70100
+        },
+        "shared_dispatch": {
+          "calls": 2756,
+          "ns": 44960
+        },
+        "sync_dispatch": {
+          "calls": 2756,
+          "ns": 1239480
+        },
+        "ready_binding": {
+          "calls": 265,
+          "ns": 163060
+        },
+        "cross_pickup": {
+          "calls": 0,
+          "ns": 0
+        }
+      },
+      "S2": {
+        "resource_feedback": {
+          "calls": 61,
+          "ns": 100260
+        },
+        "observe": {
+          "calls": 322,
+          "ns": 53080
+        },
+        "auto_dispatch": {
+          "calls": 3884,
+          "ns": 640980
+        },
+        "strict_dispatch": {
+          "calls": 3884,
+          "ns": 138100
+        },
+        "shared_dispatch": {
+          "calls": 3884,
+          "ns": 71440
+        },
+        "sync_dispatch": {
+          "calls": 3884,
+          "ns": 586660
+        },
+        "ready_binding": {
+          "calls": 241,
+          "ns": 59340
+        },
+        "cross_pickup": {
+          "calls": 0,
+          "ns": 0
+        }
+      },
+      "S3": {
+        "resource_feedback": {
+          "calls": 78,
+          "ns": 5880
+        },
+        "observe": {
+          "calls": 475,
+          "ns": 72860
+        },
+        "auto_dispatch": {
+          "calls": 4946,
+          "ns": 860680
+        },
+        "strict_dispatch": {
+          "calls": 4946,
+          "ns": 173500
+        },
+        "shared_dispatch": {
+          "calls": 4946,
+          "ns": 89640
+        },
+        "sync_dispatch": {
+          "calls": 4946,
+          "ns": 707940
+        },
+        "ready_binding": {
+          "calls": 333,
+          "ns": 79780
+        },
+        "cross_pickup": {
+          "calls": 0,
+          "ns": 0
+        }
+      },
+      "S4": {
+        "resource_feedback": {
+          "calls": 79,
+          "ns": 5160
+        },
+        "observe": {
+          "calls": 504,
+          "ns": 74400
+        },
+        "auto_dispatch": {
+          "calls": 5025,
+          "ns": 835720
+        },
+        "strict_dispatch": {
+          "calls": 5025,
+          "ns": 175840
+        },
+        "shared_dispatch": {
+          "calls": 5025,
+          "ns": 92200
+        },
+        "sync_dispatch": {
+          "calls": 5025,
+          "ns": 719040
+        },
+        "ready_binding": {
+          "calls": 365,
+          "ns": 91800
+        },
+        "cross_pickup": {
+          "calls": 0,
+          "ns": 0
+        }
+      }
+    },
+    "final": [
+      {
+        "version": 4,
+        "decisions": [
+          657,
+          1391
+        ],
+        "started": [
+          747,
+          1301
+        ],
+        "cold": 256,
+        "learned": 1792,
+        "calibrations": 1,
+        "updates": [
+          3,
+          6
+        ],
+        "batch_size": 64,
+        "snapshots": 64
+      }
+    ],
+    "groups": [
+      {
+        "full": 1082,
+        "inherited": 966
+      }
+    ],
+    "placement": [
+      {
+        "shape": 0,
+        "preferred": [
+          231,
+          793
+        ],
+        "released": [
+          231,
+          793
+        ],
+        "queued": [
+          301,
+          723
+        ],
+        "taken": [
+          301,
+          723
+        ],
+        "actual": [
+          301,
+          723
+        ]
+      },
+      {
+        "shape": 1,
+        "preferred": [
+          426,
+          598
+        ],
+        "released": [
+          426,
+          598
+        ],
+        "queued": [
+          446,
+          578
+        ],
+        "taken": [
+          446,
+          578
+        ],
+        "actual": [
+          446,
+          578
+        ]
+      },
+      {
+        "shape": 2,
+        "preferred": [
+          0,
+          0
+        ],
+        "released": [
+          0,
+          0
+        ],
+        "queued": [
+          0,
+          0
+        ],
+        "taken": [
+          0,
+          0
+        ],
+        "actual": [
+          0,
+          0
+        ]
+      },
+      {
+        "shape": 3,
+        "preferred": [
+          0,
+          0
+        ],
+        "released": [
+          0,
+          0
+        ],
+        "queued": [
+          0,
+          0
+        ],
+        "taken": [
+          0,
+          0
+        ],
+        "actual": [
+          0,
+          0
+        ]
+      }
+    ],
+    "blocks": [
+      {
+        "shape": 0,
+        "queued": [
+          301,
+          723
+        ],
+        "claimed": [
+          301,
+          723
+        ],
+        "published": [
+          301,
+          723
+        ],
+        "retired": [
+          301,
+          723
+        ]
+      },
+      {
+        "shape": 1,
+        "queued": [
+          446,
+          578
+        ],
+        "claimed": [
+          446,
+          578
+        ],
+        "published": [
+          446,
+          578
+        ],
+        "retired": [
+          446,
+          578
+        ]
+      },
+      {
+        "shape": 2,
+        "queued": [
+          0,
+          0
+        ],
+        "claimed": [
+          0,
+          0
+        ],
+        "published": [
+          0,
+          0
+        ],
+        "retired": [
+          0,
+          0
+        ]
+      },
+      {
+        "shape": 3,
+        "queued": [
+          0,
+          0
+        ],
+        "claimed": [
+          0,
+          0
+        ],
+        "published": [
+          0,
+          0
+        ],
+        "retired": [
+          0,
+          0
+        ]
+      }
+    ],
+    "prices": [
+      {
+        "shape": 0,
+        "queue": [
+          2000,
+          1000
+        ],
+        "publish": [
+          250,
+          750,
+          750,
+          500
+        ],
+        "dependency": [
+          250,
+          750,
+          750,
+          500
+        ],
+        "observed": [
+          38,
+          89
+        ]
+      },
+      {
+        "shape": 1,
+        "queue": [
+          2000,
+          2000
+        ],
+        "publish": [
+          250,
+          750,
+          750,
+          250
+        ],
+        "dependency": [
+          500,
+          750,
+          750,
+          500
+        ],
+        "observed": [
+          39,
+          87
+        ]
+      },
+      {
+        "shape": 2,
+        "queue": [
+          2000,
+          2000
+        ],
+        "publish": [
+          250,
+          750,
+          750,
+          250
+        ],
+        "dependency": [
+          250,
+          750,
+          750,
+          250
+        ],
+        "observed": [
+          0,
+          0
+        ]
+      },
+      {
+        "shape": 3,
+        "queue": [
+          2000,
+          2000
+        ],
+        "publish": [
+          250,
+          750,
+          750,
+          250
+        ],
+        "dependency": [
+          250,
+          750,
+          750,
+          250
+        ],
+        "observed": [
+          0,
+          0
+        ]
+      }
+    ],
+    "price_updates": [
+      {
+        "shape": 0,
+        "cluster": 0,
+        "queue": 0,
+        "o0": 0,
+        "o1": 0,
+        "s0": 0,
+        "s1": 0
+      },
+      {
+        "shape": 0,
+        "cluster": 1,
+        "queue": 1,
+        "o0": 0,
+        "o1": 1,
+        "s0": 0,
+        "s1": 1
+      },
+      {
+        "shape": 1,
+        "cluster": 0,
+        "queue": 0,
+        "o0": 0,
+        "o1": 0,
+        "s0": 1,
+        "s1": 0
+      },
+      {
+        "shape": 1,
+        "cluster": 1,
+        "queue": 0,
+        "o0": 0,
+        "o1": 0,
+        "s0": 0,
+        "s1": 1
+      },
+      {
+        "shape": 2,
+        "cluster": 0,
+        "queue": 0,
+        "o0": 0,
+        "o1": 0,
+        "s0": 0,
+        "s1": 0
+      },
+      {
+        "shape": 2,
+        "cluster": 1,
+        "queue": 0,
+        "o0": 0,
+        "o1": 0,
+        "s0": 0,
+        "s1": 0
+      },
+      {
+        "shape": 3,
+        "cluster": 0,
+        "queue": 0,
+        "o0": 0,
+        "o1": 0,
+        "s0": 0,
+        "s1": 0
+      },
+      {
+        "shape": 3,
+        "cluster": 1,
+        "queue": 0,
+        "o0": 0,
+        "o1": 0,
+        "s0": 0,
+        "s1": 0
+      }
+    ],
+    "tasks": 2048,
+    "logical_blocks": 2048,
+    "captured_execution_records": 2048,
+    "O_submit_ms": 3.8004799999999928,
+    "O_placement_and_wire_ms": 0.98632,
+    "S_ready_binding_sum_ms": 0.6017,
+    "S_phase_sum_ms": {
+      "complete": 2.6058200000000062,
+      "dispatch": 4.126900000000001,
+      "resolve": 0.6274400000000009
+    },
+    "compute_hashes": {
+      "0": "0x78b21d77e40f5d10",
+      "1": "0x61eed84f73ec7bc1",
+      "2": "0xf44542e69b1df3d1",
+      "3": "0xc7fed830024b68b2"
+    }
+  },
+  "MultiSkew": {
+    "device_log": "device-logs/debug/device-0/device-2964268_20261117125151590.log",
+    "stages": {
+      "O": {
+        "poll": {
+          "calls": 384,
+          "ns": 9000
+        },
+        "queue_depth": {
+          "calls": 384,
+          "ns": 3320
+        },
+        "fanin": {
+          "calls": 384,
+          "ns": 8500
+        },
+        "load": {
+          "calls": 384,
+          "ns": 11600
+        },
+        "choose_commit": {
+          "calls": 384,
+          "ns": 24920
+        },
+        "wire_ready": {
+          "calls": 384,
+          "ns": 72740
+        }
+      },
+      "S0": {
+        "resource_feedback": {
+          "calls": 11,
+          "ns": 14100
+        },
+        "observe": {
+          "calls": 6163,
+          "ns": 102200
+        },
+        "auto_dispatch": {
+          "calls": 666,
+          "ns": 176700
+        },
+        "strict_dispatch": {
+          "calls": 666,
+          "ns": 3219960
+        },
+        "shared_dispatch": {
+          "calls": 666,
+          "ns": 22060
+        },
+        "sync_dispatch": {
+          "calls": 666,
+          "ns": 197380
+        },
+        "ready_binding": {
+          "calls": 0,
+          "ns": 0
+        },
+        "cross_pickup": {
+          "calls": 0,
+          "ns": 0
+        }
+      },
+      "S1": {
+        "resource_feedback": {
+          "calls": 10,
+          "ns": 1860
+        },
+        "observe": {
+          "calls": 5959,
+          "ns": 89860
+        },
+        "auto_dispatch": {
+          "calls": 628,
+          "ns": 241500
+        },
+        "strict_dispatch": {
+          "calls": 628,
+          "ns": 3348260
+        },
+        "shared_dispatch": {
+          "calls": 628,
+          "ns": 25820
+        },
+        "sync_dispatch": {
+          "calls": 628,
+          "ns": 347660
+        },
+        "ready_binding": {
+          "calls": 0,
+          "ns": 0
+        },
+        "cross_pickup": {
+          "calls": 0,
+          "ns": 0
+        }
+      },
+      "S2": {
+        "resource_feedback": {
+          "calls": 29,
+          "ns": 28680
+        },
+        "observe": {
+          "calls": 4713,
+          "ns": 62660
+        },
+        "auto_dispatch": {
+          "calls": 1812,
+          "ns": 173700
+        },
+        "strict_dispatch": {
+          "calls": 1812,
+          "ns": 2605600
+        },
+        "shared_dispatch": {
+          "calls": 1812,
+          "ns": 69080
+        },
+        "sync_dispatch": {
+          "calls": 1812,
+          "ns": 420200
+        },
+        "ready_binding": {
+          "calls": 0,
+          "ns": 0
+        },
+        "cross_pickup": {
+          "calls": 0,
+          "ns": 0
+        }
+      },
+      "S3": {
+        "resource_feedback": {
+          "calls": 36,
+          "ns": 3060
+        },
+        "observe": {
+          "calls": 5432,
+          "ns": 75540
+        },
+        "auto_dispatch": {
+          "calls": 2258,
+          "ns": 221200
+        },
+        "strict_dispatch": {
+          "calls": 2258,
+          "ns": 2830380
+        },
+        "shared_dispatch": {
+          "calls": 2258,
+          "ns": 71140
+        },
+        "sync_dispatch": {
+          "calls": 2258,
+          "ns": 552260
+        },
+        "ready_binding": {
+          "calls": 0,
+          "ns": 0
+        },
+        "cross_pickup": {
+          "calls": 0,
+          "ns": 0
+        }
+      },
+      "S4": {
+        "resource_feedback": {
+          "calls": 37,
+          "ns": 2480
+        },
+        "observe": {
+          "calls": 4677,
+          "ns": 73080
+        },
+        "auto_dispatch": {
+          "calls": 2331,
+          "ns": 222260
+        },
+        "strict_dispatch": {
+          "calls": 2331,
+          "ns": 2829840
+        },
+        "shared_dispatch": {
+          "calls": 2331,
+          "ns": 98980
+        },
+        "sync_dispatch": {
+          "calls": 2331,
+          "ns": 530060
+        },
+        "ready_binding": {
+          "calls": 0,
+          "ns": 0
+        },
+        "cross_pickup": {
+          "calls": 0,
+          "ns": 0
+        }
+      }
+    },
+    "final": [
+      {
+        "version": 4,
+        "decisions": [
+          48,
+          336
+        ],
+        "started": [
+          12122,
+          14822
+        ],
+        "cold": 256,
+        "learned": 128,
+        "calibrations": 1,
+        "updates": [
+          1,
+          1
+        ],
+        "batch_size": 64,
+        "snapshots": 6
+      }
+    ],
+    "groups": [
+      {
+        "full": 384,
+        "inherited": 0
+      }
+    ],
+    "placement": [
+      {
+        "shape": 0,
+        "preferred": [
+          0,
+          0
+        ],
+        "released": [
+          0,
+          0
+        ],
+        "queued": [
+          0,
+          0
+        ],
+        "taken": [
+          0,
+          0
+        ],
+        "actual": [
+          0,
+          0
+        ]
+      },
+      {
+        "shape": 1,
+        "preferred": [
+          1458,
+          25486
+        ],
+        "released": [
+          1458,
+          25486
+        ],
+        "queued": [
+          12122,
+          14822
+        ],
+        "taken": [
+          12122,
+          14822
+        ],
+        "actual": [
+          12122,
+          14822
+        ]
+      },
+      {
+        "shape": 2,
+        "preferred": [
+          0,
+          0
+        ],
+        "released": [
+          0,
+          0
+        ],
+        "queued": [
+          0,
+          0
+        ],
+        "taken": [
+          0,
+          0
+        ],
+        "actual": [
+          0,
+          0
+        ]
+      },
+      {
+        "shape": 3,
+        "preferred": [
+          0,
+          0
+        ],
+        "released": [
+          0,
+          0
+        ],
+        "queued": [
+          0,
+          0
+        ],
+        "taken": [
+          0,
+          0
+        ],
+        "actual": [
+          0,
+          0
+        ]
+      }
+    ],
+    "blocks": [
+      {
+        "shape": 0,
+        "queued": [
+          0,
+          0
+        ],
+        "claimed": [
+          0,
+          0
+        ],
+        "published": [
+          0,
+          0
+        ],
+        "retired": [
+          0,
+          0
+        ]
+      },
+      {
+        "shape": 1,
+        "queued": [
+          12122,
+          14822
+        ],
+        "claimed": [
+          12122,
+          14822
+        ],
+        "published": [
+          12122,
+          14822
+        ],
+        "retired": [
+          12122,
+          14822
+        ]
+      },
+      {
+        "shape": 2,
+        "queued": [
+          0,
+          0
+        ],
+        "claimed": [
+          0,
+          0
+        ],
+        "published": [
+          0,
+          0
+        ],
+        "retired": [
+          0,
+          0
+        ]
+      },
+      {
+        "shape": 3,
+        "queued": [
+          0,
+          0
+        ],
+        "claimed": [
+          0,
+          0
+        ],
+        "published": [
+          0,
+          0
+        ],
+        "retired": [
+          0,
+          0
+        ]
+      }
+    ],
+    "prices": [
+      {
+        "shape": 0,
+        "queue": [
+          2000,
+          2000
+        ],
+        "publish": [
+          250,
+          750,
+          750,
+          250
+        ],
+        "dependency": [
+          250,
+          750,
+          750,
+          250
+        ],
+        "observed": [
+          0,
+          0
+        ]
+      },
+      {
+        "shape": 1,
+        "queue": [
+          4000,
+          4000
+        ],
+        "publish": [
+          250,
+          750,
+          750,
+          250
+        ],
+        "dependency": [
+          250,
+          750,
+          750,
+          250
+        ],
+        "observed": [
+          65,
+          67
+        ]
+      },
+      {
+        "shape": 2,
+        "queue": [
+          2000,
+          2000
+        ],
+        "publish": [
+          250,
+          750,
+          750,
+          250
+        ],
+        "dependency": [
+          250,
+          750,
+          750,
+          250
+        ],
+        "observed": [
+          0,
+          0
+        ]
+      },
+      {
+        "shape": 3,
+        "queue": [
+          2000,
+          2000
+        ],
+        "publish": [
+          250,
+          750,
+          750,
+          250
+        ],
+        "dependency": [
+          250,
+          750,
+          750,
+          250
+        ],
+        "observed": [
+          0,
+          0
+        ]
+      }
+    ],
+    "price_updates": [
+      {
+        "shape": 0,
+        "cluster": 0,
+        "queue": 0,
+        "o0": 0,
+        "o1": 0,
+        "s0": 0,
+        "s1": 0
+      },
+      {
+        "shape": 0,
+        "cluster": 1,
+        "queue": 0,
+        "o0": 0,
+        "o1": 0,
+        "s0": 0,
+        "s1": 0
+      },
+      {
+        "shape": 1,
+        "cluster": 0,
+        "queue": 1,
+        "o0": 0,
+        "o1": 0,
+        "s0": 0,
+        "s1": 0
+      },
+      {
+        "shape": 1,
+        "cluster": 1,
+        "queue": 1,
+        "o0": 0,
+        "o1": 0,
+        "s0": 0,
+        "s1": 0
+      },
+      {
+        "shape": 2,
+        "cluster": 0,
+        "queue": 0,
+        "o0": 0,
+        "o1": 0,
+        "s0": 0,
+        "s1": 0
+      },
+      {
+        "shape": 2,
+        "cluster": 1,
+        "queue": 0,
+        "o0": 0,
+        "o1": 0,
+        "s0": 0,
+        "s1": 0
+      },
+      {
+        "shape": 3,
+        "cluster": 0,
+        "queue": 0,
+        "o0": 0,
+        "o1": 0,
+        "s0": 0,
+        "s1": 0
+      },
+      {
+        "shape": 3,
+        "cluster": 1,
+        "queue": 0,
+        "o0": 0,
+        "o1": 0,
+        "s0": 0,
+        "s1": 0
+      }
+    ],
+    "tasks": 384,
+    "logical_blocks": 26944,
+    "captured_execution_records": 26944,
+    "O_submit_ms": 0.8445199999999997,
+    "O_placement_and_wire_ms": 0.13008,
+    "S_ready_binding_sum_ms": 0.0,
+    "S_phase_sum_ms": {
+      "complete": 11.32392000000001,
+      "dispatch": 17.52618000000002,
+      "resolve": 0.0015
+    },
+    "compute_hashes": {
+      "0": "0x931486694275a1c2"
+    }
+  },
+  "Burst": {
+    "device_log": "device-logs/debug/device-0/device-2964587_20261117125221602.log",
+    "stages": {
+      "O": {
+        "poll": {
+          "calls": 385,
+          "ns": 7880
+        },
+        "queue_depth": {
+          "calls": 383,
+          "ns": 5580
+        },
+        "fanin": {
+          "calls": 385,
+          "ns": 14040
+        },
+        "load": {
+          "calls": 385,
+          "ns": 12140
+        },
+        "choose_commit": {
+          "calls": 385,
+          "ns": 25180
+        },
+        "wire_ready": {
+          "calls": 385,
+          "ns": 27640
+        }
+      },
+      "S0": {
+        "resource_feedback": {
+          "calls": 300,
+          "ns": 286700
+        },
+        "observe": {
+          "calls": 5675,
+          "ns": 102100
+        },
+        "auto_dispatch": {
+          "calls": 19195,
+          "ns": 544660
+        },
+        "strict_dispatch": {
+          "calls": 19195,
+          "ns": 3406520
+        },
+        "shared_dispatch": {
+          "calls": 19195,
+          "ns": 320780
+        },
+        "sync_dispatch": {
+          "calls": 19195,
+          "ns": 2707200
+        },
+        "ready_binding": {
+          "calls": 0,
+          "ns": 0
+        },
+        "cross_pickup": {
+          "calls": 0,
+          "ns": 0
+        }
+      },
+      "S1": {
+        "resource_feedback": {
+          "calls": 187,
+          "ns": 11380
+        },
+        "observe": {
+          "calls": 5434,
+          "ns": 102540
+        },
+        "auto_dispatch": {
+          "calls": 11962,
+          "ns": 511700
+        },
+        "strict_dispatch": {
+          "calls": 11962,
+          "ns": 3376960
+        },
+        "shared_dispatch": {
+          "calls": 11962,
+          "ns": 211720
+        },
+        "sync_dispatch": {
+          "calls": 11962,
+          "ns": 5309680
+        },
+        "ready_binding": {
+          "calls": 0,
+          "ns": 0
+        },
+        "cross_pickup": {
+          "calls": 0,
+          "ns": 0
+        }
+      },
+      "S2": {
+        "resource_feedback": {
+          "calls": 198,
+          "ns": 243040
+        },
+        "observe": {
+          "calls": 5005,
+          "ns": 60240
+        },
+        "auto_dispatch": {
+          "calls": 12659,
+          "ns": 401700
+        },
+        "strict_dispatch": {
+          "calls": 12659,
+          "ns": 2869020
+        },
+        "shared_dispatch": {
+          "calls": 12659,
+          "ns": 235060
+        },
+        "sync_dispatch": {
+          "calls": 12659,
+          "ns": 1763600
+        },
+        "ready_binding": {
+          "calls": 0,
+          "ns": 0
+        },
+        "cross_pickup": {
+          "calls": 0,
+          "ns": 0
+        }
+      },
+      "S3": {
+        "resource_feedback": {
+          "calls": 256,
+          "ns": 14380
+        },
+        "observe": {
+          "calls": 5778,
+          "ns": 72280
+        },
+        "auto_dispatch": {
+          "calls": 16354,
+          "ns": 531180
+        },
+        "strict_dispatch": {
+          "calls": 16354,
+          "ns": 3226800
+        },
+        "shared_dispatch": {
+          "calls": 16354,
+          "ns": 285600
+        },
+        "sync_dispatch": {
+          "calls": 16354,
+          "ns": 2225300
+        },
+        "ready_binding": {
+          "calls": 384,
+          "ns": 123040
+        },
+        "cross_pickup": {
+          "calls": 0,
+          "ns": 0
+        }
+      },
+      "S4": {
+        "resource_feedback": {
+          "calls": 324,
+          "ns": 18180
+        },
+        "observe": {
+          "calls": 5053,
+          "ns": 66020
+        },
+        "auto_dispatch": {
+          "calls": 20735,
+          "ns": 628100
+        },
+        "strict_dispatch": {
+          "calls": 20735,
+          "ns": 3300200
+        },
+        "shared_dispatch": {
+          "calls": 20735,
+          "ns": 376580
+        },
+        "sync_dispatch": {
+          "calls": 20735,
+          "ns": 2850580
+        },
+        "ready_binding": {
+          "calls": 0,
+          "ns": 0
+        },
+        "cross_pickup": {
+          "calls": 0,
+          "ns": 0
+        }
+      }
+    },
+    "final": [
+      {
+        "version": 4,
+        "decisions": [
+          271,
+          114
+        ],
+        "started": [
+          11109,
+          15836
+        ],
+        "cold": 256,
+        "learned": 129,
+        "calibrations": 1,
+        "updates": [
+          0,
+          0
+        ],
+        "batch_size": 64,
+        "snapshots": 7
+      }
+    ],
+    "groups": [
+      {
+        "full": 383,
+        "inherited": 2
+      }
+    ],
+    "placement": [
+      {
+        "shape": 0,
+        "preferred": [
+          0,
+          0
+        ],
+        "released": [
+          0,
+          0
+        ],
+        "queued": [
+          0,
+          0
+        ],
+        "taken": [
+          0,
+          0
+        ],
+        "actual": [
+          0,
+          0
+        ]
+      },
+      {
+        "shape": 1,
+        "preferred": [
+          10809,
+          16136
+        ],
+        "released": [
+          10809,
+          16136
+        ],
+        "queued": [
+          11109,
+          15836
+        ],
+        "taken": [
+          11109,
+          15836
+        ],
+        "actual": [
+          11109,
+          15836
+        ]
+      },
+      {
+        "shape": 2,
+        "preferred": [
+          0,
+          0
+        ],
+        "released": [
+          0,
+          0
+        ],
+        "queued": [
+          0,
+          0
+        ],
+        "taken": [
+          0,
+          0
+        ],
+        "actual": [
+          0,
+          0
+        ]
+      },
+      {
+        "shape": 3,
+        "preferred": [
+          0,
+          0
+        ],
+        "released": [
+          0,
+          0
+        ],
+        "queued": [
+          0,
+          0
+        ],
+        "taken": [
+          0,
+          0
+        ],
+        "actual": [
+          0,
+          0
+        ]
+      }
+    ],
+    "blocks": [
+      {
+        "shape": 0,
+        "queued": [
+          0,
+          0
+        ],
+        "claimed": [
+          0,
+          0
+        ],
+        "published": [
+          0,
+          0
+        ],
+        "retired": [
+          0,
+          0
+        ]
+      },
+      {
+        "shape": 1,
+        "queued": [
+          11109,
+          15836
+        ],
+        "claimed": [
+          11109,
+          15836
+        ],
+        "published": [
+          11109,
+          15836
+        ],
+        "retired": [
+          11109,
+          15836
+        ]
+      },
+      {
+        "shape": 2,
+        "queued": [
+          0,
+          0
+        ],
+        "claimed": [
+          0,
+          0
+        ],
+        "published": [
+          0,
+          0
+        ],
+        "retired": [
+          0,
+          0
+        ]
+      },
+      {
+        "shape": 3,
+        "queued": [
+          0,
+          0
+        ],
+        "claimed": [
+          0,
+          0
+        ],
+        "published": [
+          0,
+          0
+        ],
+        "retired": [
+          0,
+          0
+        ]
+      }
+    ],
+    "prices": [
+      {
+        "shape": 0,
+        "queue": [
+          2000,
+          2000
+        ],
+        "publish": [
+          250,
+          750,
+          750,
+          250
+        ],
+        "dependency": [
+          250,
+          750,
+          750,
+          250
+        ],
+        "observed": [
+          0,
+          0
+        ]
+      },
+      {
+        "shape": 1,
+        "queue": [
+          2000,
+          2000
+        ],
+        "publish": [
+          250,
+          750,
+          750,
+          250
+        ],
+        "dependency": [
+          250,
+          750,
+          750,
+          250
+        ],
+        "observed": [
+          0,
+          1
+        ]
+      },
+      {
+        "shape": 2,
+        "queue": [
+          2000,
+          2000
+        ],
+        "publish": [
+          250,
+          750,
+          750,
+          250
+        ],
+        "dependency": [
+          250,
+          750,
+          750,
+          250
+        ],
+        "observed": [
+          0,
+          0
+        ]
+      },
+      {
+        "shape": 3,
+        "queue": [
+          2000,
+          2000
+        ],
+        "publish": [
+          250,
+          750,
+          750,
+          250
+        ],
+        "dependency": [
+          250,
+          750,
+          750,
+          250
+        ],
+        "observed": [
+          0,
+          0
+        ]
+      }
+    ],
+    "price_updates": [
+      {
+        "shape": 0,
+        "cluster": 0,
+        "queue": 0,
+        "o0": 0,
+        "o1": 0,
+        "s0": 0,
+        "s1": 0
+      },
+      {
+        "shape": 0,
+        "cluster": 1,
+        "queue": 0,
+        "o0": 0,
+        "o1": 0,
+        "s0": 0,
+        "s1": 0
+      },
+      {
+        "shape": 1,
+        "cluster": 0,
+        "queue": 0,
+        "o0": 0,
+        "o1": 0,
+        "s0": 0,
+        "s1": 0
+      },
+      {
+        "shape": 1,
+        "cluster": 1,
+        "queue": 0,
+        "o0": 0,
+        "o1": 0,
+        "s0": 0,
+        "s1": 0
+      },
+      {
+        "shape": 2,
+        "cluster": 0,
+        "queue": 0,
+        "o0": 0,
+        "o1": 0,
+        "s0": 0,
+        "s1": 0
+      },
+      {
+        "shape": 2,
+        "cluster": 1,
+        "queue": 0,
+        "o0": 0,
+        "o1": 0,
+        "s0": 0,
+        "s1": 0
+      },
+      {
+        "shape": 3,
+        "cluster": 0,
+        "queue": 0,
+        "o0": 0,
+        "o1": 0,
+        "s0": 0,
+        "s1": 0
+      },
+      {
+        "shape": 3,
+        "cluster": 1,
+        "queue": 0,
+        "o0": 0,
+        "o1": 0,
+        "s0": 0,
+        "s1": 0
+      }
+    ],
+    "tasks": 385,
+    "logical_blocks": 26945,
+    "captured_execution_records": 26945,
+    "O_submit_ms": 0.8498400000000002,
+    "O_placement_and_wire_ms": 0.09246,
+    "S_ready_binding_sum_ms": 0.12304,
+    "S_phase_sum_ms": {
+      "complete": 10.712799999999962,
+      "dispatch": 17.86468000000005,
+      "resolve": 0.15832000000000152
+    },
+    "compute_hashes": {
+      "0": "0xc6f36b166dcf4811"
+    },
+    "burst": {
+      "producer_execution_us": 9076.4,
+      "producer_end_us": 9213.58,
+      "last_child_submit_end_us": 892.38,
+      "children_submitted_before_producer_finished": 384,
+      "post_producer_compute_tail_us": 6199.68
+    }
+  },
+  "Fanout": {
+    "device_log": "device-logs/debug/device-0/device-2964427_20261117125206521.log",
+    "stages": {
+      "O": {
+        "poll": {
+          "calls": 385,
+          "ns": 9240
+        },
+        "queue_depth": {
+          "calls": 383,
+          "ns": 4360
+        },
+        "fanin": {
+          "calls": 385,
+          "ns": 13020
+        },
+        "load": {
+          "calls": 385,
+          "ns": 13200
+        },
+        "choose_commit": {
+          "calls": 385,
+          "ns": 25360
+        },
+        "wire_ready": {
+          "calls": 385,
+          "ns": 79040
+        }
+      },
+      "S0": {
+        "resource_feedback": {
+          "calls": 21,
+          "ns": 23680
+        },
+        "observe": {
+          "calls": 4888,
+          "ns": 100520
+        },
+        "auto_dispatch": {
+          "calls": 1322,
+          "ns": 184540
+        },
+        "strict_dispatch": {
+          "calls": 1322,
+          "ns": 2743920
+        },
+        "shared_dispatch": {
+          "calls": 1322,
+          "ns": 27480
+        },
+        "sync_dispatch": {
+          "calls": 1322,
+          "ns": 277560
+        },
+        "ready_binding": {
+          "calls": 0,
+          "ns": 0
+        },
+        "cross_pickup": {
+          "calls": 0,
+          "ns": 0
+        }
+      },
+      "S1": {
+        "resource_feedback": {
+          "calls": 19,
+          "ns": 1640
+        },
+        "observe": {
+          "calls": 4756,
+          "ns": 87780
+        },
+        "auto_dispatch": {
+          "calls": 1157,
+          "ns": 213600
+        },
+        "strict_dispatch": {
+          "calls": 1157,
+          "ns": 2854080
+        },
+        "shared_dispatch": {
+          "calls": 1157,
+          "ns": 33000
+        },
+        "sync_dispatch": {
+          "calls": 1157,
+          "ns": 431620
+        },
+        "ready_binding": {
+          "calls": 0,
+          "ns": 0
+        },
+        "cross_pickup": {
+          "calls": 0,
+          "ns": 0
+        }
+      },
+      "S2": {
+        "resource_feedback": {
+          "calls": 10,
+          "ns": 11340
+        },
+        "observe": {
+          "calls": 5468,
+          "ns": 65200
+        },
+        "auto_dispatch": {
+          "calls": 609,
+          "ns": 169860
+        },
+        "strict_dispatch": {
+          "calls": 609,
+          "ns": 2838420
+        },
+        "shared_dispatch": {
+          "calls": 609,
+          "ns": 41680
+        },
+        "sync_dispatch": {
+          "calls": 609,
+          "ns": 162220
+        },
+        "ready_binding": {
+          "calls": 0,
+          "ns": 0
+        },
+        "cross_pickup": {
+          "calls": 0,
+          "ns": 0
+        }
+      },
+      "S3": {
+        "resource_feedback": {
+          "calls": 12,
+          "ns": 1540
+        },
+        "observe": {
+          "calls": 6335,
+          "ns": 75980
+        },
+        "auto_dispatch": {
+          "calls": 710,
+          "ns": 212580
+        },
+        "strict_dispatch": {
+          "calls": 710,
+          "ns": 3127700
+        },
+        "shared_dispatch": {
+          "calls": 710,
+          "ns": 46360
+        },
+        "sync_dispatch": {
+          "calls": 710,
+          "ns": 206140
+        },
+        "ready_binding": {
+          "calls": 82,
+          "ns": 25200
+        },
+        "cross_pickup": {
+          "calls": 0,
+          "ns": 0
+        }
+      },
+      "S4": {
+        "resource_feedback": {
+          "calls": 14,
+          "ns": 1240
+        },
+        "observe": {
+          "calls": 5498,
+          "ns": 66340
+        },
+        "auto_dispatch": {
+          "calls": 860,
+          "ns": 228420
+        },
+        "strict_dispatch": {
+          "calls": 860,
+          "ns": 3086160
+        },
+        "shared_dispatch": {
+          "calls": 860,
+          "ns": 70380
+        },
+        "sync_dispatch": {
+          "calls": 860,
+          "ns": 215980
+        },
+        "ready_binding": {
+          "calls": 0,
+          "ns": 0
+        },
+        "cross_pickup": {
+          "calls": 0,
+          "ns": 0
+        }
+      }
+    },
+    "final": [
+      {
+        "version": 4,
+        "decisions": [
+          305,
+          80
+        ],
+        "started": [
+          9644,
+          17301
+        ],
+        "cold": 256,
+        "learned": 129,
+        "calibrations": 1,
+        "updates": [
+          1,
+          0
+        ],
+        "batch_size": 64,
+        "snapshots": 7
+      }
+    ],
+    "groups": [
+      {
+        "full": 383,
+        "inherited": 2
+      }
+    ],
+    "placement": [
+      {
+        "shape": 0,
+        "preferred": [
+          0,
+          0
+        ],
+        "released": [
+          0,
+          0
+        ],
+        "queued": [
+          0,
+          0
+        ],
+        "taken": [
+          0,
+          0
+        ],
+        "actual": [
+          0,
+          0
+        ]
+      },
+      {
+        "shape": 1,
+        "preferred": [
+          19513,
+          7432
+        ],
+        "released": [
+          19513,
+          7432
+        ],
+        "queued": [
+          9644,
+          17301
+        ],
+        "taken": [
+          9644,
+          17301
+        ],
+        "actual": [
+          9644,
+          17301
+        ]
+      },
+      {
+        "shape": 2,
+        "preferred": [
+          0,
+          0
+        ],
+        "released": [
+          0,
+          0
+        ],
+        "queued": [
+          0,
+          0
+        ],
+        "taken": [
+          0,
+          0
+        ],
+        "actual": [
+          0,
+          0
+        ]
+      },
+      {
+        "shape": 3,
+        "preferred": [
+          0,
+          0
+        ],
+        "released": [
+          0,
+          0
+        ],
+        "queued": [
+          0,
+          0
+        ],
+        "taken": [
+          0,
+          0
+        ],
+        "actual": [
+          0,
+          0
+        ]
+      }
+    ],
+    "blocks": [
+      {
+        "shape": 0,
+        "queued": [
+          0,
+          0
+        ],
+        "claimed": [
+          0,
+          0
+        ],
+        "published": [
+          0,
+          0
+        ],
+        "retired": [
+          0,
+          0
+        ]
+      },
+      {
+        "shape": 1,
+        "queued": [
+          9644,
+          17301
+        ],
+        "claimed": [
+          9644,
+          17301
+        ],
+        "published": [
+          9644,
+          17301
+        ],
+        "retired": [
+          9644,
+          17301
+        ]
+      },
+      {
+        "shape": 2,
+        "queued": [
+          0,
+          0
+        ],
+        "claimed": [
+          0,
+          0
+        ],
+        "published": [
+          0,
+          0
+        ],
+        "retired": [
+          0,
+          0
+        ]
+      },
+      {
+        "shape": 3,
+        "queued": [
+          0,
+          0
+        ],
+        "claimed": [
+          0,
+          0
+        ],
+        "published": [
+          0,
+          0
+        ],
+        "retired": [
+          0,
+          0
+        ]
+      }
+    ],
+    "prices": [
+      {
+        "shape": 0,
+        "queue": [
+          2000,
+          2000
+        ],
+        "publish": [
+          250,
+          750,
+          750,
+          250
+        ],
+        "dependency": [
+          250,
+          750,
+          750,
+          250
+        ],
+        "observed": [
+          0,
+          0
+        ]
+      },
+      {
+        "shape": 1,
+        "queue": [
+          4000,
+          2000
+        ],
+        "publish": [
+          250,
+          750,
+          750,
+          250
+        ],
+        "dependency": [
+          250,
+          750,
+          750,
+          250
+        ],
+        "observed": [
+          66,
+          68
+        ]
+      },
+      {
+        "shape": 2,
+        "queue": [
+          2000,
+          2000
+        ],
+        "publish": [
+          250,
+          750,
+          750,
+          250
+        ],
+        "dependency": [
+          250,
+          750,
+          750,
+          250
+        ],
+        "observed": [
+          0,
+          0
+        ]
+      },
+      {
+        "shape": 3,
+        "queue": [
+          2000,
+          2000
+        ],
+        "publish": [
+          250,
+          750,
+          750,
+          250
+        ],
+        "dependency": [
+          250,
+          750,
+          750,
+          250
+        ],
+        "observed": [
+          0,
+          0
+        ]
+      }
+    ],
+    "price_updates": [
+      {
+        "shape": 0,
+        "cluster": 0,
+        "queue": 0,
+        "o0": 0,
+        "o1": 0,
+        "s0": 0,
+        "s1": 0
+      },
+      {
+        "shape": 0,
+        "cluster": 1,
+        "queue": 0,
+        "o0": 0,
+        "o1": 0,
+        "s0": 0,
+        "s1": 0
+      },
+      {
+        "shape": 1,
+        "cluster": 0,
+        "queue": 1,
+        "o0": 0,
+        "o1": 0,
+        "s0": 0,
+        "s1": 0
+      },
+      {
+        "shape": 1,
+        "cluster": 1,
+        "queue": 0,
+        "o0": 0,
+        "o1": 0,
+        "s0": 0,
+        "s1": 0
+      },
+      {
+        "shape": 2,
+        "cluster": 0,
+        "queue": 0,
+        "o0": 0,
+        "o1": 0,
+        "s0": 0,
+        "s1": 0
+      },
+      {
+        "shape": 2,
+        "cluster": 1,
+        "queue": 0,
+        "o0": 0,
+        "o1": 0,
+        "s0": 0,
+        "s1": 0
+      },
+      {
+        "shape": 3,
+        "cluster": 0,
+        "queue": 0,
+        "o0": 0,
+        "o1": 0,
+        "s0": 0,
+        "s1": 0
+      },
+      {
+        "shape": 3,
+        "cluster": 1,
+        "queue": 0,
+        "o0": 0,
+        "o1": 0,
+        "s0": 0,
+        "s1": 0
+      }
+    ],
+    "tasks": 385,
+    "logical_blocks": 26945,
+    "captured_execution_records": 26945,
+    "O_submit_ms": 0.8867800000000002,
+    "O_placement_and_wire_ms": 0.14422,
+    "S_ready_binding_sum_ms": 0.0252,
+    "S_phase_sum_ms": {
+      "complete": 10.499199999999997,
+      "dispatch": 17.791860000000003,
+      "resolve": 0.03860000000000002
+    },
+    "compute_hashes": {
+      "0": "0x931486694275a1c2"
+    }
+  },
+  "Multi16": {
+    "device_log": "device-logs/debug/device-0/device-2964116_20261117125142506.log",
+    "stages": {
+      "O": {
+        "poll": {
+          "calls": 384,
+          "ns": 9200
+        },
+        "queue_depth": {
+          "calls": 384,
+          "ns": 3360
+        },
+        "fanin": {
+          "calls": 384,
+          "ns": 8840
+        },
+        "load": {
+          "calls": 384,
+          "ns": 11980
+        },
+        "choose_commit": {
+          "calls": 384,
+          "ns": 25840
+        },
+        "wire_ready": {
+          "calls": 384,
+          "ns": 78120
+        }
+      },
+      "S0": {
+        "resource_feedback": {
+          "calls": 3,
+          "ns": 5400
+        },
+        "observe": {
+          "calls": 1258,
+          "ns": 41420
+        },
+        "auto_dispatch": {
+          "calls": 146,
+          "ns": 5100
+        },
+        "strict_dispatch": {
+          "calls": 146,
+          "ns": 798560
+        },
+        "shared_dispatch": {
+          "calls": 146,
+          "ns": 2820
+        },
+        "sync_dispatch": {
+          "calls": 146,
+          "ns": 43580
+        },
+        "ready_binding": {
+          "calls": 0,
+          "ns": 0
+        },
+        "cross_pickup": {
+          "calls": 0,
+          "ns": 0
+        }
+      },
+      "S1": {
+        "resource_feedback": {
+          "calls": 3,
+          "ns": 580
+        },
+        "observe": {
+          "calls": 1190,
+          "ns": 35800
+        },
+        "auto_dispatch": {
+          "calls": 135,
+          "ns": 4340
+        },
+        "strict_dispatch": {
+          "calls": 135,
+          "ns": 790300
+        },
+        "shared_dispatch": {
+          "calls": 135,
+          "ns": 3400
+        },
+        "sync_dispatch": {
+          "calls": 135,
+          "ns": 66340
+        },
+        "ready_binding": {
+          "calls": 0,
+          "ns": 0
+        },
+        "cross_pickup": {
+          "calls": 0,
+          "ns": 0
+        }
+      },
+      "S2": {
+        "resource_feedback": {
+          "calls": 4,
+          "ns": 4880
+        },
+        "observe": {
+          "calls": 1179,
+          "ns": 25580
+        },
+        "auto_dispatch": {
+          "calls": 229,
+          "ns": 14420
+        },
+        "strict_dispatch": {
+          "calls": 229,
+          "ns": 665920
+        },
+        "shared_dispatch": {
+          "calls": 229,
+          "ns": 4680
+        },
+        "sync_dispatch": {
+          "calls": 229,
+          "ns": 54020
+        },
+        "ready_binding": {
+          "calls": 0,
+          "ns": 0
+        },
+        "cross_pickup": {
+          "calls": 0,
+          "ns": 0
+        }
+      },
+      "S3": {
+        "resource_feedback": {
+          "calls": 5,
+          "ns": 960
+        },
+        "observe": {
+          "calls": 1352,
+          "ns": 30960
+        },
+        "auto_dispatch": {
+          "calls": 280,
+          "ns": 17720
+        },
+        "strict_dispatch": {
+          "calls": 280,
+          "ns": 736420
+        },
+        "shared_dispatch": {
+          "calls": 280,
+          "ns": 8020
+        },
+        "sync_dispatch": {
+          "calls": 280,
+          "ns": 65180
+        },
+        "ready_binding": {
+          "calls": 0,
+          "ns": 0
+        },
+        "cross_pickup": {
+          "calls": 0,
+          "ns": 0
+        }
+      },
+      "S4": {
+        "resource_feedback": {
+          "calls": 5,
+          "ns": 520
+        },
+        "observe": {
+          "calls": 1165,
+          "ns": 25060
+        },
+        "auto_dispatch": {
+          "calls": 306,
+          "ns": 19340
+        },
+        "strict_dispatch": {
+          "calls": 306,
+          "ns": 718280
+        },
+        "shared_dispatch": {
+          "calls": 306,
+          "ns": 4800
+        },
+        "sync_dispatch": {
+          "calls": 306,
+          "ns": 71080
+        },
+        "ready_binding": {
+          "calls": 0,
+          "ns": 0
+        },
+        "cross_pickup": {
+          "calls": 0,
+          "ns": 0
+        }
+      }
+    },
+    "final": [
+      {
+        "version": 4,
+        "decisions": [
+          344,
+          40
+        ],
+        "started": [
+          2448,
+          3696
+        ],
+        "cold": 256,
+        "learned": 128,
+        "calibrations": 1,
+        "updates": [
+          1,
+          1
+        ],
+        "batch_size": 64,
+        "snapshots": 6
+      }
+    ],
+    "groups": [
+      {
+        "full": 384,
+        "inherited": 0
+      }
+    ],
+    "placement": [
+      {
+        "shape": 0,
+        "preferred": [
+          0,
+          0
+        ],
+        "released": [
+          0,
+          0
+        ],
+        "queued": [
+          0,
+          0
+        ],
+        "taken": [
+          0,
+          0
+        ],
+        "actual": [
+          0,
+          0
+        ]
+      },
+      {
+        "shape": 1,
+        "preferred": [
+          5504,
+          640
+        ],
+        "released": [
+          5504,
+          640
+        ],
+        "queued": [
+          2448,
+          3696
+        ],
+        "taken": [
+          2448,
+          3696
+        ],
+        "actual": [
+          2448,
+          3696
+        ]
+      },
+      {
+        "shape": 2,
+        "preferred": [
+          0,
+          0
+        ],
+        "released": [
+          0,
+          0
+        ],
+        "queued": [
+          0,
+          0
+        ],
+        "taken": [
+          0,
+          0
+        ],
+        "actual": [
+          0,
+          0
+        ]
+      },
+      {
+        "shape": 3,
+        "preferred": [
+          0,
+          0
+        ],
+        "released": [
+          0,
+          0
+        ],
+        "queued": [
+          0,
+          0
+        ],
+        "taken": [
+          0,
+          0
+        ],
+        "actual": [
+          0,
+          0
+        ]
+      }
+    ],
+    "blocks": [
+      {
+        "shape": 0,
+        "queued": [
+          0,
+          0
+        ],
+        "claimed": [
+          0,
+          0
+        ],
+        "published": [
+          0,
+          0
+        ],
+        "retired": [
+          0,
+          0
+        ]
+      },
+      {
+        "shape": 1,
+        "queued": [
+          2448,
+          3696
+        ],
+        "claimed": [
+          2448,
+          3696
+        ],
+        "published": [
+          2448,
+          3696
+        ],
+        "retired": [
+          2448,
+          3696
+        ]
+      },
+      {
+        "shape": 2,
+        "queued": [
+          0,
+          0
+        ],
+        "claimed": [
+          0,
+          0
+        ],
+        "published": [
+          0,
+          0
+        ],
+        "retired": [
+          0,
+          0
+        ]
+      },
+      {
+        "shape": 3,
+        "queued": [
+          0,
+          0
+        ],
+        "claimed": [
+          0,
+          0
+        ],
+        "published": [
+          0,
+          0
+        ],
+        "retired": [
+          0,
+          0
+        ]
+      }
+    ],
+    "prices": [
+      {
+        "shape": 0,
+        "queue": [
+          2000,
+          2000
+        ],
+        "publish": [
+          250,
+          750,
+          750,
+          250
+        ],
+        "dependency": [
+          250,
+          750,
+          750,
+          250
+        ],
+        "observed": [
+          0,
+          0
+        ]
+      },
+      {
+        "shape": 1,
+        "queue": [
+          4000,
+          4000
+        ],
+        "publish": [
+          250,
+          750,
+          750,
+          250
+        ],
+        "dependency": [
+          250,
+          750,
+          750,
+          250
+        ],
+        "observed": [
+          54,
+          103
+        ]
+      },
+      {
+        "shape": 2,
+        "queue": [
+          2000,
+          2000
+        ],
+        "publish": [
+          250,
+          750,
+          750,
+          250
+        ],
+        "dependency": [
+          250,
+          750,
+          750,
+          250
+        ],
+        "observed": [
+          0,
+          0
+        ]
+      },
+      {
+        "shape": 3,
+        "queue": [
+          2000,
+          2000
+        ],
+        "publish": [
+          250,
+          750,
+          750,
+          250
+        ],
+        "dependency": [
+          250,
+          750,
+          750,
+          250
+        ],
+        "observed": [
+          0,
+          0
+        ]
+      }
+    ],
+    "price_updates": [
+      {
+        "shape": 0,
+        "cluster": 0,
+        "queue": 0,
+        "o0": 0,
+        "o1": 0,
+        "s0": 0,
+        "s1": 0
+      },
+      {
+        "shape": 0,
+        "cluster": 1,
+        "queue": 0,
+        "o0": 0,
+        "o1": 0,
+        "s0": 0,
+        "s1": 0
+      },
+      {
+        "shape": 1,
+        "cluster": 0,
+        "queue": 1,
+        "o0": 0,
+        "o1": 0,
+        "s0": 0,
+        "s1": 0
+      },
+      {
+        "shape": 1,
+        "cluster": 1,
+        "queue": 1,
+        "o0": 0,
+        "o1": 0,
+        "s0": 0,
+        "s1": 0
+      },
+      {
+        "shape": 2,
+        "cluster": 0,
+        "queue": 0,
+        "o0": 0,
+        "o1": 0,
+        "s0": 0,
+        "s1": 0
+      },
+      {
+        "shape": 2,
+        "cluster": 1,
+        "queue": 0,
+        "o0": 0,
+        "o1": 0,
+        "s0": 0,
+        "s1": 0
+      },
+      {
+        "shape": 3,
+        "cluster": 0,
+        "queue": 0,
+        "o0": 0,
+        "o1": 0,
+        "s0": 0,
+        "s1": 0
+      },
+      {
+        "shape": 3,
+        "cluster": 1,
+        "queue": 0,
+        "o0": 0,
+        "o1": 0,
+        "s0": 0,
+        "s1": 0
+      }
+    ],
+    "tasks": 384,
+    "logical_blocks": 6144,
+    "captured_execution_records": 6144,
+    "O_submit_ms": 0.8579200000000008,
+    "O_placement_and_wire_ms": 0.13734,
+    "S_ready_binding_sum_ms": 0.0,
+    "S_phase_sum_ms": {
+      "complete": 2.72576,
+      "dispatch": 4.279060000000003,
+      "resolve": 0.0019199999999999875
+    },
+    "compute_hashes": {
+      "0": "0x931486694275a1c2"
+    }
+  },
+  "Skew": {
+    "device_log": "device-logs/debug/device-0/device-2963958_20261117125132557.log",
+    "stages": {
+      "O": {
+        "poll": {
+          "calls": 2720,
+          "ns": 51000
+        },
+        "queue_depth": {
+          "calls": 1452,
+          "ns": 19000
+        },
+        "fanin": {
+          "calls": 2720,
+          "ns": 159480
+        },
+        "load": {
+          "calls": 2720,
+          "ns": 102260
+        },
+        "choose_commit": {
+          "calls": 2720,
+          "ns": 158640
+        },
+        "wire_ready": {
+          "calls": 2720,
+          "ns": 780200
+        }
+      },
+      "S0": {
+        "resource_feedback": {
+          "calls": 85,
+          "ns": 139480
+        },
+        "observe": {
+          "calls": 538,
+          "ns": 95420
+        },
+        "auto_dispatch": {
+          "calls": 5402,
+          "ns": 1086920
+        },
+        "strict_dispatch": {
+          "calls": 5402,
+          "ns": 100800
+        },
+        "shared_dispatch": {
+          "calls": 5402,
+          "ns": 99080
+        },
+        "sync_dispatch": {
+          "calls": 5402,
+          "ns": 874100
+        },
+        "ready_binding": {
+          "calls": 431,
+          "ns": 269380
+        },
+        "cross_pickup": {
+          "calls": 0,
+          "ns": 0
+        }
+      },
+      "S1": {
+        "resource_feedback": {
+          "calls": 63,
+          "ns": 4960
+        },
+        "observe": {
+          "calls": 416,
+          "ns": 70620
+        },
+        "auto_dispatch": {
+          "calls": 4029,
+          "ns": 1035820
+        },
+        "strict_dispatch": {
+          "calls": 4029,
+          "ns": 97220
+        },
+        "shared_dispatch": {
+          "calls": 4029,
+          "ns": 66400
+        },
+        "sync_dispatch": {
+          "calls": 4029,
+          "ns": 1629620
+        },
+        "ready_binding": {
+          "calls": 327,
+          "ns": 206020
+        },
+        "cross_pickup": {
+          "calls": 0,
+          "ns": 0
+        }
+      },
+      "S2": {
+        "resource_feedback": {
+          "calls": 85,
+          "ns": 134620
+        },
+        "observe": {
+          "calls": 462,
+          "ns": 70680
+        },
+        "auto_dispatch": {
+          "calls": 5381,
+          "ns": 870900
+        },
+        "strict_dispatch": {
+          "calls": 5381,
+          "ns": 174140
+        },
+        "shared_dispatch": {
+          "calls": 5381,
+          "ns": 96600
+        },
+        "sync_dispatch": {
+          "calls": 5381,
+          "ns": 813040
+        },
+        "ready_binding": {
+          "calls": 332,
+          "ns": 82440
+        },
+        "cross_pickup": {
+          "calls": 0,
+          "ns": 0
+        }
+      },
+      "S3": {
+        "resource_feedback": {
+          "calls": 103,
+          "ns": 6500
+        },
+        "observe": {
+          "calls": 642,
+          "ns": 90840
+        },
+        "auto_dispatch": {
+          "calls": 6565,
+          "ns": 1130700
+        },
+        "strict_dispatch": {
+          "calls": 6565,
+          "ns": 219400
+        },
+        "shared_dispatch": {
+          "calls": 6565,
+          "ns": 116380
+        },
+        "sync_dispatch": {
+          "calls": 6565,
+          "ns": 938300
+        },
+        "ready_binding": {
+          "calls": 462,
+          "ns": 111700
+        },
+        "cross_pickup": {
+          "calls": 0,
+          "ns": 0
+        }
+      },
+      "S4": {
+        "resource_feedback": {
+          "calls": 106,
+          "ns": 6900
+        },
+        "observe": {
+          "calls": 662,
+          "ns": 97120
+        },
+        "auto_dispatch": {
+          "calls": 6744,
+          "ns": 1105460
+        },
+        "strict_dispatch": {
+          "calls": 6744,
+          "ns": 223700
+        },
+        "shared_dispatch": {
+          "calls": 6744,
+          "ns": 124600
+        },
+        "sync_dispatch": {
+          "calls": 6744,
+          "ns": 968060
+        },
+        "ready_binding": {
+          "calls": 488,
+          "ns": 133360
+        },
+        "cross_pickup": {
+          "calls": 0,
+          "ns": 0
+        }
+      }
+    },
+    "final": [
+      {
+        "version": 4,
+        "decisions": [
+          864,
+          1856
+        ],
+        "started": [
+          954,
+          1766
+        ],
+        "cold": 256,
+        "learned": 2464,
+        "calibrations": 1,
+        "updates": [
+          3,
+          5
+        ],
+        "batch_size": 64,
+        "snapshots": 86
+      }
+    ],
+    "groups": [
+      {
+        "full": 1452,
+        "inherited": 1268
+      }
+    ],
+    "placement": [
+      {
+        "shape": 0,
+        "preferred": [
+          300,
+          1060
+        ],
+        "released": [
+          300,
+          1060
+        ],
+        "queued": [
+          383,
+          977
+        ],
+        "taken": [
+          383,
+          977
+        ],
+        "actual": [
+          383,
+          977
+        ]
+      },
+      {
+        "shape": 1,
+        "preferred": [
+          564,
+          796
+        ],
+        "released": [
+          564,
+          796
+        ],
+        "queued": [
+          571,
+          789
+        ],
+        "taken": [
+          571,
+          789
+        ],
+        "actual": [
+          571,
+          789
+        ]
+      },
+      {
+        "shape": 2,
+        "preferred": [
+          0,
+          0
+        ],
+        "released": [
+          0,
+          0
+        ],
+        "queued": [
+          0,
+          0
+        ],
+        "taken": [
+          0,
+          0
+        ],
+        "actual": [
+          0,
+          0
+        ]
+      },
+      {
+        "shape": 3,
+        "preferred": [
+          0,
+          0
+        ],
+        "released": [
+          0,
+          0
+        ],
+        "queued": [
+          0,
+          0
+        ],
+        "taken": [
+          0,
+          0
+        ],
+        "actual": [
+          0,
+          0
+        ]
+      }
+    ],
+    "blocks": [
+      {
+        "shape": 0,
+        "queued": [
+          383,
+          977
+        ],
+        "claimed": [
+          383,
+          977
+        ],
+        "published": [
+          383,
+          977
+        ],
+        "retired": [
+          383,
+          977
+        ]
+      },
+      {
+        "shape": 1,
+        "queued": [
+          571,
+          789
+        ],
+        "claimed": [
+          571,
+          789
+        ],
+        "published": [
+          571,
+          789
+        ],
+        "retired": [
+          571,
+          789
+        ]
+      },
+      {
+        "shape": 2,
+        "queued": [
+          0,
+          0
+        ],
+        "claimed": [
+          0,
+          0
+        ],
+        "published": [
+          0,
+          0
+        ],
+        "retired": [
+          0,
+          0
+        ]
+      },
+      {
+        "shape": 3,
+        "queued": [
+          0,
+          0
+        ],
+        "claimed": [
+          0,
+          0
+        ],
+        "published": [
+          0,
+          0
+        ],
+        "retired": [
+          0,
+          0
+        ]
+      }
+    ],
+    "prices": [
+      {
+        "shape": 0,
+        "queue": [
+          2000,
+          2000
+        ],
+        "publish": [
+          250,
+          750,
+          750,
+          500
+        ],
+        "dependency": [
+          250,
+          750,
+          750,
+          500
+        ],
+        "observed": [
+          42,
+          85
+        ]
+      },
+      {
+        "shape": 1,
+        "queue": [
+          2000,
+          2000
+        ],
+        "publish": [
+          250,
+          750,
+          750,
+          250
+        ],
+        "dependency": [
+          500,
+          750,
+          750,
+          500
+        ],
+        "observed": [
+          55,
+          71
+        ]
+      },
+      {
+        "shape": 2,
+        "queue": [
+          2000,
+          2000
+        ],
+        "publish": [
+          250,
+          750,
+          750,
+          250
+        ],
+        "dependency": [
+          250,
+          750,
+          750,
+          250
+        ],
+        "observed": [
+          0,
+          0
+        ]
+      },
+      {
+        "shape": 3,
+        "queue": [
+          2000,
+          2000
+        ],
+        "publish": [
+          250,
+          750,
+          750,
+          250
+        ],
+        "dependency": [
+          250,
+          750,
+          750,
+          250
+        ],
+        "observed": [
+          0,
+          0
+        ]
+      }
+    ],
+    "price_updates": [
+      {
+        "shape": 0,
+        "cluster": 0,
+        "queue": 0,
+        "o0": 0,
+        "o1": 0,
+        "s0": 0,
+        "s1": 0
+      },
+      {
+        "shape": 0,
+        "cluster": 1,
+        "queue": 0,
+        "o0": 0,
+        "o1": 1,
+        "s0": 0,
+        "s1": 1
+      },
+      {
+        "shape": 1,
+        "cluster": 0,
+        "queue": 0,
+        "o0": 0,
+        "o1": 0,
+        "s0": 1,
+        "s1": 0
+      },
+      {
+        "shape": 1,
+        "cluster": 1,
+        "queue": 0,
+        "o0": 0,
+        "o1": 0,
+        "s0": 0,
+        "s1": 1
+      },
+      {
+        "shape": 2,
+        "cluster": 0,
+        "queue": 0,
+        "o0": 0,
+        "o1": 0,
+        "s0": 0,
+        "s1": 0
+      },
+      {
+        "shape": 2,
+        "cluster": 1,
+        "queue": 0,
+        "o0": 0,
+        "o1": 0,
+        "s0": 0,
+        "s1": 0
+      },
+      {
+        "shape": 3,
+        "cluster": 0,
+        "queue": 0,
+        "o0": 0,
+        "o1": 0,
+        "s0": 0,
+        "s1": 0
+      },
+      {
+        "shape": 3,
+        "cluster": 1,
+        "queue": 0,
+        "o0": 0,
+        "o1": 0,
+        "s0": 0,
+        "s1": 0
+      }
+    ],
+    "tasks": 2720,
+    "logical_blocks": 2720,
+    "captured_execution_records": 2720,
+    "O_submit_ms": 5.009819999999992,
+    "O_placement_and_wire_ms": 1.27058,
+    "S_ready_binding_sum_ms": 0.8029,
+    "S_phase_sum_ms": {
+      "complete": 3.3527599999999995,
+      "dispatch": 5.358999999999983,
+      "resolve": 0.7831000000000127
+    },
+    "compute_hashes": {
+      "0": "0x78b21d77e40f5d10",
+      "1": "0x61eed84f73ec7bc1",
+      "2": "0xf44542e69b1df3d1",
+      "3": "0xc7fed830024b68b2"
+    }
+  },
+  "Scale": {
+    "device_log": "device-logs/debug/device-0/device-2963642_20261117125110084.log",
+    "stages": {
+      "O": {
+        "poll": {
+          "calls": 4096,
+          "ns": 88360
+        },
+        "queue_depth": {
+          "calls": 3585,
+          "ns": 78060
+        },
+        "fanin": {
+          "calls": 4096,
+          "ns": 193480
+        },
+        "load": {
+          "calls": 4096,
+          "ns": 149300
+        },
+        "choose_commit": {
+          "calls": 4096,
+          "ns": 254540
+        },
+        "wire_ready": {
+          "calls": 4096,
+          "ns": 1214280
+        }
+      },
+      "S0": {
+        "resource_feedback": {
+          "calls": 107,
+          "ns": 175660
+        },
+        "observe": {
+          "calls": 987,
+          "ns": 202400
+        },
+        "auto_dispatch": {
+          "calls": 6786,
+          "ns": 2086460
+        },
+        "strict_dispatch": {
+          "calls": 6786,
+          "ns": 128880
+        },
+        "shared_dispatch": {
+          "calls": 6786,
+          "ns": 112020
+        },
+        "sync_dispatch": {
+          "calls": 6786,
+          "ns": 1107960
+        },
+        "ready_binding": {
+          "calls": 521,
+          "ns": 304560
+        },
+        "cross_pickup": {
+          "calls": 0,
+          "ns": 0
+        }
+      },
+      "S1": {
+        "resource_feedback": {
+          "calls": 89,
+          "ns": 6360
+        },
+        "observe": {
+          "calls": 706,
+          "ns": 123180
+        },
+        "auto_dispatch": {
+          "calls": 5647,
+          "ns": 1776420
+        },
+        "strict_dispatch": {
+          "calls": 5647,
+          "ns": 143100
+        },
+        "shared_dispatch": {
+          "calls": 5647,
+          "ns": 94440
+        },
+        "sync_dispatch": {
+          "calls": 5647,
+          "ns": 2248600
+        },
+        "ready_binding": {
+          "calls": 466,
+          "ns": 273760
+        },
+        "cross_pickup": {
+          "calls": 0,
+          "ns": 0
+        }
+      },
+      "S2": {
+        "resource_feedback": {
+          "calls": 120,
+          "ns": 190420
+        },
+        "observe": {
+          "calls": 639,
+          "ns": 98020
+        },
+        "auto_dispatch": {
+          "calls": 7622,
+          "ns": 1209900
+        },
+        "strict_dispatch": {
+          "calls": 7622,
+          "ns": 289740
+        },
+        "shared_dispatch": {
+          "calls": 7622,
+          "ns": 148360
+        },
+        "sync_dispatch": {
+          "calls": 7622,
+          "ns": 1176200
+        },
+        "ready_binding": {
+          "calls": 273,
+          "ns": 68440
+        },
+        "cross_pickup": {
+          "calls": 0,
+          "ns": 0
+        }
+      },
+      "S3": {
+        "resource_feedback": {
+          "calls": 156,
+          "ns": 10020
+        },
+        "observe": {
+          "calls": 851,
+          "ns": 120460
+        },
+        "auto_dispatch": {
+          "calls": 9943,
+          "ns": 1486460
+        },
+        "strict_dispatch": {
+          "calls": 9943,
+          "ns": 382540
+        },
+        "shared_dispatch": {
+          "calls": 9943,
+          "ns": 172720
+        },
+        "sync_dispatch": {
+          "calls": 9943,
+          "ns": 1430180
+        },
+        "ready_binding": {
+          "calls": 431,
+          "ns": 120040
+        },
+        "cross_pickup": {
+          "calls": 0,
+          "ns": 0
+        }
+      },
+      "S4": {
+        "resource_feedback": {
+          "calls": 154,
+          "ns": 10340
+        },
+        "observe": {
+          "calls": 913,
+          "ns": 133120
+        },
+        "auto_dispatch": {
+          "calls": 9819,
+          "ns": 1529300
+        },
+        "strict_dispatch": {
+          "calls": 9819,
+          "ns": 360780
+        },
+        "shared_dispatch": {
+          "calls": 9819,
+          "ns": 202720
+        },
+        "sync_dispatch": {
+          "calls": 9819,
+          "ns": 1445040
+        },
+        "ready_binding": {
+          "calls": 357,
+          "ns": 84740
+        },
+        "cross_pickup": {
+          "calls": 0,
+          "ns": 0
+        }
+      }
+    },
+    "final": [
+      {
+        "version": 4,
+        "decisions": [
+          1317,
+          2779
+        ],
+        "started": [
+          1693,
+          2403
+        ],
+        "cold": 256,
+        "learned": 3840,
+        "calibrations": 1,
+        "updates": [
+          4,
+          4
+        ],
+        "batch_size": 64,
+        "snapshots": 128
+      }
+    ],
+    "groups": [
+      {
+        "full": 3585,
+        "inherited": 511
+      }
+    ],
+    "placement": [
+      {
+        "shape": 0,
+        "preferred": [
+          464,
+          1584
+        ],
+        "released": [
+          464,
+          1584
+        ],
+        "queued": [
+          706,
+          1342
+        ],
+        "taken": [
+          706,
+          1342
+        ],
+        "actual": [
+          706,
+          1342
+        ]
+      },
+      {
+        "shape": 1,
+        "preferred": [
+          853,
+          1195
+        ],
+        "released": [
+          853,
+          1195
+        ],
+        "queued": [
+          987,
+          1061
+        ],
+        "taken": [
+          987,
+          1061
+        ],
+        "actual": [
+          987,
+          1061
+        ]
+      },
+      {
+        "shape": 2,
+        "preferred": [
+          0,
+          0
+        ],
+        "released": [
+          0,
+          0
+        ],
+        "queued": [
+          0,
+          0
+        ],
+        "taken": [
+          0,
+          0
+        ],
+        "actual": [
+          0,
+          0
+        ]
+      },
+      {
+        "shape": 3,
+        "preferred": [
+          0,
+          0
+        ],
+        "released": [
+          0,
+          0
+        ],
+        "queued": [
+          0,
+          0
+        ],
+        "taken": [
+          0,
+          0
+        ],
+        "actual": [
+          0,
+          0
+        ]
+      }
+    ],
+    "blocks": [
+      {
+        "shape": 0,
+        "queued": [
+          706,
+          1342
+        ],
+        "claimed": [
+          706,
+          1342
+        ],
+        "published": [
+          706,
+          1342
+        ],
+        "retired": [
+          706,
+          1342
+        ]
+      },
+      {
+        "shape": 1,
+        "queued": [
+          987,
+          1061
+        ],
+        "claimed": [
+          987,
+          1061
+        ],
+        "published": [
+          987,
+          1061
+        ],
+        "retired": [
+          987,
+          1061
+        ]
+      },
+      {
+        "shape": 2,
+        "queued": [
+          0,
+          0
+        ],
+        "claimed": [
+          0,
+          0
+        ],
+        "published": [
+          0,
+          0
+        ],
+        "retired": [
+          0,
+          0
+        ]
+      },
+      {
+        "shape": 3,
+        "queued": [
+          0,
+          0
+        ],
+        "claimed": [
+          0,
+          0
+        ],
+        "published": [
+          0,
+          0
+        ],
+        "retired": [
+          0,
+          0
+        ]
+      }
+    ],
+    "prices": [
+      {
+        "shape": 0,
+        "queue": [
+          2000,
+          2000
+        ],
+        "publish": [
+          250,
+          750,
+          1500,
+          500
+        ],
+        "dependency": [
+          250,
+          750,
+          750,
+          250
+        ],
+        "observed": [
+          51,
+          77
+        ]
+      },
+      {
+        "shape": 1,
+        "queue": [
+          2000,
+          2000
+        ],
+        "publish": [
+          250,
+          750,
+          750,
+          250
+        ],
+        "dependency": [
+          500,
+          750,
+          750,
+          500
+        ],
+        "observed": [
+          49,
+          77
+        ]
+      },
+      {
+        "shape": 2,
+        "queue": [
+          2000,
+          2000
+        ],
+        "publish": [
+          250,
+          750,
+          750,
+          250
+        ],
+        "dependency": [
+          250,
+          750,
+          750,
+          250
+        ],
+        "observed": [
+          0,
+          0
+        ]
+      },
+      {
+        "shape": 3,
+        "queue": [
+          2000,
+          2000
+        ],
+        "publish": [
+          250,
+          750,
+          750,
+          250
+        ],
+        "dependency": [
+          250,
+          750,
+          750,
+          250
+        ],
+        "observed": [
+          0,
+          0
+        ]
+      }
+    ],
+    "price_updates": [
+      {
+        "shape": 0,
+        "cluster": 0,
+        "queue": 0,
+        "o0": 0,
+        "o1": 1,
+        "s0": 0,
+        "s1": 0
+      },
+      {
+        "shape": 0,
+        "cluster": 1,
+        "queue": 0,
+        "o0": 0,
+        "o1": 1,
+        "s0": 0,
+        "s1": 0
+      },
+      {
+        "shape": 1,
+        "cluster": 0,
+        "queue": 0,
+        "o0": 0,
+        "o1": 0,
+        "s0": 1,
+        "s1": 0
+      },
+      {
+        "shape": 1,
+        "cluster": 1,
+        "queue": 0,
+        "o0": 0,
+        "o1": 0,
+        "s0": 0,
+        "s1": 1
+      },
+      {
+        "shape": 2,
+        "cluster": 0,
+        "queue": 0,
+        "o0": 0,
+        "o1": 0,
+        "s0": 0,
+        "s1": 0
+      },
+      {
+        "shape": 2,
+        "cluster": 1,
+        "queue": 0,
+        "o0": 0,
+        "o1": 0,
+        "s0": 0,
+        "s1": 0
+      },
+      {
+        "shape": 3,
+        "cluster": 0,
+        "queue": 0,
+        "o0": 0,
+        "o1": 0,
+        "s0": 0,
+        "s1": 0
+      },
+      {
+        "shape": 3,
+        "cluster": 1,
+        "queue": 0,
+        "o0": 0,
+        "o1": 0,
+        "s0": 0,
+        "s1": 0
+      }
+    ],
+    "tasks": 4096,
+    "logical_blocks": 4096,
+    "captured_execution_records": 4096,
+    "O_submit_ms": 6.643300000000006,
+    "O_placement_and_wire_ms": 1.97802,
+    "S_ready_binding_sum_ms": 0.85154,
+    "S_phase_sum_ms": {
+      "complete": 4.439599999999998,
+      "dispatch": 8.322799999999981,
+      "resolve": 0.7712000000000053
+    },
+    "compute_hashes": {
+      "0": "0x212c407e5c39dda2",
+      "1": "0x4c0e49fc6b5f2f9f"
+    }
+  }
+}

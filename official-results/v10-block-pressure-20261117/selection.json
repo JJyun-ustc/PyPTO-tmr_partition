@@ -1,0 +1,15 @@
+{
+  "default_stage": "A0-v8",
+  "experimental_stages": [
+    "A1-ledger",
+    "A2-block-waves",
+    "A3-guarded-groups",
+    "A4-future-shadow"
+  ],
+  "reason": "A4 mitigates constructed ready bursts but representative BGEMM/attention regress; retain experimental evidence without replacing the accepted v8 default. A4 Burst is near frozen official Shared, not a proven speedup over it.",
+  "validation_stage": "A4-future-shadow",
+  "source_and_test_snapshots_preserved": true,
+  "restored_default_tests": "8 related C++ targets passed",
+  "restored_default_cpp_tests": 190,
+  "restored_default_source_and_binaries_match": true
+}

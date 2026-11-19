@@ -1,0 +1,46 @@
+[AICPU] Build failed with exit code 2
+[AICPU] Build stdout:
+[  5%] Built target aicpu_dispatcher
+[ 11%] Building CXX object CMakeFiles/aicpu_kernel.dir/data/aicpu-cluster-study/ready-affinity-runtime/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler_cold_path.cpp.o
+[ 11%] Building CXX object CMakeFiles/aicpu_kernel.dir/data/aicpu-cluster-study/ready-affinity-runtime/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler_completion.cpp.o
+[AICPU] Build stderr:
+/data/aicpu-cluster-study/ready-affinity-runtime/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler_cold_path.cpp: In member function 'void SchedulerContext::deinit()':
+/data/aicpu-cluster-study/ready-affinity-runtime/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler_cold_path.cpp:1452:24: error: 'steal_clocks_' was not declared in this scope
+     for (auto &clock : steal_clocks_)
+                        ^~~~~~~~~~~~~
+/data/aicpu-cluster-study/ready-affinity-runtime/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler_cold_path.cpp:1452:24: note: suggested alternative: 'fread_unlocked'
+     for (auto &clock : steal_clocks_)
+                        ^~~~~~~~~~~~~
+                        fread_unlocked
+gmake[2]: *** [CMakeFiles/aicpu_kernel.dir/build.make:412: CMakeFiles/aicpu_kernel.dir/data/aicpu-cluster-study/ready-affinity-runtime/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler_cold_path.cpp.o] Error 1
+gmake[2]: *** Waiting for unfinished jobs....
+gmake[1]: *** [CMakeFiles/Makefile2:85: CMakeFiles/aicpu_kernel.dir/all] Error 2
+gmake: *** [Makefile:91: all] Error 2
+Traceback (most recent call last):
+  File "<stdin>", line 4, in <module>
+  File "/data/aicpu-cluster-study/ready-affinity-runtime/simpler_setup/runtime_builder.py", line 467, in get_binaries
+    aicpu_path = fut_aicpu.result()
+                 ^^^^^^^^^^^^^^^^^^
+  File "/usr/local/python3.11.15/lib/python3.11/concurrent/futures/_base.py", line 449, in result
+    return self.__get_result()
+           ^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/python3.11.15/lib/python3.11/concurrent/futures/_base.py", line 401, in __get_result
+    raise self._exception
+  File "/usr/local/python3.11.15/lib/python3.11/concurrent/futures/thread.py", line 58, in run
+    result = self.fn(*self.args, **self.kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data/aicpu-cluster-study/ready-affinity-runtime/simpler_setup/runtime_builder.py", line 447, in _compile_target
+    return compiler.compile(  # type: ignore[return-value]
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data/aicpu-cluster-study/ready-affinity-runtime/simpler_setup/runtime_compiler.py", line 400, in compile
+    return _build(str(platform_build_dir))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data/aicpu-cluster-study/ready-affinity-runtime/simpler_setup/runtime_compiler.py", line 338, in _build
+    binary_path = self._run_compilation(
+                  ^^^^^^^^^^^^^^^^^^^^^^
+  File "/data/aicpu-cluster-study/ready-affinity-runtime/simpler_setup/runtime_compiler.py", line 515, in _run_compilation
+    self._run_build_step(build_cmd, build_dir, platform, "Build")
+  File "/data/aicpu-cluster-study/ready-affinity-runtime/simpler_setup/runtime_compiler.py", line 436, in _run_build_step
+    raise RuntimeError(f"{step_name} failed for {platform} with exit code {result.returncode}")
+RuntimeError: Build failed for AICPU with exit code 2
+RuntimeBinaries(host_path=PosixPath('/data/aicpu-cluster-study/ready-affinity-runtime/build/lib/a2a3/onboard/tensormap_and_ringbuffer/libhost_runtime.so'), aicpu_path=PosixPath('/data/aicpu-cluster-study/ready-affinity-runtime/build/lib/a2a3/onboard/tensormap_and_ringbuffer/libaicpu_kernel.so'), aicore_path=PosixPath('/data/aicpu-cluster-study/ready-affinity-runtime/build/lib/a2a3/onboard/tensormap_and_ringbuffer/aicore_kernel.o'), sim_context_path=None, dispatcher_path=PosixPath('/data/aicpu-cluster-study/ready-affinity-runtime/build/lib/a2a3/dispatcher/libsimpler_aicpu_dispatcher.so'), sdma_warmup_path=PosixPath('/data/aicpu-cluster-study/ready-affinity-runtime/build/lib/a2a3/sdma_warmup/sdma_warmup_kernel.o'))
