@@ -127,54 +127,17 @@ void SchedulerContext::publish_partition_resources(int32_t thread_idx) {
     if (chip_swimlane_level_ >= ChipSwimlaneLevel::SCHED_PHASES) begin = get_sys_cnt_aicpu();
 #endif
     auto &feedback = sched_->ready_feedback;
-    feedback.writers[thread_idx].now_tick = get_sys_cnt_aicpu();
-    feedback.writers[thread_idx].max_age_ticks = PLATFORM_PROF_SYS_CNT_FREQ / 50000;
     int side = aicpu_cluster_ids_[thread_idx];
     bool leader = true;
     for (int t = 0; t < thread_idx; ++t)
         if (aicpu_cluster_ids_[t] == side) leader = false;
     for (int shape = 0; shape < simpler::tmr::READY_SHAPES; ++shape) {
-        auto resource_shape = static_cast<ResourceShape>(shape);
-        auto &tracker = core_trackers_[thread_idx];
-        uint64_t cap = tracker.resource_capacity(resource_shape);
-        uint64_t free =
-            resource_shape == ResourceShape::DUMMY ?
-                1 :
-                tracker.get_dispatchable_cores(resource_shape, CoreTracker::DispatchPhase::IDLE).count() +
-                    tracker.get_dispatchable_cores(resource_shape, CoreTracker::DispatchPhase::PENDING).count();
-        feedback.writers[thread_idx].rows[shape].resources.store(cap | (free << 16), std::memory_order_relaxed);
-        if (!leader) continue;
-        int64_t q[6]{}, p[6]{}, queued = 0, pressure = 0;
-        uint64_t capacity = 0, available = 0;
-        for (int t = 0; t < simpler::tmr::READY_THREADS; ++t) {
-            const auto &row = feedback.writers[t].rows[shape];
-            q[t] = row.queue_units(side);
-            // Use the same queue cut in the total-pressure cut, even during concurrent writes.
-            p[t] = q[t] +
-                   int64_t(simpler::tmr::READY_UNITS_PER_BLOCK) *
-                       int64_t(row.accepted[side].load(std::memory_order_relaxed)) -
-                   int64_t(row.completed_units[side].load(std::memory_order_relaxed));
-            queued += q[t];
-            pressure += p[t];
-            if (feedback.cluster[t] == side) {
-                uint64_t resources = row.resources.load(std::memory_order_relaxed);
-                capacity += resources & 0xffff;
-                available += resources >> 16;
-            }
-        }
-        auto &hint = feedback.hints[side][shape];
-        uint64_t version = hint.version.load(std::memory_order_relaxed);
-        hint.version.store(version + 1, std::memory_order_release);
-        std::atomic_thread_fence(std::memory_order_seq_cst);
-        hint.work.store(pressure, std::memory_order_relaxed);
-        hint.queued.store(queued, std::memory_order_relaxed);
-        hint.resources.store(capacity | (available << 16), std::memory_order_relaxed);
-        for (int t = 0; t < simpler::tmr::READY_THREADS; ++t) {
-            hint.pressure_cut[t].store(p[t], std::memory_order_relaxed);
-            hint.queue_cut[t].store(q[t], std::memory_order_relaxed);
-        }
-        hint.version.store(version + 2, std::memory_order_release);
+        feedback.writers[thread_idx].rows[shape].capacity.store(
+            core_trackers_[thread_idx].resource_capacity(static_cast<ResourceShape>(shape)), std::memory_order_relaxed
+        );
+        if (leader) feedback.publish_side(thread_idx, shape);
     }
+    feedback.refresh_all(thread_idx);
 #if SIMPLER_DFX
     if (begin) {
         auto &trace = feedback.writers[thread_idx].trace;
@@ -186,7 +149,7 @@ void SchedulerContext::publish_partition_resources(int32_t thread_idx) {
 
 uint64_t SchedulerContext::observe_partition_task(int32_t thread_idx, ChipTaskSlotState &slot_state, bool) {
     auto &metadata = slot_state.payload->placement;
-    if ((metadata.scope || sched_->ready_feedback.enabled.load(std::memory_order_acquire)) &&
+    if (!metadata.scope && sched_->ready_feedback.enabled.load(std::memory_order_acquire) &&
         metadata.dispatch_cluster.load(std::memory_order_relaxed) < 0) {
         int expected = -1;
         metadata.dispatch_cluster.compare_exchange_strong(
@@ -483,6 +446,12 @@ void SchedulerContext::dispatch_shape(
                     slot_state->task->target_aicpu_cluster, aicpu_cluster_ids_[thread_idx], thread_idx
                 );
             }
+            if (remote && (!slot_state->payload->placement.scope || slot_state->task_attrs.requires_sync_start() ||
+                           shape == ResourceShape::DUMMY ||
+                           (slot_state->task_attrs.has_predicate() && !slot_state->payload->predicate.pass()))) {
+                disp_queues[static_cast<int>(shape)].push(slot_state);
+                continue;
+            }
             CoreTracker::BitStates selected_mix_clusters(0ULL);
 
             if (is_mix) {
@@ -548,7 +517,6 @@ void SchedulerContext::dispatch_shape(
             if (slot_state->payload->placement.scope) {
                 auto &row = sched_->ready_feedback.writers[thread_idx].rows[static_cast<int>(shape)];
                 simpler::tmr::ReadyRow::add(row.claimed[slot_state->task->target_aicpu_cluster], claim);
-                simpler::tmr::ReadyRow::add(row.accepted[aicpu_cluster_ids_[thread_idx]], claim);
             }
             if (sched_->ready_feedback.enabled.load(std::memory_order_relaxed)) {
                 slot_state->payload->placement.dispatched[aicpu_cluster_ids_[thread_idx]].fetch_add(
@@ -589,9 +557,7 @@ void SchedulerContext::dispatch_shape(
         for (int i = 0; i < published_n; i++) {
             if (published_list[i]->payload->placement.scope) {
                 auto &writer = sched_->ready_feedback.writers[thread_idx];
-                simpler::tmr::ReadyRow::add(
-                    writer.rows[static_cast<int>(shape)].executed[aicpu_cluster_ids_[thread_idx]], published_counts[i]
-                );
+                writer.executed[static_cast<int>(shape)][aicpu_cluster_ids_[thread_idx]] += published_counts[i];
                 if (published_list[i]->task->target_aicpu_cluster != aicpu_cluster_ids_[thread_idx])
                     writer.remote_blocks += published_counts[i];
                 if (published_list[i]->logical_block_num > 1 &&
@@ -782,31 +748,19 @@ void SchedulerContext::dispatch_ready_tasks(
                 if (aicpu_cluster_ids_[t] == cluster) leader = false;
             auto &feedback = sched_->ready_feedback;
             auto &owner = feedback.writers[thread_idx];
-            if (leader && ++owner.probe_clock >= owner.probe_next) {
+            bool vacancy = false;
+            for (int i = 0; leader && i < static_cast<int>(ResourceShape::DUMMY); ++i)
+                vacancy |=
+                    tracker.get_dispatchable_cores(static_cast<ResourceShape>(i), CoreTracker::DispatchPhase::IDLE)
+                        .has_value();
+            if (leader && vacancy && ++owner.probe_clock >= owner.probe_next) {
                 owner.probe_next = owner.probe_clock + simpler::tmr::READY_PROBE_LOOPS;
                 ++owner.probes;
+                // Normal local dispatch has exhausted fitting work; leftover entries can have incompatible masks.
                 for (int i = 0; i < static_cast<int>(ResourceShape::DUMMY); ++i) {
                     auto shape = static_cast<ResourceShape>(i);
                     if (!tracker.get_dispatchable_cores(shape, CoreTracker::DispatchPhase::IDLE).has_value()) continue;
-                    if (sched_->cluster_ready_queues[cluster][i].size() ||
-                        sched_->auto_ready_queues[cluster][i].size() || sched_->ready_queues[i].size())
-                        continue;
-                    feedback.refresh(thread_idx, i);
-                    const auto &view = owner.views[i];
-                    uint64_t remote_cap = view.capacity[1 - cluster];
-                    if (!simpler::tmr::may_remote_pickup(
-                            feedback.queued(thread_idx, i, cluster), feedback.queued(thread_idx, i, 1 - cluster),
-                            remote_cap * simpler::tmr::READY_UNITS_PER_BLOCK
-                        ))
-                        continue;
-                    uint64_t cap = view.capacity[cluster];
-                    if (!cap || !remote_cap) continue;
-                    uint64_t here = simpler::tmr::READY_WAVE * feedback.pressure(thread_idx, i, cluster) / cap;
-                    uint64_t there =
-                        simpler::tmr::READY_WAVE * feedback.pressure(thread_idx, i, 1 - cluster) / remote_cap;
-                    if (there <= here + simpler::tmr::READY_UNITS_PER_BLOCK *
-                                            (simpler::tmr::READY_REMOTE_PRICE + simpler::tmr::READY_SWITCH_MARGIN))
-                        continue;
+                    if (feedback.queued(thread_idx, i, 1 - cluster) <= 0) continue;
                     ++owner.attempts;
                     dispatch_shape(
                         thread_idx, sched_->auto_ready_queues[1 - cluster], shape, CoreTracker::DispatchPhase::IDLE,
@@ -1243,7 +1197,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
     uint32_t placement_iteration = 0;
     while (true) {
         if (thread_idx < sched_thread_num_ && sched_->ready_feedback.enabled.load(std::memory_order_acquire) &&
-            ((placement_iteration++ & 63u) == 0)) {
+            ((placement_iteration++ % simpler::tmr::READY_FEEDBACK_LOOPS) == 0)) {
             publish_partition_resources(thread_idx);
         }
         if (completed_.load(std::memory_order_acquire)) {
@@ -1477,11 +1431,9 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
                     uint64_t units =
                         dummy_slot.active_mask.to_shape() == ResourceShape::DUMMY ? 1 : dummy_slot.logical_block_num;
                     simpler::tmr::ReadyRow::add(row.claimed[dummy_slot.task->target_aicpu_cluster], units);
-                    simpler::tmr::ReadyRow::add(row.accepted[aicpu_cluster_ids_[thread_idx]], units);
-                    simpler::tmr::ReadyRow::add(row.executed[aicpu_cluster_ids_[thread_idx]], units);
-                    simpler::tmr::ReadyRow::add(
-                        row.completed_units[aicpu_cluster_ids_[thread_idx]], units * simpler::tmr::READY_UNITS_PER_BLOCK
-                    );
+                    sched_->ready_feedback.writers[thread_idx]
+                        .executed[static_cast<int>(dummy_slot.active_mask.to_shape())]
+                                 [aicpu_cluster_ids_[thread_idx]] += units;
                     dummy_slot.payload->placement.dispatched[aicpu_cluster_ids_[thread_idx]].fetch_add(
                         units, std::memory_order_relaxed
                     );

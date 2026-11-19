@@ -442,6 +442,7 @@ TEST_F(SchedulerStateTest, AutomaticSingleBlockAndStrictTasksHaveSeparateQueues)
     automatic.task->target_aicpu_cluster = 0;
     strict.task->target_aicpu_cluster = 0;
     automatic.payload->placement.scope = 1;
+    automatic.payload->placement.predicted_cluster = 0;
     automatic.payload->placement.preferred_cluster = 0;
     sched.ready_feedback.schedulers[0] = 1;
     sched.push_ready_routed(&automatic);
@@ -462,6 +463,7 @@ TEST_F(SchedulerStateTest, ReadyAccountingIsOncePerTaskWithoutTimingSamples) {
     slot.task->target_aicpu_cluster = 1;
     slot.logical_block_num = 16;
     slot.payload->placement.scope = 1;
+    slot.payload->placement.predicted_cluster = 0;
     slot.payload->placement.preferred_cluster = 1;
     sched.ready_feedback.schedulers[1] = 1;
     sched.stamp_ready_queue(slot);
@@ -689,10 +691,11 @@ TEST_F(SchedulerStateTest, DeferredBindingUsesActualProducerAndAccountsExactlyOn
     producer.payload->placement.preferred_cluster = 0;
     producer.payload->placement.dispatch_cluster.store(1);
     consumer.payload->placement.scope = 1;
+    consumer.payload->placement.predicted_cluster = 0;
     consumer.payload->placement.preferred_cluster = -1;
     consumer.task->target_aicpu_cluster = -1;
     sched.ready_feedback.cluster[2] = 0;
-    SchedulerState::record_completed_affinity(consumer, &producer);
+    sched.record_completed_affinity(consumer, &producer);
     // Producer affinity and the publishing S's side are separate.
     sched.record_ready_origin(consumer, &producer, 0, 2);
     sched.stamp_ready_queue(consumer);
@@ -728,6 +731,7 @@ TEST_F(SchedulerStateTest, UnknownReleaseTimestampDoesNotChangeSchedulerOriginTo
     sched.ready_feedback.schedulers[1] = 3;
     producer.payload->placement.dispatch_cluster.store(0);
     consumer.payload->placement.scope = 1;
+    consumer.payload->placement.predicted_cluster = 0;
     consumer.payload->placement.preferred_cluster = -1;
     sched.ready_feedback.cluster[2] = 0;
     // A shared producer can start its fanout walk before feedback is enabled.

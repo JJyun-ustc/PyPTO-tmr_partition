@@ -9,6 +9,7 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 #include <gtest/gtest.h>
+#include <thread>
 
 #include "ready_affinity.h"
 
@@ -105,144 +106,205 @@ TEST(ReadyAffinity, SplitProducerUsesActualDistribution) {
     EXPECT_EQ(side_vote(task.affinity_votes, 0), 64);
     EXPECT_EQ(side_vote(task.affinity_votes, 1), 192);
 }
-TEST(ReadyAffinity, SmallQueueSavingDoesNotOverrideHandoffCost) {
-    uint64_t pressure[2]{24, 0}, cap[2]{10, 10}, free[2]{1, 1};
-    EXPECT_EQ(choose_ready_side(0, AffinityStrength::STRONG, 0, pressure, cap, free, 10), 0);
-    pressure[0] = 180;
-    EXPECT_EQ(choose_ready_side(0, AffinityStrength::STRONG, 0, pressure, cap, free, 10), 1);
+
+static void topology(ReadyFeedback &f) {
+    f.schedulers[0] = 2;
+    f.schedulers[1] = 3;
+    for (int t = 0; t < 6; ++t)
+        f.cluster[t] = t < 2 ? 0 : 1;
 }
-TEST(ReadyAffinity, InflightWorkPreventsLargeTaskChoosingBusySide) {
-    uint64_t pressure[2]{0, 6000}, cap[2]{20, 28}, free[2]{20, 0};
-    EXPECT_EQ(choose_ready_side(-1, AffinityStrength::NEUTRAL, -1, pressure, cap, free, 256), 0);
+TEST(ReadyAffinity, PublishMovesPredictionAndQueueInOneTransaction) {
+    ReadyRow row;
+    row.publish(0, 1, 16);
+    ReadySample snapshot;
+    ASSERT_TRUE(row.read(snapshot));
+    EXPECT_EQ(snapshot.revoked[0], 16);
+    EXPECT_EQ(snapshot.enqueued[1], 16);
+    EXPECT_EQ(snapshot.enqueued[0], 0);
 }
-TEST(ReadyAffinity, ZeroCapacityExcludesSide) {
-    uint64_t pressure[2]{0, 0}, cap[2]{0, 10}, free[2]{0, 1};
-    EXPECT_EQ(choose_ready_side(0, AffinityStrength::STRONG, 0, pressure, cap, free, 48), 1);
+TEST(ReadyAffinity, RacingPublicationRetainsPreviousSnapshot) {
+    ReadyRow row;
+    ReadySample old;
+    old.enqueued[0] = 7;
+    row.version.store(1);
+    row.revoked[0].store(100);
+    EXPECT_FALSE(row.read(old));
+    EXPECT_EQ(old.enqueued[0], 7);
+    EXPECT_EQ(old.revoked[0], 0);
 }
-TEST(ReadyAffinity, CacheSurvivesConsecutiveProducerCompletions) {
+TEST(ReadyAffinity, ConcurrentReaderNeverObservesHalfPublication) {
+    ReadyRow row;
+    std::atomic<bool> done{false};
+    std::atomic<int> bad{0};
+    std::thread writer([&] {
+        for (int i = 0; i < 10000; ++i)
+            row.publish(0, 1, 3);
+        done.store(true);
+    });
+    do {
+        ReadySample snap;
+        if (row.read(snap) && snap.revoked[0] != snap.enqueued[1]) ++bad;
+    } while (!done.load());
+    writer.join();
+    EXPECT_EQ(bad.load(), 0);
+}
+TEST(ReadyAffinity, LeadersOwnWritersAndPreserveBothQueueSides) {
     ReadyFeedback f;
-    f.schedulers[0] = f.schedulers[1] = 1;
+    topology(f);
+    f.writers[0].rows[0].publish(0, 1, 10);
+    f.writers[2].rows[0].publish(1, 0, 20);
+    f.writers[5].rows[0].publish(1, 1, 30);
+    f.publish_side(0, 0);
+    f.publish_side(2, 0);
+    f.refresh(5, 0);
+    EXPECT_EQ(f.queued(5, 0, 0), 20);
+    EXPECT_EQ(f.queued(5, 0, 1), 40);
+    EXPECT_EQ(f.writers[5].views[0].sides[0].schedulers.enqueued[1], 10);
+    EXPECT_EQ(f.writers[5].views[0].sides[1].schedulers.enqueued[0], 20);
+    EXPECT_EQ(f.writers[5].views[0].sides[1].schedulers.enqueued[1], 0);
+}
+TEST(ReadyAffinity, ReservationAndQueueUseCurrentOAndSnapshotS) {
+    ReadyFeedback f;
+    topology(f);
     ReadyTaskState task;
-    for (int i = 0; i < 16; ++i) {
-        f.begin_batch(2);
-        (void)f.bind(2, 0, task, 1);
-    }
-    EXPECT_EQ(f.writers[2].refreshes, 1);
-    (void)f.bind(2, 0, task, 1);
-    EXPECT_EQ(f.writers[2].refreshes, 2);
+    f.predict(0, task, 10, true);
+    int p = task.predicted_cluster;
+    EXPECT_EQ(f.blocked(0, p), 10);
+    f.writers[2].rows[0].publish(p, 1, 10);
+    EXPECT_EQ(f.blocked(0, p), 10);
+    f.publish_side(2, 0);
+    f.refresh(5, 0);
+    EXPECT_EQ(f.blocked(0, p), 0);
+    EXPECT_EQ(f.queued(5, 0, 1), 10);
+    f.writers[5].rows[0].publish(0, 0, 7);
+    f.assigned[0][0] += 7;
+    EXPECT_EQ(f.blocked(0, 0), 0);
+    EXPECT_EQ(f.queued(5, 0, 0), 7);
 }
-TEST(ReadyAffinity, OwnBurstPublicationsChangeNextDecision) {
+TEST(ReadyAffinity, OwnDeltasSurviveRefreshWithoutDoubleCounting) {
     ReadyFeedback f;
-    f.schedulers[0] = f.schedulers[1] = 1;
-    ReadyTaskState task;
-    task.preferred_cluster = 0;
-    EXPECT_EQ(f.bind(2, 0, task, 10), 0);
-    ReadyRow::add(f.writers[2].rows[0].enqueued[0], 10);
-    EXPECT_EQ(f.bind(2, 0, task, 10), 1);
-    EXPECT_EQ(f.writers[2].refreshes, 1);
-}
-TEST(ReadyAffinity, LocalClaimTransfersQueueToInflightWithoutLosingPressure) {
-    ReadyRow r;
-    ReadyRow::add(r.enqueued[0], 8);
-    EXPECT_EQ(r.pressure_units(0), 48);
-    ReadyRow::add(r.claimed[0], 8);
-    ReadyRow::add(r.accepted[0], 8);
-    EXPECT_EQ(r.queue_units(0), 0);
-    EXPECT_EQ(r.pressure_units(0), 48);
-    ReadyRow::add(r.completed_units[0], 18);
-    EXPECT_EQ(r.pressure_units(0), 30);
-}
-TEST(ReadyAffinity, RemoteRangeMovesPressureToActualSide) {
-    ReadyRow r;
-    ReadyRow::add(r.enqueued[0], 16);
-    ReadyRow::add(r.claimed[0], 8);
-    ReadyRow::add(r.accepted[1], 8);
-    EXPECT_EQ(r.queue_units(0), 48);
-    EXPECT_EQ(r.queue_units(1), 0);
-    EXPECT_EQ(r.pressure_units(0), 48);
-    EXPECT_EQ(r.pressure_units(1), 48);
-    ReadyRow::add(r.completed_units[1], 48);
-    EXPECT_EQ(r.pressure_units(1), 0);
-}
-TEST(ReadyAffinity, MixCompletionFractionsDoNotTripleCountBlocks) {
-    ReadyRow r;
-    r.accepted[0].store(1);
-    for (int i = 0; i < 3; ++i)
-        ReadyRow::add(r.completed_units[0], 6 / 3);
-    EXPECT_EQ(r.pressure_units(0), 0);
-    r.accepted[0].store(2);
-    for (int i = 0; i < 2; ++i)
-        ReadyRow::add(r.completed_units[0], 6 / 2);
-    EXPECT_EQ(r.pressure_units(0), 0);
-}
-TEST(ReadyAffinity, RefreshWatermarkDoesNotDoubleCountOwnQueueAndInflight) {
-    ReadyFeedback f;
-    f.schedulers[0] = f.schedulers[1] = 1;
+    topology(f);
     auto &row = f.writers[2].rows[0];
-    row.enqueued[0].store(10);
-    row.claimed[0].store(4);
-    row.accepted[0].store(4);
-    row.completed_units[0].store(6);
+    row.publish(1, 0, 8);
+    f.publish_side(2, 0);
+    f.refresh(2, 0);
+    EXPECT_EQ(f.queued(2, 0, 0), 8);
+    row.publish(0, 0, 4);
+    EXPECT_EQ(f.queued(2, 0, 0), 12);
+    f.publish_side(2, 0);
+    f.refresh(2, 0);
+    EXPECT_EQ(f.queued(2, 0, 0), 12);
+    ReadyRow::add(row.claimed[0], 8);
+    EXPECT_EQ(f.queued(2, 0, 0), 4);
+    f.publish_side(2, 0);
+    f.refresh(2, 0);
+    EXPECT_EQ(f.queued(2, 0, 0), 4);
+}
+TEST(ReadyAffinity, NegativeRemoteClaimRowRetainsDebitAcrossRefresh) {
+    ReadyFeedback f;
+    topology(f);
+    f.writers[0].rows[0].publish(0, 0, 8);
+    f.writers[2].rows[0].claimed[0].store(4);
+    f.publish_side(0, 0);
+    f.publish_side(2, 0);
+    f.refresh(2, 0);
+    EXPECT_EQ(f.queued(2, 0, 0), 4);
+    f.writers[2].rows[0].claimed[0].store(8);
+    EXPECT_EQ(f.queued(2, 0, 0), 0);
+}
+TEST(ReadyAffinity, OrchestratorSidecarIsVisibleExactlyOnceToSchedulers) {
+    ReadyFeedback f;
+    topology(f);
+    f.writers[5].rows[0].publish(0, 1, 9);
+    f.publish_side(0, 0);
+    f.publish_side(2, 0);
+    f.refresh(0, 0);
+    f.refresh(5, 0);
+    EXPECT_EQ(f.queued(0, 0, 1), 9);
+    EXPECT_EQ(f.queued(5, 0, 1), 9);
+    EXPECT_EQ(f.writers[0].views[0].sides[0].orchestrator.enqueued[1], 0);
+    EXPECT_EQ(f.writers[0].views[0].sides[1].orchestrator.enqueued[1], 9);
+}
+TEST(ReadyAffinity, SnapshotReplacementDoesNotAccumulateOldTotals) {
+    ReadyFeedback f;
+    topology(f);
+    f.writers[0].rows[0].publish(0, 1, 9);
+    f.publish_side(0, 0);
+    f.refresh(5, 0);
+    f.refresh(5, 0);
+    EXPECT_EQ(f.queued(5, 0, 1), 9);
+}
+TEST(ReadyAffinity, FailedHintReadPreservesBothReservationAndQueue) {
+    ReadyFeedback f;
+    topology(f);
     auto &hint = f.hints[0][0];
-    hint.work.store(54);
-    hint.queued.store(36);
-    hint.pressure_cut[2].store(54);
-    hint.queue_cut[2].store(36);
-    f.refresh(2, 0);
-    EXPECT_EQ(f.pressure(2, 0, 0), 54);
-    EXPECT_EQ(f.queued(2, 0, 0), 36);
-    row.completed_units[0].store(12);
-    EXPECT_EQ(f.pressure(2, 0, 0), 48);
-    hint.work.store(48);
-    hint.pressure_cut[2].store(48);
-    f.writers[2].views[0].uses = 16;
-    f.refresh(2, 0);
-    EXPECT_EQ(f.pressure(2, 0, 0), 48);
+    hint.revoked[0].store(3);
+    hint.enqueued[1].store(3);
+    f.refresh(5, 0);
+    hint.version.store(1);
+    hint.revoked[0].store(100);
+    f.refresh(5, 0);
+    EXPECT_EQ(f.writers[5].views[0].sides[0].schedulers.revoked[0], 3);
+    EXPECT_EQ(f.queued(5, 0, 1), 3);
 }
-TEST(ReadyAffinity, SignedRemoteClaimCutPreservesCredit) {
+TEST(ReadyAffinity, ORefreshEvery64CreationsRatherThanEveryReady) {
     ReadyFeedback f;
-    auto &r = f.writers[2].rows[0];
-    r.claimed[0].store(4);
-    auto &h = f.hints[0][0];
-    h.work.store(24);
-    h.queued.store(24);
-    h.pressure_cut[2].store(-24);
-    h.queue_cut[2].store(-24);
-    f.refresh(2, 0);
-    EXPECT_EQ(f.pressure(2, 0, 0), 24);
-    r.claimed[0].store(8);
-    EXPECT_EQ(f.pressure(2, 0, 0), 0);
+    topology(f);
+    for (int i = 0; i < 64; ++i) {
+        ReadyTaskState t;
+        f.predict(0, t, 1, true);
+    }
+    EXPECT_EQ(f.writers[5].refreshes, 4);
+    ReadyTaskState t;
+    f.predict(0, t, 1, true);
+    EXPECT_EQ(f.writers[5].refreshes, 8);
 }
-TEST(ReadyAffinity, RacingSnapshotRetainsOldViewWithoutSpinning) {
+TEST(ReadyAffinity, ReadyBindingNeverRefreshesFeedbackOrScoresPressure) {
     ReadyFeedback f;
-    f.refresh(2, 0);
-    auto &v = f.writers[2].views[0];
-    v.uses = 16;
-    f.hints[0][0].version.store(1);
-    f.hints[0][0].work.store(1000);
-    f.refresh(2, 0);
-    EXPECT_EQ(f.pressure(2, 0, 0), 0);
+    topology(f);
+    ReadyTaskState t;
+    t.predicted_cluster = 0;
+    for (int i = 0; i < 64; ++i)
+        EXPECT_EQ(f.bind(2, 0, t, 1), 0);
+    EXPECT_EQ(f.writers[2].refreshes, 0);
+    EXPECT_EQ(f.writers[2].rows[0].revoked[0].load(), 64);
 }
-TEST(ReadyAffinity, CacheExpiresByLowFrequencyClock) {
+TEST(ReadyAffinity, ActualVoteThresholdIsStrictlyGreaterThanQuarter) {
+    int32_t sched[2]{2, 3};
+    uint64_t q[2]{};
+    EXPECT_EQ(light_ready_side(0, pack_votes(3, 5), true, q, sched), 0);
+    EXPECT_EQ(light_ready_side(0, pack_votes(2, 6), true, q, sched), 1);
+}
+TEST(ReadyAffinity, InferredVoteThresholdIsStrictlyGreaterThanHalf) {
+    int32_t sched[2]{2, 3};
+    uint64_t q[2]{};
+    EXPECT_EQ(light_ready_side(0, pack_votes(1, 3), false, q, sched), 0);
+    EXPECT_EQ(light_ready_side(0, pack_votes(1, 4), false, q, sched), 1);
+    EXPECT_EQ(light_ready_side(0, 0, true, q, sched), 0);
+}
+TEST(ReadyAffinity, CongestionProtectsPredictionFromAffinityCorrection) {
+    int32_t sched[2]{2, 3};
+    uint64_t q[2]{0, 8};
+    EXPECT_EQ(light_ready_side(0, pack_votes(0, 256), true, q, sched), 0);
+    q[0] = 8;
+    EXPECT_EQ(light_ready_side(0, pack_votes(0, 256), true, q, sched), 1);
+}
+TEST(ReadyAffinity, CurrentOLocalReadyPublicationsAffectNextPrediction) {
     ReadyFeedback f;
-    auto &owner = f.writers[2];
-    owner.max_age_ticks = 100;
-    f.refresh(2, 0);
-    owner.now_tick = 101;
-    f.refresh(2, 0);
-    EXPECT_EQ(owner.refreshes, 2);
+    topology(f);
+    ReadyTaskState a, b;
+    int first = f.predict(0, a, 10, false);
+    f.bind(5, 0, a, 10);
+    int next = f.predict(0, b, 10, false);
+    EXPECT_NE(first, next);
+    EXPECT_EQ(f.assigned[0][first] + f.assigned[0][next], 20);
 }
-TEST(ReadyAffinity, CompletedExecutionOverridesCreationPreference) {
+TEST(ReadyAffinity, QueuedDifferenceRemainsSignedUntilScore) {
     ReadyFeedback f;
-    f.schedulers[0] = f.schedulers[1] = 10;
-    ReadyTaskState task;
-    task.preferred_cluster = 0;
-    task.affinity_votes = pack_votes(256, 0);
-    task.completed_votes.store(pack_votes(0, 256));
-    EXPECT_EQ(f.bind(2, 0, task, 1), 1);
-}
-TEST(ReadyAffinity, RemoteProbeUsesBlocksRatherThanQueueEntryCount) {
-    EXPECT_FALSE(may_remote_pickup(1, 100, 12));
-    EXPECT_FALSE(may_remote_pickup(0, 11, 12));
-    EXPECT_TRUE(may_remote_pickup(0, 256, 12));
+    topology(f);
+    f.writers[2].rows[0].claimed[0].store(9);
+    f.publish_side(2, 0);
+    f.refresh(5, 0);
+    EXPECT_EQ(f.queued(5, 0, 0), -9);
+    EXPECT_EQ(positive(f.queued(5, 0, 0)), 0);
 }

@@ -582,11 +582,10 @@ struct SchedulerState {
             int shape = static_cast<int>(slot_state.active_mask.to_shape());
             uint64_t units =
                 slot_state.active_mask.to_shape() == ResourceShape::DUMMY ? 1 : slot_state.logical_block_num;
+            always_assert(metadata.predicted_cluster >= 0 && metadata.predicted_cluster < 2);
             int side = ready_feedback.bind(metadata.ready_writer, shape, metadata, units);
             slot_state.task->target_aicpu_cluster = side;
-            simpler::tmr::ReadyRow::add(
-                ready_feedback.writers[metadata.ready_writer].rows[shape].enqueued[side], units
-            );
+
             metadata.bound = true;
         }
 #if SIMPLER_DFX
@@ -601,8 +600,14 @@ struct SchedulerState {
 #endif
     }
 
-    static void record_completed_affinity(ChipTaskSlotState &consumer, const ChipTaskSlotState *producer) {
+    void record_completed_affinity(
+        ChipTaskSlotState &consumer, const ChipTaskSlotState *producer, int writer = simpler::tmr::READY_THREADS - 1
+    ) {
         if (!consumer.payload->placement.scope || !producer) return;
+        [[maybe_unused]] uint64_t begin = 0;
+#if SIMPLER_DFX
+        if (get_chip_swimlane_level() >= ChipSwimlaneLevel::SCHED_PHASES) begin = get_sys_cnt_aicpu();
+#endif
         const auto &parent = producer->payload->placement;
         uint64_t votes = parent.actual_votes();
         if (!votes) {
@@ -612,6 +617,15 @@ struct SchedulerState {
         }
         // Each WAIT edge contributes once, before its existing acq_rel fanin increment.
         if (votes) consumer.payload->placement.completed_votes.fetch_add(votes, std::memory_order_relaxed);
+#if SIMPLER_DFX
+        if (begin) {
+            auto &trace = ready_feedback.writers[writer].trace;
+            trace.ticks[8] += get_sys_cnt_aicpu() - begin;
+            ++trace.calls[8];
+        }
+#else
+        (void)writer;
+#endif
     }
     void record_ready_origin(ChipTaskSlotState &slot_state, const ChipTaskSlotState *producer, uint64_t, int writer) {
         if (!slot_state.payload->placement.scope || !producer) return;
@@ -1262,7 +1276,7 @@ struct SchedulerState {
         // Atomically increment fanin_refcount and check if all producers are done
         // ACQ_REL on fanin_refcount already synchronizes with the orchestrator's
         // init release, making fanin_count visible — plain load suffices.
-        record_completed_affinity(slot_state, producer);
+        record_completed_affinity(slot_state, producer, writer);
         int32_t new_refcount = slot_state.fanin_refcount.fetch_add(1, std::memory_order_acq_rel) + 1;
 
         if (new_refcount == slot_state.fanin_count) {
@@ -1277,7 +1291,7 @@ struct SchedulerState {
         EarlyDispatchReleaseSink *sink = nullptr, const ChipTaskSlotState *producer = nullptr,
         uint64_t release_tick = 0, int writer = simpler::tmr::READY_THREADS - 1
     ) {
-        record_completed_affinity(slot_state, producer);
+        record_completed_affinity(slot_state, producer, writer);
         int32_t new_refcount = slot_state.fanin_refcount.fetch_add(1, std::memory_order_acq_rel) + 1;
         atomic_count += 1;  // fanin_refcount.fetch_add
 
@@ -1398,7 +1412,6 @@ struct SchedulerState {
         // below; their dispatch_fanin propagation is collected here and replayed
         // after the walk, so no consumer's doorbell waits on a sibling's propagate.
         EarlyDispatchReleaseSink rel_sink;
-        if (ready_feedback.enabled.load(std::memory_order_acquire)) ready_feedback.begin_batch(thread_idx);
         uint64_t placement_release_tick = 0;
         while (current != nullptr) {
             ChipTaskSlotState &consumer_slot = *current->slot_state;

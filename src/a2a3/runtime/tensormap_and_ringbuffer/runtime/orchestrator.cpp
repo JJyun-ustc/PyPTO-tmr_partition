@@ -574,7 +574,7 @@ void OrchestratorState::wire_fanin_task(ChipTaskSlotState &slot_state, int32_t w
                 early_disqualified = true;
             }
             if (pstate >= CHIP_TASK_COMPLETED) {
-                SchedulerState::record_completed_affinity(slot_state, producer);
+                sched->record_completed_affinity(slot_state, producer);
                 completed_fanin++;
             } else {
                 producer->fanout_head = rss.dep_pool.prepend(producer->fanout_head, &slot_state);
@@ -1225,17 +1225,28 @@ static TaskOutputTensors submit_task_common(
         });
         vote.finish(payload.placement, scope);
         builder.record(payload.placement);
-        if ((builder.tasks & 63u) == 1) {
-            auto &writer = feedback.writers[simpler::tmr::READY_THREADS - 1];
-            writer.now_tick = get_sys_cnt_aicpu();
-            writer.max_age_ticks = PLATFORM_PROF_SYS_CNT_FREQ / 50000;
-        }
         task.target_aicpu_cluster = -1;
         cur_slot_state.task_attrs.set_early_resolve(false);
 #if SIMPLER_DFX
         if (begin) {
             builder.trace.ticks[0] += get_sys_cnt_aicpu() - begin;
             ++builder.trace.calls[0];
+        }
+#endif
+        [[maybe_unused]] uint64_t score_begin = 0;
+#if SIMPLER_DFX
+        if (orch->chip_swimlane_level >= ChipSwimlaneLevel::SCHED_PHASES) score_begin = get_sys_cnt_aicpu();
+#endif
+        uint64_t units =
+            cur_slot_state.active_mask.to_shape() == ResourceShape::DUMMY ? 1 : cur_slot_state.logical_block_num;
+        feedback.predict(
+            static_cast<int>(cur_slot_state.active_mask.to_shape()), payload.placement, units,
+            fanin_builder.wait_count != 0
+        );
+#if SIMPLER_DFX
+        if (score_begin) {
+            builder.trace.ticks[1] += get_sys_cnt_aicpu() - score_begin;
+            ++builder.trace.calls[1];
         }
 #endif
     }
@@ -1298,7 +1309,7 @@ static TaskOutputTensors submit_task_common(
         // reduction-dropped DEP_NONE edge — drops its submit->wire pin so the
         // (already completed) producer can be CONSUMED.
         for_each_fanin_slot_state(payload, [&](ChipTaskSlotState *producer, DepFlags flags) {
-            if (dep_has_wait(flags)) SchedulerState::record_completed_affinity(cur_slot_state, producer);
+            if (dep_has_wait(flags)) sched->record_completed_affinity(cur_slot_state, producer);
             if (!dep_has_retain(flags)) {
                 sched->release_producer(*producer);  // wiring-phase atomic, not bucketed (see wire_fanin_task)
             }

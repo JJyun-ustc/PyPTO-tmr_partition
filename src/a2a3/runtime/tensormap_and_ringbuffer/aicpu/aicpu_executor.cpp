@@ -762,8 +762,11 @@ int32_t AicpuExecutor::run_orchestration(Runtime *runtime, int32_t thread_idx) {
             // the core-type-classified count post_handshake_init produces on
             // the serial path.
             runtime_finalize_after_wire(rt, sched_ctx_.aic_count(), sched_ctx_.aiv_count());
-            for (int t = 0; t < aicpu_thread_num_; ++t)
-                rt->scheduler.ready_feedback.cluster[t] = runtime->dev.aicpu_cluster_ids[t];
+            for (int t = 0; t < simpler::tmr::READY_THREADS - 1; ++t)
+                rt->scheduler.ready_feedback.cluster[t] =
+                    t < sched_thread_num_ ? runtime->dev.aicpu_cluster_ids[t] : -1;
+            rt->scheduler.ready_feedback.cluster[simpler::tmr::READY_THREADS - 1] =
+                runtime->dev.aicpu_cluster_ids[sched_thread_num_];
             rt->orchestrator.aicpu_cluster_sched_count[0] = 0;
             rt->orchestrator.aicpu_cluster_sched_count[1] = 0;
             for (int32_t t = 0; t < sched_thread_num_; t++) {
@@ -1068,20 +1071,19 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             auto &model = rt->orchestrator.affinity_builder;
             if (model.tasks) {
                 LOG_INFO(
-                    "AICPU_READY_AFFINITY version=12 pickup=%d tasks=%llu neutral=%llu weak=%llu strong=%llu",
+                    "AICPU_READY_AFFINITY version=13 pickup=%d tasks=%llu neutral=%llu weak=%llu strong=%llu",
                     int(simpler::tmr::READY_REMOTE_PICKUP), static_cast<unsigned long long>(model.tasks),
                     static_cast<unsigned long long>(model.neutral), static_cast<unsigned long long>(model.weak),
                     static_cast<unsigned long long>(model.strong)
                 );
                 for (int shape = 0; shape < simpler::tmr::READY_SHAPES; ++shape) {
-                    uint64_t q[2]{}, c[2]{}, x[2]{}, a[2]{}, d[2]{};
+                    uint64_t q[2]{}, c[2]{}, x[2]{}, released[2]{};
                     for (const auto &writer : rt->scheduler.ready_feedback.writers)
                         for (int side = 0; side < 2; ++side) {
                             q[side] += writer.rows[shape].enqueued[side].load();
                             c[side] += writer.rows[shape].claimed[side].load();
-                            x[side] += writer.rows[shape].executed[side].load();
-                            a[side] += writer.rows[shape].accepted[side].load();
-                            d[side] += writer.rows[shape].completed_units[side].load();
+                            x[side] += writer.executed[shape][side];
+                            released[side] += writer.rows[shape].revoked[side].load();
                         }
                     LOG_INFO(
                         "AICPU_READY_LEDGER shape=%d queued=%llu,%llu claimed=%llu,%llu executed=%llu,%llu", shape,
@@ -1090,9 +1092,10 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                         static_cast<unsigned long long>(x[0]), static_cast<unsigned long long>(x[1])
                     );
                     LOG_INFO(
-                        "AICPU_READY_COMPLETION shape=%d accepted=%llu,%llu completed_units=%llu,%llu", shape,
-                        static_cast<unsigned long long>(a[0]), static_cast<unsigned long long>(a[1]),
-                        static_cast<unsigned long long>(d[0]), static_cast<unsigned long long>(d[1])
+                        "AICPU_RESERVATION_LEDGER shape=%d assigned=%llu,%llu revoked=%llu,%llu", shape,
+                        static_cast<unsigned long long>(rt->scheduler.ready_feedback.assigned[shape][0]),
+                        static_cast<unsigned long long>(rt->scheduler.ready_feedback.assigned[shape][1]),
+                        static_cast<unsigned long long>(released[0]), static_cast<unsigned long long>(released[1])
                     );
                 }
                 for (int t = 0; t < simpler::tmr::READY_THREADS; ++t) {
@@ -1110,10 +1113,11 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             }
 #if SIMPLER_DFX
             if (get_chip_swimlane_level() >= ChipSwimlaneLevel::SCHED_PHASES) {
-                const char *o_names[] = {"affinity", "unused", "unused", "unused", "unused", "wire_ready"};
-                const char *s_names[] = {"resource_feedback", "observe",       "auto_dispatch", "strict_dispatch",
-                                         "shared_dispatch",   "sync_dispatch", "ready_binding", "cross_pickup"};
-                for (int i : {0, 5})
+                const char *o_names[] = {"affinity", "score", "unused", "unused", "unused", "wire_ready"};
+                const char *s_names[] = {"resource_feedback", "observe",         "auto_dispatch",
+                                         "strict_dispatch",   "shared_dispatch", "sync_dispatch",
+                                         "ready_binding",     "cross_pickup",    "affinity_votes"};
+                for (int i : {0, 1, 5})
                     LOG_INFO(
                         "AICPU_PARTITION_TRACE owner=O stage=%s calls=%llu ns=%llu", o_names[i],
                         static_cast<unsigned long long>(model.trace.calls[i]),
@@ -1122,7 +1126,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                         )
                     );
                 for (int t = 0; t < simpler::tmr::READY_THREADS; ++t)
-                    for (int i = 0; i < 8; ++i) {
+                    for (int i = 0; i < 9; ++i) {
                         const auto &trace = rt->scheduler.ready_feedback.writers[t].trace;
                         LOG_INFO(
                             "AICPU_PARTITION_TRACE owner=S%d stage=%s calls=%llu ns=%llu", t, s_names[i],
