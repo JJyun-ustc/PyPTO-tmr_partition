@@ -574,6 +574,7 @@ void OrchestratorState::wire_fanin_task(ChipTaskSlotState &slot_state, int32_t w
                 early_disqualified = true;
             }
             if (pstate >= CHIP_TASK_COMPLETED) {
+                SchedulerState::record_completed_affinity(slot_state, producer);
                 completed_fanin++;
             } else {
                 producer->fanout_head = rss.dep_pool.prepend(producer->fanout_head, &slot_state);
@@ -1224,6 +1225,11 @@ static TaskOutputTensors submit_task_common(
         });
         vote.finish(payload.placement, scope);
         builder.record(payload.placement);
+        if ((builder.tasks & 63u) == 1) {
+            auto &writer = feedback.writers[simpler::tmr::READY_THREADS - 1];
+            writer.now_tick = get_sys_cnt_aicpu();
+            writer.max_age_ticks = PLATFORM_PROF_SYS_CNT_FREQ / 50000;
+        }
         task.target_aicpu_cluster = -1;
         cur_slot_state.task_attrs.set_early_resolve(false);
 #if SIMPLER_DFX
@@ -1292,6 +1298,7 @@ static TaskOutputTensors submit_task_common(
         // reduction-dropped DEP_NONE edge — drops its submit->wire pin so the
         // (already completed) producer can be CONSUMED.
         for_each_fanin_slot_state(payload, [&](ChipTaskSlotState *producer, DepFlags flags) {
+            if (dep_has_wait(flags)) SchedulerState::record_completed_affinity(cur_slot_state, producer);
             if (!dep_has_retain(flags)) {
                 sched->release_producer(*producer);  // wiring-phase atomic, not bucketed (see wire_fanin_task)
             }

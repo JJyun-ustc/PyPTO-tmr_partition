@@ -524,7 +524,7 @@ struct SchedulerState {
     // Ready queues remain global (scheduling is ring-agnostic)
     ChipReadyQueue ready_queues[NUM_RESOURCE_SHAPES];
     ChipReadyQueue cluster_ready_queues[2][NUM_RESOURCE_SHAPES];
-    // Only movable automatic single-block compute tasks enter these queues.
+    // Only movable ordinary automatic compute tasks enter these queues.
     ChipReadyQueue auto_ready_queues[2][NUM_RESOURCE_SHAPES];
 
     // Ready sync_start queues, one per shape. A ready sync_start cohort parks here
@@ -550,7 +550,7 @@ struct SchedulerState {
             always_assert(cluster < 0);
             return ready_sync_queues[static_cast<int32_t>(shape)];
         }
-        if (cluster >= 0 && slot_state.payload->placement.scope && slot_state.logical_block_num == 1)
+        if (cluster >= 0 && slot_state.payload->placement.scope)
             return auto_ready_queues[cluster][static_cast<int32_t>(shape)];
         return cluster < 0 ? ready_queues[static_cast<int32_t>(shape)] :
                              cluster_ready_queues[cluster][static_cast<int32_t>(shape)];
@@ -601,13 +601,23 @@ struct SchedulerState {
 #endif
     }
 
-    static void
-    record_ready_origin(ChipTaskSlotState &slot_state, const ChipTaskSlotState *producer, uint64_t, int writer) {
+    static void record_completed_affinity(ChipTaskSlotState &consumer, const ChipTaskSlotState *producer) {
+        if (!consumer.payload->placement.scope || !producer) return;
+        const auto &parent = producer->payload->placement;
+        uint64_t votes = parent.actual_votes();
+        if (!votes) {
+            int side = parent.dispatch_cluster.load(std::memory_order_acquire);
+            if (side < 0) side = producer->task->target_aicpu_cluster;
+            if (side >= 0) votes = side ? simpler::tmr::pack_votes(0, 256) : simpler::tmr::pack_votes(256, 0);
+        }
+        // Each WAIT edge contributes once, before its existing acq_rel fanin increment.
+        if (votes) consumer.payload->placement.completed_votes.fetch_add(votes, std::memory_order_relaxed);
+    }
+    void record_ready_origin(ChipTaskSlotState &slot_state, const ChipTaskSlotState *producer, uint64_t, int writer) {
         if (!slot_state.payload->placement.scope || !producer) return;
         auto &record = slot_state.payload->placement;
         record.ready_writer = writer;
-        int side = producer->payload->placement.dispatch_cluster.load(std::memory_order_acquire);
-        record.release_cluster = side >= 0 ? side : producer->task->target_aicpu_cluster;
+        record.release_cluster = ready_feedback.cluster[writer];
     }
 
     // Route a ready slot to the right global queue. Dep-only tasks — DUMMY-shaped
@@ -1252,6 +1262,7 @@ struct SchedulerState {
         // Atomically increment fanin_refcount and check if all producers are done
         // ACQ_REL on fanin_refcount already synchronizes with the orchestrator's
         // init release, making fanin_count visible — plain load suffices.
+        record_completed_affinity(slot_state, producer);
         int32_t new_refcount = slot_state.fanin_refcount.fetch_add(1, std::memory_order_acq_rel) + 1;
 
         if (new_refcount == slot_state.fanin_count) {
@@ -1266,6 +1277,7 @@ struct SchedulerState {
         EarlyDispatchReleaseSink *sink = nullptr, const ChipTaskSlotState *producer = nullptr,
         uint64_t release_tick = 0, int writer = simpler::tmr::READY_THREADS - 1
     ) {
+        record_completed_affinity(slot_state, producer);
         int32_t new_refcount = slot_state.fanin_refcount.fetch_add(1, std::memory_order_acq_rel) + 1;
         atomic_count += 1;  // fanin_refcount.fetch_add
 

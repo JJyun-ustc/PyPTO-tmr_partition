@@ -216,3 +216,30 @@ TEST_F(TaskStateTest, DoubleSubtaskCompletionCounterWeakness) {
     bool done2 = sched.on_subtask_complete(slot);
     EXPECT_TRUE(done2) << "Counter model: double-completion falsely triggers done";
 }
+
+TEST_F(TaskStateTest, ConcurrentLocalAndRemoteRangeClaimsCoverEachBlockOnce) {
+    alignas(64) ChipTaskSlotState slot;
+    init_slot(slot, CHIP_TASK_PENDING, 1, 1);
+    constexpr int BLOCKS = 256;
+    slot.logical_block_num = BLOCKS;
+    std::atomic<int> visits[BLOCKS]{};
+    auto claim = [&](int budget) {
+        int start = 0;
+        for (;;) {
+            int count = slot.claim_block_range(BLOCKS, budget, start);
+            if (!count) break;
+            ASSERT_GE(start, 0);
+            ASSERT_LE(start + count, BLOCKS);
+            ASSERT_LE(count, budget);
+            for (int b = start; b < start + count; ++b)
+                visits[b].fetch_add(1);
+        }
+    };
+    std::thread local_a(claim, 3), local_b(claim, 5), remote(claim, 8);
+    local_a.join();
+    local_b.join();
+    remote.join();
+    EXPECT_EQ(slot.next_block_idx.load(), BLOCKS);
+    for (const auto &count : visits)
+        EXPECT_EQ(count.load(), 1);
+}

@@ -155,6 +155,15 @@ void SchedulerContext::complete_slot_task(
         }
     }
 
+    if (slot_state.payload->placement.scope) {
+        auto &row =
+            sched_->ready_feedback.writers[thread_idx].rows[static_cast<int>(slot_state.active_mask.to_shape())];
+        uint64_t active = __builtin_popcount(slot_state.active_mask.core_mask());
+        // MIX has two or three subtask FINs per block: their fractions sum to exactly six units.
+        simpler::tmr::ReadyRow::add(
+            row.completed_units[aicpu_cluster_ids_[thread_idx]], simpler::tmr::READY_UNITS_PER_BLOCK / active
+        );
+    }
     bool task_complete = sched_->on_subtask_complete(slot_state);
 
 #if SIMPLER_DFX

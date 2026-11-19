@@ -691,7 +691,9 @@ TEST_F(SchedulerStateTest, DeferredBindingUsesActualProducerAndAccountsExactlyOn
     consumer.payload->placement.scope = 1;
     consumer.payload->placement.preferred_cluster = -1;
     consumer.task->target_aicpu_cluster = -1;
-    // Release origin remains available without timing samples.
+    sched.ready_feedback.cluster[2] = 0;
+    SchedulerState::record_completed_affinity(consumer, &producer);
+    // Producer affinity and the publishing S's side are separate.
     sched.record_ready_origin(consumer, &producer, 0, 2);
     sched.stamp_ready_queue(consumer);
     sched.stamp_ready_queue(consumer);
@@ -706,7 +708,7 @@ TEST_F(SchedulerStateTest, DeferredBindingUsesActualProducerAndAccountsExactlyOn
     EXPECT_EQ(&sched.ready_queue_for(consumer, ResourceShape::AIC, false), &sched.auto_ready_queues[1][0]);
 }
 
-TEST_F(SchedulerStateTest, AutomaticMultiblockAndStrictTargetsCannotEnterBorrowableQueues) {
+TEST_F(SchedulerStateTest, AutomaticMultiblockIsBorrowableAndStrictTargetIsNot) {
     alignas(64) ChipTaskSlotState wide, strict;
     init_slot(wide, CHIP_TASK_PENDING, 1, 1);
     init_slot(strict, CHIP_TASK_PENDING, 1, 1);
@@ -714,7 +716,7 @@ TEST_F(SchedulerStateTest, AutomaticMultiblockAndStrictTargetsCannotEnterBorrowa
     wide.payload->placement.scope = 1;
     wide.task->target_aicpu_cluster = 1;
     strict.task->target_aicpu_cluster = 1;
-    EXPECT_EQ(&sched.ready_queue_for(wide, ResourceShape::AIV, false), &sched.cluster_ready_queues[1][1]);
+    EXPECT_EQ(&sched.ready_queue_for(wide, ResourceShape::AIV, false), &sched.auto_ready_queues[1][1]);
     EXPECT_EQ(&sched.ready_queue_for(strict, ResourceShape::AIV, false), &sched.cluster_ready_queues[1][1]);
 }
 
@@ -727,6 +729,7 @@ TEST_F(SchedulerStateTest, UnknownReleaseTimestampDoesNotChangeSchedulerOriginTo
     producer.payload->placement.dispatch_cluster.store(0);
     consumer.payload->placement.scope = 1;
     consumer.payload->placement.preferred_cluster = -1;
+    sched.ready_feedback.cluster[2] = 0;
     // A shared producer can start its fanout walk before feedback is enabled.
     // Its missing sample timestamp does not make it an O-origin publication.
     sched.record_ready_origin(consumer, &producer, 0, 2);

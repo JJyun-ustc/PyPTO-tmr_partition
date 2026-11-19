@@ -123,3 +123,5 @@ Newest first.
 
 - [A1–A4累积 block 压力实验](2026-11-aicpu-cluster-block-pressure.md)
 - [v11 ready 亲和实验](2026-11-aicpu-cluster-ready-affinity.md)
+
+- [v12 组合压力与多block领取实验](2026-11-aicpu-cluster-ready-pressure.md)

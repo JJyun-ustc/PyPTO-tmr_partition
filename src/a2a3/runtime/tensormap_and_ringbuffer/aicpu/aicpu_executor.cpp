@@ -1068,18 +1068,20 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             auto &model = rt->orchestrator.affinity_builder;
             if (model.tasks) {
                 LOG_INFO(
-                    "AICPU_READY_AFFINITY version=11 pickup=%d tasks=%llu neutral=%llu weak=%llu strong=%llu",
+                    "AICPU_READY_AFFINITY version=12 pickup=%d tasks=%llu neutral=%llu weak=%llu strong=%llu",
                     int(simpler::tmr::READY_REMOTE_PICKUP), static_cast<unsigned long long>(model.tasks),
                     static_cast<unsigned long long>(model.neutral), static_cast<unsigned long long>(model.weak),
                     static_cast<unsigned long long>(model.strong)
                 );
                 for (int shape = 0; shape < simpler::tmr::READY_SHAPES; ++shape) {
-                    uint64_t q[2]{}, c[2]{}, x[2]{};
+                    uint64_t q[2]{}, c[2]{}, x[2]{}, a[2]{}, d[2]{};
                     for (const auto &writer : rt->scheduler.ready_feedback.writers)
                         for (int side = 0; side < 2; ++side) {
                             q[side] += writer.rows[shape].enqueued[side].load();
                             c[side] += writer.rows[shape].claimed[side].load();
                             x[side] += writer.rows[shape].executed[side].load();
+                            a[side] += writer.rows[shape].accepted[side].load();
+                            d[side] += writer.rows[shape].completed_units[side].load();
                         }
                     LOG_INFO(
                         "AICPU_READY_LEDGER shape=%d queued=%llu,%llu claimed=%llu,%llu executed=%llu,%llu", shape,
@@ -1087,15 +1089,22 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                         static_cast<unsigned long long>(c[0]), static_cast<unsigned long long>(c[1]),
                         static_cast<unsigned long long>(x[0]), static_cast<unsigned long long>(x[1])
                     );
+                    LOG_INFO(
+                        "AICPU_READY_COMPLETION shape=%d accepted=%llu,%llu completed_units=%llu,%llu", shape,
+                        static_cast<unsigned long long>(a[0]), static_cast<unsigned long long>(a[1]),
+                        static_cast<unsigned long long>(d[0]), static_cast<unsigned long long>(d[1])
+                    );
                 }
                 for (int t = 0; t < simpler::tmr::READY_THREADS; ++t) {
                     const auto &writer = rt->scheduler.ready_feedback.writers[t];
                     LOG_INFO(
-                        "AICPU_READY_FEEDBACK writer=%d refreshes=%llu probes=%llu attempts=%llu remote=%llu", t,
-                        static_cast<unsigned long long>(writer.refreshes),
+                        "AICPU_READY_FEEDBACK writer=%d refreshes=%llu probes=%llu attempts=%llu remote=%llu "
+                        "remote_multi=%llu",
+                        t, static_cast<unsigned long long>(writer.refreshes),
                         static_cast<unsigned long long>(writer.probes),
                         static_cast<unsigned long long>(writer.attempts),
-                        static_cast<unsigned long long>(writer.remote_blocks)
+                        static_cast<unsigned long long>(writer.remote_blocks),
+                        static_cast<unsigned long long>(writer.remote_multi_blocks)
                     );
                 }
             }
