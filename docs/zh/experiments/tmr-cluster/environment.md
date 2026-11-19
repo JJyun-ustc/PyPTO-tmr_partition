@@ -1,3 +1,5 @@
+> v12本轮在当前容器物理卡0/逻辑0、PCIe 0000:C1:00.0重测全部对照。版本与环境见 [v12实验](ready-pressure.md) 及 `official-results/v12-ready-pressure-20261119/environment.json`。本轮不实现预计block时长。
+
 > 本页保留原环境记录。v11 在独立worktree构建，物理卡5/逻辑设备0；依赖版本见 main 的 `official-results/v11-ready-affinity-20261119/python-packages.json`，新复现步骤见 [v11实验](ready-affinity.md)。
 
 # 环境记录与复现步骤

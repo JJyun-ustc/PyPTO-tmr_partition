@@ -1,0 +1,455 @@
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.426.030 [aicpusd_resource_limit.cpp:57][AddToCgroup][tid:28800] Add to cgroup successfully, cmd:[cd /var/  && sudo ./tsdaemon_add_to_usermemory.sh memory 28800 0 0].
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.426.148 [aicpusd_drv_manager.cpp:306][InitSocType][tid:28800] Aicpu no need to get this soc version, chipType=5
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.426.171 [aicpusd_feature_ctrl.cpp:41][Init][tid:28800] socVersion is Ascend910B2
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:38.426.269 [aicpu_context.cc:209][SetAicpuRunMode][tid:28800][AICPU_SHARDER] Set runMode:[0] success.
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.426.300 [aicpusd_drv_manager.cpp:583][CheckBindHostPid][tid:28800] call drvQueryProcessHostPid result, hostpid[13126], cpType[0]
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.426.313 [aicpusd_interface_process.cpp:311][InitAICPUScheduler][tid:28800] Bind pid sign success
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.426.819 [aicpusd_resource_manager.cpp:258][InitBufManager][tid:28800] Aicpu schedule Init BufManager!
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.427.390 [aicpusd_drv_manager.cpp:391][InitDrvSchedModule][tid:28800] Attach device[0] to drv scheduler
+[INFO] DRV(28800,aicpu_scheduler):2026-11-19-15:13:38.427.612 [event_sched.c:663][event-sche] [halEschedAttachDevice] Attach device finish. (ret=0; devId=0)
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.427.624 [aicpusd_drv_manager.cpp:612][GetAicpuNumPerDevice][tid:28800] Get aicpu core num[6]
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.427.631 [aicpusd_drv_manager.cpp:409][InitDrvSchedModule][tid:28800] Create group[0], device[0], type[1]
+[INFO] DRV(28800,aicpu_scheduler):2026-11-19-15:13:38.427.662 [event_sched.c:1108][event-sche] [eschedCreateGrp] Esched create grp success. (devId=0; gid=0; sched_mode=1; grpName=)
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.427.673 [aicpusd_drv_manager.cpp:424][InitDrvSchedModule][tid:28800] Set event[0] priority[0] success.
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.427.681 [aicpusd_drv_manager.cpp:424][InitDrvSchedModule][tid:28800] Set event[1] priority[0] success.
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.427.689 [aicpusd_drv_manager.cpp:424][InitDrvSchedModule][tid:28800] Set event[2] priority[0] success.
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.427.695 [aicpusd_drv_manager.cpp:424][InitDrvSchedModule][tid:28800] Set event[3] priority[0] success.
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.427.702 [aicpusd_drv_manager.cpp:424][InitDrvSchedModule][tid:28800] Set event[4] priority[0] success.
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.427.709 [aicpusd_drv_manager.cpp:424][InitDrvSchedModule][tid:28800] Set event[5] priority[0] success.
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.427.716 [aicpusd_drv_manager.cpp:424][InitDrvSchedModule][tid:28800] Set event[7] priority[0] success.
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.427.722 [aicpusd_drv_manager.cpp:424][InitDrvSchedModule][tid:28800] Set event[8] priority[0] success.
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.427.729 [aicpusd_drv_manager.cpp:424][InitDrvSchedModule][tid:28800] Set event[9] priority[2] success.
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.427.737 [aicpusd_drv_manager.cpp:424][InitDrvSchedModule][tid:28800] Set event[17] priority[1] success.
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.427.743 [aicpusd_drv_manager.cpp:424][InitDrvSchedModule][tid:28800] Set event[20] priority[0] success.
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.427.750 [aicpusd_drv_manager.cpp:424][InitDrvSchedModule][tid:28800] Set event[21] priority[0] success.
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.427.756 [aicpusd_drv_manager.cpp:424][InitDrvSchedModule][tid:28800] Set event[23] priority[0] success.
+[INFO] DRV(28800,aicpu_scheduler):2026-11-19-15:13:38.427.786 [event_sched.c:1108][event-sche] [eschedCreateGrp] Esched create grp success. (devId=0; gid=32; sched_mode=2; grpName=drv_msg_grp)
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.427.949 [aicpusd_monitor.cpp:120][InitMonitor][tid:28800] Begin to init aicpu monitor.
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.427.956 [aicpusd_drv_manager.cpp:600][GetAicpuNum][tid:28800] Get aicpu core num[6], device num[1]
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.427.968 [aicpusd_monitor.cpp:444][SetOpTimeoutFlag][tid:28800] Set op timer flag to 1
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.428.667 [aicpusd_monitor.cpp:164][InitAsyncOpTimer][tid:28800] Start init async op timer in monitor
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.428.696 [aicpusd_event_process.cpp:60][AicpuEventProcess][tid:28800] AicpuEventProcess construct.
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.428.706 [aicpusd_threads_process.cpp:101][Start][tid:28800] Aicpu scheduler start, hostpid[13126], profilingMode[0], runMode[0], vfId[0], schedMode[0]
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.428.714 [aicpusd_drv_manager.cpp:600][GetAicpuNum][tid:28800] Get aicpu core num[6], device num[1]
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.428.724 [profiling_adp.cc:165][tid:28800]:Start init profiling data info.
+[INFO] DRV(28800,aicpu_scheduler):2026-11-19-15:13:38.433.122 [agentmm_svm.c:120][devmm] [devmm_is_support_smmu] There is 1 svm0.
+[INFO] DRV(28800,aicpu_scheduler):2026-11-19-15:13:38.436.678 [agentmm_svm.c:157][devmm] [_devmm_init_agent_proc] Init svm success. (hostpid=13126; devid=0; vfid=0; devid_mask=0x1)
+[INFO] DRV(28800,aicpu_scheduler):2026-11-19-15:13:38.436.723 [agentmm_svm.c:175][devmm] [devmm_init_agent_proc] Init svm info. (hostpid=13126; devid=0; vfid=0; ret=0; cnt=0)
+[INFO] DRV(28800,aicpu_scheduler):2026-11-19-15:13:38.436.818 [buff_manage_kernel_api.c:171][bufmng] [buffPoolGetFd] pid 28800 open dev file, poolFd 27
+[INFO] DRV(28800,aicpu_scheduler):2026-11-19-15:13:38.436.979 [buff_manage_kernel_api.c:352][bufmng] [buffPoolAttachEx] Pool attach. (pool=3115; fd=27; attach_pid=28800; uid=35737; cacheType=0)
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.437.158 [aicpusd_threads_process.cpp:495][MemorySvmDevice][tid:28800] Drv mem init svm device success.
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:38.437.166 [aicpu_context.cc:209][SetAicpuRunMode][tid:28800][AICPU_SHARDER] Set runMode:[0] success.
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:38.437.176 [aicpu_context.cc:123][InitTaskMonitorContext][tid:28800][AICPU_SHARDER] aicpu core count[6]
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.437.194 [aicpusd_drv_manager.cpp:600][GetAicpuNum][tid:28800] Get aicpu core num[6], device num[1]
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.437.201 [aicpusd_drv_manager.cpp:606][GetDeviceList][tid:28800] Get device list
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.437.210 [aicpusd_worker.cpp:109][CreateWorker][tid:28800] set SIGCHLD to 0, old sighandler[0], errno[2]
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.437.217 [aicpusd_drv_manager.cpp:612][GetAicpuNumPerDevice][tid:28800] Get aicpu core num[6]
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.437.224 [aicpusd_worker.cpp:158][CreateOneWorker][tid:28800] CreateOneWorker device[0]:thread[0] started.
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.437.279 [aicpusd_worker.cpp:158][CreateOneWorker][tid:28800] CreateOneWorker device[0]:thread[1] started.
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.437.366 [aicpusd_worker.cpp:182][Work][tid:28812] Aicpu device[0]:thread[0] started.
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.437.379 [aicpusd_worker.cpp:294][AddPidToTask][tid:28812] Bind pid by hal index:0.
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.437.433 [aicpusd_worker.cpp:182][Work][tid:28813] Aicpu device[0]:thread[1] started.
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.437.443 [aicpusd_worker.cpp:294][AddPidToTask][tid:28813] Bind pid by hal index:1.
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.437.543 [aicpusd_worker.cpp:300][AddPidToTask][tid:28813] halBindCgroup success
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.437.561 [aicpusd_drv_manager.cpp:612][GetAicpuNumPerDevice][tid:28813] Get aicpu core num[6]
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.437.570 [aicpusd_worker.cpp:341][SetAffinityBySelf][tid:28813] [hw]SetAffinityBySelf, physIndex[3], devNum[0]
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.437.592 [aicpusd_worker.cpp:300][AddPidToTask][tid:28812] halBindCgroup success
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.437.601 [aicpusd_drv_manager.cpp:612][GetAicpuNumPerDevice][tid:28812] Get aicpu core num[6]
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.437.601 [aicpusd_worker.cpp:357][SetAffinityBySelf][tid:28813] set affinity success, aicpu logical index[1], aicpu physical index[3], device id[0]
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.437.608 [aicpusd_worker.cpp:341][SetAffinityBySelf][tid:28812] [hw]SetAffinityBySelf, physIndex[2], devNum[0]
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.437.630 [aicpusd_worker.cpp:158][CreateOneWorker][tid:28800] CreateOneWorker device[0]:thread[2] started.
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.437.640 [aicpusd_worker.cpp:357][SetAffinityBySelf][tid:28812] set affinity success, aicpu logical index[0], aicpu physical index[2], device id[0]
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.437.649 [aicpusd_worker.cpp:407][SetAffinity][tid:28812] aicpu bind tid by self, index[0], deviceId[0], res[0].
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.437.625 [aicpusd_worker.cpp:407][SetAffinity][tid:28813] aicpu bind tid by self, index[1], deviceId[0], res[0].
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.437.657 [aicpusd_worker.cpp:426][SetThreadIdRelation][tid:28812] set thread index:0 and tid:28812 relation to List
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.437.667 [aicpusd_worker.cpp:426][SetThreadIdRelation][tid:28813] set thread index:1 and tid:28813 relation to List
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.437.681 [aicpusd_worker.cpp:244][InitInterruptWorker][tid:28812] halEschedSubscribeEvent success, deviceId[0], groupId[0], threadIndex[0] eventBitmap[72057594104120319].
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.437.689 [aicpusd_worker.cpp:244][InitInterruptWorker][tid:28813] halEschedSubscribeEvent success, deviceId[0], groupId[0], threadIndex[1] eventBitmap[72057594104120319].
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.437.710 [aicpusd_worker.cpp:158][CreateOneWorker][tid:28800] CreateOneWorker device[0]:thread[3] started.
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.437.765 [aicpusd_worker.cpp:182][Work][tid:28814] Aicpu device[0]:thread[2] started.
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.437.775 [aicpusd_worker.cpp:294][AddPidToTask][tid:28814] Bind pid by hal index:2.
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.437.821 [aicpusd_worker.cpp:158][CreateOneWorker][tid:28800] CreateOneWorker device[0]:thread[4] started.
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.437.868 [aicpusd_worker.cpp:158][CreateOneWorker][tid:28800] CreateOneWorker device[0]:thread[5] started.
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.437.925 [aicpusd_worker.cpp:182][Work][tid:28815] Aicpu device[0]:thread[3] started.
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.437.936 [aicpusd_worker.cpp:294][AddPidToTask][tid:28815] Bind pid by hal index:3.
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.437.956 [aicpusd_worker.cpp:182][Work][tid:28816] Aicpu device[0]:thread[4] started.
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.437.965 [aicpusd_worker.cpp:294][AddPidToTask][tid:28816] Bind pid by hal index:4.
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.437.984 [aicpusd_worker.cpp:182][Work][tid:28817] Aicpu device[0]:thread[5] started.
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.437.992 [aicpusd_worker.cpp:294][AddPidToTask][tid:28817] Bind pid by hal index:5.
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.438.065 [aicpusd_worker.cpp:300][AddPidToTask][tid:28817] halBindCgroup success
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.438.074 [aicpusd_drv_manager.cpp:612][GetAicpuNumPerDevice][tid:28817] Get aicpu core num[6]
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.438.081 [aicpusd_worker.cpp:341][SetAffinityBySelf][tid:28817] [hw]SetAffinityBySelf, physIndex[7], devNum[0]
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.438.098 [aicpusd_worker.cpp:300][AddPidToTask][tid:28816] halBindCgroup success
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.438.106 [aicpusd_drv_manager.cpp:612][GetAicpuNumPerDevice][tid:28816] Get aicpu core num[6]
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.438.112 [aicpusd_worker.cpp:341][SetAffinityBySelf][tid:28816] [hw]SetAffinityBySelf, physIndex[6], devNum[0]
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.438.126 [aicpusd_worker.cpp:300][AddPidToTask][tid:28815] halBindCgroup success
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.438.133 [aicpusd_drv_manager.cpp:612][GetAicpuNumPerDevice][tid:28815] Get aicpu core num[6]
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.438.139 [aicpusd_worker.cpp:341][SetAffinityBySelf][tid:28815] [hw]SetAffinityBySelf, physIndex[5], devNum[0]
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.438.136 [aicpusd_worker.cpp:357][SetAffinityBySelf][tid:28817] set affinity success, aicpu logical index[5], aicpu physical index[7], device id[0]
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.438.198 [aicpusd_worker.cpp:407][SetAffinity][tid:28817] aicpu bind tid by self, index[5], deviceId[0], res[0].
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.438.214 [aicpusd_worker.cpp:426][SetThreadIdRelation][tid:28817] set thread index:5 and tid:28817 relation to List
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.438.168 [aicpusd_worker.cpp:357][SetAffinityBySelf][tid:28815] set affinity success, aicpu logical index[3], aicpu physical index[5], device id[0]
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.438.141 [aicpusd_worker.cpp:357][SetAffinityBySelf][tid:28816] set affinity success, aicpu logical index[4], aicpu physical index[6], device id[0]
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.438.153 [aicpusd_worker.cpp:300][AddPidToTask][tid:28814] halBindCgroup success
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.438.287 [aicpusd_drv_manager.cpp:612][GetAicpuNumPerDevice][tid:28814] Get aicpu core num[6]
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.438.236 [aicpusd_worker.cpp:244][InitInterruptWorker][tid:28817] halEschedSubscribeEvent success, deviceId[0], groupId[0], threadIndex[5] eventBitmap[72057594104120319].
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.438.251 [aicpusd_worker.cpp:407][SetAffinity][tid:28815] aicpu bind tid by self, index[3], deviceId[0], res[0].
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.438.273 [aicpusd_worker.cpp:407][SetAffinity][tid:28816] aicpu bind tid by self, index[4], deviceId[0], res[0].
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.438.334 [aicpusd_worker.cpp:426][SetThreadIdRelation][tid:28816] set thread index:4 and tid:28816 relation to List
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.438.322 [aicpusd_worker.cpp:426][SetThreadIdRelation][tid:28815] set thread index:3 and tid:28815 relation to List
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.438.294 [aicpusd_worker.cpp:341][SetAffinityBySelf][tid:28814] [hw]SetAffinityBySelf, physIndex[4], devNum[0]
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.438.352 [aicpusd_worker.cpp:244][InitInterruptWorker][tid:28816] halEschedSubscribeEvent success, deviceId[0], groupId[0], threadIndex[4] eventBitmap[72057594104120319].
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.438.364 [aicpusd_worker.cpp:244][InitInterruptWorker][tid:28815] halEschedSubscribeEvent success, deviceId[0], groupId[0], threadIndex[3] eventBitmap[72057594104120319].
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.438.410 [aicpusd_worker.cpp:357][SetAffinityBySelf][tid:28814] set affinity success, aicpu logical index[2], aicpu physical index[4], device id[0]
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.438.435 [aicpusd_worker.cpp:407][SetAffinity][tid:28814] aicpu bind tid by self, index[2], deviceId[0], res[0].
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.438.444 [aicpusd_worker.cpp:426][SetThreadIdRelation][tid:28814] set thread index:2 and tid:28814 relation to List
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.438.458 [aicpusd_worker.cpp:244][InitInterruptWorker][tid:28814] halEschedSubscribeEvent success, deviceId[0], groupId[0], threadIndex[2] eventBitmap[72057594104120319].
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.438.521 [aicpusd_worker.cpp:142][CreateWorker][tid:28800] set SIGCHLD to old sighandler[0]
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.438.908 [aicpusd_monitor.cpp:408][Run][tid:28800] Aicpu monitor thread running
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.438.926 [aicpusd_drv_manager.cpp:606][GetDeviceList][tid:28800] Get device list
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.438.943 [ae_kernel_lib_manager.cc:78][BatchLoadKernelSo][tid:28800][AICPU_PROCESSER] Start to batch load kernel so. kernelType=2, loadSoNum=3.
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.438.985 [ae_kernel_lib_fwk.cc:152][Init][tid:28800][AICPU_PROCESSER] FWKernelTfImpl init success, soFile_=/usr/lib64/aicpu_kernels/0/aicpu_kernels_device/libtf_kernels.so.
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.438.993 [ae_kernel_lib_fwk.cc:109][BatchLoadKernelSo][tid:28800][AICPU_PROCESSER] Begin to batch load kernel so, kerelType:[2].
+[WARNING] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.439.002 [ae_so_manager.cc:189][OpenSo][tid:28800][AICPU_PROCESSER] Format to realpath failed:[], path:[]
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.439.053 [ae_so_manager.cc:193][OpenSo][tid:28800][AICPU_PROCESSER] Open so /usr/lib64/aicpu_kernels/0/aicpu_kernels_device/libtf_kernels.so begin.
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.504.269 [aicpu_process_state.cc:34][operator()][tid:28800][TFAdapter] MallocMemory, func=new, size=144, purpose=AICPUProcessState object
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.504.306 [tf_adpt_session_mgr.cc:362][Initialize][tid:28800][TFAdapter] SessionMgr Initialize success.
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.522.998 [ae_so_manager.cc:202][OpenSo][tid:28800][AICPU_PROCESSER] Open so /usr/lib64/aicpu_kernels/0/aicpu_kernels_device/libtf_kernels.so success.
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.523.051 [ae_so_manager.cc:653][CreateSingleSoMgr][tid:28800][AICPU_PROCESSER] soname[/usr/lib64/aicpu_kernels/0/aicpu_kernels_device/libaicpu_kernels.so]
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.523.061 [ae_so_manager.cc:657][CreateSingleSoMgr][tid:28800][AICPU_PROCESSER] MallocMemory, func=new, size=152, purpose=SingleSoManager object
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.523.113 [ae_so_manager.cc:193][OpenSo][tid:28800][AICPU_PROCESSER] Open so /usr/lib64/aicpu_kernels/0/aicpu_kernels_device/libaicpu_kernels.so begin.
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.525.012 [ae_so_manager.cc:202][OpenSo][tid:28800][AICPU_PROCESSER] Open so /usr/lib64/aicpu_kernels/0/aicpu_kernels_device/libaicpu_kernels.so success.
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.525.035 [ae_so_manager.cc:686][CreateSingleSoMgr][tid:28800][AICPU_PROCESSER] Load so success, soFile=/usr/lib64/aicpu_kernels/0/aicpu_kernels_device/libaicpu_kernels.so.
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.525.049 [ae_so_manager.cc:653][CreateSingleSoMgr][tid:28800][AICPU_PROCESSER] soname[/usr/lib64/aicpu_kernels/0/aicpu_kernels_device/libcpu_kernels.so]
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.525.056 [ae_so_manager.cc:657][CreateSingleSoMgr][tid:28800][AICPU_PROCESSER] MallocMemory, func=new, size=152, purpose=SingleSoManager object
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.525.092 [ae_so_manager.cc:193][OpenSo][tid:28800][AICPU_PROCESSER] Open so /usr/lib64/aicpu_kernels/0/aicpu_kernels_device/libcpu_kernels.so begin.
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.527.835 [ae_so_manager.cc:202][OpenSo][tid:28800][AICPU_PROCESSER] Open so /usr/lib64/aicpu_kernels/0/aicpu_kernels_device/libcpu_kernels.so success.
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.527.858 [ae_so_manager.cc:686][CreateSingleSoMgr][tid:28800][AICPU_PROCESSER] Load so success, soFile=/usr/lib64/aicpu_kernels/0/aicpu_kernels_device/libcpu_kernels.so.
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.527.867 [ae_kernel_lib_manager.cc:108][BatchLoadKernelSo][tid:28800][AICPU_PROCESSER] Finish to batch load kernel so. loadSoNum=3.
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.527.893 [ae_kernel_lib_manager.cc:78][BatchLoadKernelSo][tid:28800][AICPU_PROCESSER] Start to batch load kernel so. kernelType=2, loadSoNum=1.
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.527.905 [ae_so_manager.cc:653][CreateSingleSoMgr][tid:28800][AICPU_PROCESSER] soname[/usr/lib64/aicpu_kernels/0/aicpu_kernels_device/libaicpu_extend_kernels.so]
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.527.912 [ae_so_manager.cc:657][CreateSingleSoMgr][tid:28800][AICPU_PROCESSER] MallocMemory, func=new, size=152, purpose=SingleSoManager object
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.527.947 [ae_so_manager.cc:193][OpenSo][tid:28800][AICPU_PROCESSER] Open so /usr/lib64/aicpu_kernels/0/aicpu_kernels_device/libaicpu_extend_kernels.so begin.
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.530.627 [ae_so_manager.cc:202][OpenSo][tid:28800][AICPU_PROCESSER] Open so /usr/lib64/aicpu_kernels/0/aicpu_kernels_device/libaicpu_extend_kernels.so success.
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.530.651 [ae_so_manager.cc:686][CreateSingleSoMgr][tid:28800][AICPU_PROCESSER] Load so success, soFile=/usr/lib64/aicpu_kernels/0/aicpu_kernels_device/libaicpu_extend_kernels.so.
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.530.660 [ae_kernel_lib_manager.cc:108][BatchLoadKernelSo][tid:28800][AICPU_PROCESSER] Finish to batch load kernel so. loadSoNum=1.
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.530.677 [aicpusd_threads_process.cpp:173][Start][tid:28800] Aicpu scheduler start successfully, deviceId[0], hostpid[13126], profilingMode[0], runMode[0]
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.530.690 [aicpusd_period_statistic.cpp:100][InitStatistic][tid:28800] start init static devid:0, hostpid:13126
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.531.146 [aicpusd_period_statistic.cpp:126][SetThreadAffinity][tid:28820] prepare bind threadId=4397790850240 to cpuId=0
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.531.264 [aicpusd_proc_mem_statistic.cpp:188][GetOsMemInfoFromFile][tid:28820] vmRss:74752 KB, vmHwm:74752 KB.
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.531.368 [aicpusd_proc_mem_statistic.cpp:128][GetXsMemInfoFromFile][tid:28820] allocsize:0 B, real size:0 B, summary: 0        0       .
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.531.427 [aicpusd_proc_mem_statistic.cpp:88][GetSvmInfoFromFile][tid:28820] peakPgCnt:0, peakHPgCnt:0 summary:peak_page_cnt=0; peak_hpage_cnt=0; peak_gpage_cnt=0.
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.533.739 [aicpusd_cust_so_manager.cpp:813][InitFileLocker][tid:28800] Init cust so file locker success, path=/home/CustAiCpuUser/lib_locker, fd=29
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.533.766 [aicpusd_interface_process.cpp:346][InitAICPUScheduler][tid:28800] Success to start compute process, deviceId[0], hostPid[13126], runMode[0]
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.533.788 [main.cpp:83][AttachHostGroup][tid:28800] There is not group need to be attached
+[INFO] TDT(28800,aicpu_scheduler):2026-11-19-15:13:38.533.836 [tsd_event_client.cpp:209][SubmitEvent][tid:28800] [TsdEventClient] Begin submit event to dev[0] pid[4214] eventType[19] subeventId[8].
+[INFO] DRV(28800,aicpu_scheduler):2026-11-19-15:13:38.535.987 [event_sched.c:1108][event-sche] [eschedCreateGrp] Esched create grp success. (devId=0; gid=30; sched_mode=2; grpName=)
+[INFO] TDT(28800,aicpu_scheduler):2026-11-19-15:13:38.536.004 [tsd_event_client.cpp:423][IsSubscribe][tid:28800] [TsdEventClient] halEschedCreateGrp dev[0] group[30] type[2] success
+[INFO] TDT(28800,aicpu_scheduler):2026-11-19-15:13:38.536.013 [tsd_event_interface.cpp:44][SubscribeEvent][tid:28800] Dev[0] begin subscribe event mask[524288][19].
+[INFO] TDT(28800,aicpu_scheduler):2026-11-19-15:13:38.536.025 [tsd_event_interface.cpp:52][SubscribeEvent][tid:28800] halEschedSubscribeEvent success, deviceId[0], groupId[30], threadIndex[0] eventBitmap[524288].
+[INFO] TDT(28800,aicpu_scheduler):2026-11-19-15:13:38.536.145 [tsd_event_client.cpp:209][SubmitEvent][tid:28800] [TsdEventClient] Begin submit event to dev[0] pid[4214] eventType[19] subeventId[0].
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.580.478 [aicpusd_event_manager.cpp:400][ProcessHWTSControlEvent][tid:28814] Begin to process ctrl msg, cmd type[13].
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.580.526 [aicpusd_event_process.cpp:392][ProcessSetTimeoutEvent][tid:28814] Config OP execute timeout success, enable[1] timeout[45s].
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.580.534 [aicpusd_event_process.cpp:420][ProcessSetTimeoutEvent][tid:28814] Begin to send response information using tsDevSendMsgAsync function.
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.580.555 [aicpusd_event_process.cpp:426][ProcessSetTimeoutEvent][tid:28814] Finished to send timeout cfg response information, ret[0].
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.580.565 [aicpusd_event_manager.cpp:830][ProcTsCtrlEvent][tid:28814] Finish to process CTRL event, eventid[5], threadIndex[2], ret[0].
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.599.362 [aicpusd_event_manager.cpp:525][HWTSKernelEventMessageParse][tid:28815] Kernel type of current task is [5], dataDumpEnableMode[0].
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.599.378 [aicpusd_event_manager.cpp:534][ExecuteHWTSKFCEventTask][tid:28815] kfc task, streamId[46], taskId[0].
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:38.599.388 [aicpu_context.cc:176][SetTaskAndStreamId][tid:28815][AICPU_SHARDER] Set taskId:[0] and streamId:[46] success.
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.599.399 [aicpu_processer.cc:31][aeCallInterface][tid:28815][AICPU_PROCESSER] Begin to CallKernelApi, kernelType=5.
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.599.476 [ae_so_manager.cc:653][CreateSingleSoMgr][tid:28815][AICPU_PROCESSER] soname[/usr/lib64/aicpu_kernels/0/aicpu_kernels_device/libaicpu_extend_kernels.so]
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.599.487 [ae_so_manager.cc:657][CreateSingleSoMgr][tid:28815][AICPU_PROCESSER] MallocMemory, func=new, size=152, purpose=SingleSoManager object
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.599.541 [ae_so_manager.cc:193][OpenSo][tid:28815][AICPU_PROCESSER] Open so /usr/lib64/aicpu_kernels/0/aicpu_kernels_device/libaicpu_extend_kernels.so begin.
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.599.581 [ae_so_manager.cc:202][OpenSo][tid:28815][AICPU_PROCESSER] Open so /usr/lib64/aicpu_kernels/0/aicpu_kernels_device/libaicpu_extend_kernels.so success.
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.599.593 [ae_so_manager.cc:686][CreateSingleSoMgr][tid:28815][AICPU_PROCESSER] Load so success, soFile=/usr/lib64/aicpu_kernels/0/aicpu_kernels_device/libaicpu_extend_kernels.so.
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.599.615 [ae_kernel_lib_aicpu_kfc.cpp:168][CallKernelApi][tid:28815][AICPU_PROCESSER] Get KFC kernelname[DynTileFwkKernelServerInit] func success
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:38.599.624 [aicpu_context.cc:192][SetBlockIdxAndBlockNum][tid:28815][AICPU_SHARDER] Set blockIdx:[0] and blockNum:[1] success.
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:38.600.054 [tile_fwk_aicpu_interface.cpp:179][tile_fwk_aicpu_interface.cpp:179][LoadTileFwkKernelFunc][tid:28815]kernelName StaticTileFwkBackendKernelServer has been loaded
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:38.600.076 [tile_fwk_aicpu_interface.cpp:179][tile_fwk_aicpu_interface.cpp:179][LoadTileFwkKernelFunc][tid:28815]kernelName DynTileFwkBackendKernelServerInit has been loaded
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:38.600.086 [tile_fwk_aicpu_interface.cpp:179][tile_fwk_aicpu_interface.cpp:179][LoadTileFwkKernelFunc][tid:28815]kernelName DynTileFwkBackendKernelServer has been loaded
+[ERROR] HCCL(28800,aicpu_scheduler):2026-11-19-15:13:38.614.093 [simpler-dispatcher] Init: wrote /usr/lib64/aicpu_kernels/0/aicpu_kernels_device/simpler_inner_cbd80677d31aba62_0.so (4214936 bytes)
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.614.119 [aicpu_processer.cc:41][aeCallInterface][tid:28815][AICPU_PROCESSER] [PERF] start=1795072418599407, end=1795072418614119, use=14712 us
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.614.140 [aicpusd_event_manager.cpp:629][ProcessHWTSKernelEvent][tid:28815] End send ack to Ts, kernelType[5], deviceId[0], subevent_id[0], mailboxId[5], serialNo[937652], streamId[46], taskId[0], result[0], originResult[0], status[0].
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.615.327 [aicpusd_event_manager.cpp:525][HWTSKernelEventMessageParse][tid:28816] Kernel type of current task is [2], dataDumpEnableMode[0].
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:38.615.359 [aicpu_context.cc:176][SetTaskAndStreamId][tid:28816][AICPU_SHARDER] Set taskId:[1] and streamId:[46] success.
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.615.373 [aicpusd_event_manager.cpp:648][ExecuteHWTSEventTask][tid:28816] Begin to ExecuteTsKernelTask, mailboxId[6], serialNo[980727], streamId[46], taskId[1], dataDumpEnableMode[0], kernelType[2], subeventId[0].
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.615.382 [aicpusd_event_process.cpp:848][ExecuteTsKernelTask][tid:28816] Begin to process aicpu engine process, kernelType[2].
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.615.392 [aicpu_processer.cc:31][aeCallInterface][tid:28816][AICPU_PROCESSER] Begin to CallKernelApi, kernelType=2.
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.615.412 [ae_so_manager.cc:653][CreateSingleSoMgr][tid:28816][AICPU_PROCESSER] soname[/usr/lib64/aicpu_kernels/0/aicpu_kernels_device/simpler_inner_cbd80677d31aba62_0.so]
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.615.424 [ae_so_manager.cc:657][CreateSingleSoMgr][tid:28816][AICPU_PROCESSER] MallocMemory, func=new, size=152, purpose=SingleSoManager object
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.615.468 [ae_so_manager.cc:193][OpenSo][tid:28816][AICPU_PROCESSER] Open so /usr/lib64/aicpu_kernels/0/aicpu_kernels_device/simpler_inner_cbd80677d31aba62_0.so begin.
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.615.901 [ae_so_manager.cc:202][OpenSo][tid:28816][AICPU_PROCESSER] Open so /usr/lib64/aicpu_kernels/0/aicpu_kernels_device/simpler_inner_cbd80677d31aba62_0.so success.
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.615.921 [ae_so_manager.cc:686][CreateSingleSoMgr][tid:28816][AICPU_PROCESSER] Load so success, soFile=/usr/lib64/aicpu_kernels/0/aicpu_kernels_device/simpler_inner_cbd80677d31aba62_0.so.
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:38.615.944 [aicpu_context.cc:149][SetOpname][tid:28816][AICPU_SHARDER] set op name to simpler_aicpu_init for thread[4]
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:38.615.954 [aicpu_context.cc:192][SetBlockIdxAndBlockNum][tid:28816][AICPU_SHARDER] Set blockIdx:[0] and blockNum:[1] success.
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.615.975 [aicpu_processer.cc:41][aeCallInterface][tid:28816][AICPU_PROCESSER] [PERF] start=1795072418615402, end=1795072418615975, use=573 us
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.615.986 [aicpusd_event_process.cpp:892][PostProcessTsKernelTask][tid:28816] Aicpu engine process success, result[0].
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:38.616.001 [aicpusd_event_manager.cpp:629][ProcessHWTSKernelEvent][tid:28816] End send ack to Ts, kernelType[2], deviceId[0], subevent_id[0], mailboxId[6], serialNo[980727], streamId[46], taskId[1], result[0], originResult[0], status[0].
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:39.160.964 [aicpusd_event_manager.cpp:525][HWTSKernelEventMessageParse][tid:28817] Kernel type of current task is [2], dataDumpEnableMode[0].
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:39.160.994 [aicpu_context.cc:176][SetTaskAndStreamId][tid:28817][AICPU_SHARDER] Set taskId:[2] and streamId:[46] success.
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:39.161.003 [aicpusd_event_manager.cpp:648][ExecuteHWTSEventTask][tid:28817] Begin to ExecuteTsKernelTask, mailboxId[7], serialNo[937380], streamId[46], taskId[2], dataDumpEnableMode[0], kernelType[2], subeventId[0].
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:39.161.013 [aicpusd_event_process.cpp:848][ExecuteTsKernelTask][tid:28817] Begin to process aicpu engine process, kernelType[2].
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:39.161.022 [aicpu_processer.cc:31][aeCallInterface][tid:28817][AICPU_PROCESSER] Begin to CallKernelApi, kernelType=2.
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:39.161.048 [aicpu_context.cc:149][SetOpname][tid:28817][AICPU_SHARDER] set op name to simpler_aicpu_register_callable for thread[5]
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:39.161.056 [aicpu_context.cc:192][SetBlockIdxAndBlockNum][tid:28817][AICPU_SHARDER] Set blockIdx:[0] and blockNum:[1] success.
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:39.161.131 [device_log.cpp:78]28817 load_orch_so "[aicpu_executor.cpp:442] Thread 0: New orch SO detected (callable_id=0), (re)loading"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:39.161.875 [device_log.cpp:78]28817 simpler_aicpu_register_callable "[aicpu_executor.cpp:1179] simpler_aicpu_register_callable: completed for callable_id=0"
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:39.161.896 [aicpu_processer.cc:41][aeCallInterface][tid:28817][AICPU_PROCESSER] [PERF] start=1795072419161029, end=1795072419161896, use=867 us
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:39.161.906 [aicpusd_event_process.cpp:892][PostProcessTsKernelTask][tid:28817] Aicpu engine process success, result[0].
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:39.161.925 [aicpusd_event_manager.cpp:629][ProcessHWTSKernelEvent][tid:28817] End send ack to Ts, kernelType[2], deviceId[0], subevent_id[0], mailboxId[7], serialNo[937380], streamId[46], taskId[2], result[0], originResult[0], status[0].
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:41.181.893 [aicpusd_event_manager.cpp:525][HWTSKernelEventMessageParse][tid:28815] Kernel type of current task is [2], dataDumpEnableMode[0].
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:41.181.893 [aicpusd_event_manager.cpp:525][HWTSKernelEventMessageParse][tid:28816] Kernel type of current task is [2], dataDumpEnableMode[0].
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.181.939 [aicpu_context.cc:176][SetTaskAndStreamId][tid:28815][AICPU_SHARDER] Set taskId:[3] and streamId:[44] success.
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.181.946 [aicpu_context.cc:176][SetTaskAndStreamId][tid:28816][AICPU_SHARDER] Set taskId:[3] and streamId:[44] success.
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:41.181.893 [aicpusd_event_manager.cpp:525][HWTSKernelEventMessageParse][tid:28814] Kernel type of current task is [2], dataDumpEnableMode[0].
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:41.181.893 [aicpusd_event_manager.cpp:525][HWTSKernelEventMessageParse][tid:28813] Kernel type of current task is [2], dataDumpEnableMode[0].
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:41.181.892 [aicpusd_event_manager.cpp:525][HWTSKernelEventMessageParse][tid:28812] Kernel type of current task is [2], dataDumpEnableMode[0].
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:41.181.893 [aicpusd_event_manager.cpp:525][HWTSKernelEventMessageParse][tid:28817] Kernel type of current task is [2], dataDumpEnableMode[0].
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:41.181.951 [aicpusd_event_manager.cpp:648][ExecuteHWTSEventTask][tid:28815] Begin to ExecuteTsKernelTask, mailboxId[5], serialNo[937653], streamId[44], taskId[3], dataDumpEnableMode[0], kernelType[2], subeventId[0].
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:41.181.955 [aicpusd_event_manager.cpp:648][ExecuteHWTSEventTask][tid:28816] Begin to ExecuteTsKernelTask, mailboxId[6], serialNo[980728], streamId[44], taskId[3], dataDumpEnableMode[0], kernelType[2], subeventId[0].
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:41.182.067 [aicpusd_event_process.cpp:848][ExecuteTsKernelTask][tid:28816] Begin to process aicpu engine process, kernelType[2].
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:41.182.080 [aicpu_processer.cc:31][aeCallInterface][tid:28816][AICPU_PROCESSER] Begin to CallKernelApi, kernelType=2.
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.182.026 [aicpu_context.cc:176][SetTaskAndStreamId][tid:28812][AICPU_SHARDER] Set taskId:[3] and streamId:[44] success.
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.182.117 [aicpu_context.cc:149][SetOpname][tid:28816][AICPU_SHARDER] set op name to simpler_aicpu_exec for thread[4]
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.182.127 [aicpu_context.cc:192][SetBlockIdxAndBlockNum][tid:28816][AICPU_SHARDER] Set blockIdx:[4] and blockNum:[6] success.
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.182.021 [aicpu_context.cc:176][SetTaskAndStreamId][tid:28813][AICPU_SHARDER] Set taskId:[3] and streamId:[44] success.
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.182.042 [aicpu_context.cc:176][SetTaskAndStreamId][tid:28817][AICPU_SHARDER] Set taskId:[3] and streamId:[44] success.
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:41.182.105 [aicpusd_event_manager.cpp:648][ExecuteHWTSEventTask][tid:28812] Begin to ExecuteTsKernelTask, mailboxId[2], serialNo[981601], streamId[44], taskId[3], dataDumpEnableMode[0], kernelType[2], subeventId[0].
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:41.182.056 [aicpusd_event_process.cpp:848][ExecuteTsKernelTask][tid:28815] Begin to process aicpu engine process, kernelType[2].
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.181.978 [aicpu_context.cc:176][SetTaskAndStreamId][tid:28814][AICPU_SHARDER] Set taskId:[3] and streamId:[44] success.
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:41.182.154 [aicpusd_event_manager.cpp:648][ExecuteHWTSEventTask][tid:28813] Begin to ExecuteTsKernelTask, mailboxId[3], serialNo[936415], streamId[44], taskId[3], dataDumpEnableMode[0], kernelType[2], subeventId[0].
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:41.182.227 [aicpusd_event_process.cpp:848][ExecuteTsKernelTask][tid:28813] Begin to process aicpu engine process, kernelType[2].
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:41.182.185 [aicpusd_event_process.cpp:848][ExecuteTsKernelTask][tid:28812] Begin to process aicpu engine process, kernelType[2].
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:41.182.248 [aicpu_processer.cc:31][aeCallInterface][tid:28812][AICPU_PROCESSER] Begin to CallKernelApi, kernelType=2.
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:41.182.213 [aicpusd_event_manager.cpp:648][ExecuteHWTSEventTask][tid:28814] Begin to ExecuteTsKernelTask, mailboxId[4], serialNo[981582], streamId[44], taskId[3], dataDumpEnableMode[0], kernelType[2], subeventId[0].
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:41.182.170 [aicpusd_event_manager.cpp:648][ExecuteHWTSEventTask][tid:28817] Begin to ExecuteTsKernelTask, mailboxId[7], serialNo[937381], streamId[44], taskId[3], dataDumpEnableMode[0], kernelType[2], subeventId[0].
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:41.182.286 [aicpusd_event_process.cpp:848][ExecuteTsKernelTask][tid:28817] Begin to process aicpu engine process, kernelType[2].
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:41.182.199 [aicpu_processer.cc:31][aeCallInterface][tid:28815][AICPU_PROCESSER] Begin to CallKernelApi, kernelType=2.
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.182.269 [aicpu_context.cc:149][SetOpname][tid:28812][AICPU_SHARDER] set op name to simpler_aicpu_exec for thread[0]
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:41.182.275 [aicpusd_event_process.cpp:848][ExecuteTsKernelTask][tid:28814] Begin to process aicpu engine process, kernelType[2].
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:41.182.240 [aicpu_processer.cc:31][aeCallInterface][tid:28813][AICPU_PROCESSER] Begin to CallKernelApi, kernelType=2.
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:41.182.299 [aicpu_processer.cc:31][aeCallInterface][tid:28817][AICPU_PROCESSER] Begin to CallKernelApi, kernelType=2.
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.182.313 [aicpu_context.cc:149][SetOpname][tid:28815][AICPU_SHARDER] set op name to simpler_aicpu_exec for thread[3]
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.182.381 [aicpu_context.cc:192][SetBlockIdxAndBlockNum][tid:28815][AICPU_SHARDER] Set blockIdx:[3] and blockNum:[6] success.
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:41.182.339 [aicpu_processer.cc:31][aeCallInterface][tid:28814][AICPU_PROCESSER] Begin to CallKernelApi, kernelType=2.
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.182.355 [aicpu_context.cc:149][SetOpname][tid:28813][AICPU_SHARDER] set op name to simpler_aicpu_exec for thread[1]
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.182.417 [aicpu_context.cc:192][SetBlockIdxAndBlockNum][tid:28813][AICPU_SHARDER] Set blockIdx:[1] and blockNum:[6] success.
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.182.323 [aicpu_context.cc:192][SetBlockIdxAndBlockNum][tid:28812][AICPU_SHARDER] Set blockIdx:[0] and blockNum:[6] success.
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.182.407 [aicpu_context.cc:149][SetOpname][tid:28814][AICPU_SHARDER] set op name to simpler_aicpu_exec for thread[2]
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.182.369 [aicpu_context.cc:149][SetOpname][tid:28817][AICPU_SHARDER] set op name to simpler_aicpu_exec for thread[5]
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.182.452 [aicpu_context.cc:192][SetBlockIdxAndBlockNum][tid:28814][AICPU_SHARDER] Set blockIdx:[2] and blockNum:[6] success.
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.182.461 [aicpu_context.cc:192][SetBlockIdxAndBlockNum][tid:28817][AICPU_SHARDER] Set blockIdx:[5] and blockNum:[6] success.
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.182.486 [device_log.cpp:78]28817 platform_aicpu_affinity_gate_filter "[platform_aicpu_affinity.cpp:144] AICPU filter gate: allowed_count=6 total_launched=6"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.182.499 [device_log.cpp:78]28817 platform_aicpu_affinity_gate_filter "[platform_aicpu_affinity.cpp:147] AICPU filter gate:   allowed[0] = cpu_id 2  role=sched"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.182.506 [device_log.cpp:78]28817 platform_aicpu_affinity_gate_filter "[platform_aicpu_affinity.cpp:147] AICPU filter gate:   allowed[1] = cpu_id 3  role=sched"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.182.514 [device_log.cpp:78]28817 platform_aicpu_affinity_gate_filter "[platform_aicpu_affinity.cpp:147] AICPU filter gate:   allowed[2] = cpu_id 4  role=sched"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.182.525 [device_log.cpp:78]28817 platform_aicpu_affinity_gate_filter "[platform_aicpu_affinity.cpp:147] AICPU filter gate:   allowed[3] = cpu_id 5  role=sched"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.182.532 [device_log.cpp:78]28817 platform_aicpu_affinity_gate_filter "[platform_aicpu_affinity.cpp:147] AICPU filter gate:   allowed[4] = cpu_id 6  role=sched"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.182.539 [device_log.cpp:78]28817 platform_aicpu_affinity_gate_filter "[platform_aicpu_affinity.cpp:147] AICPU filter gate:   allowed[5] = cpu_id 7  role=orch"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.182.551 [device_log.cpp:78]28817 platform_aicpu_affinity_gate_filter "[platform_aicpu_affinity.cpp:175] AICPU filter gate: thread idx=5 cpu=7 exec_idx=5 ACTIVE(orch)"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.182.553 [device_log.cpp:78]28816 platform_aicpu_affinity_gate_filter "[platform_aicpu_affinity.cpp:175] AICPU filter gate: thread idx=0 cpu=6 exec_idx=4 ACTIVE(sched)"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.182.552 [device_log.cpp:78]28814 platform_aicpu_affinity_gate_filter "[platform_aicpu_affinity.cpp:175] AICPU filter gate: thread idx=4 cpu=4 exec_idx=2 ACTIVE(sched)"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.182.577 [device_log.cpp:78]28817 aicpu_execute "[aicpu_executor.cpp:1203] aicpu_execute: Starting AICPU kernel execution"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.182.552 [device_log.cpp:78]28815 platform_aicpu_affinity_gate_filter "[platform_aicpu_affinity.cpp:175] AICPU filter gate: thread idx=1 cpu=5 exec_idx=3 ACTIVE(sched)"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.182.555 [device_log.cpp:78]28812 platform_aicpu_affinity_gate_filter "[platform_aicpu_affinity.cpp:175] AICPU filter gate: thread idx=3 cpu=2 exec_idx=0 ACTIVE(sched)"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.182.555 [device_log.cpp:78]28813 platform_aicpu_affinity_gate_filter "[platform_aicpu_affinity.cpp:175] AICPU filter gate: thread idx=2 cpu=3 exec_idx=1 ACTIVE(sched)"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.182.577 [device_log.cpp:78]28816 aicpu_execute "[aicpu_executor.cpp:1203] aicpu_execute: Starting AICPU kernel execution"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.182.595 [device_log.cpp:78]28815 aicpu_execute "[aicpu_executor.cpp:1203] aicpu_execute: Starting AICPU kernel execution"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.182.606 [device_log.cpp:78]28812 aicpu_execute "[aicpu_executor.cpp:1203] aicpu_execute: Starting AICPU kernel execution"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.182.584 [device_log.cpp:78]28814 aicpu_execute "[aicpu_executor.cpp:1203] aicpu_execute: Starting AICPU kernel execution"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.182.608 [device_log.cpp:78]28813 aicpu_execute "[aicpu_executor.cpp:1203] aicpu_execute: Starting AICPU kernel execution"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.182.642 [device_log.cpp:78]28812 init "[aicpu_executor.cpp:315] AicpuExecutor: Initializing"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.182.741 [device_log.cpp:78]28812 chip_swimlane_aicpu_init "[chip_swimlane_collector_aicpu.cpp:437] Initializing performance profiling for 72 cores (free queue), chip_swimlane_level=4"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.182.819 [device_log.cpp:78]28812 chip_swimlane_aicpu_init "[chip_swimlane_collector_aicpu.cpp:560] Performance profiling initialized for 72 cores (with AICore rotation)"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.182.836 [device_log.cpp:78]28812 chip_swimlane_aicpu_init_phase "[chip_swimlane_collector_aicpu.cpp:1122] Phase profiling initialized: 5 sched threads, 1 orch threads, 16384 records/thread"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.182.848 [device_log.cpp:78]28812 pre_handshake_init "[scheduler_cold_path.cpp:1325] Handshaking with 72 cores"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.182.910 [device_log.cpp:78]28817 dep_gen_aicpu_init "[dep_gen_collector_aicpu.cpp:198] dep_gen: popped initial buffer addr=0x12c06e400000"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.182.930 [device_log.cpp:78]28817 aicpu_orchestration_entry "[bgemm_orch] tile_size: 128, grid_m: 1, grid_n: 1, grid_k: 2, num_groups: 250, incore_loop: 4"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.183.012 [device_log.cpp:78]28815 resolve_and_dispatch "[scheduler_dispatch.cpp:901] Thread 3: dispatch starting with 15 cores"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.183.013 [device_log.cpp:78]28816 resolve_and_dispatch "[scheduler_dispatch.cpp:901] Thread 4: dispatch starting with 12 cores"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.183.012 [device_log.cpp:78]28814 resolve_and_dispatch "[scheduler_dispatch.cpp:901] Thread 2: dispatch starting with 15 cores"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.183.013 [device_log.cpp:78]28812 resolve_and_dispatch "[scheduler_dispatch.cpp:901] Thread 0: dispatch starting with 15 cores"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.183.013 [device_log.cpp:78]28813 resolve_and_dispatch "[scheduler_dispatch.cpp:901] Thread 1: dispatch starting with 15 cores"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.184.558 [device_log.cpp:78]28817 aicpu_orchestration_entry "[bgemm_orch] Submitted 500 gemm tasks and 500 add tasks (1000 total)"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.184.584 [device_log.cpp:78]28817 dep_gen_aicpu_flush "[dep_gen_collector_aicpu.cpp:452] dep_gen: flushed buffer with 1000 records"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.184.600 [device_log.cpp:78]28817 flush_phase_pool "[chip_swimlane_collector_aicpu.cpp:1310] Thread 5: flushed orch phase buffer with 1000 records"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.184.615 [device_log.cpp:78]28817 chip_swimlane_aicpu_init_core_assignments "[chip_swimlane_collector_aicpu.cpp:1362] Core-to-thread mapping init: 72 cores"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.184.621 [device_log.cpp:78]28816 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:874] Thread 4: Flushing performance buffers for 12 cores"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.184.639 [device_log.cpp:78]28816 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:900] Thread 4: Core 4 flushed buffer with 50 records"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.184.653 [device_log.cpp:78]28816 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:964] Thread 4: Core 4 flushed AICore buffer (seq=0, count=50)"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.184.663 [device_log.cpp:78]28816 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:900] Thread 4: Core 32 flushed buffer with 62 records"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.184.675 [device_log.cpp:78]28816 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:964] Thread 4: Core 32 flushed AICore buffer (seq=0, count=62)"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.184.686 [device_log.cpp:78]28816 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:900] Thread 4: Core 33 flushed buffer with 33 records"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.184.699 [device_log.cpp:78]28816 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:964] Thread 4: Core 33 flushed AICore buffer (seq=0, count=33)"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.184.707 [device_log.cpp:78]28816 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:900] Thread 4: Core 9 flushed buffer with 39 records"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.184.721 [device_log.cpp:78]28816 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:964] Thread 4: Core 9 flushed AICore buffer (seq=0, count=39)"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.184.731 [device_log.cpp:78]28816 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:900] Thread 4: Core 42 flushed buffer with 11 records"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.184.743 [device_log.cpp:78]28816 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:964] Thread 4: Core 42 flushed AICore buffer (seq=0, count=11)"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.184.757 [device_log.cpp:78]28816 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:900] Thread 4: Core 43 flushed buffer with 2 records"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.184.622 [device_log.cpp:78]28814 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:874] Thread 2: Flushing performance buffers for 15 cores"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.184.785 [device_log.cpp:78]28814 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:900] Thread 2: Core 2 flushed buffer with 48 records"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.184.628 [device_log.cpp:78]28817 run_orchestration "[aicpu_executor.cpp:950] Thread 5: Orchestrator completed"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.184.615 [device_log.cpp:78]28812 handle_orchestrator_exit "[scheduler_cold_path.cpp:90] Thread 0: completed tasks 1000/1000"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.184.615 [device_log.cpp:78]28815 handle_orchestrator_exit "[scheduler_cold_path.cpp:90] Thread 3: completed tasks 1000/1000"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.184.767 [device_log.cpp:78]28816 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:964] Thread 4: Core 43 flushed AICore buffer (seq=0, count=2)"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.184.860 [device_log.cpp:78]28816 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:900] Thread 4: Core 14 flushed buffer with 25 records"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.184.798 [device_log.cpp:78]28814 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:964] Thread 2: Core 2 flushed AICore buffer (seq=0, count=48)"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.184.814 [device_log.cpp:78]28817 run "[aicpu_executor.cpp:1044] Thread 5: Completed"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.184.904 [device_log.cpp:78]28817 aicpu_execute "[aicpu_executor.cpp:1260] aicpu_execute: Kernel execution completed successfully"
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:41.184.917 [aicpu_processer.cc:41][aeCallInterface][tid:28817][AICPU_PROCESSER] [PERF] start=1795072421182366, end=1795072421184916, use=2550 us
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:41.184.927 [aicpusd_event_process.cpp:892][PostProcessTsKernelTask][tid:28817] Aicpu engine process success, result[0].
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.184.875 [device_log.cpp:78]28816 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:964] Thread 4: Core 14 flushed AICore buffer (seq=0, count=25)"
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:41.184.949 [aicpusd_event_manager.cpp:629][ProcessHWTSKernelEvent][tid:28817] End send ack to Ts, kernelType[2], deviceId[0], subevent_id[0], mailboxId[7], serialNo[937381], streamId[44], taskId[3], result[0], originResult[0], status[0].
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.184.829 [device_log.cpp:78]28812 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:874] Thread 0: Flushing performance buffers for 15 cores"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.184.846 [device_log.cpp:78]28815 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:874] Thread 3: Flushing performance buffers for 15 cores"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.184.623 [device_log.cpp:78]28813 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:874] Thread 1: Flushing performance buffers for 15 cores"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.184.888 [device_log.cpp:78]28814 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:900] Thread 2: Core 28 flushed buffer with 55 records"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.184.953 [device_log.cpp:78]28816 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:900] Thread 4: Core 52 flushed buffer with 2 records"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.036 [device_log.cpp:78]28816 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:964] Thread 4: Core 52 flushed AICore buffer (seq=0, count=2)"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.049 [device_log.cpp:78]28816 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:900] Thread 4: Core 53 flushed buffer with 1 records"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.061 [device_log.cpp:78]28816 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:964] Thread 4: Core 53 flushed AICore buffer (seq=0, count=1)"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.073 [device_log.cpp:78]28816 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:900] Thread 4: Core 19 flushed buffer with 10 records"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.083 [device_log.cpp:78]28816 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:964] Thread 4: Core 19 flushed AICore buffer (seq=0, count=10)"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.095 [device_log.cpp:78]28816 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:900] Thread 4: Core 62 flushed buffer with 1 records"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.106 [device_log.cpp:78]28816 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:964] Thread 4: Core 62 flushed AICore buffer (seq=0, count=1)"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.118 [device_log.cpp:78]28816 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:900] Thread 4: Core 63 flushed buffer with 1 records"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.129 [device_log.cpp:78]28816 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:964] Thread 4: Core 63 flushed AICore buffer (seq=0, count=1)"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.184.994 [device_log.cpp:78]28815 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:900] Thread 3: Core 3 flushed buffer with 50 records"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.151 [device_log.cpp:78]28816 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:997] Thread 4: Performance buffer flush complete, 12 buffers flushed"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.024 [device_log.cpp:78]28814 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:964] Thread 2: Core 28 flushed AICore buffer (seq=0, count=55)"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.175 [device_log.cpp:78]28814 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:900] Thread 2: Core 29 flushed buffer with 27 records"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.188 [device_log.cpp:78]28814 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:964] Thread 2: Core 29 flushed AICore buffer (seq=0, count=27)"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.201 [device_log.cpp:78]28814 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:900] Thread 2: Core 7 flushed buffer with 39 records"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.166 [device_log.cpp:78]28816 flush_phase_pool "[chip_swimlane_collector_aicpu.cpp:1310] Thread 4: flushed sched phase buffer with 503 records"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.184.977 [device_log.cpp:78]28812 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:900] Thread 0: Core 0 flushed buffer with 41 records"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.009 [device_log.cpp:78]28813 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:900] Thread 1: Core 1 flushed buffer with 27 records"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.152 [device_log.cpp:78]28815 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:964] Thread 3: Core 3 flushed AICore buffer (seq=0, count=50)"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.211 [device_log.cpp:78]28814 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:964] Thread 2: Core 7 flushed AICore buffer (seq=0, count=39)"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.225 [device_log.cpp:78]28816 run "[aicpu_executor.cpp:1018] Thread 4: Executed 237 tasks from runtime"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.293 [device_log.cpp:78]28816 shutdown "[scheduler_cold_path.cpp:665] Thread 4: retiring 12 cores"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.253 [device_log.cpp:78]28813 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:964] Thread 1: Core 1 flushed AICore buffer (seq=0, count=27)"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.322 [device_log.cpp:78]28813 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:900] Thread 1: Core 26 flushed buffer with 48 records"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.334 [device_log.cpp:78]28813 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:964] Thread 1: Core 26 flushed AICore buffer (seq=0, count=48)"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.344 [device_log.cpp:78]28813 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:900] Thread 1: Core 27 flushed buffer with 19 records"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.354 [device_log.cpp:78]28813 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:964] Thread 1: Core 27 flushed AICore buffer (seq=0, count=19)"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.364 [device_log.cpp:78]28813 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:900] Thread 1: Core 6 flushed buffer with 8 records"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.375 [device_log.cpp:78]28813 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:964] Thread 1: Core 6 flushed AICore buffer (seq=0, count=8)"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.385 [device_log.cpp:78]28813 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:900] Thread 1: Core 36 flushed buffer with 5 records"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.394 [device_log.cpp:78]28813 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:964] Thread 1: Core 36 flushed AICore buffer (seq=0, count=5)"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.404 [device_log.cpp:78]28813 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:900] Thread 1: Core 37 flushed buffer with 1 records"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.415 [device_log.cpp:78]28813 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:964] Thread 1: Core 37 flushed AICore buffer (seq=0, count=1)"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.425 [device_log.cpp:78]28813 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:900] Thread 1: Core 11 flushed buffer with 2 records"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.435 [device_log.cpp:78]28813 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:964] Thread 1: Core 11 flushed AICore buffer (seq=0, count=2)"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.444 [device_log.cpp:78]28813 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:900] Thread 1: Core 46 flushed buffer with 1 records"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.455 [device_log.cpp:78]28813 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:964] Thread 1: Core 46 flushed AICore buffer (seq=0, count=1)"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.464 [device_log.cpp:78]28813 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:900] Thread 1: Core 47 flushed buffer with 1 records"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.475 [device_log.cpp:78]28813 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:964] Thread 1: Core 47 flushed AICore buffer (seq=0, count=1)"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.484 [device_log.cpp:78]28813 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:900] Thread 1: Core 16 flushed buffer with 1 records"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.494 [device_log.cpp:78]28813 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:964] Thread 1: Core 16 flushed AICore buffer (seq=0, count=1)"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.503 [device_log.cpp:78]28813 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:900] Thread 1: Core 56 flushed buffer with 1 records"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.512 [device_log.cpp:78]28813 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:964] Thread 1: Core 56 flushed AICore buffer (seq=0, count=1)"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.521 [device_log.cpp:78]28813 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:900] Thread 1: Core 57 flushed buffer with 1 records"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.531 [device_log.cpp:78]28813 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:964] Thread 1: Core 57 flushed AICore buffer (seq=0, count=1)"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.540 [device_log.cpp:78]28813 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:900] Thread 1: Core 21 flushed buffer with 1 records"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.549 [device_log.cpp:78]28813 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:964] Thread 1: Core 21 flushed AICore buffer (seq=0, count=1)"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.324 [device_log.cpp:78]28816 run "[aicpu_executor.cpp:1044] Thread 4: Completed"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.571 [device_log.cpp:78]28813 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:997] Thread 1: Performance buffer flush complete, 13 buffers flushed"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.240 [device_log.cpp:78]28812 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:964] Thread 0: Core 0 flushed AICore buffer (seq=0, count=41)"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.594 [device_log.cpp:78]28812 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:900] Thread 0: Core 24 flushed buffer with 54 records"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.604 [device_log.cpp:78]28812 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:964] Thread 0: Core 24 flushed AICore buffer (seq=0, count=54)"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.615 [device_log.cpp:78]28812 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:900] Thread 0: Core 25 flushed buffer with 20 records"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.624 [device_log.cpp:78]28812 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:964] Thread 0: Core 25 flushed AICore buffer (seq=0, count=20)"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.633 [device_log.cpp:78]28812 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:900] Thread 0: Core 5 flushed buffer with 26 records"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.643 [device_log.cpp:78]28812 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:964] Thread 0: Core 5 flushed AICore buffer (seq=0, count=26)"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.652 [device_log.cpp:78]28812 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:900] Thread 0: Core 34 flushed buffer with 5 records"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.661 [device_log.cpp:78]28812 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:964] Thread 0: Core 34 flushed AICore buffer (seq=0, count=5)"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.670 [device_log.cpp:78]28812 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:900] Thread 0: Core 35 flushed buffer with 2 records"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.679 [device_log.cpp:78]28812 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:964] Thread 0: Core 35 flushed AICore buffer (seq=0, count=2)"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.689 [device_log.cpp:78]28812 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:900] Thread 0: Core 10 flushed buffer with 10 records"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.698 [device_log.cpp:78]28812 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:964] Thread 0: Core 10 flushed AICore buffer (seq=0, count=10)"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.707 [device_log.cpp:78]28812 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:900] Thread 0: Core 44 flushed buffer with 1 records"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.717 [device_log.cpp:78]28812 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:964] Thread 0: Core 44 flushed AICore buffer (seq=0, count=1)"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.726 [device_log.cpp:78]28812 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:900] Thread 0: Core 15 flushed buffer with 4 records"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.735 [device_log.cpp:78]28812 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:964] Thread 0: Core 15 flushed AICore buffer (seq=0, count=4)"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.744 [device_log.cpp:78]28812 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:900] Thread 0: Core 20 flushed buffer with 3 records"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.753 [device_log.cpp:78]28812 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:964] Thread 0: Core 20 flushed AICore buffer (seq=0, count=3)"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.572 [device_log.cpp:78]28816 aicpu_execute "[aicpu_executor.cpp:1260] aicpu_execute: Kernel execution completed successfully"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.775 [device_log.cpp:78]28812 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:997] Thread 0: Performance buffer flush complete, 10 buffers flushed"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.583 [device_log.cpp:78]28813 flush_phase_pool "[chip_swimlane_collector_aicpu.cpp:1310] Thread 1: flushed sched phase buffer with 269 records"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.269 [device_log.cpp:78]28815 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:900] Thread 3: Core 30 flushed buffer with 69 records"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.282 [device_log.cpp:78]28814 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:900] Thread 2: Core 38 flushed buffer with 11 records"
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.779 [aicpu_processer.cc:41][aeCallInterface][tid:28816][AICPU_PROCESSER] [PERF] start=1795072421182091, end=1795072421185778, use=3687 us
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.829 [aicpusd_event_process.cpp:892][PostProcessTsKernelTask][tid:28816] Aicpu engine process success, result[0].
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.792 [device_log.cpp:78]28813 run "[aicpu_executor.cpp:1018] Thread 1: Executed 116 tasks from runtime"
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.847 [aicpusd_event_manager.cpp:629][ProcessHWTSKernelEvent][tid:28816] End send ack to Ts, kernelType[2], deviceId[0], subevent_id[0], mailboxId[6], serialNo[980728], streamId[44], taskId[3], result[0], originResult[0], status[0].
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.807 [device_log.cpp:78]28815 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:964] Thread 3: Core 30 flushed AICore buffer (seq=0, count=69)"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.819 [device_log.cpp:78]28814 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:964] Thread 2: Core 38 flushed AICore buffer (seq=0, count=11)"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.879 [device_log.cpp:78]28814 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:900] Thread 2: Core 39 flushed buffer with 3 records"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.898 [device_log.cpp:78]28814 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:964] Thread 2: Core 39 flushed AICore buffer (seq=0, count=3)"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.912 [device_log.cpp:78]28814 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:900] Thread 2: Core 12 flushed buffer with 19 records"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.783 [device_log.cpp:78]28812 flush_phase_pool "[chip_swimlane_collector_aicpu.cpp:1310] Thread 0: flushed sched phase buffer with 378 records"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.855 [device_log.cpp:78]28813 shutdown "[scheduler_cold_path.cpp:665] Thread 1: retiring 15 cores"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.867 [device_log.cpp:78]28815 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:900] Thread 3: Core 31 flushed buffer with 37 records"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.958 [device_log.cpp:78]28813 run "[aicpu_executor.cpp:1044] Thread 1: Completed"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.964 [device_log.cpp:78]28815 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:964] Thread 3: Core 31 flushed AICore buffer (seq=0, count=37)"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.977 [device_log.cpp:78]28815 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:900] Thread 3: Core 8 flushed buffer with 42 records"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.990 [device_log.cpp:78]28815 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:964] Thread 3: Core 8 flushed AICore buffer (seq=0, count=42)"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.186.001 [device_log.cpp:78]28815 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:900] Thread 3: Core 40 flushed buffer with 16 records"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.923 [device_log.cpp:78]28814 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:964] Thread 2: Core 12 flushed AICore buffer (seq=0, count=19)"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.186.027 [device_log.cpp:78]28814 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:900] Thread 2: Core 48 flushed buffer with 2 records"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.936 [device_log.cpp:78]28812 run "[aicpu_executor.cpp:1018] Thread 0: Executed 166 tasks from runtime"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.186.055 [device_log.cpp:78]28812 shutdown "[scheduler_cold_path.cpp:665] Thread 0: retiring 15 cores"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.185.970 [device_log.cpp:78]28813 aicpu_execute "[aicpu_executor.cpp:1260] aicpu_execute: Kernel execution completed successfully"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.186.075 [device_log.cpp:78]28812 run "[aicpu_executor.cpp:1044] Thread 0: Completed"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.186.086 [device_log.cpp:78]28812 aicpu_execute "[aicpu_executor.cpp:1260] aicpu_execute: Kernel execution completed successfully"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.186.042 [device_log.cpp:78]28814 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:964] Thread 2: Core 48 flushed AICore buffer (seq=0, count=2)"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.186.112 [device_log.cpp:78]28814 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:900] Thread 2: Core 49 flushed buffer with 2 records"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.186.014 [device_log.cpp:78]28815 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:964] Thread 3: Core 40 flushed AICore buffer (seq=0, count=16)"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.186.139 [device_log.cpp:78]28815 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:900] Thread 3: Core 41 flushed buffer with 2 records"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.186.154 [device_log.cpp:78]28815 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:964] Thread 3: Core 41 flushed AICore buffer (seq=0, count=2)"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.186.166 [device_log.cpp:78]28815 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:900] Thread 3: Core 13 flushed buffer with 26 records"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.186.177 [device_log.cpp:78]28815 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:964] Thread 3: Core 13 flushed AICore buffer (seq=0, count=26)"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.186.190 [device_log.cpp:78]28815 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:900] Thread 3: Core 50 flushed buffer with 1 records"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.186.200 [device_log.cpp:78]28815 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:964] Thread 3: Core 50 flushed AICore buffer (seq=0, count=1)"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.186.212 [device_log.cpp:78]28815 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:900] Thread 3: Core 51 flushed buffer with 1 records"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.186.224 [device_log.cpp:78]28815 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:964] Thread 3: Core 51 flushed AICore buffer (seq=0, count=1)"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.186.236 [device_log.cpp:78]28815 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:900] Thread 3: Core 18 flushed buffer with 12 records"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.186.246 [device_log.cpp:78]28815 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:964] Thread 3: Core 18 flushed AICore buffer (seq=0, count=12)"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.186.259 [device_log.cpp:78]28815 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:900] Thread 3: Core 60 flushed buffer with 1 records"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.186.125 [device_log.cpp:78]28814 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:964] Thread 2: Core 49 flushed AICore buffer (seq=0, count=2)"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.186.281 [device_log.cpp:78]28814 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:900] Thread 2: Core 17 flushed buffer with 9 records"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.186.296 [device_log.cpp:78]28814 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:964] Thread 2: Core 17 flushed AICore buffer (seq=0, count=9)"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.186.308 [device_log.cpp:78]28814 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:900] Thread 2: Core 58 flushed buffer with 1 records"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.186.318 [device_log.cpp:78]28814 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:964] Thread 2: Core 58 flushed AICore buffer (seq=0, count=1)"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.186.332 [device_log.cpp:78]28814 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:900] Thread 2: Core 22 flushed buffer with 4 records"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.186.345 [device_log.cpp:78]28814 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:964] Thread 2: Core 22 flushed AICore buffer (seq=0, count=4)"
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:41.186.097 [aicpu_processer.cc:41][aeCallInterface][tid:28812][AICPU_PROCESSER] [PERF] start=1795072421182259, end=1795072421186096, use=3837 us
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.186.369 [device_log.cpp:78]28814 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:997] Thread 2: Performance buffer flush complete, 12 buffers flushed"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.186.384 [device_log.cpp:78]28814 flush_phase_pool "[chip_swimlane_collector_aicpu.cpp:1310] Thread 2: flushed sched phase buffer with 448 records"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.186.394 [device_log.cpp:78]28814 run "[aicpu_executor.cpp:1018] Thread 2: Executed 220 tasks from runtime"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.186.407 [device_log.cpp:78]28814 shutdown "[scheduler_cold_path.cpp:665] Thread 2: retiring 15 cores"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.186.268 [device_log.cpp:78]28815 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:964] Thread 3: Core 60 flushed AICore buffer (seq=0, count=1)"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.186.431 [device_log.cpp:78]28814 run "[aicpu_executor.cpp:1044] Thread 2: Completed"
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:41.186.078 [aicpu_processer.cc:41][aeCallInterface][tid:28813][AICPU_PROCESSER] [PERF] start=1795072421182351, end=1795072421186077, use=3726 us
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.186.442 [device_log.cpp:78]28814 aicpu_execute "[aicpu_executor.cpp:1260] aicpu_execute: Kernel execution completed successfully"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.186.436 [device_log.cpp:78]28815 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:900] Thread 3: Core 23 flushed buffer with 4 records"
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:41.186.458 [aicpu_processer.cc:41][aeCallInterface][tid:28814][AICPU_PROCESSER] [PERF] start=1795072421182403, end=1795072421186457, use=4054 us
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.186.465 [device_log.cpp:78]28815 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:964] Thread 3: Core 23 flushed AICore buffer (seq=0, count=4)"
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:41.186.369 [aicpusd_event_process.cpp:892][PostProcessTsKernelTask][tid:28812] Aicpu engine process success, result[0].
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.186.488 [device_log.cpp:78]28815 chip_swimlane_aicpu_flush "[chip_swimlane_collector_aicpu.cpp:997] Thread 3: Performance buffer flush complete, 12 buffers flushed"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.186.502 [device_log.cpp:78]28815 flush_phase_pool "[chip_swimlane_collector_aicpu.cpp:1310] Thread 3: flushed sched phase buffer with 525 records"
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:41.186.466 [aicpusd_event_process.cpp:892][PostProcessTsKernelTask][tid:28814] Aicpu engine process success, result[0].
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:41.186.448 [aicpusd_event_process.cpp:892][PostProcessTsKernelTask][tid:28813] Aicpu engine process success, result[0].
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:41.186.534 [aicpusd_event_manager.cpp:629][ProcessHWTSKernelEvent][tid:28814] End send ack to Ts, kernelType[2], deviceId[0], subevent_id[0], mailboxId[4], serialNo[981582], streamId[44], taskId[3], result[0], originResult[0], status[0].
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:41.186.546 [aicpusd_event_manager.cpp:629][ProcessHWTSKernelEvent][tid:28813] End send ack to Ts, kernelType[2], deviceId[0], subevent_id[0], mailboxId[3], serialNo[936415], streamId[44], taskId[3], result[0], originResult[0], status[0].
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:41.186.500 [aicpusd_event_manager.cpp:629][ProcessHWTSKernelEvent][tid:28812] End send ack to Ts, kernelType[2], deviceId[0], subevent_id[0], mailboxId[2], serialNo[981601], streamId[44], taskId[3], result[0], originResult[0], status[0].
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.186.515 [device_log.cpp:78]28815 run "[aicpu_executor.cpp:1018] Thread 3: Executed 261 tasks from runtime"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.186.585 [device_log.cpp:78]28815 shutdown "[scheduler_cold_path.cpp:665] Thread 3: retiring 15 cores"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.186.603 [device_log.cpp:78]28815 run "[aicpu_executor.cpp:1044] Thread 3: Completed"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.186.626 [device_log.cpp:78]28815 aicpu_execute "[aicpu_executor.cpp:1245] aicpu_execute: Last thread finished, cleaning up"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.186.655 [device_log.cpp:78]28815 deinit "[aicpu_executor.cpp:1144] DeInit: Runtime execution state reset"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.186.664 [device_log.cpp:78]28815 deinit "[aicpu_executor.cpp:1153] DeInit: AicpuExecutor reset complete"
+[INFO] AICPU(28800,aicpu_scheduler):2026-11-19-15:13:41.186.675 [device_log.cpp:78]28815 aicpu_execute "[aicpu_executor.cpp:1260] aicpu_execute: Kernel execution completed successfully"
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:41.186.685 [aicpu_processer.cc:41][aeCallInterface][tid:28815][AICPU_PROCESSER] [PERF] start=1795072421182309, end=1795072421186685, use=4376 us
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:41.186.693 [aicpusd_event_process.cpp:892][PostProcessTsKernelTask][tid:28815] Aicpu engine process success, result[0].
+[INFO] CCECPU(28800,aicpu_scheduler):2026-11-19-15:13:41.186.707 [aicpusd_event_manager.cpp:629][ProcessHWTSKernelEvent][tid:28815] End send ack to Ts, kernelType[2], deviceId[0], subevent_id[0], mailboxId[5], serialNo[937653], streamId[44], taskId[3], result[0], originResult[0], status[0].

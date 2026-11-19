@@ -1,16 +1,21 @@
-# PyPTO TMR：AICPU cluster 二分放置实验
+# PyPTO TMR：AICPU cluster 放置研究
 
-本仓库保存完整 PyPTO 系统上的 Ascend 910B2 AICPU cluster 放置研究。
-当前 v8 删除跨侧领取，采用小组偏好复用、ready 延迟绑定、低频摘要和三项评分。
-这里的 cluster 是 **AICPU cluster**，不是 AI Core 组。
+当前发布 **v12 组合压力研究版本**：保留O依赖亲和与首次ready绑定，组合引入交接代价评分、
+跨前驱事件缓存复用、已领取未完成block压力，以及受限的多block跨侧范围领取。
+**本轮不实现预计block执行时间字段、采样或学习。** cluster指AICPU cluster，不是AI Core组。
 
-- [完整算法、队列和状态记账](docs/zh/experiments/tmr-cluster/algorithm.md)
-- [中文实验说明与历史比较](docs/zh/experiments/tmr-cluster/experiment.md)
-- [Paged Attention：等长与长短混合依赖负载](docs/zh/experiments/tmr-cluster/paged-attention.md)
-- [环境与复现步骤](docs/zh/experiments/tmr-cluster/environment.md)
-- [BGEMM 权重消融原始结果](official-results/v8-no-pickup-20261117/summary.json)
-- [Paged Attention 全部逐轮数据](official-results/v9-paged-attention-20261117/paired/summary.json)
-- [源码来源与版本](docs/zh/experiments/tmr-cluster/source-provenance.json)
+本版没有取得整体加速：Scale和PA仍慢于v8；PA Skew相对v11进一步回退。
+全部结果原样保留，不按结果调参。v8保留在 `runtime-snapshot`，v11保留在 `runtime-ready-affinity`，
+v12在独立分支 `runtime-ready-pressure`。
+
+- [完整算法、流程与状态记账](docs/zh/experiments/tmr-cluster/algorithm.md)
+- [v12中文实验报告：结果、O/S诊断及覆盖限制](docs/zh/experiments/tmr-cluster/ready-pressure.md)
+- [全部逐轮样本与验证](official-results/v12-ready-pressure-20261119/summary.json)
+- [比较CSV](official-results/v12-ready-pressure-20261119/results.csv)
+- [v11历史报告](docs/zh/experiments/tmr-cluster/ready-affinity.md)
+- [v11历史算法](docs/zh/experiments/tmr-cluster/algorithm-v11.md)
+- [历史v8算法](docs/zh/experiments/tmr-cluster/algorithm-v8.md)
+- [源码来源与精确提交](docs/zh/experiments/tmr-cluster/source-provenance.json)
 
 ## 获取完整代码
 
@@ -19,26 +24,30 @@ git clone --recurse-submodules https://github.com/JJyun-ustc/PyPTO-tmr_partition
 cd PyPTO-tmr_partition
 ```
 
-`main` 保存 PyPTO；同仓库 `runtime-snapshot` 分支保存完整修改后的 runtime。
-main 的 runtime 子模块固定引用其具体提交。第三方来源和许可证随源码保留。
+main保存完整PyPTO，runtime子模块固定到本仓库v12运行库具体提交。
+旧v8/v11分支保留；原研究v8 worktree及原始PyPTO未被覆盖。
 
-## 最新补充测试
+## 本轮结果
 
-Shared 也是六线程、两个 AICPU cluster、O=CPU7，普通任务使用全局共享队列。
-同二进制配对 Paged Attention，每策略 30 轮、两批反序，device_wall 中位数：
+同一张910B2物理卡0/逻辑0重测，PCIe 0000:C1:00.0；与v11历史报告的物理卡不同。
+官方Shared使用独立冻结上游运行库，src唯一差异为线程上限4→6。
+O固定CPU7，S使用CPU2–6，两个AICPU cluster；不做O位置对照。
+每策略每用例30轮，以下为device_wall中位数，单位ms。
 
-| 负载 | Shared | v8 Auto | Auto 变化 |
-| --- | ---: | ---: | ---: |
-| 等长，2048 节点 | 2.42840 ms | 2.15587 ms | −11.22% |
-| 长短混合，2720 节点 | 3.25837 ms | 2.88967 ms | −11.32% |
+|负载|官方Shared复核|v8|v11|v12|v12相对v11|
+|---|---:|---:|---:|---:|---:|
+|Bgemm|1.02958|0.99605|0.98585|0.98775|+0.19%|
+|Scale|4.86817|3.80125|5.08348|5.05940|-0.47%|
+|Uniform|2.45222|2.17013|2.64492|2.60237|-1.61%|
+|Skew|3.26717|2.86363|3.52490|3.68002|+4.40%|
 
-四个用例通过正确性检查。长短混合的 Auto p95 比 Shared 高约 2.47%，
-独立诊断 O submit 也更高；不能只凭中位数推断尾部或控制路径均已改善。
-BGEMM 消融、额外配置与 190 项 C++ / 15 项板上回归证据见实验说明。
-仿真场景因缺少 g++-15 未完成，设备实验未持有独占锁，未进行 O 位置对照。
+共600个普通样本、20次通过的golden与20次独立诊断。两批反序指用例顺序反转，版本顺序固定。
+191个C++用例及15个板上正确性用例通过；未持有独占设备锁，小幅差异不能视为稳定收益。
+多block板上回归未触发远端领取，不能据此声称已验证该路径的端到端收益；并发范围唯一领取由CPU测试覆盖。
+仿真场景因缺少g++-15未执行。详细p95、首尾Shared漂移与采样范围见报告。
 
-环境记录包含依赖与工具链版本，不是容器或磁盘镜像。虚拟环境、缓存、编译产物和
-凭据不上传；驱动/CANN 需在目标环境另行安装。许可证见 [LICENSE](LICENSE)。
+环境记录包含依赖、工具链与复现说明，不是磁盘镜像。Git不包含虚拟环境、编译产物、
+缓存或凭据；驱动/CANN需另行安装。许可证见 [LICENSE](LICENSE)。
 
 ---
 

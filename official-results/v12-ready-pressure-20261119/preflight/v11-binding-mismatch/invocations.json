@@ -1,0 +1,26 @@
+[
+  {
+    "label": "Bgemm",
+    "batch": "golden",
+    "case": "ClusterCase0Adaptive",
+    "returncode": 1,
+    "command": [
+      "/data/aicpu-cluster-study/ready-affinity-runtime/.venv/bin/python",
+      "-c",
+      "import multiprocessing,runpy,sys,torch; multiprocessing.cpu_count=lambda:2; torch.set_num_threads(2); sys.argv=sys.argv[1:]; runpy.run_path(sys.argv[0],run_name='__main__')",
+      "/data/aicpu-cluster-study/ready-affinity-runtime/examples/a2a3/tensormap_and_ringbuffer/benchmark_bgemm/test_benchmark_bgemm.py",
+      "-p",
+      "a2a3",
+      "-d",
+      "0",
+      "--manual",
+      "include",
+      "--case",
+      "ClusterCase0Adaptive",
+      "--rounds",
+      "1",
+      "--log-level",
+      "timing"
+    ]
+  }
+]

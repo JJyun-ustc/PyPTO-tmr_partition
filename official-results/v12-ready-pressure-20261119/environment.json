@@ -1,0 +1,22 @@
+{
+  "uname -a": {
+    "returncode": 0,
+    "output": "Linux 3d071b713cf6 5.10.0-136.108.0.188.31.oe2203sp1.bclinux.aarch64 #1 SMP Mon May 26 17:50:37 CST 2025 aarch64 aarch64 aarch64 GNU/Linux\n"
+  },
+  "g++ --version": {
+    "returncode": 0,
+    "output": "g++ (GCC) 12.3.1 (openEuler 12.3.1-99.oe2403sp2)\nCopyright (C) 2022 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.\n\n"
+  },
+  "cmake --version": {
+    "returncode": 0,
+    "output": "cmake version 3.27.9\n\nCMake suite maintained and supported by Kitware (kitware.com/cmake).\n"
+  },
+  ".venv/bin/python --version": {
+    "returncode": 0,
+    "output": "Python 3.10.22\n"
+  },
+  "npu-smi info": {
+    "returncode": 0,
+    "output": "+------------------------------------------------------------------------------------------------------------------+\n| npu-smi 26.1.1                              Version: 26.1.1                                                      |\n+---------------------------+---------------+----------------------------------------------------------------------+\n| NPU   Name                | Health        | Power(W)             Temp(C)                 Hugepages-Usage(page)   |\n| Chip                      | Bus-Id        | AICore(%)            Memory-Usage(MB)        HBM-Usage(MB)           |\n+===========================+===============+======================================================================+\n| 0     910B2               | OK            | 104.1                41                      0    / 0                |\n| 0                         | 0000:C1:00.0  | 0                    0    / 0                3574 / 65536            |\n+===========================+===============+======================================================================+\n+---------------------------+---------------+----------------------------------------------------------------------+\n| NPU     Chip              | Process id    | Process name       | Process memory(MB)    | Process id in container |\n+===========================+===============+======================================================================+\n| 0       0                 | 1497239       | python             | 118                   | 1497239                 |\n+===========================+===============+======================================================================+\n"
+  }
+}

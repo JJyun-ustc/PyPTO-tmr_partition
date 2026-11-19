@@ -1,0 +1,16 @@
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+  File "/data/pypto-work/pypto-home/python/cpython-3.10.22-linux-aarch64-gnu/lib/python3.10/runpy.py", line 289, in run_path
+    return _run_module_code(code, init_globals, run_name,
+  File "/data/pypto-work/pypto-home/python/cpython-3.10.22-linux-aarch64-gnu/lib/python3.10/runpy.py", line 96, in _run_module_code
+    _run_code(code, mod_globals, init_globals,
+  File "/data/pypto-work/pypto-home/python/cpython-3.10.22-linux-aarch64-gnu/lib/python3.10/runpy.py", line 86, in _run_code
+    exec(code, run_globals)
+  File "/data/aicpu-cluster-study/ready-affinity-runtime/examples/a2a3/tensormap_and_ringbuffer/benchmark_bgemm/test_benchmark_bgemm.py", line 13, in <module>
+    from simpler.task_interface import ArgDirection as D
+  File "/data/aicpu-cluster-study/ready-affinity-runtime/python/simpler/task_interface.py", line 226, in <module>
+    _assert_bindings_match_source_tree()
+  File "/data/aicpu-cluster-study/ready-affinity-runtime/python/simpler/task_interface.py", line 217, in _assert_bindings_match_source_tree
+    raise ImportError(
+ImportError: _task_interface was built from 7ac2fb88cf97, but this source tree is at 5f6afa38e7fb. The compiled extension does not rebuild on import (editable.rebuild = false), so its struct layouts may no longer match the Python that drives them — fields can read as 0 with no error.
+Rebuild:  pip install --no-build-isolation -e .

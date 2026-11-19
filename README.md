@@ -1,18 +1,19 @@
 # PyPTO TMR：AICPU cluster 放置研究
 
-当前发布 **v11 ready亲和研究版本**：在独立运行库分支重新实现，删除旧价格学习、
-O负载评分、未来预留与完成负载计数。O只形成依赖亲和，第一次ready选择队列侧，
-S按block认领，并允许低频、受限的自动单block跨侧领取。
-这里的cluster是AICPU cluster，不是AI Core组。
+当前发布 **v12 组合压力研究版本**：保留O依赖亲和与首次ready绑定，组合引入交接代价评分、
+跨前驱事件缓存复用、已领取未完成block压力，以及受限的多block跨侧范围领取。
+**本轮不实现预计block执行时间字段、采样或学习。** cluster指AICPU cluster，不是AI Core组。
 
-**实验不支持“普遍优于v8”**：多block与人工突发负载改善，Scale和PA回退。
-旧v8在 `runtime-snapshot` 原样保留，新版在 `runtime-ready-affinity`。
+本版没有取得整体加速：Scale和PA仍慢于v8；PA Skew相对v11进一步回退。
+全部结果原样保留，不按结果调参。v8保留在 `runtime-snapshot`，v11保留在 `runtime-ready-affinity`，
+v12在独立分支 `runtime-ready-pressure`。
 
 - [完整算法、流程与状态记账](docs/zh/experiments/tmr-cluster/algorithm.md)
-- [v11中文实验报告：全部中位数/p95、O/S诊断与限制](docs/zh/experiments/tmr-cluster/ready-affinity.md)
-- [全部逐轮样本与验证](official-results/v11-ready-affinity-20261119/summary.json)
-- [比较CSV](official-results/v11-ready-affinity-20261119/results.csv)
-- [A1–A4累积实验](docs/zh/experiments/tmr-cluster/block-pressure.md)
+- [v12中文实验报告：结果、O/S诊断及覆盖限制](docs/zh/experiments/tmr-cluster/ready-pressure.md)
+- [全部逐轮样本与验证](official-results/v12-ready-pressure-20261119/summary.json)
+- [比较CSV](official-results/v12-ready-pressure-20261119/results.csv)
+- [v11历史报告](docs/zh/experiments/tmr-cluster/ready-affinity.md)
+- [v11历史算法](docs/zh/experiments/tmr-cluster/algorithm-v11.md)
 - [历史v8算法](docs/zh/experiments/tmr-cluster/algorithm-v8.md)
 - [源码来源与精确提交](docs/zh/experiments/tmr-cluster/source-provenance.json)
 
@@ -23,33 +24,29 @@ git clone --recurse-submodules https://github.com/JJyun-ustc/PyPTO-tmr_partition
 cd PyPTO-tmr_partition
 ```
 
-main保存完整PyPTO，runtime子模块固定到本仓库的v11运行库具体提交。
-旧版本可从 `runtime-snapshot` 或先前main提交获取。第三方来源、许可证随源码保留。
-原研究worktree中的v8与原始PyPTO未被覆盖。
+main保存完整PyPTO，runtime子模块固定到本仓库v12运行库具体提交。
+旧v8/v11分支保留；原研究v8 worktree及原始PyPTO未被覆盖。
 
 ## 本轮结果
 
-同一张910B2物理卡5重测：独立冻结官方Shared、v8、v11关闭领取、v11开启领取，
-O固定CPU7，S使用CPU2–6，两个AICPU cluster。
-每组30轮、15正序+15反序；以下为普通device_wall中位数，单位ms。
+同一张910B2物理卡0/逻辑0重测，PCIe 0000:C1:00.0；与v11历史报告的物理卡不同。
+官方Shared使用独立冻结上游运行库，src唯一差异为线程上限4→6。
+O固定CPU7，S使用CPU2–6，两个AICPU cluster；不做O位置对照。
+每策略每用例30轮，以下为device_wall中位数，单位ms。
 
-|负载|官方Shared复核|v8|v11开启领取|v11相对v8|
-|---|---:|---:|---:|---:|
-|Bgemm|1.0334|0.9904|0.9840|-0.65%|
-|Scale|4.8404|3.8404|5.1357|+33.73%|
-|Uniform|2.4578|2.1965|2.6628|+21.23%|
-|Skew|3.2542|2.8784|3.5130|+22.05%|
-|Multi16|1.2200|1.2827|1.1681|-8.93%|
-|MultiSkew|4.9481|5.0247|4.6181|-8.09%|
-|Fanout|4.8895|4.4633|4.5475|+1.89%|
-|Burst|14.0967|14.7075|13.7389|-6.59%|
+|负载|官方Shared复核|v8|v11|v12|v12相对v11|
+|---|---:|---:|---:|---:|---:|
+|Bgemm|1.02958|0.99605|0.98585|0.98775|+0.19%|
+|Scale|4.86817|3.80125|5.08348|5.05940|-0.47%|
+|Uniform|2.45222|2.17013|2.64492|2.60237|-1.61%|
+|Skew|3.26717|2.86363|3.52490|3.68002|+4.40%|
 
-共1200个普通样本、40次golden及40次独立诊断；184项C++测试、15个板上回归通过。
-官方源码唯一runtime src差异是线程上限4→6，官方调度、队列和依赖处理冻结；
-这与过去修改运行库中的Shared分支不同。MultiSkew官方前后漂移约2.08%，未持有独占锁，
-小幅差异不作确定收益；仿真场景因缺少g++-15未执行。未做O位置对照。
+共600个普通样本、20次通过的golden与20次独立诊断。两批反序指用例顺序反转，版本顺序固定。
+191个C++用例及15个板上正确性用例通过；未持有独占设备锁，小幅差异不能视为稳定收益。
+多block板上回归未触发远端领取，不能据此声称已验证该路径的端到端收益；并发范围唯一领取由CPU测试覆盖。
+仿真场景因缺少g++-15未执行。详细p95、首尾Shared漂移与采样范围见报告。
 
-环境记录是依赖/工具链与复现说明，不是磁盘镜像。Git不包含虚拟环境、编译产物、
+环境记录包含依赖、工具链与复现说明，不是磁盘镜像。Git不包含虚拟环境、编译产物、
 缓存或凭据；驱动/CANN需另行安装。许可证见 [LICENSE](LICENSE)。
 
 ---
