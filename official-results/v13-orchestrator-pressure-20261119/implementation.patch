@@ -1,0 +1,1231 @@
+diff --git a/src/a2a3/runtime/tensormap_and_ringbuffer/aicpu/aicpu_executor.cpp b/src/a2a3/runtime/tensormap_and_ringbuffer/aicpu/aicpu_executor.cpp
+index 6aa419b..b514be2 100644
+--- a/src/a2a3/runtime/tensormap_and_ringbuffer/aicpu/aicpu_executor.cpp
++++ b/src/a2a3/runtime/tensormap_and_ringbuffer/aicpu/aicpu_executor.cpp
+@@ -762,8 +762,11 @@ int32_t AicpuExecutor::run_orchestration(Runtime *runtime, int32_t thread_idx) {
+             // the core-type-classified count post_handshake_init produces on
+             // the serial path.
+             runtime_finalize_after_wire(rt, sched_ctx_.aic_count(), sched_ctx_.aiv_count());
+-            for (int t = 0; t < aicpu_thread_num_; ++t)
+-                rt->scheduler.ready_feedback.cluster[t] = runtime->dev.aicpu_cluster_ids[t];
++            for (int t = 0; t < simpler::tmr::READY_THREADS - 1; ++t)
++                rt->scheduler.ready_feedback.cluster[t] =
++                    t < sched_thread_num_ ? runtime->dev.aicpu_cluster_ids[t] : -1;
++            rt->scheduler.ready_feedback.cluster[simpler::tmr::READY_THREADS - 1] =
++                runtime->dev.aicpu_cluster_ids[sched_thread_num_];
+             rt->orchestrator.aicpu_cluster_sched_count[0] = 0;
+             rt->orchestrator.aicpu_cluster_sched_count[1] = 0;
+             for (int32_t t = 0; t < sched_thread_num_; t++) {
+@@ -1068,20 +1071,19 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
+             auto &model = rt->orchestrator.affinity_builder;
+             if (model.tasks) {
+                 LOG_INFO(
+-                    "AICPU_READY_AFFINITY version=12 pickup=%d tasks=%llu neutral=%llu weak=%llu strong=%llu",
++                    "AICPU_READY_AFFINITY version=13 pickup=%d tasks=%llu neutral=%llu weak=%llu strong=%llu",
+                     int(simpler::tmr::READY_REMOTE_PICKUP), static_cast<unsigned long long>(model.tasks),
+                     static_cast<unsigned long long>(model.neutral), static_cast<unsigned long long>(model.weak),
+                     static_cast<unsigned long long>(model.strong)
+                 );
+                 for (int shape = 0; shape < simpler::tmr::READY_SHAPES; ++shape) {
+-                    uint64_t q[2]{}, c[2]{}, x[2]{}, a[2]{}, d[2]{};
++                    uint64_t q[2]{}, c[2]{}, x[2]{}, released[2]{};
+                     for (const auto &writer : rt->scheduler.ready_feedback.writers)
+                         for (int side = 0; side < 2; ++side) {
+                             q[side] += writer.rows[shape].enqueued[side].load();
+                             c[side] += writer.rows[shape].claimed[side].load();
+-                            x[side] += writer.rows[shape].executed[side].load();
+-                            a[side] += writer.rows[shape].accepted[side].load();
+-                            d[side] += writer.rows[shape].completed_units[side].load();
++                            x[side] += writer.executed[shape][side];
++                            released[side] += writer.rows[shape].revoked[side].load();
+                         }
+                     LOG_INFO(
+                         "AICPU_READY_LEDGER shape=%d queued=%llu,%llu claimed=%llu,%llu executed=%llu,%llu", shape,
+@@ -1090,9 +1092,10 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
+                         static_cast<unsigned long long>(x[0]), static_cast<unsigned long long>(x[1])
+                     );
+                     LOG_INFO(
+-                        "AICPU_READY_COMPLETION shape=%d accepted=%llu,%llu completed_units=%llu,%llu", shape,
+-                        static_cast<unsigned long long>(a[0]), static_cast<unsigned long long>(a[1]),
+-                        static_cast<unsigned long long>(d[0]), static_cast<unsigned long long>(d[1])
++                        "AICPU_RESERVATION_LEDGER shape=%d assigned=%llu,%llu revoked=%llu,%llu", shape,
++                        static_cast<unsigned long long>(rt->scheduler.ready_feedback.assigned[shape][0]),
++                        static_cast<unsigned long long>(rt->scheduler.ready_feedback.assigned[shape][1]),
++                        static_cast<unsigned long long>(released[0]), static_cast<unsigned long long>(released[1])
+                     );
+                 }
+                 for (int t = 0; t < simpler::tmr::READY_THREADS; ++t) {
+@@ -1110,10 +1113,11 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
+             }
+ #if SIMPLER_DFX
+             if (get_chip_swimlane_level() >= ChipSwimlaneLevel::SCHED_PHASES) {
+-                const char *o_names[] = {"affinity", "unused", "unused", "unused", "unused", "wire_ready"};
+-                const char *s_names[] = {"resource_feedback", "observe",       "auto_dispatch", "strict_dispatch",
+-                                         "shared_dispatch",   "sync_dispatch", "ready_binding", "cross_pickup"};
+-                for (int i : {0, 5})
++                const char *o_names[] = {"affinity", "score", "unused", "unused", "unused", "wire_ready"};
++                const char *s_names[] = {"resource_feedback", "observe",         "auto_dispatch",
++                                         "strict_dispatch",   "shared_dispatch", "sync_dispatch",
++                                         "ready_binding",     "cross_pickup",    "affinity_votes"};
++                for (int i : {0, 1, 5})
+                     LOG_INFO(
+                         "AICPU_PARTITION_TRACE owner=O stage=%s calls=%llu ns=%llu", o_names[i],
+                         static_cast<unsigned long long>(model.trace.calls[i]),
+@@ -1122,7 +1126,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
+                         )
+                     );
+                 for (int t = 0; t < simpler::tmr::READY_THREADS; ++t)
+-                    for (int i = 0; i < 8; ++i) {
++                    for (int i = 0; i < 9; ++i) {
+                         const auto &trace = rt->scheduler.ready_feedback.writers[t].trace;
+                         LOG_INFO(
+                             "AICPU_PARTITION_TRACE owner=S%d stage=%s calls=%llu ns=%llu", t, s_names[i],
+diff --git a/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/orchestrator.cpp b/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/orchestrator.cpp
+index 1ff8c87..7678af1 100644
+--- a/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/orchestrator.cpp
++++ b/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/orchestrator.cpp
+@@ -574,7 +574,7 @@ void OrchestratorState::wire_fanin_task(ChipTaskSlotState &slot_state, int32_t w
+                 early_disqualified = true;
+             }
+             if (pstate >= CHIP_TASK_COMPLETED) {
+-                SchedulerState::record_completed_affinity(slot_state, producer);
++                sched->record_completed_affinity(slot_state, producer);
+                 completed_fanin++;
+             } else {
+                 producer->fanout_head = rss.dep_pool.prepend(producer->fanout_head, &slot_state);
+@@ -1225,11 +1225,6 @@ static TaskOutputTensors submit_task_common(
+         });
+         vote.finish(payload.placement, scope);
+         builder.record(payload.placement);
+-        if ((builder.tasks & 63u) == 1) {
+-            auto &writer = feedback.writers[simpler::tmr::READY_THREADS - 1];
+-            writer.now_tick = get_sys_cnt_aicpu();
+-            writer.max_age_ticks = PLATFORM_PROF_SYS_CNT_FREQ / 50000;
+-        }
+         task.target_aicpu_cluster = -1;
+         cur_slot_state.task_attrs.set_early_resolve(false);
+ #if SIMPLER_DFX
+@@ -1237,6 +1232,22 @@ static TaskOutputTensors submit_task_common(
+             builder.trace.ticks[0] += get_sys_cnt_aicpu() - begin;
+             ++builder.trace.calls[0];
+         }
++#endif
++        [[maybe_unused]] uint64_t score_begin = 0;
++#if SIMPLER_DFX
++        if (orch->chip_swimlane_level >= ChipSwimlaneLevel::SCHED_PHASES) score_begin = get_sys_cnt_aicpu();
++#endif
++        uint64_t units =
++            cur_slot_state.active_mask.to_shape() == ResourceShape::DUMMY ? 1 : cur_slot_state.logical_block_num;
++        feedback.predict(
++            static_cast<int>(cur_slot_state.active_mask.to_shape()), payload.placement, units,
++            fanin_builder.wait_count != 0
++        );
++#if SIMPLER_DFX
++        if (score_begin) {
++            builder.trace.ticks[1] += get_sys_cnt_aicpu() - score_begin;
++            ++builder.trace.calls[1];
++        }
+ #endif
+     }
+ 
+@@ -1298,7 +1309,7 @@ static TaskOutputTensors submit_task_common(
+         // reduction-dropped DEP_NONE edge — drops its submit->wire pin so the
+         // (already completed) producer can be CONSUMED.
+         for_each_fanin_slot_state(payload, [&](ChipTaskSlotState *producer, DepFlags flags) {
+-            if (dep_has_wait(flags)) SchedulerState::record_completed_affinity(cur_slot_state, producer);
++            if (dep_has_wait(flags)) sched->record_completed_affinity(cur_slot_state, producer);
+             if (!dep_has_retain(flags)) {
+                 sched->release_producer(*producer);  // wiring-phase atomic, not bucketed (see wire_fanin_task)
+             }
+diff --git a/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/ready_affinity.h b/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/ready_affinity.h
+index e041886..6bd71ba 100644
+--- a/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/ready_affinity.h
++++ b/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/ready_affinity.h
+@@ -17,16 +17,15 @@ namespace simpler::tmr {
+ constexpr int READY_THREADS = 6;
+ constexpr int READY_SHAPES = 4;
+ constexpr int READY_SCOPE_DEPTH = 64;
+-constexpr uint32_t READY_REFRESH_TASKS = 16;
++constexpr uint32_t READY_REFRESH_TASKS = 64;
+ constexpr uint32_t READY_FEEDBACK_LOOPS = 64;
+ constexpr uint32_t READY_PROBE_LOOPS = 32;
+ constexpr uint32_t READY_PROBE_COOLDOWN = 128;
+-constexpr uint64_t READY_UNITS_PER_BLOCK = 6;
+-constexpr uint64_t READY_WAVE = 256;
+-// These are policy prices in waves, not measured nanoseconds or kernel durations.
+-constexpr uint64_t READY_REMOTE_PRICE = 128;
+-constexpr uint64_t READY_PUBLISH_PRICE = 32;
+-constexpr uint64_t READY_SWITCH_MARGIN = 16;
++// Fixed policy prices; no measured duration, calibration or price learning.
++constexpr uint64_t READY_LOCAL_PRICE = 250;
++constexpr uint64_t READY_REMOTE_PRICE = 750;
++constexpr uint64_t READY_QUEUE_PRICE = 2000;
++constexpr uint64_t READY_FUTURE_PRICE = 500;
+ constexpr bool READY_REMOTE_PICKUP = true;
+ 
+ enum class AffinityStrength : uint8_t { NEUTRAL, WEAK, STRONG };
+@@ -34,6 +33,8 @@ inline uint64_t pack_votes(uint32_t a, uint32_t b) { return uint64_t(a) | (uint6
+ inline uint32_t side_vote(uint64_t votes, int side) { return static_cast<uint32_t>(votes >> (32 * side)); }
+ inline uint64_t distribution_vote(uint64_t a, uint64_t b) {
+     if (!a && !b) return 0;
++    if (!a) return pack_votes(0, 256);
++    if (!b) return pack_votes(256, 0);
+     uint32_t left = static_cast<uint32_t>(256 * a / (a + b));
+     return pack_votes(left, 256 - left);
+ }
+@@ -45,13 +46,14 @@ struct ReadyTaskState {
+     bool bound{false};
+     int8_t ready_writer{READY_THREADS - 1};
+     int8_t release_cluster{-1};
++    int8_t predicted_cluster{-1};
+     std::atomic<int32_t> dispatch_cluster{-1};
+     uint64_t affinity_votes{0};
+     std::atomic<uint64_t> completed_votes{0};
+     std::atomic<uint32_t> dispatched[2]{};
+     void reset() {
+         scope = 0;
+-        preferred_cluster = release_cluster = -1;
++        preferred_cluster = release_cluster = predicted_cluster = -1;
+         strength = AffinityStrength::NEUTRAL;
+         hops = 0;
+         bound = false;
+@@ -104,7 +106,7 @@ struct AffinityVote {
+ };
+ 
+ struct ReadyTrace {
+-    uint64_t ticks[8]{}, calls[8]{};
++    uint64_t ticks[9]{}, calls[9]{};
+ };
+ struct AffinityBuilder {
+     uint32_t next_scope{0}, scope_ids[READY_SCOPE_DEPTH]{};
+@@ -121,118 +123,149 @@ struct AffinityBuilder {
+     }
+ };
+ 
+-// Only the owning O/S writes a row. Completion units divide one block across its active subtasks.
+-struct alignas(128) ReadyRow {
+-    std::atomic<uint64_t> enqueued[2]{}, claimed[2]{}, accepted[2]{}, executed[2]{}, completed_units[2]{};
+-    std::atomic<uint64_t> resources{0};
++struct ReadySample {
++    uint64_t revoked[2]{}, enqueued[2]{}, claimed[2]{};
++};
++// R and E form one single-writer transaction. C is an independent monotone atomic observation.
++struct alignas(64) ReadyRow {
++    std::atomic<uint64_t> version{0}, capacity{0};
++    std::atomic<uint64_t> revoked[2]{}, enqueued[2]{}, claimed[2]{};
+     static void add(std::atomic<uint64_t> &counter, uint64_t n) {
+         counter.store(counter.load(std::memory_order_relaxed) + n, std::memory_order_relaxed);
+     }
+-    int64_t queue_units(int c) const {
+-        return int64_t(READY_UNITS_PER_BLOCK) * (int64_t(enqueued[c].load(std::memory_order_relaxed)) -
+-                                                 int64_t(claimed[c].load(std::memory_order_relaxed)));
++    void publish(int predicted, int queue, uint64_t units) {
++        uint64_t v = version.load(std::memory_order_relaxed);
++        version.store(v + 1, std::memory_order_relaxed);
++        std::atomic_thread_fence(std::memory_order_seq_cst);
++        add(revoked[predicted], units);
++        add(enqueued[queue], units);
++        version.store(v + 2, std::memory_order_release);
++    }
++    bool read(ReadySample &out) const {
++        uint64_t v = version.load(std::memory_order_acquire);
++        if (v & 1) return false;
++        ReadySample next;
++        for (int c = 0; c < 2; ++c) {
++            next.revoked[c] = revoked[c].load(std::memory_order_relaxed);
++            next.enqueued[c] = enqueued[c].load(std::memory_order_relaxed);
++            next.claimed[c] = claimed[c].load(std::memory_order_relaxed);
++        }
++        std::atomic_thread_fence(std::memory_order_acquire);
++        if (v != version.load(std::memory_order_relaxed)) return false;
++        out = next;
++        return true;
+     }
+-    int64_t pressure_units(int c) const {
+-        return queue_units(c) + int64_t(READY_UNITS_PER_BLOCK) * int64_t(accepted[c].load(std::memory_order_relaxed)) -
+-               int64_t(completed_units[c].load(std::memory_order_relaxed));
++    int64_t queue(int c) const {
++        return int64_t(enqueued[c].load(std::memory_order_relaxed)) -
++               int64_t(claimed[c].load(std::memory_order_relaxed));
+     }
+     void reset() {
++        version.store(0);
++        capacity.store(0);
+         for (int c = 0; c < 2; ++c) {
++            revoked[c].store(0);
+             enqueued[c].store(0);
+             claimed[c].store(0);
+-            accepted[c].store(0);
+-            executed[c].store(0);
+-            completed_units[c].store(0);
+         }
+-        resources.store(0);
+     }
+ };
+-static_assert(sizeof(ReadyRow) == 128);
++static_assert(sizeof(ReadyRow) == 64);
+ 
+-// Cuts and signed bases describe the same collected rows; clamp only after applying local deltas.
+-struct alignas(128) ReadyHint {
+-    std::atomic<uint64_t> version{0}, resources{0};
+-    std::atomic<int64_t> work{0}, queued{0};
+-    std::atomic<int64_t> pressure_cut[READY_THREADS]{}, queue_cut[READY_THREADS]{};
++struct ReadyHintSample {
++    ReadySample schedulers, orchestrator;
++    uint64_t capacity{0};
++    int64_t own_cut[2]{};
++};
++// Each hint owns only its side's S rows. O is a separate sidecar on O's side, never part of S totals.
++struct alignas(64) ReadyHint {
++    std::atomic<uint64_t> version{0}, capacity{0};
++    std::atomic<uint64_t> revoked[2]{}, enqueued[2]{}, claimed[2]{};
++    std::atomic<uint64_t> o_revoked[2]{}, o_enqueued[2]{}, o_claimed[2]{};
++    std::atomic<int64_t> queue_cut[READY_THREADS - 1][2]{};
++    bool read(int writer, ReadyHintSample &out) const {
++        uint64_t v = version.load(std::memory_order_acquire);
++        if (v & 1) return false;
++        ReadyHintSample next;
++        next.capacity = capacity.load(std::memory_order_relaxed);
++        for (int c = 0; c < 2; ++c) {
++            next.schedulers.revoked[c] = revoked[c].load(std::memory_order_relaxed);
++            next.schedulers.enqueued[c] = enqueued[c].load(std::memory_order_relaxed);
++            next.schedulers.claimed[c] = claimed[c].load(std::memory_order_relaxed);
++            next.orchestrator.revoked[c] = o_revoked[c].load(std::memory_order_relaxed);
++            next.orchestrator.enqueued[c] = o_enqueued[c].load(std::memory_order_relaxed);
++            next.orchestrator.claimed[c] = o_claimed[c].load(std::memory_order_relaxed);
++            if (writer < READY_THREADS - 1) next.own_cut[c] = queue_cut[writer][c].load(std::memory_order_relaxed);
++        }
++        std::atomic_thread_fence(std::memory_order_acquire);
++        if (v != version.load(std::memory_order_relaxed)) return false;
++        out = next;
++        return true;
++    }
+     void reset() {
+         version.store(0);
+-        resources.store(0);
+-        work.store(0);
+-        queued.store(0);
+-        for (int t = 0; t < READY_THREADS; ++t) {
+-            pressure_cut[t].store(0);
+-            queue_cut[t].store(0);
++        capacity.store(0);
++        for (int c = 0; c < 2; ++c) {
++            revoked[c].store(0);
++            enqueued[c].store(0);
++            claimed[c].store(0);
++            o_revoked[c].store(0);
++            o_enqueued[c].store(0);
++            o_claimed[c].store(0);
++            for (auto &cut : queue_cut)
++                cut[c].store(0);
+         }
+     }
+ };
+-static_assert(sizeof(ReadyHint) == 128);
++static_assert(sizeof(ReadyHint) == 192);
+ struct ReadyView {
+-    int64_t work[2]{}, queued[2]{}, pcut[2]{}, qcut[2]{};
+-    uint64_t capacity[2]{}, free[2]{}, refreshed_tick{0};
+-    uint32_t uses{READY_REFRESH_TASKS};
++    ReadyHintSample sides[2];
+ };
+ struct alignas(64) ReadyWriter {
+     ReadyRow rows[READY_SHAPES];
+     ReadyView views[READY_SHAPES];
+-    uint64_t epoch{0}, refreshes{0}, probes{0}, attempts{0}, remote_blocks{0}, remote_multi_blocks{0};
+-    uint64_t now_tick{0}, max_age_ticks{0};
+-    uint32_t probe_clock{0}, probe_next{0};
++    ReadySample collected[READY_SHAPES][READY_THREADS];
++    uint64_t executed[READY_SHAPES][2]{};
++    uint64_t refreshes{0}, probes{0}, attempts{0}, remote_blocks{0}, remote_multi_blocks{0};
++    uint32_t probe_clock{0}, probe_next{READY_PROBE_LOOPS};
+     ReadyTrace trace;
+     void reset() {
+         for (auto &row : rows)
+             row.reset();
+         for (auto &view : views)
+             view = ReadyView{};
+-        epoch = refreshes = probes = attempts = remote_blocks = remote_multi_blocks = 0;
+-        now_tick = max_age_ticks = 0;
+-        probe_clock = probe_next = 0;
++        for (auto &shape : collected)
++            for (auto &sample : shape)
++                sample = ReadySample{};
++        for (auto &shape : executed)
++            for (auto &n : shape)
++                n = 0;
++        refreshes = probes = attempts = remote_blocks = remote_multi_blocks = 0;
++        probe_clock = 0;
++        probe_next = READY_PROBE_LOOPS;
+         trace = ReadyTrace{};
+     }
+ };
+-inline uint64_t positive(int64_t n) { return n > 0 ? static_cast<uint64_t>(n) : 0; }
+-inline uint64_t ready_score(
+-    int side, uint64_t pressure_units, uint64_t capacity, uint64_t units, uint64_t votes, int release_side,
+-    uint64_t confidence
+-) {
+-    uint64_t waves = READY_WAVE * (pressure_units + READY_UNITS_PER_BLOCK * units) / (READY_UNITS_PER_BLOCK * capacity);
+-    if (waves < READY_WAVE) waves = READY_WAVE;
+-    uint64_t total = uint64_t(side_vote(votes, 0)) + side_vote(votes, 1);
+-    uint64_t remote = total ? READY_REMOTE_PRICE * confidence * side_vote(votes, 1 - side) / (256 * total) : 0;
+-    return waves + remote + (release_side >= 0 && release_side != side ? READY_PUBLISH_PRICE : 0);
+-}
+-inline int choose_ready_side(
+-    int preferred, AffinityStrength strength, int release_side, const uint64_t work[2], const uint64_t capacity[2],
+-    const uint64_t free[2], uint64_t units, uint64_t votes = 0, uint64_t confidence = 256
+-) {
+-    if (!capacity[0] && !capacity[1]) return preferred >= 0 ? preferred : 0;
+-    if (!capacity[0]) return 1;
+-    if (!capacity[1]) return 0;
+-    if (!votes && preferred >= 0)
+-        votes = preferred ? pack_votes(0, strength == AffinityStrength::STRONG ? 256 : 64) :
+-                            pack_votes(strength == AffinityStrength::STRONG ? 256 : 64, 0);
+-    uint64_t scores[2]{};
+-    for (int c = 0; c < 2; ++c)
+-        scores[c] = ready_score(c, work[c], capacity[c], units, votes, release_side, confidence);
+-    int anchor = preferred >= 0 ? preferred : (release_side >= 0 ? release_side : -1);
+-    if (votes) {
+-        uint32_t a = side_vote(votes, 0), b = side_vote(votes, 1);
+-        if (a != b) anchor = a > b ? 0 : 1;
+-    }
+-    if (anchor >= 0 && scores[anchor] <= scores[1 - anchor] + READY_SWITCH_MARGIN) return anchor;
+-    if (scores[0] != scores[1]) return scores[0] < scores[1] ? 0 : 1;
+-    if (free[0] != free[1]) return free[0] > free[1] ? 0 : 1;
+-    return 0;
+-}
+-inline bool may_remote_pickup(uint64_t local_work, uint64_t remote_work, int remote_capacity) {
+-    return !local_work && remote_capacity > 0 && remote_work >= uint64_t(remote_capacity);
++inline uint64_t positive(int64_t n) { return n > 0 ? uint64_t(n) : 0; }
++inline int
++light_ready_side(int predicted, uint64_t votes, bool actual, const uint64_t queue[2], const int32_t schedulers[2]) {
++    if (!schedulers[predicted]) return schedulers[1 - predicted] ? 1 - predicted : predicted;
++    int other = 1 - predicted;
++    if (!schedulers[other]) return predicted;
++    uint64_t a = side_vote(votes, predicted), b = side_vote(votes, other), total = a + b;
++    if (!total || b <= a || (b - a) * (actual ? 4 : 2) <= total) return predicted;
++    // More than two additional queued blocks per S, with an absolute floor, protects the candidate side.
++    bool congested =
++        queue[other] >= 4 && queue[other] * schedulers[predicted] >
++                                 queue[predicted] * schedulers[other] + 2u * schedulers[predicted] * schedulers[other];
++    return congested ? predicted : other;
+ }
+-
+ struct ReadyFeedback {
+     std::atomic<bool> enabled{false};
+     int32_t schedulers[2]{};
+     int32_t cluster[READY_THREADS]{-1, -1, -1, -1, -1, -1};
+     ReadyHint hints[2][READY_SHAPES];
+     ReadyWriter writers[READY_THREADS];
++    uint64_t assigned[READY_SHAPES][2]{}, creations{0};
+     void reset() {
+         enabled.store(false);
+         schedulers[0] = schedulers[1] = 0;
+@@ -243,63 +276,116 @@ struct ReadyFeedback {
+                 hint.reset();
+         for (auto &writer : writers)
+             writer.reset();
++        for (auto &shape : assigned)
++            for (auto &n : shape)
++                n = 0;
++        creations = 0;
+     }
+-    // Event grouping is diagnostic only; cached feedback survives producer boundaries.
+-    void begin_batch(int writer) { ++writers[writer].epoch; }
+     void refresh(int writer, int shape) {
+         auto &owner = writers[writer];
+-        auto &view = owner.views[shape];
+-        bool expired = owner.max_age_ticks && owner.now_tick - view.refreshed_tick >= owner.max_age_ticks;
+-        if (view.uses < READY_REFRESH_TASKS && !expired) return;
+-        for (int side = 0; side < 2; ++side) {
+-            const auto &hint = hints[side][shape];
+-            uint64_t v = hint.version.load(std::memory_order_acquire);
+-            if (v & 1) continue;
+-            int64_t work = hint.work.load(std::memory_order_relaxed);
+-            int64_t queued = hint.queued.load(std::memory_order_relaxed);
+-            int64_t pcut = hint.pressure_cut[writer].load(std::memory_order_relaxed);
+-            int64_t qcut = hint.queue_cut[writer].load(std::memory_order_relaxed);
+-            uint64_t r = hint.resources.load(std::memory_order_relaxed);
+-            std::atomic_thread_fence(std::memory_order_acquire);
+-            if (v != hint.version.load(std::memory_order_relaxed)) continue;
+-            view.work[side] = work;
+-            view.queued[side] = queued;
+-            view.pcut[side] = pcut;
+-            view.qcut[side] = qcut;
+-            view.capacity[side] = r & 0xffff;
+-            view.free[side] = r >> 16;
+-        }
+-        view.refreshed_tick = owner.now_tick;
+-        view.uses = 0;
++        for (int side = 0; side < 2; ++side)
++            hints[side][shape].read(writer, owner.views[shape].sides[side]);
+         ++owner.refreshes;
+     }
+-    uint64_t pressure(int writer, int shape, int side) const {
+-        const auto &owner = writers[writer];
+-        const auto &view = owner.views[shape];
+-        return positive(view.work[side] + owner.rows[shape].pressure_units(side) - view.pcut[side]);
++    void refresh_all(int writer) {
++        for (int shape = 0; shape < READY_SHAPES; ++shape)
++            refresh(writer, shape);
++    }
++    void publish_side(int leader, int shape) {
++        int side = cluster[leader];
++        auto &owner = writers[leader];
++        auto &cache = owner.collected[shape];
++        ReadySample sum;
++        uint64_t cap = 0;
++        for (int t = 0; t < READY_THREADS - 1; ++t)
++            if (cluster[t] == side) {
++                writers[t].rows[shape].read(cache[t]);
++                cap += writers[t].rows[shape].capacity.load(std::memory_order_relaxed);
++                for (int c = 0; c < 2; ++c) {
++                    sum.revoked[c] += cache[t].revoked[c];
++                    sum.enqueued[c] += cache[t].enqueued[c];
++                    sum.claimed[c] += cache[t].claimed[c];
++                }
++            }
++        ReadySample o;
++        if (cluster[READY_THREADS - 1] == side) {
++            writers[READY_THREADS - 1].rows[shape].read(cache[READY_THREADS - 1]);
++            o = cache[READY_THREADS - 1];
++        }
++        auto &hint = hints[side][shape];
++        uint64_t v = hint.version.load(std::memory_order_relaxed);
++        hint.version.store(v + 1, std::memory_order_relaxed);
++        std::atomic_thread_fence(std::memory_order_seq_cst);
++        hint.capacity.store(cap, std::memory_order_relaxed);
++        for (int c = 0; c < 2; ++c) {
++            hint.revoked[c].store(sum.revoked[c], std::memory_order_relaxed);
++            hint.enqueued[c].store(sum.enqueued[c], std::memory_order_relaxed);
++            hint.claimed[c].store(sum.claimed[c], std::memory_order_relaxed);
++            hint.o_revoked[c].store(o.revoked[c], std::memory_order_relaxed);
++            hint.o_enqueued[c].store(o.enqueued[c], std::memory_order_relaxed);
++            hint.o_claimed[c].store(o.claimed[c], std::memory_order_relaxed);
++            for (int t = 0; t < READY_THREADS - 1; ++t)
++                hint.queue_cut[t][c].store(
++                    cluster[t] == side ? int64_t(cache[t].enqueued[c]) - int64_t(cache[t].claimed[c]) : 0,
++                    std::memory_order_relaxed
++                );
++        }
++        hint.version.store(v + 2, std::memory_order_release);
+     }
+-    uint64_t queued(int writer, int shape, int side) const {
++    int64_t queued(int writer, int shape, int c) const {
+         const auto &owner = writers[writer];
+-        const auto &view = owner.views[shape];
+-        return positive(view.queued[side] + owner.rows[shape].queue_units(side) - view.qcut[side]);
++        int64_t q = owner.rows[shape].queue(c);
++        for (const auto &side : owner.views[shape].sides) {
++            q += int64_t(side.schedulers.enqueued[c]) - int64_t(side.schedulers.claimed[c]);
++            if (writer < READY_THREADS - 1)
++                q += int64_t(side.orchestrator.enqueued[c]) - int64_t(side.orchestrator.claimed[c]) - side.own_cut[c];
++        }
++        return q;
+     }
+-    int bind(int writer, int shape, const ReadyTaskState &task, uint64_t units) {
+-        refresh(writer, shape);
+-        auto &owner = writers[writer];
+-        auto &view = owner.views[shape];
+-        ++view.uses;
+-        uint64_t work[2]{}, cap[2]{};
+-        for (int side = 0; side < 2; ++side) {
+-            work[side] = pressure(writer, shape, side);
+-            cap[side] = view.capacity[side] ? view.capacity[side] : schedulers[side];
++    int64_t blocked(int shape, int c) const {
++        int64_t w = int64_t(assigned[shape][c]) -
++                    int64_t(writers[READY_THREADS - 1].rows[shape].revoked[c].load(std::memory_order_relaxed));
++        for (const auto &side : writers[READY_THREADS - 1].views[shape].sides)
++            w -= int64_t(side.schedulers.revoked[c]);
++        return w;
++    }
++    int predict(int shape, ReadyTaskState &task, uint64_t units, bool waiting) {
++        constexpr int O = READY_THREADS - 1;
++        if ((creations++ % READY_REFRESH_TASKS) == 0) refresh_all(O);
++        uint64_t votes = task.affinity_votes;
++        uint64_t total = uint64_t(side_vote(votes, 0)) + side_vote(votes, 1);
++        uint64_t score[2]{};
++        for (int c = 0; c < 2; ++c) {
++            if (!schedulers[c]) {
++                score[c] = ~uint64_t{0};
++                continue;
++            }
++            uint64_t price;
++            if (waiting && total)
++                price = READY_LOCAL_PRICE + (READY_REMOTE_PRICE - READY_LOCAL_PRICE) * side_vote(votes, 1 - c) / total;
++            else price = cluster[O] >= 0 && cluster[O] != c ? READY_REMOTE_PRICE : READY_LOCAL_PRICE;
++            uint64_t q = positive(queued(O, shape, c)) + (waiting ? 0 : units);
++            uint64_t cap = writers[O].views[shape].sides[c].capacity;
++            if (!cap) cap = schedulers[c];
++            uint64_t w = positive(blocked(shape, c)) + (waiting ? units : 0);
++            if (w > cap) w = cap;
++            score[c] = price + READY_QUEUE_PRICE * q / (2 * schedulers[c]) + READY_FUTURE_PRICE * w / cap;
+         }
++        int chosen = score[0] < score[1] ? 0 : 1;
++        if (score[0] == score[1])
++            chosen = assigned[shape][0] * schedulers[1] <= assigned[shape][1] * schedulers[0] ? 0 : 1;
++        assigned[shape][chosen] += units;
++        task.predicted_cluster = chosen;
++        return chosen;
++    }
++    int bind(int writer, int shape, const ReadyTaskState &task, uint64_t units) {
+         uint64_t votes = task.completed_votes.load(std::memory_order_acquire);
+-        uint64_t confidence = votes || task.strength != AffinityStrength::WEAK ? 256 : 64;
+-        if (!votes) votes = task.affinity_votes;
+-        int release = task.release_cluster >= 0 ? task.release_cluster : cluster[writer];
+-        return choose_ready_side(
+-            task.preferred_cluster, task.strength, release, work, cap, view.free, units, votes, confidence
+-        );
++        bool actual = votes != 0;
++        if (!actual) votes = task.affinity_votes;
++        uint64_t q[2]{positive(queued(writer, shape, 0)), positive(queued(writer, shape, 1))};
++        int side = light_ready_side(task.predicted_cluster, votes, actual, q, schedulers);
++        writers[writer].rows[shape].publish(task.predicted_cluster, side, units);
++        return side;
+     }
+ };
+ }  // namespace simpler::tmr
+diff --git a/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler.h b/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler.h
+index 5c08de2..d42004e 100644
+--- a/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler.h
++++ b/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler.h
+@@ -582,11 +582,10 @@ struct SchedulerState {
+             int shape = static_cast<int>(slot_state.active_mask.to_shape());
+             uint64_t units =
+                 slot_state.active_mask.to_shape() == ResourceShape::DUMMY ? 1 : slot_state.logical_block_num;
++            always_assert(metadata.predicted_cluster >= 0 && metadata.predicted_cluster < 2);
+             int side = ready_feedback.bind(metadata.ready_writer, shape, metadata, units);
+             slot_state.task->target_aicpu_cluster = side;
+-            simpler::tmr::ReadyRow::add(
+-                ready_feedback.writers[metadata.ready_writer].rows[shape].enqueued[side], units
+-            );
++
+             metadata.bound = true;
+         }
+ #if SIMPLER_DFX
+@@ -601,8 +600,14 @@ struct SchedulerState {
+ #endif
+     }
+ 
+-    static void record_completed_affinity(ChipTaskSlotState &consumer, const ChipTaskSlotState *producer) {
++    void record_completed_affinity(
++        ChipTaskSlotState &consumer, const ChipTaskSlotState *producer, int writer = simpler::tmr::READY_THREADS - 1
++    ) {
+         if (!consumer.payload->placement.scope || !producer) return;
++        [[maybe_unused]] uint64_t begin = 0;
++#if SIMPLER_DFX
++        if (get_chip_swimlane_level() >= ChipSwimlaneLevel::SCHED_PHASES) begin = get_sys_cnt_aicpu();
++#endif
+         const auto &parent = producer->payload->placement;
+         uint64_t votes = parent.actual_votes();
+         if (!votes) {
+@@ -612,6 +617,15 @@ struct SchedulerState {
+         }
+         // Each WAIT edge contributes once, before its existing acq_rel fanin increment.
+         if (votes) consumer.payload->placement.completed_votes.fetch_add(votes, std::memory_order_relaxed);
++#if SIMPLER_DFX
++        if (begin) {
++            auto &trace = ready_feedback.writers[writer].trace;
++            trace.ticks[8] += get_sys_cnt_aicpu() - begin;
++            ++trace.calls[8];
++        }
++#else
++        (void)writer;
++#endif
+     }
+     void record_ready_origin(ChipTaskSlotState &slot_state, const ChipTaskSlotState *producer, uint64_t, int writer) {
+         if (!slot_state.payload->placement.scope || !producer) return;
+@@ -1262,7 +1276,7 @@ struct SchedulerState {
+         // Atomically increment fanin_refcount and check if all producers are done
+         // ACQ_REL on fanin_refcount already synchronizes with the orchestrator's
+         // init release, making fanin_count visible — plain load suffices.
+-        record_completed_affinity(slot_state, producer);
++        record_completed_affinity(slot_state, producer, writer);
+         int32_t new_refcount = slot_state.fanin_refcount.fetch_add(1, std::memory_order_acq_rel) + 1;
+ 
+         if (new_refcount == slot_state.fanin_count) {
+@@ -1277,7 +1291,7 @@ struct SchedulerState {
+         EarlyDispatchReleaseSink *sink = nullptr, const ChipTaskSlotState *producer = nullptr,
+         uint64_t release_tick = 0, int writer = simpler::tmr::READY_THREADS - 1
+     ) {
+-        record_completed_affinity(slot_state, producer);
++        record_completed_affinity(slot_state, producer, writer);
+         int32_t new_refcount = slot_state.fanin_refcount.fetch_add(1, std::memory_order_acq_rel) + 1;
+         atomic_count += 1;  // fanin_refcount.fetch_add
+ 
+@@ -1398,7 +1412,6 @@ struct SchedulerState {
+         // below; their dispatch_fanin propagation is collected here and replayed
+         // after the walk, so no consumer's doorbell waits on a sibling's propagate.
+         EarlyDispatchReleaseSink rel_sink;
+-        if (ready_feedback.enabled.load(std::memory_order_acquire)) ready_feedback.begin_batch(thread_idx);
+         uint64_t placement_release_tick = 0;
+         while (current != nullptr) {
+             ChipTaskSlotState &consumer_slot = *current->slot_state;
+diff --git a/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler_completion.cpp b/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler_completion.cpp
+index 72f73e5..f49d84e 100644
+--- a/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler_completion.cpp
++++ b/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler_completion.cpp
+@@ -155,15 +155,6 @@ void SchedulerContext::complete_slot_task(
+         }
+     }
+ 
+-    if (slot_state.payload->placement.scope) {
+-        auto &row =
+-            sched_->ready_feedback.writers[thread_idx].rows[static_cast<int>(slot_state.active_mask.to_shape())];
+-        uint64_t active = __builtin_popcount(slot_state.active_mask.core_mask());
+-        // MIX has two or three subtask FINs per block: their fractions sum to exactly six units.
+-        simpler::tmr::ReadyRow::add(
+-            row.completed_units[aicpu_cluster_ids_[thread_idx]], simpler::tmr::READY_UNITS_PER_BLOCK / active
+-        );
+-    }
+     bool task_complete = sched_->on_subtask_complete(slot_state);
+ 
+ #if SIMPLER_DFX
+diff --git a/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler_dispatch.cpp b/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler_dispatch.cpp
+index 8b10372..1db0e5b 100644
+--- a/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler_dispatch.cpp
++++ b/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler_dispatch.cpp
+@@ -127,54 +127,17 @@ void SchedulerContext::publish_partition_resources(int32_t thread_idx) {
+     if (chip_swimlane_level_ >= ChipSwimlaneLevel::SCHED_PHASES) begin = get_sys_cnt_aicpu();
+ #endif
+     auto &feedback = sched_->ready_feedback;
+-    feedback.writers[thread_idx].now_tick = get_sys_cnt_aicpu();
+-    feedback.writers[thread_idx].max_age_ticks = PLATFORM_PROF_SYS_CNT_FREQ / 50000;
+     int side = aicpu_cluster_ids_[thread_idx];
+     bool leader = true;
+     for (int t = 0; t < thread_idx; ++t)
+         if (aicpu_cluster_ids_[t] == side) leader = false;
+     for (int shape = 0; shape < simpler::tmr::READY_SHAPES; ++shape) {
+-        auto resource_shape = static_cast<ResourceShape>(shape);
+-        auto &tracker = core_trackers_[thread_idx];
+-        uint64_t cap = tracker.resource_capacity(resource_shape);
+-        uint64_t free =
+-            resource_shape == ResourceShape::DUMMY ?
+-                1 :
+-                tracker.get_dispatchable_cores(resource_shape, CoreTracker::DispatchPhase::IDLE).count() +
+-                    tracker.get_dispatchable_cores(resource_shape, CoreTracker::DispatchPhase::PENDING).count();
+-        feedback.writers[thread_idx].rows[shape].resources.store(cap | (free << 16), std::memory_order_relaxed);
+-        if (!leader) continue;
+-        int64_t q[6]{}, p[6]{}, queued = 0, pressure = 0;
+-        uint64_t capacity = 0, available = 0;
+-        for (int t = 0; t < simpler::tmr::READY_THREADS; ++t) {
+-            const auto &row = feedback.writers[t].rows[shape];
+-            q[t] = row.queue_units(side);
+-            // Use the same queue cut in the total-pressure cut, even during concurrent writes.
+-            p[t] = q[t] +
+-                   int64_t(simpler::tmr::READY_UNITS_PER_BLOCK) *
+-                       int64_t(row.accepted[side].load(std::memory_order_relaxed)) -
+-                   int64_t(row.completed_units[side].load(std::memory_order_relaxed));
+-            queued += q[t];
+-            pressure += p[t];
+-            if (feedback.cluster[t] == side) {
+-                uint64_t resources = row.resources.load(std::memory_order_relaxed);
+-                capacity += resources & 0xffff;
+-                available += resources >> 16;
+-            }
+-        }
+-        auto &hint = feedback.hints[side][shape];
+-        uint64_t version = hint.version.load(std::memory_order_relaxed);
+-        hint.version.store(version + 1, std::memory_order_release);
+-        std::atomic_thread_fence(std::memory_order_seq_cst);
+-        hint.work.store(pressure, std::memory_order_relaxed);
+-        hint.queued.store(queued, std::memory_order_relaxed);
+-        hint.resources.store(capacity | (available << 16), std::memory_order_relaxed);
+-        for (int t = 0; t < simpler::tmr::READY_THREADS; ++t) {
+-            hint.pressure_cut[t].store(p[t], std::memory_order_relaxed);
+-            hint.queue_cut[t].store(q[t], std::memory_order_relaxed);
+-        }
+-        hint.version.store(version + 2, std::memory_order_release);
++        feedback.writers[thread_idx].rows[shape].capacity.store(
++            core_trackers_[thread_idx].resource_capacity(static_cast<ResourceShape>(shape)), std::memory_order_relaxed
++        );
++        if (leader) feedback.publish_side(thread_idx, shape);
+     }
++    feedback.refresh_all(thread_idx);
+ #if SIMPLER_DFX
+     if (begin) {
+         auto &trace = feedback.writers[thread_idx].trace;
+@@ -186,7 +149,7 @@ void SchedulerContext::publish_partition_resources(int32_t thread_idx) {
+ 
+ uint64_t SchedulerContext::observe_partition_task(int32_t thread_idx, ChipTaskSlotState &slot_state, bool) {
+     auto &metadata = slot_state.payload->placement;
+-    if ((metadata.scope || sched_->ready_feedback.enabled.load(std::memory_order_acquire)) &&
++    if (!metadata.scope && sched_->ready_feedback.enabled.load(std::memory_order_acquire) &&
+         metadata.dispatch_cluster.load(std::memory_order_relaxed) < 0) {
+         int expected = -1;
+         metadata.dispatch_cluster.compare_exchange_strong(
+@@ -483,6 +446,12 @@ void SchedulerContext::dispatch_shape(
+                     slot_state->task->target_aicpu_cluster, aicpu_cluster_ids_[thread_idx], thread_idx
+                 );
+             }
++            if (remote && (!slot_state->payload->placement.scope || slot_state->task_attrs.requires_sync_start() ||
++                           shape == ResourceShape::DUMMY ||
++                           (slot_state->task_attrs.has_predicate() && !slot_state->payload->predicate.pass()))) {
++                disp_queues[static_cast<int>(shape)].push(slot_state);
++                continue;
++            }
+             CoreTracker::BitStates selected_mix_clusters(0ULL);
+ 
+             if (is_mix) {
+@@ -548,7 +517,6 @@ void SchedulerContext::dispatch_shape(
+             if (slot_state->payload->placement.scope) {
+                 auto &row = sched_->ready_feedback.writers[thread_idx].rows[static_cast<int>(shape)];
+                 simpler::tmr::ReadyRow::add(row.claimed[slot_state->task->target_aicpu_cluster], claim);
+-                simpler::tmr::ReadyRow::add(row.accepted[aicpu_cluster_ids_[thread_idx]], claim);
+             }
+             if (sched_->ready_feedback.enabled.load(std::memory_order_relaxed)) {
+                 slot_state->payload->placement.dispatched[aicpu_cluster_ids_[thread_idx]].fetch_add(
+@@ -589,9 +557,7 @@ void SchedulerContext::dispatch_shape(
+         for (int i = 0; i < published_n; i++) {
+             if (published_list[i]->payload->placement.scope) {
+                 auto &writer = sched_->ready_feedback.writers[thread_idx];
+-                simpler::tmr::ReadyRow::add(
+-                    writer.rows[static_cast<int>(shape)].executed[aicpu_cluster_ids_[thread_idx]], published_counts[i]
+-                );
++                writer.executed[static_cast<int>(shape)][aicpu_cluster_ids_[thread_idx]] += published_counts[i];
+                 if (published_list[i]->task->target_aicpu_cluster != aicpu_cluster_ids_[thread_idx])
+                     writer.remote_blocks += published_counts[i];
+                 if (published_list[i]->logical_block_num > 1 &&
+@@ -782,31 +748,19 @@ void SchedulerContext::dispatch_ready_tasks(
+                 if (aicpu_cluster_ids_[t] == cluster) leader = false;
+             auto &feedback = sched_->ready_feedback;
+             auto &owner = feedback.writers[thread_idx];
+-            if (leader && ++owner.probe_clock >= owner.probe_next) {
++            bool vacancy = false;
++            for (int i = 0; leader && i < static_cast<int>(ResourceShape::DUMMY); ++i)
++                vacancy |=
++                    tracker.get_dispatchable_cores(static_cast<ResourceShape>(i), CoreTracker::DispatchPhase::IDLE)
++                        .has_value();
++            if (leader && vacancy && ++owner.probe_clock >= owner.probe_next) {
+                 owner.probe_next = owner.probe_clock + simpler::tmr::READY_PROBE_LOOPS;
+                 ++owner.probes;
++                // Normal local dispatch has exhausted fitting work; leftover entries can have incompatible masks.
+                 for (int i = 0; i < static_cast<int>(ResourceShape::DUMMY); ++i) {
+                     auto shape = static_cast<ResourceShape>(i);
+                     if (!tracker.get_dispatchable_cores(shape, CoreTracker::DispatchPhase::IDLE).has_value()) continue;
+-                    if (sched_->cluster_ready_queues[cluster][i].size() ||
+-                        sched_->auto_ready_queues[cluster][i].size() || sched_->ready_queues[i].size())
+-                        continue;
+-                    feedback.refresh(thread_idx, i);
+-                    const auto &view = owner.views[i];
+-                    uint64_t remote_cap = view.capacity[1 - cluster];
+-                    if (!simpler::tmr::may_remote_pickup(
+-                            feedback.queued(thread_idx, i, cluster), feedback.queued(thread_idx, i, 1 - cluster),
+-                            remote_cap * simpler::tmr::READY_UNITS_PER_BLOCK
+-                        ))
+-                        continue;
+-                    uint64_t cap = view.capacity[cluster];
+-                    if (!cap || !remote_cap) continue;
+-                    uint64_t here = simpler::tmr::READY_WAVE * feedback.pressure(thread_idx, i, cluster) / cap;
+-                    uint64_t there =
+-                        simpler::tmr::READY_WAVE * feedback.pressure(thread_idx, i, 1 - cluster) / remote_cap;
+-                    if (there <= here + simpler::tmr::READY_UNITS_PER_BLOCK *
+-                                            (simpler::tmr::READY_REMOTE_PRICE + simpler::tmr::READY_SWITCH_MARGIN))
+-                        continue;
++                    if (feedback.queued(thread_idx, i, 1 - cluster) <= 0) continue;
+                     ++owner.attempts;
+                     dispatch_shape(
+                         thread_idx, sched_->auto_ready_queues[1 - cluster], shape, CoreTracker::DispatchPhase::IDLE,
+@@ -1243,7 +1197,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
+     uint32_t placement_iteration = 0;
+     while (true) {
+         if (thread_idx < sched_thread_num_ && sched_->ready_feedback.enabled.load(std::memory_order_acquire) &&
+-            ((placement_iteration++ & 63u) == 0)) {
++            ((placement_iteration++ % simpler::tmr::READY_FEEDBACK_LOOPS) == 0)) {
+             publish_partition_resources(thread_idx);
+         }
+         if (completed_.load(std::memory_order_acquire)) {
+@@ -1477,11 +1431,9 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
+                     uint64_t units =
+                         dummy_slot.active_mask.to_shape() == ResourceShape::DUMMY ? 1 : dummy_slot.logical_block_num;
+                     simpler::tmr::ReadyRow::add(row.claimed[dummy_slot.task->target_aicpu_cluster], units);
+-                    simpler::tmr::ReadyRow::add(row.accepted[aicpu_cluster_ids_[thread_idx]], units);
+-                    simpler::tmr::ReadyRow::add(row.executed[aicpu_cluster_ids_[thread_idx]], units);
+-                    simpler::tmr::ReadyRow::add(
+-                        row.completed_units[aicpu_cluster_ids_[thread_idx]], units * simpler::tmr::READY_UNITS_PER_BLOCK
+-                    );
++                    sched_->ready_feedback.writers[thread_idx]
++                        .executed[static_cast<int>(dummy_slot.active_mask.to_shape())]
++                                 [aicpu_cluster_ids_[thread_idx]] += units;
+                     dummy_slot.payload->placement.dispatched[aicpu_cluster_ids_[thread_idx]].fetch_add(
+                         units, std::memory_order_relaxed
+                     );
+diff --git a/tests/ut/cpp/a2a3/runtime/tensormap_and_ringbuffer/test_scheduler_state.cpp b/tests/ut/cpp/a2a3/runtime/tensormap_and_ringbuffer/test_scheduler_state.cpp
+index 6906b61..d42e51c 100644
+--- a/tests/ut/cpp/a2a3/runtime/tensormap_and_ringbuffer/test_scheduler_state.cpp
++++ b/tests/ut/cpp/a2a3/runtime/tensormap_and_ringbuffer/test_scheduler_state.cpp
+@@ -442,6 +442,7 @@ TEST_F(SchedulerStateTest, AutomaticSingleBlockAndStrictTasksHaveSeparateQueues)
+     automatic.task->target_aicpu_cluster = 0;
+     strict.task->target_aicpu_cluster = 0;
+     automatic.payload->placement.scope = 1;
++    automatic.payload->placement.predicted_cluster = 0;
+     automatic.payload->placement.preferred_cluster = 0;
+     sched.ready_feedback.schedulers[0] = 1;
+     sched.push_ready_routed(&automatic);
+@@ -462,6 +463,7 @@ TEST_F(SchedulerStateTest, ReadyAccountingIsOncePerTaskWithoutTimingSamples) {
+     slot.task->target_aicpu_cluster = 1;
+     slot.logical_block_num = 16;
+     slot.payload->placement.scope = 1;
++    slot.payload->placement.predicted_cluster = 0;
+     slot.payload->placement.preferred_cluster = 1;
+     sched.ready_feedback.schedulers[1] = 1;
+     sched.stamp_ready_queue(slot);
+@@ -689,10 +691,11 @@ TEST_F(SchedulerStateTest, DeferredBindingUsesActualProducerAndAccountsExactlyOn
+     producer.payload->placement.preferred_cluster = 0;
+     producer.payload->placement.dispatch_cluster.store(1);
+     consumer.payload->placement.scope = 1;
++    consumer.payload->placement.predicted_cluster = 0;
+     consumer.payload->placement.preferred_cluster = -1;
+     consumer.task->target_aicpu_cluster = -1;
+     sched.ready_feedback.cluster[2] = 0;
+-    SchedulerState::record_completed_affinity(consumer, &producer);
++    sched.record_completed_affinity(consumer, &producer);
+     // Producer affinity and the publishing S's side are separate.
+     sched.record_ready_origin(consumer, &producer, 0, 2);
+     sched.stamp_ready_queue(consumer);
+@@ -728,6 +731,7 @@ TEST_F(SchedulerStateTest, UnknownReleaseTimestampDoesNotChangeSchedulerOriginTo
+     sched.ready_feedback.schedulers[1] = 3;
+     producer.payload->placement.dispatch_cluster.store(0);
+     consumer.payload->placement.scope = 1;
++    consumer.payload->placement.predicted_cluster = 0;
+     consumer.payload->placement.preferred_cluster = -1;
+     sched.ready_feedback.cluster[2] = 0;
+     // A shared producer can start its fanout walk before feedback is enabled.
+diff --git a/tests/ut/cpp/a2a3/runtime/test_ready_affinity.cpp b/tests/ut/cpp/a2a3/runtime/test_ready_affinity.cpp
+index 5de39b8..145946e 100644
+--- a/tests/ut/cpp/a2a3/runtime/test_ready_affinity.cpp
++++ b/tests/ut/cpp/a2a3/runtime/test_ready_affinity.cpp
+@@ -9,6 +9,7 @@
+  * -----------------------------------------------------------------------------------------------------------
+  */
+ #include <gtest/gtest.h>
++#include <thread>
+ 
+ #include "ready_affinity.h"
+ 
+@@ -105,144 +106,205 @@ TEST(ReadyAffinity, SplitProducerUsesActualDistribution) {
+     EXPECT_EQ(side_vote(task.affinity_votes, 0), 64);
+     EXPECT_EQ(side_vote(task.affinity_votes, 1), 192);
+ }
+-TEST(ReadyAffinity, SmallQueueSavingDoesNotOverrideHandoffCost) {
+-    uint64_t pressure[2]{24, 0}, cap[2]{10, 10}, free[2]{1, 1};
+-    EXPECT_EQ(choose_ready_side(0, AffinityStrength::STRONG, 0, pressure, cap, free, 10), 0);
+-    pressure[0] = 180;
+-    EXPECT_EQ(choose_ready_side(0, AffinityStrength::STRONG, 0, pressure, cap, free, 10), 1);
++
++static void topology(ReadyFeedback &f) {
++    f.schedulers[0] = 2;
++    f.schedulers[1] = 3;
++    for (int t = 0; t < 6; ++t)
++        f.cluster[t] = t < 2 ? 0 : 1;
++}
++TEST(ReadyAffinity, PublishMovesPredictionAndQueueInOneTransaction) {
++    ReadyRow row;
++    row.publish(0, 1, 16);
++    ReadySample snapshot;
++    ASSERT_TRUE(row.read(snapshot));
++    EXPECT_EQ(snapshot.revoked[0], 16);
++    EXPECT_EQ(snapshot.enqueued[1], 16);
++    EXPECT_EQ(snapshot.enqueued[0], 0);
+ }
+-TEST(ReadyAffinity, InflightWorkPreventsLargeTaskChoosingBusySide) {
+-    uint64_t pressure[2]{0, 6000}, cap[2]{20, 28}, free[2]{20, 0};
+-    EXPECT_EQ(choose_ready_side(-1, AffinityStrength::NEUTRAL, -1, pressure, cap, free, 256), 0);
++TEST(ReadyAffinity, RacingPublicationRetainsPreviousSnapshot) {
++    ReadyRow row;
++    ReadySample old;
++    old.enqueued[0] = 7;
++    row.version.store(1);
++    row.revoked[0].store(100);
++    EXPECT_FALSE(row.read(old));
++    EXPECT_EQ(old.enqueued[0], 7);
++    EXPECT_EQ(old.revoked[0], 0);
+ }
+-TEST(ReadyAffinity, ZeroCapacityExcludesSide) {
+-    uint64_t pressure[2]{0, 0}, cap[2]{0, 10}, free[2]{0, 1};
+-    EXPECT_EQ(choose_ready_side(0, AffinityStrength::STRONG, 0, pressure, cap, free, 48), 1);
++TEST(ReadyAffinity, ConcurrentReaderNeverObservesHalfPublication) {
++    ReadyRow row;
++    std::atomic<bool> done{false};
++    std::atomic<int> bad{0};
++    std::thread writer([&] {
++        for (int i = 0; i < 10000; ++i)
++            row.publish(0, 1, 3);
++        done.store(true);
++    });
++    do {
++        ReadySample snap;
++        if (row.read(snap) && snap.revoked[0] != snap.enqueued[1]) ++bad;
++    } while (!done.load());
++    writer.join();
++    EXPECT_EQ(bad.load(), 0);
+ }
+-TEST(ReadyAffinity, CacheSurvivesConsecutiveProducerCompletions) {
++TEST(ReadyAffinity, LeadersOwnWritersAndPreserveBothQueueSides) {
+     ReadyFeedback f;
+-    f.schedulers[0] = f.schedulers[1] = 1;
+-    ReadyTaskState task;
+-    for (int i = 0; i < 16; ++i) {
+-        f.begin_batch(2);
+-        (void)f.bind(2, 0, task, 1);
+-    }
+-    EXPECT_EQ(f.writers[2].refreshes, 1);
+-    (void)f.bind(2, 0, task, 1);
+-    EXPECT_EQ(f.writers[2].refreshes, 2);
++    topology(f);
++    f.writers[0].rows[0].publish(0, 1, 10);
++    f.writers[2].rows[0].publish(1, 0, 20);
++    f.writers[5].rows[0].publish(1, 1, 30);
++    f.publish_side(0, 0);
++    f.publish_side(2, 0);
++    f.refresh(5, 0);
++    EXPECT_EQ(f.queued(5, 0, 0), 20);
++    EXPECT_EQ(f.queued(5, 0, 1), 40);
++    EXPECT_EQ(f.writers[5].views[0].sides[0].schedulers.enqueued[1], 10);
++    EXPECT_EQ(f.writers[5].views[0].sides[1].schedulers.enqueued[0], 20);
++    EXPECT_EQ(f.writers[5].views[0].sides[1].schedulers.enqueued[1], 0);
+ }
+-TEST(ReadyAffinity, OwnBurstPublicationsChangeNextDecision) {
++TEST(ReadyAffinity, ReservationAndQueueUseCurrentOAndSnapshotS) {
+     ReadyFeedback f;
+-    f.schedulers[0] = f.schedulers[1] = 1;
++    topology(f);
+     ReadyTaskState task;
+-    task.preferred_cluster = 0;
+-    EXPECT_EQ(f.bind(2, 0, task, 10), 0);
+-    ReadyRow::add(f.writers[2].rows[0].enqueued[0], 10);
+-    EXPECT_EQ(f.bind(2, 0, task, 10), 1);
+-    EXPECT_EQ(f.writers[2].refreshes, 1);
+-}
+-TEST(ReadyAffinity, LocalClaimTransfersQueueToInflightWithoutLosingPressure) {
+-    ReadyRow r;
+-    ReadyRow::add(r.enqueued[0], 8);
+-    EXPECT_EQ(r.pressure_units(0), 48);
+-    ReadyRow::add(r.claimed[0], 8);
+-    ReadyRow::add(r.accepted[0], 8);
+-    EXPECT_EQ(r.queue_units(0), 0);
+-    EXPECT_EQ(r.pressure_units(0), 48);
+-    ReadyRow::add(r.completed_units[0], 18);
+-    EXPECT_EQ(r.pressure_units(0), 30);
+-}
+-TEST(ReadyAffinity, RemoteRangeMovesPressureToActualSide) {
+-    ReadyRow r;
+-    ReadyRow::add(r.enqueued[0], 16);
+-    ReadyRow::add(r.claimed[0], 8);
+-    ReadyRow::add(r.accepted[1], 8);
+-    EXPECT_EQ(r.queue_units(0), 48);
+-    EXPECT_EQ(r.queue_units(1), 0);
+-    EXPECT_EQ(r.pressure_units(0), 48);
+-    EXPECT_EQ(r.pressure_units(1), 48);
+-    ReadyRow::add(r.completed_units[1], 48);
+-    EXPECT_EQ(r.pressure_units(1), 0);
+-}
+-TEST(ReadyAffinity, MixCompletionFractionsDoNotTripleCountBlocks) {
+-    ReadyRow r;
+-    r.accepted[0].store(1);
+-    for (int i = 0; i < 3; ++i)
+-        ReadyRow::add(r.completed_units[0], 6 / 3);
+-    EXPECT_EQ(r.pressure_units(0), 0);
+-    r.accepted[0].store(2);
+-    for (int i = 0; i < 2; ++i)
+-        ReadyRow::add(r.completed_units[0], 6 / 2);
+-    EXPECT_EQ(r.pressure_units(0), 0);
+-}
+-TEST(ReadyAffinity, RefreshWatermarkDoesNotDoubleCountOwnQueueAndInflight) {
++    f.predict(0, task, 10, true);
++    int p = task.predicted_cluster;
++    EXPECT_EQ(f.blocked(0, p), 10);
++    f.writers[2].rows[0].publish(p, 1, 10);
++    EXPECT_EQ(f.blocked(0, p), 10);
++    f.publish_side(2, 0);
++    f.refresh(5, 0);
++    EXPECT_EQ(f.blocked(0, p), 0);
++    EXPECT_EQ(f.queued(5, 0, 1), 10);
++    f.writers[5].rows[0].publish(0, 0, 7);
++    f.assigned[0][0] += 7;
++    EXPECT_EQ(f.blocked(0, 0), 0);
++    EXPECT_EQ(f.queued(5, 0, 0), 7);
++}
++TEST(ReadyAffinity, OwnDeltasSurviveRefreshWithoutDoubleCounting) {
+     ReadyFeedback f;
+-    f.schedulers[0] = f.schedulers[1] = 1;
++    topology(f);
+     auto &row = f.writers[2].rows[0];
+-    row.enqueued[0].store(10);
+-    row.claimed[0].store(4);
+-    row.accepted[0].store(4);
+-    row.completed_units[0].store(6);
+-    auto &hint = f.hints[0][0];
+-    hint.work.store(54);
+-    hint.queued.store(36);
+-    hint.pressure_cut[2].store(54);
+-    hint.queue_cut[2].store(36);
++    row.publish(1, 0, 8);
++    f.publish_side(2, 0);
++    f.refresh(2, 0);
++    EXPECT_EQ(f.queued(2, 0, 0), 8);
++    row.publish(0, 0, 4);
++    EXPECT_EQ(f.queued(2, 0, 0), 12);
++    f.publish_side(2, 0);
+     f.refresh(2, 0);
+-    EXPECT_EQ(f.pressure(2, 0, 0), 54);
+-    EXPECT_EQ(f.queued(2, 0, 0), 36);
+-    row.completed_units[0].store(12);
+-    EXPECT_EQ(f.pressure(2, 0, 0), 48);
+-    hint.work.store(48);
+-    hint.pressure_cut[2].store(48);
+-    f.writers[2].views[0].uses = 16;
++    EXPECT_EQ(f.queued(2, 0, 0), 12);
++    ReadyRow::add(row.claimed[0], 8);
++    EXPECT_EQ(f.queued(2, 0, 0), 4);
++    f.publish_side(2, 0);
+     f.refresh(2, 0);
+-    EXPECT_EQ(f.pressure(2, 0, 0), 48);
++    EXPECT_EQ(f.queued(2, 0, 0), 4);
+ }
+-TEST(ReadyAffinity, SignedRemoteClaimCutPreservesCredit) {
++TEST(ReadyAffinity, NegativeRemoteClaimRowRetainsDebitAcrossRefresh) {
+     ReadyFeedback f;
+-    auto &r = f.writers[2].rows[0];
+-    r.claimed[0].store(4);
+-    auto &h = f.hints[0][0];
+-    h.work.store(24);
+-    h.queued.store(24);
+-    h.pressure_cut[2].store(-24);
+-    h.queue_cut[2].store(-24);
++    topology(f);
++    f.writers[0].rows[0].publish(0, 0, 8);
++    f.writers[2].rows[0].claimed[0].store(4);
++    f.publish_side(0, 0);
++    f.publish_side(2, 0);
+     f.refresh(2, 0);
+-    EXPECT_EQ(f.pressure(2, 0, 0), 24);
+-    r.claimed[0].store(8);
+-    EXPECT_EQ(f.pressure(2, 0, 0), 0);
++    EXPECT_EQ(f.queued(2, 0, 0), 4);
++    f.writers[2].rows[0].claimed[0].store(8);
++    EXPECT_EQ(f.queued(2, 0, 0), 0);
+ }
+-TEST(ReadyAffinity, RacingSnapshotRetainsOldViewWithoutSpinning) {
++TEST(ReadyAffinity, OrchestratorSidecarIsVisibleExactlyOnceToSchedulers) {
+     ReadyFeedback f;
+-    f.refresh(2, 0);
+-    auto &v = f.writers[2].views[0];
+-    v.uses = 16;
+-    f.hints[0][0].version.store(1);
+-    f.hints[0][0].work.store(1000);
+-    f.refresh(2, 0);
+-    EXPECT_EQ(f.pressure(2, 0, 0), 0);
++    topology(f);
++    f.writers[5].rows[0].publish(0, 1, 9);
++    f.publish_side(0, 0);
++    f.publish_side(2, 0);
++    f.refresh(0, 0);
++    f.refresh(5, 0);
++    EXPECT_EQ(f.queued(0, 0, 1), 9);
++    EXPECT_EQ(f.queued(5, 0, 1), 9);
++    EXPECT_EQ(f.writers[0].views[0].sides[0].orchestrator.enqueued[1], 0);
++    EXPECT_EQ(f.writers[0].views[0].sides[1].orchestrator.enqueued[1], 9);
+ }
+-TEST(ReadyAffinity, CacheExpiresByLowFrequencyClock) {
++TEST(ReadyAffinity, SnapshotReplacementDoesNotAccumulateOldTotals) {
+     ReadyFeedback f;
+-    auto &owner = f.writers[2];
+-    owner.max_age_ticks = 100;
+-    f.refresh(2, 0);
+-    owner.now_tick = 101;
+-    f.refresh(2, 0);
+-    EXPECT_EQ(owner.refreshes, 2);
++    topology(f);
++    f.writers[0].rows[0].publish(0, 1, 9);
++    f.publish_side(0, 0);
++    f.refresh(5, 0);
++    f.refresh(5, 0);
++    EXPECT_EQ(f.queued(5, 0, 1), 9);
+ }
+-TEST(ReadyAffinity, CompletedExecutionOverridesCreationPreference) {
++TEST(ReadyAffinity, FailedHintReadPreservesBothReservationAndQueue) {
+     ReadyFeedback f;
+-    f.schedulers[0] = f.schedulers[1] = 10;
+-    ReadyTaskState task;
+-    task.preferred_cluster = 0;
+-    task.affinity_votes = pack_votes(256, 0);
+-    task.completed_votes.store(pack_votes(0, 256));
+-    EXPECT_EQ(f.bind(2, 0, task, 1), 1);
+-}
+-TEST(ReadyAffinity, RemoteProbeUsesBlocksRatherThanQueueEntryCount) {
+-    EXPECT_FALSE(may_remote_pickup(1, 100, 12));
+-    EXPECT_FALSE(may_remote_pickup(0, 11, 12));
+-    EXPECT_TRUE(may_remote_pickup(0, 256, 12));
++    topology(f);
++    auto &hint = f.hints[0][0];
++    hint.revoked[0].store(3);
++    hint.enqueued[1].store(3);
++    f.refresh(5, 0);
++    hint.version.store(1);
++    hint.revoked[0].store(100);
++    f.refresh(5, 0);
++    EXPECT_EQ(f.writers[5].views[0].sides[0].schedulers.revoked[0], 3);
++    EXPECT_EQ(f.queued(5, 0, 1), 3);
++}
++TEST(ReadyAffinity, ORefreshEvery64CreationsRatherThanEveryReady) {
++    ReadyFeedback f;
++    topology(f);
++    for (int i = 0; i < 64; ++i) {
++        ReadyTaskState t;
++        f.predict(0, t, 1, true);
++    }
++    EXPECT_EQ(f.writers[5].refreshes, 4);
++    ReadyTaskState t;
++    f.predict(0, t, 1, true);
++    EXPECT_EQ(f.writers[5].refreshes, 8);
++}
++TEST(ReadyAffinity, ReadyBindingNeverRefreshesFeedbackOrScoresPressure) {
++    ReadyFeedback f;
++    topology(f);
++    ReadyTaskState t;
++    t.predicted_cluster = 0;
++    for (int i = 0; i < 64; ++i)
++        EXPECT_EQ(f.bind(2, 0, t, 1), 0);
++    EXPECT_EQ(f.writers[2].refreshes, 0);
++    EXPECT_EQ(f.writers[2].rows[0].revoked[0].load(), 64);
++}
++TEST(ReadyAffinity, ActualVoteThresholdIsStrictlyGreaterThanQuarter) {
++    int32_t sched[2]{2, 3};
++    uint64_t q[2]{};
++    EXPECT_EQ(light_ready_side(0, pack_votes(3, 5), true, q, sched), 0);
++    EXPECT_EQ(light_ready_side(0, pack_votes(2, 6), true, q, sched), 1);
++}
++TEST(ReadyAffinity, InferredVoteThresholdIsStrictlyGreaterThanHalf) {
++    int32_t sched[2]{2, 3};
++    uint64_t q[2]{};
++    EXPECT_EQ(light_ready_side(0, pack_votes(1, 3), false, q, sched), 0);
++    EXPECT_EQ(light_ready_side(0, pack_votes(1, 4), false, q, sched), 1);
++    EXPECT_EQ(light_ready_side(0, 0, true, q, sched), 0);
++}
++TEST(ReadyAffinity, CongestionProtectsPredictionFromAffinityCorrection) {
++    int32_t sched[2]{2, 3};
++    uint64_t q[2]{0, 8};
++    EXPECT_EQ(light_ready_side(0, pack_votes(0, 256), true, q, sched), 0);
++    q[0] = 8;
++    EXPECT_EQ(light_ready_side(0, pack_votes(0, 256), true, q, sched), 1);
++}
++TEST(ReadyAffinity, CurrentOLocalReadyPublicationsAffectNextPrediction) {
++    ReadyFeedback f;
++    topology(f);
++    ReadyTaskState a, b;
++    int first = f.predict(0, a, 10, false);
++    f.bind(5, 0, a, 10);
++    int next = f.predict(0, b, 10, false);
++    EXPECT_NE(first, next);
++    EXPECT_EQ(f.assigned[0][first] + f.assigned[0][next], 20);
++}
++TEST(ReadyAffinity, QueuedDifferenceRemainsSignedUntilScore) {
++    ReadyFeedback f;
++    topology(f);
++    f.writers[2].rows[0].claimed[0].store(9);
++    f.publish_side(2, 0);
++    f.refresh(5, 0);
++    EXPECT_EQ(f.queued(5, 0, 0), -9);
++    EXPECT_EQ(positive(f.queued(5, 0, 0)), 0);
+ }

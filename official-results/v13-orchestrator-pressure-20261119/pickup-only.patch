@@ -1,0 +1,13 @@
+diff --git a/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/ready_affinity.h b/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/ready_affinity.h
+index 6bd71ba..d9e58f1 100644
+--- a/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/ready_affinity.h
++++ b/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/ready_affinity.h
+@@ -26,7 +26,7 @@ constexpr uint64_t READY_LOCAL_PRICE = 250;
+ constexpr uint64_t READY_REMOTE_PRICE = 750;
+ constexpr uint64_t READY_QUEUE_PRICE = 2000;
+ constexpr uint64_t READY_FUTURE_PRICE = 500;
+-constexpr bool READY_REMOTE_PICKUP = true;
++constexpr bool READY_REMOTE_PICKUP = false;
+ 
+ enum class AffinityStrength : uint8_t { NEUTRAL, WEAK, STRONG };
+ inline uint64_t pack_votes(uint32_t a, uint32_t b) { return uint64_t(a) | (uint64_t(b) << 32); }

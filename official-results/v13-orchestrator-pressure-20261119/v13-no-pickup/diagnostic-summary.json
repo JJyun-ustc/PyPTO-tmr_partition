@@ -1,0 +1,1878 @@
+{
+  "Bgemm": {
+    "device_log": "device-logs/debug/device-0/device-42185_20261119130840941.log",
+    "topology": {
+      "2": {
+        "cpu": 4,
+        "role": "sched"
+      },
+      "1": {
+        "cpu": 3,
+        "role": "sched"
+      },
+      "0": {
+        "cpu": 2,
+        "role": "sched"
+      },
+      "3": {
+        "cpu": 5,
+        "role": "sched"
+      },
+      "4": {
+        "cpu": 6,
+        "role": "sched"
+      },
+      "5": {
+        "cpu": 7,
+        "role": "orch"
+      }
+    },
+    "stages": {
+      "O": {
+        "affinity": {
+          "calls": 1000,
+          "ns": 48280
+        },
+        "score": {
+          "calls": 1000,
+          "ns": 64860
+        },
+        "wire_ready": {
+          "calls": 1000,
+          "ns": 210640
+        }
+      },
+      "S0": {
+        "resource_feedback": {
+          "calls": 16,
+          "ns": 48300
+        },
+        "observe": {
+          "calls": 0,
+          "ns": 0
+        },
+        "auto_dispatch": {
+          "calls": 1008,
+          "ns": 412880
+        },
+        "strict_dispatch": {
+          "calls": 1008,
+          "ns": 19740
+        },
+        "shared_dispatch": {
+          "calls": 1008,
+          "ns": 17580
+        },
+        "sync_dispatch": {
+          "calls": 1008,
+          "ns": 180100
+        },
+        "ready_binding": {
+          "calls": 118,
+          "ns": 39740
+        },
+        "cross_pickup": {
+          "calls": 1008,
+          "ns": 12000
+        },
+        "affinity_votes": {
+          "calls": 174,
+          "ns": 3400
+        }
+      },
+      "S1": {
+        "resource_feedback": {
+          "calls": 15,
+          "ns": 12160
+        },
+        "observe": {
+          "calls": 0,
+          "ns": 0
+        },
+        "auto_dispatch": {
+          "calls": 915,
+          "ns": 398180
+        },
+        "strict_dispatch": {
+          "calls": 915,
+          "ns": 27920
+        },
+        "shared_dispatch": {
+          "calls": 915,
+          "ns": 14740
+        },
+        "sync_dispatch": {
+          "calls": 915,
+          "ns": 394160
+        },
+        "ready_binding": {
+          "calls": 87,
+          "ns": 28740
+        },
+        "cross_pickup": {
+          "calls": 915,
+          "ns": 12900
+        },
+        "affinity_votes": {
+          "calls": 122,
+          "ns": 2440
+        }
+      },
+      "S2": {
+        "resource_feedback": {
+          "calls": 17,
+          "ns": 45120
+        },
+        "observe": {
+          "calls": 0,
+          "ns": 0
+        },
+        "auto_dispatch": {
+          "calls": 1068,
+          "ns": 293360
+        },
+        "strict_dispatch": {
+          "calls": 1068,
+          "ns": 56640
+        },
+        "shared_dispatch": {
+          "calls": 1068,
+          "ns": 24740
+        },
+        "sync_dispatch": {
+          "calls": 1068,
+          "ns": 163960
+        },
+        "ready_binding": {
+          "calls": 91,
+          "ns": 20700
+        },
+        "cross_pickup": {
+          "calls": 1068,
+          "ns": 16100
+        },
+        "affinity_votes": {
+          "calls": 155,
+          "ns": 2760
+        }
+      },
+      "S3": {
+        "resource_feedback": {
+          "calls": 23,
+          "ns": 13100
+        },
+        "observe": {
+          "calls": 0,
+          "ns": 0
+        },
+        "auto_dispatch": {
+          "calls": 1441,
+          "ns": 307660
+        },
+        "strict_dispatch": {
+          "calls": 1441,
+          "ns": 80040
+        },
+        "shared_dispatch": {
+          "calls": 1441,
+          "ns": 27720
+        },
+        "sync_dispatch": {
+          "calls": 1441,
+          "ns": 220680
+        },
+        "ready_binding": {
+          "calls": 106,
+          "ns": 24460
+        },
+        "cross_pickup": {
+          "calls": 1441,
+          "ns": 28620
+        },
+        "affinity_votes": {
+          "calls": 146,
+          "ns": 2900
+        }
+      },
+      "S4": {
+        "resource_feedback": {
+          "calls": 23,
+          "ns": 11820
+        },
+        "observe": {
+          "calls": 0,
+          "ns": 0
+        },
+        "auto_dispatch": {
+          "calls": 1443,
+          "ns": 301040
+        },
+        "strict_dispatch": {
+          "calls": 1443,
+          "ns": 72740
+        },
+        "shared_dispatch": {
+          "calls": 1443,
+          "ns": 33400
+        },
+        "sync_dispatch": {
+          "calls": 1443,
+          "ns": 212380
+        },
+        "ready_binding": {
+          "calls": 98,
+          "ns": 21820
+        },
+        "cross_pickup": {
+          "calls": 1443,
+          "ns": 19440
+        },
+        "affinity_votes": {
+          "calls": 153,
+          "ns": 4080
+        }
+      },
+      "S5": {
+        "resource_feedback": {
+          "calls": 0,
+          "ns": 0
+        },
+        "observe": {
+          "calls": 0,
+          "ns": 0
+        },
+        "auto_dispatch": {
+          "calls": 0,
+          "ns": 0
+        },
+        "strict_dispatch": {
+          "calls": 0,
+          "ns": 0
+        },
+        "shared_dispatch": {
+          "calls": 0,
+          "ns": 0
+        },
+        "sync_dispatch": {
+          "calls": 0,
+          "ns": 0
+        },
+        "ready_binding": {
+          "calls": 500,
+          "ns": 36420
+        },
+        "cross_pickup": {
+          "calls": 0,
+          "ns": 0
+        },
+        "affinity_votes": {
+          "calls": 0,
+          "ns": 0
+        }
+      }
+    },
+    "ready_final": [
+      {
+        "version": 13,
+        "pickup": 0,
+        "tasks": 1000,
+        "neutral": 658,
+        "weak": 205,
+        "strong": 137
+      }
+    ],
+    "ready_ledger": [
+      {
+        "shape": 0,
+        "queued": [
+          197,
+          303
+        ],
+        "claimed": [
+          197,
+          303
+        ],
+        "executed": [
+          197,
+          303
+        ]
+      },
+      {
+        "shape": 1,
+        "queued": [
+          172,
+          328
+        ],
+        "claimed": [
+          172,
+          328
+        ],
+        "executed": [
+          172,
+          328
+        ]
+      },
+      {
+        "shape": 2,
+        "queued": [
+          0,
+          0
+        ],
+        "claimed": [
+          0,
+          0
+        ],
+        "executed": [
+          0,
+          0
+        ]
+      },
+      {
+        "shape": 3,
+        "queued": [
+          0,
+          0
+        ],
+        "claimed": [
+          0,
+          0
+        ],
+        "executed": [
+          0,
+          0
+        ]
+      }
+    ],
+    "ready_feedback": [
+      {
+        "writer": 0,
+        "refreshes": 64,
+        "probes": 0,
+        "attempts": 0,
+        "remote": 0,
+        "remote_multi": 0
+      },
+      {
+        "writer": 1,
+        "refreshes": 60,
+        "probes": 0,
+        "attempts": 0,
+        "remote": 0,
+        "remote_multi": 0
+      },
+      {
+        "writer": 2,
+        "refreshes": 68,
+        "probes": 0,
+        "attempts": 0,
+        "remote": 0,
+        "remote_multi": 0
+      },
+      {
+        "writer": 3,
+        "refreshes": 92,
+        "probes": 0,
+        "attempts": 0,
+        "remote": 0,
+        "remote_multi": 0
+      },
+      {
+        "writer": 4,
+        "refreshes": 92,
+        "probes": 0,
+        "attempts": 0,
+        "remote": 0,
+        "remote_multi": 0
+      },
+      {
+        "writer": 5,
+        "refreshes": 64,
+        "probes": 0,
+        "attempts": 0,
+        "remote": 0,
+        "remote_multi": 0
+      }
+    ],
+    "completion_ledger": [],
+    "reservation_ledger": [
+      {
+        "shape": 0,
+        "assigned": [
+          197,
+          303
+        ],
+        "revoked": [
+          197,
+          303
+        ]
+      },
+      {
+        "shape": 1,
+        "assigned": [
+          140,
+          360
+        ],
+        "revoked": [
+          140,
+          360
+        ]
+      },
+      {
+        "shape": 2,
+        "assigned": [
+          0,
+          0
+        ],
+        "revoked": [
+          0,
+          0
+        ]
+      },
+      {
+        "shape": 3,
+        "assigned": [
+          0,
+          0
+        ],
+        "revoked": [
+          0,
+          0
+        ]
+      }
+    ],
+    "final": [],
+    "groups": [],
+    "placement": [],
+    "blocks": [],
+    "prices": [],
+    "price_updates": [],
+    "tasks": 1000,
+    "logical_blocks": 1000,
+    "captured_execution_records": 1000,
+    "O_submit_ms": 1.4992200000000069,
+    "O_placement_and_wire_ms": 0.32378,
+    "S_ready_binding_sum_ms": 0.13546,
+    "O_ready_binding_ms": 0.03642,
+    "S_phase_sum_ms": {
+      "complete": 1.2933199999999965,
+      "dispatch": 1.8905799999999997,
+      "resolve": 0.06317999999999997
+    },
+    "captured_wait_edges": 750,
+    "single_side_wait_edges": 750,
+    "cross_side_captured_wait_edges": 153,
+    "mixed_execution_tasks": 0,
+    "compute_hashes": {
+      "0": "0x212c407e5c39dda2",
+      "1": "0x4c0e49fc6b5f2f9f"
+    }
+  },
+  "Uniform": {
+    "device_log": "device-logs/debug/device-0/device-42938_20261119131004961.log",
+    "topology": {
+      "4": {
+        "cpu": 6,
+        "role": "sched"
+      },
+      "2": {
+        "cpu": 4,
+        "role": "sched"
+      },
+      "3": {
+        "cpu": 5,
+        "role": "sched"
+      },
+      "5": {
+        "cpu": 7,
+        "role": "orch"
+      },
+      "1": {
+        "cpu": 3,
+        "role": "sched"
+      },
+      "0": {
+        "cpu": 2,
+        "role": "sched"
+      }
+    },
+    "stages": {
+      "O": {
+        "affinity": {
+          "calls": 2048,
+          "ns": 104820
+        },
+        "score": {
+          "calls": 2048,
+          "ns": 152080
+        },
+        "wire_ready": {
+          "calls": 2048,
+          "ns": 496760
+        }
+      },
+      "S0": {
+        "resource_feedback": {
+          "calls": 64,
+          "ns": 201720
+        },
+        "observe": {
+          "calls": 0,
+          "ns": 0
+        },
+        "auto_dispatch": {
+          "calls": 4075,
+          "ns": 700900
+        },
+        "strict_dispatch": {
+          "calls": 4075,
+          "ns": 75240
+        },
+        "shared_dispatch": {
+          "calls": 4075,
+          "ns": 67320
+        },
+        "sync_dispatch": {
+          "calls": 4075,
+          "ns": 661020
+        },
+        "ready_binding": {
+          "calls": 319,
+          "ns": 127460
+        },
+        "cross_pickup": {
+          "calls": 4075,
+          "ns": 50880
+        },
+        "affinity_votes": {
+          "calls": 352,
+          "ns": 7060
+        }
+      },
+      "S1": {
+        "resource_feedback": {
+          "calls": 50,
+          "ns": 31220
+        },
+        "observe": {
+          "calls": 0,
+          "ns": 0
+        },
+        "auto_dispatch": {
+          "calls": 3142,
+          "ns": 668360
+        },
+        "strict_dispatch": {
+          "calls": 3142,
+          "ns": 73600
+        },
+        "shared_dispatch": {
+          "calls": 3142,
+          "ns": 51500
+        },
+        "sync_dispatch": {
+          "calls": 3142,
+          "ns": 1255780
+        },
+        "ready_binding": {
+          "calls": 232,
+          "ns": 89020
+        },
+        "cross_pickup": {
+          "calls": 3142,
+          "ns": 42720
+        },
+        "affinity_votes": {
+          "calls": 258,
+          "ns": 4840
+        }
+      },
+      "S2": {
+        "resource_feedback": {
+          "calls": 57,
+          "ns": 158260
+        },
+        "observe": {
+          "calls": 0,
+          "ns": 0
+        },
+        "auto_dispatch": {
+          "calls": 3585,
+          "ns": 639580
+        },
+        "strict_dispatch": {
+          "calls": 3585,
+          "ns": 117180
+        },
+        "shared_dispatch": {
+          "calls": 3585,
+          "ns": 65420
+        },
+        "sync_dispatch": {
+          "calls": 3585,
+          "ns": 517240
+        },
+        "ready_binding": {
+          "calls": 256,
+          "ns": 72240
+        },
+        "cross_pickup": {
+          "calls": 3585,
+          "ns": 52360
+        },
+        "affinity_votes": {
+          "calls": 378,
+          "ns": 7660
+        }
+      },
+      "S3": {
+        "resource_feedback": {
+          "calls": 71,
+          "ns": 41520
+        },
+        "observe": {
+          "calls": 0,
+          "ns": 0
+        },
+        "auto_dispatch": {
+          "calls": 4489,
+          "ns": 775380
+        },
+        "strict_dispatch": {
+          "calls": 4489,
+          "ns": 149480
+        },
+        "shared_dispatch": {
+          "calls": 4489,
+          "ns": 81520
+        },
+        "sync_dispatch": {
+          "calls": 4489,
+          "ns": 636080
+        },
+        "ready_binding": {
+          "calls": 366,
+          "ns": 67880
+        },
+        "cross_pickup": {
+          "calls": 4489,
+          "ns": 66540
+        },
+        "affinity_votes": {
+          "calls": 522,
+          "ns": 9960
+        }
+      },
+      "S4": {
+        "resource_feedback": {
+          "calls": 72,
+          "ns": 38400
+        },
+        "observe": {
+          "calls": 0,
+          "ns": 0
+        },
+        "auto_dispatch": {
+          "calls": 4602,
+          "ns": 782180
+        },
+        "strict_dispatch": {
+          "calls": 4602,
+          "ns": 155780
+        },
+        "shared_dispatch": {
+          "calls": 4602,
+          "ns": 87400
+        },
+        "sync_dispatch": {
+          "calls": 4602,
+          "ns": 676600
+        },
+        "ready_binding": {
+          "calls": 363,
+          "ns": 67760
+        },
+        "cross_pickup": {
+          "calls": 4602,
+          "ns": 59780
+        },
+        "affinity_votes": {
+          "calls": 518,
+          "ns": 9960
+        }
+      },
+      "S5": {
+        "resource_feedback": {
+          "calls": 0,
+          "ns": 0
+        },
+        "observe": {
+          "calls": 0,
+          "ns": 0
+        },
+        "auto_dispatch": {
+          "calls": 0,
+          "ns": 0
+        },
+        "strict_dispatch": {
+          "calls": 0,
+          "ns": 0
+        },
+        "shared_dispatch": {
+          "calls": 0,
+          "ns": 0
+        },
+        "sync_dispatch": {
+          "calls": 0,
+          "ns": 0
+        },
+        "ready_binding": {
+          "calls": 512,
+          "ns": 29860
+        },
+        "cross_pickup": {
+          "calls": 0,
+          "ns": 0
+        },
+        "affinity_votes": {
+          "calls": 276,
+          "ns": 6980
+        }
+      }
+    },
+    "ready_final": [
+      {
+        "version": 13,
+        "pickup": 0,
+        "tasks": 2048,
+        "neutral": 745,
+        "weak": 875,
+        "strong": 428
+      }
+    ],
+    "ready_ledger": [
+      {
+        "shape": 0,
+        "queued": [
+          332,
+          692
+        ],
+        "claimed": [
+          332,
+          692
+        ],
+        "executed": [
+          332,
+          692
+        ]
+      },
+      {
+        "shape": 1,
+        "queued": [
+          282,
+          742
+        ],
+        "claimed": [
+          282,
+          742
+        ],
+        "executed": [
+          282,
+          742
+        ]
+      },
+      {
+        "shape": 2,
+        "queued": [
+          0,
+          0
+        ],
+        "claimed": [
+          0,
+          0
+        ],
+        "executed": [
+          0,
+          0
+        ]
+      },
+      {
+        "shape": 3,
+        "queued": [
+          0,
+          0
+        ],
+        "claimed": [
+          0,
+          0
+        ],
+        "executed": [
+          0,
+          0
+        ]
+      }
+    ],
+    "ready_feedback": [
+      {
+        "writer": 0,
+        "refreshes": 256,
+        "probes": 0,
+        "attempts": 0,
+        "remote": 0,
+        "remote_multi": 0
+      },
+      {
+        "writer": 1,
+        "refreshes": 200,
+        "probes": 0,
+        "attempts": 0,
+        "remote": 0,
+        "remote_multi": 0
+      },
+      {
+        "writer": 2,
+        "refreshes": 228,
+        "probes": 0,
+        "attempts": 0,
+        "remote": 0,
+        "remote_multi": 0
+      },
+      {
+        "writer": 3,
+        "refreshes": 284,
+        "probes": 0,
+        "attempts": 0,
+        "remote": 0,
+        "remote_multi": 0
+      },
+      {
+        "writer": 4,
+        "refreshes": 288,
+        "probes": 0,
+        "attempts": 0,
+        "remote": 0,
+        "remote_multi": 0
+      },
+      {
+        "writer": 5,
+        "refreshes": 128,
+        "probes": 0,
+        "attempts": 0,
+        "remote": 0,
+        "remote_multi": 0
+      }
+    ],
+    "completion_ledger": [],
+    "reservation_ledger": [
+      {
+        "shape": 0,
+        "assigned": [
+          547,
+          477
+        ],
+        "revoked": [
+          547,
+          477
+        ]
+      },
+      {
+        "shape": 1,
+        "assigned": [
+          260,
+          764
+        ],
+        "revoked": [
+          260,
+          764
+        ]
+      },
+      {
+        "shape": 2,
+        "assigned": [
+          0,
+          0
+        ],
+        "revoked": [
+          0,
+          0
+        ]
+      },
+      {
+        "shape": 3,
+        "assigned": [
+          0,
+          0
+        ],
+        "revoked": [
+          0,
+          0
+        ]
+      }
+    ],
+    "final": [],
+    "groups": [],
+    "placement": [],
+    "blocks": [],
+    "prices": [],
+    "price_updates": [],
+    "tasks": 2048,
+    "logical_blocks": 2048,
+    "captured_execution_records": 2048,
+    "O_submit_ms": 3.5635000000000088,
+    "O_placement_and_wire_ms": 0.75366,
+    "S_ready_binding_sum_ms": 0.42436,
+    "O_ready_binding_ms": 0.02986,
+    "S_phase_sum_ms": {
+      "complete": 2.4021400000000037,
+      "dispatch": 3.5991600000000004,
+      "resolve": 0.2909600000000005
+    },
+    "captured_wait_edges": 4544,
+    "single_side_wait_edges": 4032,
+    "cross_side_captured_wait_edges": 810,
+    "mixed_execution_tasks": 0,
+    "compute_hashes": {
+      "0": "0x78b21d77e40f5d10",
+      "1": "0x61eed84f73ec7bc1",
+      "2": "0xf44542e69b1df3d1",
+      "3": "0xc7fed830024b68b2"
+    }
+  },
+  "Skew": {
+    "device_log": "device-logs/debug/device-0/device-43392_20261119131045416.log",
+    "topology": {
+      "4": {
+        "cpu": 6,
+        "role": "sched"
+      },
+      "1": {
+        "cpu": 3,
+        "role": "sched"
+      },
+      "0": {
+        "cpu": 2,
+        "role": "sched"
+      },
+      "3": {
+        "cpu": 5,
+        "role": "sched"
+      },
+      "5": {
+        "cpu": 7,
+        "role": "orch"
+      },
+      "2": {
+        "cpu": 4,
+        "role": "sched"
+      }
+    },
+    "stages": {
+      "O": {
+        "affinity": {
+          "calls": 2720,
+          "ns": 143400
+        },
+        "score": {
+          "calls": 2720,
+          "ns": 200860
+        },
+        "wire_ready": {
+          "calls": 2720,
+          "ns": 688300
+        }
+      },
+      "S0": {
+        "resource_feedback": {
+          "calls": 89,
+          "ns": 279960
+        },
+        "observe": {
+          "calls": 0,
+          "ns": 0
+        },
+        "auto_dispatch": {
+          "calls": 5633,
+          "ns": 927740
+        },
+        "strict_dispatch": {
+          "calls": 5633,
+          "ns": 102580
+        },
+        "shared_dispatch": {
+          "calls": 5633,
+          "ns": 93240
+        },
+        "sync_dispatch": {
+          "calls": 5633,
+          "ns": 938520
+        },
+        "ready_binding": {
+          "calls": 422,
+          "ns": 169960
+        },
+        "cross_pickup": {
+          "calls": 5633,
+          "ns": 68160
+        },
+        "affinity_votes": {
+          "calls": 464,
+          "ns": 9100
+        }
+      },
+      "S1": {
+        "resource_feedback": {
+          "calls": 67,
+          "ns": 45420
+        },
+        "observe": {
+          "calls": 0,
+          "ns": 0
+        },
+        "auto_dispatch": {
+          "calls": 4281,
+          "ns": 925560
+        },
+        "strict_dispatch": {
+          "calls": 4281,
+          "ns": 101200
+        },
+        "shared_dispatch": {
+          "calls": 4281,
+          "ns": 77140
+        },
+        "sync_dispatch": {
+          "calls": 4281,
+          "ns": 1541200
+        },
+        "ready_binding": {
+          "calls": 304,
+          "ns": 120320
+        },
+        "cross_pickup": {
+          "calls": 4281,
+          "ns": 54540
+        },
+        "affinity_votes": {
+          "calls": 381,
+          "ns": 7120
+        }
+      },
+      "S2": {
+        "resource_feedback": {
+          "calls": 78,
+          "ns": 225460
+        },
+        "observe": {
+          "calls": 0,
+          "ns": 0
+        },
+        "auto_dispatch": {
+          "calls": 4949,
+          "ns": 855260
+        },
+        "strict_dispatch": {
+          "calls": 4949,
+          "ns": 153960
+        },
+        "shared_dispatch": {
+          "calls": 4949,
+          "ns": 94220
+        },
+        "sync_dispatch": {
+          "calls": 4949,
+          "ns": 728680
+        },
+        "ready_binding": {
+          "calls": 389,
+          "ns": 119760
+        },
+        "cross_pickup": {
+          "calls": 4949,
+          "ns": 70840
+        },
+        "affinity_votes": {
+          "calls": 521,
+          "ns": 9720
+        }
+      },
+      "S3": {
+        "resource_feedback": {
+          "calls": 97,
+          "ns": 53920
+        },
+        "observe": {
+          "calls": 0,
+          "ns": 0
+        },
+        "auto_dispatch": {
+          "calls": 6185,
+          "ns": 1024100
+        },
+        "strict_dispatch": {
+          "calls": 6185,
+          "ns": 194000
+        },
+        "shared_dispatch": {
+          "calls": 6185,
+          "ns": 112820
+        },
+        "sync_dispatch": {
+          "calls": 6185,
+          "ns": 901080
+        },
+        "ready_binding": {
+          "calls": 462,
+          "ns": 88240
+        },
+        "cross_pickup": {
+          "calls": 6185,
+          "ns": 90220
+        },
+        "affinity_votes": {
+          "calls": 664,
+          "ns": 13560
+        }
+      },
+      "S4": {
+        "resource_feedback": {
+          "calls": 100,
+          "ns": 52360
+        },
+        "observe": {
+          "calls": 0,
+          "ns": 0
+        },
+        "auto_dispatch": {
+          "calls": 6342,
+          "ns": 1032080
+        },
+        "strict_dispatch": {
+          "calls": 6342,
+          "ns": 204160
+        },
+        "shared_dispatch": {
+          "calls": 6342,
+          "ns": 118180
+        },
+        "sync_dispatch": {
+          "calls": 6342,
+          "ns": 921800
+        },
+        "ready_binding": {
+          "calls": 463,
+          "ns": 85680
+        },
+        "cross_pickup": {
+          "calls": 6342,
+          "ns": 82880
+        },
+        "affinity_votes": {
+          "calls": 652,
+          "ns": 15100
+        }
+      },
+      "S5": {
+        "resource_feedback": {
+          "calls": 0,
+          "ns": 0
+        },
+        "observe": {
+          "calls": 0,
+          "ns": 0
+        },
+        "auto_dispatch": {
+          "calls": 0,
+          "ns": 0
+        },
+        "strict_dispatch": {
+          "calls": 0,
+          "ns": 0
+        },
+        "shared_dispatch": {
+          "calls": 0,
+          "ns": 0
+        },
+        "sync_dispatch": {
+          "calls": 0,
+          "ns": 0
+        },
+        "ready_binding": {
+          "calls": 680,
+          "ns": 41020
+        },
+        "cross_pickup": {
+          "calls": 0,
+          "ns": 0
+        },
+        "affinity_votes": {
+          "calls": 422,
+          "ns": 10060
+        }
+      }
+    },
+    "ready_final": [
+      {
+        "version": 13,
+        "pickup": 0,
+        "tasks": 2720,
+        "neutral": 941,
+        "weak": 1193,
+        "strong": 586
+      }
+    ],
+    "ready_ledger": [
+      {
+        "shape": 0,
+        "queued": [
+          450,
+          910
+        ],
+        "claimed": [
+          450,
+          910
+        ],
+        "executed": [
+          450,
+          910
+        ]
+      },
+      {
+        "shape": 1,
+        "queued": [
+          401,
+          959
+        ],
+        "claimed": [
+          401,
+          959
+        ],
+        "executed": [
+          401,
+          959
+        ]
+      },
+      {
+        "shape": 2,
+        "queued": [
+          0,
+          0
+        ],
+        "claimed": [
+          0,
+          0
+        ],
+        "executed": [
+          0,
+          0
+        ]
+      },
+      {
+        "shape": 3,
+        "queued": [
+          0,
+          0
+        ],
+        "claimed": [
+          0,
+          0
+        ],
+        "executed": [
+          0,
+          0
+        ]
+      }
+    ],
+    "ready_feedback": [
+      {
+        "writer": 0,
+        "refreshes": 356,
+        "probes": 0,
+        "attempts": 0,
+        "remote": 0,
+        "remote_multi": 0
+      },
+      {
+        "writer": 1,
+        "refreshes": 268,
+        "probes": 0,
+        "attempts": 0,
+        "remote": 0,
+        "remote_multi": 0
+      },
+      {
+        "writer": 2,
+        "refreshes": 312,
+        "probes": 0,
+        "attempts": 0,
+        "remote": 0,
+        "remote_multi": 0
+      },
+      {
+        "writer": 3,
+        "refreshes": 388,
+        "probes": 0,
+        "attempts": 0,
+        "remote": 0,
+        "remote_multi": 0
+      },
+      {
+        "writer": 4,
+        "refreshes": 400,
+        "probes": 0,
+        "attempts": 0,
+        "remote": 0,
+        "remote_multi": 0
+      },
+      {
+        "writer": 5,
+        "refreshes": 172,
+        "probes": 0,
+        "attempts": 0,
+        "remote": 0,
+        "remote_multi": 0
+      }
+    ],
+    "completion_ledger": [],
+    "reservation_ledger": [
+      {
+        "shape": 0,
+        "assigned": [
+          752,
+          608
+        ],
+        "revoked": [
+          752,
+          608
+        ]
+      },
+      {
+        "shape": 1,
+        "assigned": [
+          397,
+          963
+        ],
+        "revoked": [
+          397,
+          963
+        ]
+      },
+      {
+        "shape": 2,
+        "assigned": [
+          0,
+          0
+        ],
+        "revoked": [
+          0,
+          0
+        ]
+      },
+      {
+        "shape": 3,
+        "assigned": [
+          0,
+          0
+        ],
+        "revoked": [
+          0,
+          0
+        ]
+      }
+    ],
+    "final": [],
+    "groups": [],
+    "placement": [],
+    "blocks": [],
+    "prices": [],
+    "price_updates": [],
+    "tasks": 2720,
+    "logical_blocks": 2720,
+    "captured_execution_records": 2720,
+    "O_submit_ms": 4.86402000000001,
+    "O_placement_and_wire_ms": 1.03256,
+    "S_ready_binding_sum_ms": 0.58396,
+    "O_ready_binding_ms": 0.04102,
+    "S_phase_sum_ms": {
+      "complete": 3.2022200000000067,
+      "dispatch": 4.779500000000005,
+      "resolve": 0.39183999999999336
+    },
+    "captured_wait_edges": 5992,
+    "single_side_wait_edges": 5312,
+    "cross_side_captured_wait_edges": 1179,
+    "mixed_execution_tasks": 0,
+    "compute_hashes": {
+      "0": "0x78b21d77e40f5d10",
+      "1": "0x61eed84f73ec7bc1",
+      "2": "0xf44542e69b1df3d1",
+      "3": "0xc7fed830024b68b2"
+    }
+  },
+  "Scale": {
+    "device_log": "device-logs/debug/device-0/device-42550_20261119130916858.log",
+    "topology": {
+      "0": {
+        "cpu": 2,
+        "role": "sched"
+      },
+      "5": {
+        "cpu": 7,
+        "role": "orch"
+      },
+      "2": {
+        "cpu": 4,
+        "role": "sched"
+      },
+      "1": {
+        "cpu": 3,
+        "role": "sched"
+      },
+      "3": {
+        "cpu": 5,
+        "role": "sched"
+      },
+      "4": {
+        "cpu": 6,
+        "role": "sched"
+      }
+    },
+    "stages": {
+      "O": {
+        "affinity": {
+          "calls": 4096,
+          "ns": 223840
+        },
+        "score": {
+          "calls": 4096,
+          "ns": 268240
+        },
+        "wire_ready": {
+          "calls": 4096,
+          "ns": 1115100
+        }
+      },
+      "S0": {
+        "resource_feedback": {
+          "calls": 96,
+          "ns": 298320
+        },
+        "observe": {
+          "calls": 0,
+          "ns": 0
+        },
+        "auto_dispatch": {
+          "calls": 6094,
+          "ns": 1946820
+        },
+        "strict_dispatch": {
+          "calls": 6094,
+          "ns": 112040
+        },
+        "shared_dispatch": {
+          "calls": 6094,
+          "ns": 101080
+        },
+        "sync_dispatch": {
+          "calls": 6094,
+          "ns": 1034340
+        },
+        "ready_binding": {
+          "calls": 457,
+          "ns": 146260
+        },
+        "cross_pickup": {
+          "calls": 6094,
+          "ns": 76140
+        },
+        "affinity_votes": {
+          "calls": 797,
+          "ns": 14500
+        }
+      },
+      "S1": {
+        "resource_feedback": {
+          "calls": 81,
+          "ns": 50980
+        },
+        "observe": {
+          "calls": 0,
+          "ns": 0
+        },
+        "auto_dispatch": {
+          "calls": 5165,
+          "ns": 1635420
+        },
+        "strict_dispatch": {
+          "calls": 5165,
+          "ns": 139620
+        },
+        "shared_dispatch": {
+          "calls": 5165,
+          "ns": 83440
+        },
+        "sync_dispatch": {
+          "calls": 5165,
+          "ns": 2227620
+        },
+        "ready_binding": {
+          "calls": 389,
+          "ns": 144900
+        },
+        "cross_pickup": {
+          "calls": 5165,
+          "ns": 73640
+        },
+        "affinity_votes": {
+          "calls": 517,
+          "ns": 11120
+        }
+      },
+      "S2": {
+        "resource_feedback": {
+          "calls": 97,
+          "ns": 275780
+        },
+        "observe": {
+          "calls": 0,
+          "ns": 0
+        },
+        "auto_dispatch": {
+          "calls": 6202,
+          "ns": 1215400
+        },
+        "strict_dispatch": {
+          "calls": 6202,
+          "ns": 262460
+        },
+        "shared_dispatch": {
+          "calls": 6202,
+          "ns": 132480
+        },
+        "sync_dispatch": {
+          "calls": 6202,
+          "ns": 951800
+        },
+        "ready_binding": {
+          "calls": 335,
+          "ns": 67160
+        },
+        "cross_pickup": {
+          "calls": 6202,
+          "ns": 93340
+        },
+        "affinity_votes": {
+          "calls": 635,
+          "ns": 13940
+        }
+      },
+      "S3": {
+        "resource_feedback": {
+          "calls": 133,
+          "ns": 69420
+        },
+        "observe": {
+          "calls": 0,
+          "ns": 0
+        },
+        "auto_dispatch": {
+          "calls": 8477,
+          "ns": 1460700
+        },
+        "strict_dispatch": {
+          "calls": 8477,
+          "ns": 341920
+        },
+        "shared_dispatch": {
+          "calls": 8477,
+          "ns": 165960
+        },
+        "sync_dispatch": {
+          "calls": 8477,
+          "ns": 1244040
+        },
+        "ready_binding": {
+          "calls": 467,
+          "ns": 104880
+        },
+        "cross_pickup": {
+          "calls": 8477,
+          "ns": 136900
+        },
+        "affinity_votes": {
+          "calls": 788,
+          "ns": 15980
+        }
+      },
+      "S4": {
+        "resource_feedback": {
+          "calls": 132,
+          "ns": 64980
+        },
+        "observe": {
+          "calls": 0,
+          "ns": 0
+        },
+        "auto_dispatch": {
+          "calls": 8443,
+          "ns": 1470760
+        },
+        "strict_dispatch": {
+          "calls": 8443,
+          "ns": 336220
+        },
+        "shared_dispatch": {
+          "calls": 8443,
+          "ns": 180620
+        },
+        "sync_dispatch": {
+          "calls": 8443,
+          "ns": 1276060
+        },
+        "ready_binding": {
+          "calls": 400,
+          "ns": 74060
+        },
+        "cross_pickup": {
+          "calls": 8443,
+          "ns": 115500
+        },
+        "affinity_votes": {
+          "calls": 847,
+          "ns": 21380
+        }
+      },
+      "S5": {
+        "resource_feedback": {
+          "calls": 0,
+          "ns": 0
+        },
+        "observe": {
+          "calls": 0,
+          "ns": 0
+        },
+        "auto_dispatch": {
+          "calls": 0,
+          "ns": 0
+        },
+        "strict_dispatch": {
+          "calls": 0,
+          "ns": 0
+        },
+        "shared_dispatch": {
+          "calls": 0,
+          "ns": 0
+        },
+        "sync_dispatch": {
+          "calls": 0,
+          "ns": 0
+        },
+        "ready_binding": {
+          "calls": 2048,
+          "ns": 146360
+        },
+        "cross_pickup": {
+          "calls": 0,
+          "ns": 0
+        },
+        "affinity_votes": {
+          "calls": 0,
+          "ns": 0
+        }
+      }
+    },
+    "ready_final": [
+      {
+        "version": 13,
+        "pickup": 0,
+        "tasks": 4096,
+        "neutral": 2265,
+        "weak": 1455,
+        "strong": 376
+      }
+    ],
+    "ready_ledger": [
+      {
+        "shape": 0,
+        "queued": [
+          770,
+          1278
+        ],
+        "claimed": [
+          770,
+          1278
+        ],
+        "executed": [
+          770,
+          1278
+        ]
+      },
+      {
+        "shape": 1,
+        "queued": [
+          716,
+          1332
+        ],
+        "claimed": [
+          716,
+          1332
+        ],
+        "executed": [
+          716,
+          1332
+        ]
+      },
+      {
+        "shape": 2,
+        "queued": [
+          0,
+          0
+        ],
+        "claimed": [
+          0,
+          0
+        ],
+        "executed": [
+          0,
+          0
+        ]
+      },
+      {
+        "shape": 3,
+        "queued": [
+          0,
+          0
+        ],
+        "claimed": [
+          0,
+          0
+        ],
+        "executed": [
+          0,
+          0
+        ]
+      }
+    ],
+    "ready_feedback": [
+      {
+        "writer": 0,
+        "refreshes": 384,
+        "probes": 0,
+        "attempts": 0,
+        "remote": 0,
+        "remote_multi": 0
+      },
+      {
+        "writer": 1,
+        "refreshes": 324,
+        "probes": 0,
+        "attempts": 0,
+        "remote": 0,
+        "remote_multi": 0
+      },
+      {
+        "writer": 2,
+        "refreshes": 388,
+        "probes": 0,
+        "attempts": 0,
+        "remote": 0,
+        "remote_multi": 0
+      },
+      {
+        "writer": 3,
+        "refreshes": 532,
+        "probes": 0,
+        "attempts": 0,
+        "remote": 0,
+        "remote_multi": 0
+      },
+      {
+        "writer": 4,
+        "refreshes": 528,
+        "probes": 0,
+        "attempts": 0,
+        "remote": 0,
+        "remote_multi": 0
+      },
+      {
+        "writer": 5,
+        "refreshes": 256,
+        "probes": 0,
+        "attempts": 0,
+        "remote": 0,
+        "remote_multi": 0
+      }
+    ],
+    "completion_ledger": [],
+    "reservation_ledger": [
+      {
+        "shape": 0,
+        "assigned": [
+          770,
+          1278
+        ],
+        "revoked": [
+          770,
+          1278
+        ]
+      },
+      {
+        "shape": 1,
+        "assigned": [
+          693,
+          1355
+        ],
+        "revoked": [
+          693,
+          1355
+        ]
+      },
+      {
+        "shape": 2,
+        "assigned": [
+          0,
+          0
+        ],
+        "revoked": [
+          0,
+          0
+        ]
+      },
+      {
+        "shape": 3,
+        "assigned": [
+          0,
+          0
+        ],
+        "revoked": [
+          0,
+          0
+        ]
+      }
+    ],
+    "final": [],
+    "groups": [],
+    "placement": [],
+    "blocks": [],
+    "prices": [],
+    "price_updates": [],
+    "tasks": 4096,
+    "logical_blocks": 4096,
+    "captured_execution_records": 4096,
+    "O_submit_ms": 6.371579999999986,
+    "O_placement_and_wire_ms": 1.60718,
+    "S_ready_binding_sum_ms": 0.53726,
+    "O_ready_binding_ms": 0.14636,
+    "S_phase_sum_ms": {
+      "complete": 4.607199999999989,
+      "dispatch": 7.966659999999959,
+      "resolve": 0.42315999999998577
+    },
+    "captured_wait_edges": 3584,
+    "single_side_wait_edges": 3584,
+    "cross_side_captured_wait_edges": 892,
+    "mixed_execution_tasks": 0,
+    "compute_hashes": {
+      "0": "0x212c407e5c39dda2",
+      "1": "0x4c0e49fc6b5f2f9f"
+    }
+  }
+}

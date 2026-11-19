@@ -1,0 +1,49 @@
+[mono_ns=6672203213260860][T0x3fffb3aa2420][INFO] configure_aicore_op_timeout: [device_runner_base.cpp:1666] aclrtSetOpExecuteTimeOutV2: requested=45000000 us, actual=47244640 us
+[mono_ns=6672203219054380][T0x3fffb3aa2420][INFO] ensure_device_initialized: [device_runner_base.cpp:1724] DeviceRunner: device=0 set, streams created
+[mono_ns=6672203219107250][T0x3fffb3aa2420][INFO] ensure_device_initialized: [device_runner_base.cpp:1731] DeviceRunner: device=0 max_block_dim=24 (cube=24, vector=48)
+[mono_ns=6672203255668840][T0x3fffb3aa2420][INFO] BootstrapDispatcher: [load_aicpu_op.cpp:214] BootstrapDispatcher: bundled dispatcher (14472 B) + inner SO (4465768 B) uploaded; inner SO at simpler_inner_2ff769fa983e8d24_0.so
+[mono_ns=6672203255751330][T0x3fffb3aa2420][INFO] ensure_binaries_loaded: [device_runner_base.cpp:1926] DeviceRunner: inner SO uploaded to preinstall via dispatcher bootstrap
+[mono_ns=6672203256193250][T0x3fffb3aa2420][INFO] Init: [load_aicpu_op.cpp:382] LoadAicpuOp::Init: JSON=/tmp/simpler_inner_2ff769fa983e8d24_49044.json inner_basename=simpler_inner_2ff769fa983e8d24_0.so
+[mono_ns=6672203256412450][T0x3fffb3aa2420][INFO] Init: [load_aicpu_op.cpp:390] LoadAicpuOp: Loaded inner SO via JSON, handle=0x2aaac6866b60
+[mono_ns=6672203256575930][T0x3fffb3aa2420][INFO] Init: [load_aicpu_op.cpp:407] LoadAicpuOp: resolved handle for simpler_aicpu_exec (opType=simpler_aicpu_exec_2ff769fa983e8d24): 0x2aaac6869e30
+[mono_ns=6672203256595170][T0x3fffb3aa2420][INFO] Init: [load_aicpu_op.cpp:407] LoadAicpuOp: resolved handle for simpler_aicpu_init (opType=simpler_aicpu_init_2ff769fa983e8d24): 0x2aaac686a320
+[mono_ns=6672203256609000][T0x3fffb3aa2420][INFO] Init: [load_aicpu_op.cpp:407] LoadAicpuOp: resolved handle for simpler_aicpu_register_callable (opType=simpler_aicpu_register_callable_2ff769fa983e8d24): 0x2aaac686a810
+[mono_ns=6672203256616740][T0x3fffb3aa2420][INFO] ensure_binaries_loaded: [device_runner_base.cpp:1942] DeviceRunner: inner SO registered (runtime entry handles ready)
+[mono_ns=6672203256624150][T0x3fffb3aa2420][INFO] ensure_binaries_loaded: [device_runner_base.cpp:1955] DeviceRunner: binaries loaded
+[mono_ns=6672203256660350][T0x3fffb3aa2420][INFO] fill_init_arch_fields: [device_runner.cpp:155] fill_init_arch_fields: device 0 nocache alias offset=0x80000000000
+[mono_ns=6672203256668160][T0x3fffb3aa2420][INFO] ensure_aicpu_init_launched: [device_runner_base.cpp:1871] === launch_aicpu_payload simpler_aicpu_init ===
+
+=== Runtime: tensormap_and_ringbuffer  Level: 2  Pipeline depth: default ===
+  TestDummyTask::AdaptiveDummyChain ...
+[mono_ns=6672206940546840][T0x3fffb3aa2420][INFO] register_callable_impl: [runtime_maker.cpp:313] Registering 2 kernel(s) in register_callable_impl
+[mono_ns=6672206960882530][T0x3fffb3aa2420][TIMING] log_callable_image: Callable image: device=0 runner=0x2aaac3e10580 chip_hash=0x9226e3aa46135b9e chip_dev=0x12c0c001a000 upload_bytes=660688 children=2
+[mono_ns=6672206960899200][T0x3fffb3aa2420][TIMING] log_callable_image: Callable code: device=0 runner=0x2aaac3e10580 chip_hash=0x9226e3aa46135b9e chip_dev=0x12c0c001a000 func_id=0 code_begin=0x12c0c00bb360 code_end_exclusive=0x12c0c00bb390 code_bytes=48 code_fnv1a64=0x1810b847dcc401e8
+[mono_ns=6672206960902790][T0x3fffb3aa2420][TIMING] log_callable_image: Callable code: device=0 runner=0x2aaac3e10580 chip_hash=0x9226e3aa46135b9e chip_dev=0x12c0c001a000 func_id=1 code_begin=0x12c0c00bb460 code_end_exclusive=0x12c0c00bb494 code_bytes=52 code_fnv1a64=0xbe44f66bc0774cd7
+[mono_ns=6672206960911190][T0x3fffb3aa2420][INFO] register_callable_impl: [runtime_maker.cpp:339] Orchestration SO: 642552 bytes uploaded (host-only)
+[mono_ns=6672206960917230][T0x3fffb3aa2420][TIMING] record_device_orch_callable: [device_runner_base.cpp:2425] Callable registration: device=0 runner=0x2aaac3e10580 cid=0 chip_hash=0x9226e3aa46135b9e aicore_image_hash=0xb51908a413142e3d orch_hash=0x53b2b8f20816d6ec orch_bytes=642552
+[mono_ns=6672206960998410][T0x3fffb3aa2420][INFO] register_callable_on_device: [device_runner_base.cpp:2340] === launch_aicpu_payload simpler_aicpu_register_callable ===
+[mono_ns=6672206962188550][T0x3fffb3aa2420][INFO] commit_device_register: [device_runner_base.cpp:2291] AICPU callable load committed cid=0 (count=1)
+[TIMING] torch_backend_autoload setting=unset raw=null raw_truncated=false effective=enabled torch_imported=true torch_npu_loaded=false
+[WARNING] Warning: no usable deps.json at /data/aicpu-cluster-study/orchestrator-pressure-runtime/outputs/TestDummyTask_AdaptiveDummyChain_20261119_131140/deps.json; Perfetto trace will have no dependency arrows. Run a dep_gen capture (--enable-dep-gen) and pass --deps-json <path> to add them.
+  TestDummyTask::AdaptiveDummyChain PASSED
+  TestDummyTask::ChainSameCluster ...
+[WARNING] Warning: no usable deps.json at /data/aicpu-cluster-study/orchestrator-pressure-runtime/outputs/TestDummyTask_ChainSameCluster_20261119_131140/deps.json; Perfetto trace will have no dependency arrows. Run a dep_gen capture (--enable-dep-gen) and pass --deps-json <path> to add them.
+  TestDummyTask::ChainSameCluster PASSED
+  TestDummyTask::ChainAlternatingCluster ...
+[WARNING] Warning: no usable deps.json at /data/aicpu-cluster-study/orchestrator-pressure-runtime/outputs/TestDummyTask_ChainAlternatingCluster_20261119_131140/deps.json; Perfetto trace will have no dependency arrows. Run a dep_gen capture (--enable-dep-gen) and pass --deps-json <path> to add them.
+  TestDummyTask::ChainAlternatingCluster PASSED
+  TestDummyTask::ChainClusterOne ...
+[WARNING] Warning: no usable deps.json at /data/aicpu-cluster-study/orchestrator-pressure-runtime/outputs/TestDummyTask_ChainClusterOne_20261119_131141/deps.json; Perfetto trace will have no dependency arrows. Run a dep_gen capture (--enable-dep-gen) and pass --deps-json <path> to add them.
+  TestDummyTask::ChainClusterOne PASSED
+  TestDummyTask::SingleDummyAutoDep ...
+[WARNING] Warning: no usable deps.json at /data/aicpu-cluster-study/orchestrator-pressure-runtime/outputs/TestDummyTask_SingleDummyAutoDep_20261119_131141/deps.json; Perfetto trace will have no dependency arrows. Run a dep_gen capture (--enable-dep-gen) and pass --deps-json <path> to add them.
+  TestDummyTask::SingleDummyAutoDep PASSED
+  TestDummyTask::LongDummyChain ...
+[WARNING] Warning: no usable deps.json at /data/aicpu-cluster-study/orchestrator-pressure-runtime/outputs/TestDummyTask_LongDummyChain_20261119_131141/deps.json; Perfetto trace will have no dependency arrows. Run a dep_gen capture (--enable-dep-gen) and pass --deps-json <path> to add them.
+  TestDummyTask::LongDummyChain PASSED
+  TestDummyTask::DummyExplicitDepBarrier ...
+[WARNING] Warning: no usable deps.json at /data/aicpu-cluster-study/orchestrator-pressure-runtime/outputs/TestDummyTask_DummyExplicitDepBarrier_20261119_131141/deps.json; Perfetto trace will have no dependency arrows. Run a dep_gen capture (--enable-dep-gen) and pass --deps-json <path> to add them.
+  TestDummyTask::DummyExplicitDepBarrier PASSED
+  TestDummyTask::DenseFanoutFanin ...
+[WARNING] Warning: no usable deps.json at /data/aicpu-cluster-study/orchestrator-pressure-runtime/outputs/TestDummyTask_DenseFanoutFanin_20261119_131141/deps.json; Perfetto trace will have no dependency arrows. Run a dep_gen capture (--enable-dep-gen) and pass --deps-json <path> to add them.
+  TestDummyTask::DenseFanoutFanin PASSED
