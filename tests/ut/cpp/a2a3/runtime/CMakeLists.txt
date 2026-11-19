@@ -14,7 +14,7 @@ macro(a2a3_runtime_case src)
     tmr_case(${src} ARCHS a2a3 ${ARGN})
 endmacro()
 
-tmr_case(test_cluster_partitioner.cpp ARCHS a2a3 NO_OBJS)
+tmr_case(test_ready_affinity.cpp ARCHS a2a3 NO_OBJS)
 
 # The scheduler owns retirement; this sink records calls at the platform boundary.
 if(APPLE)

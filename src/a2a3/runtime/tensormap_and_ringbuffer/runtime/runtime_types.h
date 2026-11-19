@@ -38,7 +38,7 @@
 #include "submit_types.h"
 #include "tensormap_and_ringbuffer/task_id.h"
 #include "types.h"
-#include "aicpu_cluster_partition.h"
+#include "ready_affinity.h"
 
 // Spin-wait hint for AICPU threads.  On real hardware the AICPU has dedicated
 // ARM A55 cores — no OS yield is needed, so the hint is a no-op.  In simulation
@@ -372,7 +372,7 @@ struct TaskPayload {
     // / scalars offsets only. Resolved at submit; evaluated by the scheduler at
     // dispatch.
     alignas(64) DispatchPredicate predicate;
-    simpler::tmr::AdaptiveTaskState placement;
+    simpler::tmr::ReadyTaskState placement;
     // === Cache lines 10-73 (4096B) — tensors (alignas(64) forces alignment) ===
     simpler::tmr::Tensor tensors[MAX_TENSOR_ARGS];
     // === Cache lines 74-75 (128B) — scalars ===

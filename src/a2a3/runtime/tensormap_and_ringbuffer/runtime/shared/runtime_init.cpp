@@ -167,7 +167,7 @@ bool SchedulerState::init_data_from_layout(const SchedulerLayout &layout, Device
     sched->sm_header = reinterpret_cast<SharedMemoryHeader *>(sm_dev_base);
     sched->advance_pending_mask.store(0, std::memory_order_relaxed);
     sched->has_cluster_targets.store(false, std::memory_order_relaxed);
-    sched->placement_feedback.reset();
+    sched->ready_feedback.reset();
 #if SIMPLER_SCHED_PROFILING
     sched->tasks_completed.store(0, std::memory_order_relaxed);
     sched->tasks_consumed.store(0, std::memory_order_relaxed);
@@ -249,7 +249,7 @@ void SchedulerState::reset_for_reuse(const SchedulerLayout &layout, void *sm_dev
     sched->sm_header = reinterpret_cast<SharedMemoryHeader *>(sm_dev_base);
     sched->advance_pending_mask.store(0, std::memory_order_relaxed);
     sched->has_cluster_targets.store(false, std::memory_order_relaxed);
-    sched->placement_feedback.reset();
+    sched->ready_feedback.reset();
 #if SIMPLER_SCHED_PROFILING
     sched->tasks_completed.store(0, std::memory_order_relaxed);
     sched->tasks_consumed.store(0, std::memory_order_relaxed);
@@ -301,7 +301,9 @@ void SchedulerState::wire_arena_pointers(const SchedulerLayout &layout, DeviceAr
                 &sched->cluster_ready_queues[c][i], arena, layout.off_cluster_ready_queue_slots[c][i]
             );
         }
-        ready_queue_wire_arena_pointers(&sched->cluster_dummy_queues[c], arena, layout.off_cluster_dummy_queue_slots[c]);
+        ready_queue_wire_arena_pointers(
+            &sched->cluster_dummy_queues[c], arena, layout.off_cluster_dummy_queue_slots[c]
+        );
     }
     for (int i = 0; i < NUM_RESOURCE_SHAPES; i++) {
         ready_queue_wire_arena_pointers(
@@ -476,7 +478,7 @@ bool OrchestratorState::init_data_from_layout(
     orch->scope_tasks_size = 0;
     orch->scope_tasks_capacity = layout.scope_tasks_cap;
     orch->scope_stack_top = -1;
-    orch->cluster_partitioner.reset();
+    orch->affinity_builder.reset();
     orch->scope_stack_capacity = layout.scope_stack_capacity;
     orch->manual_begin_depth = CHIP_MAX_SCOPE_DEPTH;
 
@@ -501,7 +503,7 @@ bool OrchestratorState::reset_for_reuse(
     // bitmap before any submit can read it as a producer, so entries left from
     // a previous run are unreachable.
     orch->submit_seq = 0;
-    orch->cluster_partitioner.reset();
+    orch->affinity_builder.reset();
 
     uint32_t next_epoch = orch->fanin_seen_current_epoch + 1;
     if (next_epoch == 0) {

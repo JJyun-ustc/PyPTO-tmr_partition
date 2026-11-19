@@ -104,7 +104,7 @@ struct OrchestratorState {
     // and publishes ready tasks through it before scheduler workers dispatch.
     SchedulerState *scheduler;
     int32_t aicpu_cluster_sched_count[2]{};
-    simpler::tmr::ClusterPartitioner cluster_partitioner;
+    simpler::tmr::AffinityBuilder affinity_builder;
 
     // Total core counts set once at executor init; used for submit-time deadlock detection.
     int32_t total_cluster_count{0};  // AIC cores = MIX clusters

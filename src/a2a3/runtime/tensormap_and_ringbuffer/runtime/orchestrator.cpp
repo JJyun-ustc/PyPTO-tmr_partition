@@ -829,7 +829,7 @@ void OrchestratorState::begin_scope(ScopeMode mode) {
 
     bool already_in_manual_scope = orch->in_manual_scope();
     ++orch->scope_stack_top;
-    orch->cluster_partitioner.open_scope(orch->scope_stack_top);
+    orch->affinity_builder.open_scope(orch->scope_stack_top);
     orch->scope_begins[orch->scope_stack_top] = orch->scope_tasks_size;
     if (mode == ScopeMode::MANUAL && !already_in_manual_scope) {
         orch->manual_begin_depth = orch->scope_stack_top;
@@ -887,7 +887,7 @@ void OrchestratorState::end_scope() {
 #endif
 
     bool ending_manual_scope = orch->scope_stack_top == orch->manual_begin_depth;
-    orch->cluster_partitioner.close_scope(orch->scope_stack_top);
+    orch->affinity_builder.close_scope(orch->scope_stack_top);
     int32_t begin = orch->scope_begins[orch->scope_stack_top--];
     int32_t count = orch->scope_tasks_size - begin;
     if (ending_manual_scope) {
@@ -1202,84 +1202,36 @@ static TaskOutputTensors submit_task_common(
     payload.init(args, result, prepared.alloc_result, layout);
 
     if (args.aicpu_cluster() == -2 && !cur_slot_state.task_attrs.requires_sync_start()) {
-        uint64_t decision_begin = 0;
-        auto &feedback = sched->placement_feedback;
-        auto &partitioner = orch->cluster_partitioner;
-        bool tracing = false;
+        auto &feedback = sched->ready_feedback;
+        auto &builder = orch->affinity_builder;
+        [[maybe_unused]] uint64_t begin = 0;
 #if SIMPLER_DFX
-        tracing = orch->chip_swimlane_level >= ChipSwimlaneLevel::SCHED_PHASES;
+        if (orch->chip_swimlane_level >= ChipSwimlaneLevel::SCHED_PHASES) begin = get_sys_cnt_aicpu();
 #endif
-        if (tracing) decision_begin = get_sys_cnt_aicpu();
-        uint64_t trace_start = decision_begin;
-        auto trace_stage = [&](int stage) {
-            if (!tracing) return;
-            uint64_t now = get_sys_cnt_aicpu();
-            partitioner.trace.ticks[stage] += now - trace_start;
-            ++partitioner.trace.calls[stage];
-            trace_start = now;
-        };
-
-        if (partitioner.decision_count() == 0) {
+        if (!builder.tasks) {
             feedback.schedulers[0] = orch->aicpu_cluster_sched_count[0];
             feedback.schedulers[1] = orch->aicpu_cluster_sched_count[1];
             feedback.enabled.store(true, std::memory_order_release);
             sched->has_cluster_targets.store(true, std::memory_order_release);
         }
-        partitioner.calibrate_once(feedback);
-        trace_stage(0);
-        ResourceShape shape = active_mask.to_shape();
-        int shape_index = static_cast<int>(shape);
         int depth = orch->scope_stack_top < 0 ? 0 : orch->scope_stack_top;
-        if (!partitioner.scope_ids[depth]) partitioner.open_scope(depth);
-        uint64_t scope = partitioner.scope_ids[depth];
-        uint32_t units = shape == ResourceShape::DUMMY ? 1 : cur_slot_state.logical_block_num;
-        uint32_t pending = 0, sources[2]{};
-        uint64_t parent_group = 0;
-        int inherited = -1;
-        // The existing reduced fanin list supplies online group membership.
-        // Once a usable parent is found, avoid further shared-state reads.
+        if (!builder.scope_ids[depth]) builder.open_scope(depth);
+        uint32_t scope = builder.scope_ids[depth];
+        simpler::tmr::AffinityVote vote;
         fanin_builder.for_each([&](ChipTaskSlotState *producer, DepFlags flags) {
-            if (!dep_has_wait(flags) || inherited >= 0) return;
-            const auto &parent = producer->payload->placement;
-            if (partitioner.can_inherit(parent, scope)) {
-                int actual = parent.dispatch_cluster.load(std::memory_order_acquire);
-                inherited = actual >= 0 ? actual : parent.preferred_cluster;
-                if (inherited >= 0 && feedback.schedulers[inherited]) parent_group = parent.group;
-                else inherited = -1;
-            }
-            if (inherited >= 0 || producer->task_state.load(std::memory_order_acquire) != CHIP_TASK_PENDING) return;
-            ++pending;
-            int c = parent.dispatch_cluster.load(std::memory_order_acquire);
-            if (c < 0) c = parent.scope ? parent.preferred_cluster : producer->task->target_aicpu_cluster;
-            if (c >= 0 && c < 2) ++sources[c];
+            if (dep_has_wait(flags))
+                vote.add(producer->payload->placement, producer->task->target_aicpu_cluster, scope);
         });
-        trace_stage(2);
-        simpler::tmr::PartitionDecision decision;
-        if (inherited >= 0) {
-            decision = partitioner.inherit(inherited);
-        } else {
-            trace_stage(1);
-            auto load = partitioner.load(feedback, shape_index);
-            trace_stage(3);
-            decision = partitioner.choose(load, pending, sources, shape_index, feedback.orchestrator_cluster, units);
+        vote.finish(payload.placement, scope);
+        builder.record(payload.placement);
+        task.target_aicpu_cluster = -1;
+        cur_slot_state.task_attrs.set_early_resolve(false);
+#if SIMPLER_DFX
+        if (begin) {
+            builder.trace.ticks[0] += get_sys_cnt_aicpu() - begin;
+            ++builder.trace.calls[0];
         }
-        if (decision.cluster >= 0) {
-            // Unbound automatic tasks carry only a preference until ready.
-            task.target_aicpu_cluster = -1;
-            payload.placement.scope = scope;
-            payload.placement.preferred_cluster = decision.cluster;
-            partitioner.join_group(payload.placement, parent_group, scope);
-            if (tracing) {
-                payload.placement.submit_tick = get_sys_cnt_aicpu();
-                uint64_t ticks = payload.placement.submit_tick - decision_begin;
-                partitioner.decision_ticks += ticks;
-                if (ticks > partitioner.max_decision_ticks) partitioner.max_decision_ticks = ticks;
-            }
-            partitioner.scope_assignments[depth]++;
-            partitioner.commit(decision.cluster, shape_index, units);
-            cur_slot_state.task_attrs.set_early_resolve(false);
-        }
-        trace_stage(4);
+#endif
     }
 
     // Dispatch predicate: resolve the (tensor, indices) to an absolute GM address
@@ -1354,8 +1306,8 @@ static TaskOutputTensors submit_task_common(
 
 #if SIMPLER_DFX
     if (wire_begin) {
-        orch->cluster_partitioner.trace.ticks[5] += get_sys_cnt_aicpu() - wire_begin;
-        ++orch->cluster_partitioner.trace.calls[5];
+        orch->affinity_builder.trace.ticks[5] += get_sys_cnt_aicpu() - wire_begin;
+        ++orch->affinity_builder.trace.calls[5];
     }
 #endif
     CYCLE_COUNT_LAP(g_orch_fanin_cycle);

@@ -209,10 +209,6 @@ private:
     int32_t sched_thread_num_{0};
     int32_t aicpu_thread_num_{0};
     int32_t aicpu_cluster_ids_[MAX_AICPU_THREADS]{};
-    struct alignas(64) StealClock {
-        uint32_t loop{0}, next{0};
-    };
-    StealClock steal_clocks_[MAX_AICPU_THREADS]{};
     int32_t cores_total_num_{0};
 
     // Cluster-ordered worker_id lists, populated by post_handshake_init().

@@ -539,10 +539,10 @@ struct SchedulerState {
     ChipReadyQueue dummy_ready_queue;
     ChipReadyQueue cluster_dummy_queues[2];
     std::atomic<bool> has_cluster_targets{false};
-    simpler::tmr::PartitionShared placement_feedback;
-    static_assert(simpler::tmr::PARTITION_THREADS >= PLATFORM_MAX_AICPU_THREADS);
-    static_assert(simpler::tmr::PARTITION_SCOPE_DEPTH >= CHIP_MAX_SCOPE_DEPTH);
-    static_assert(simpler::tmr::PARTITION_SHAPES == static_cast<int>(ResourceShape::DUMMY) + 1);
+    simpler::tmr::ReadyFeedback ready_feedback;
+    static_assert(simpler::tmr::READY_THREADS >= PLATFORM_MAX_AICPU_THREADS);
+    static_assert(simpler::tmr::READY_SCOPE_DEPTH >= CHIP_MAX_SCOPE_DEPTH);
+    static_assert(simpler::tmr::READY_SHAPES == static_cast<int>(ResourceShape::DUMMY) + 1);
 
     ChipReadyQueue &ready_queue_for(const ChipTaskSlotState &slot_state, ResourceShape shape, bool sync) {
         int32_t cluster = slot_state.task->target_aicpu_cluster;
@@ -552,8 +552,8 @@ struct SchedulerState {
         }
         if (cluster >= 0 && slot_state.payload->placement.scope && slot_state.logical_block_num == 1)
             return auto_ready_queues[cluster][static_cast<int32_t>(shape)];
-        return cluster < 0 ? ready_queues[static_cast<int32_t>(shape)]
-                           : cluster_ready_queues[cluster][static_cast<int32_t>(shape)];
+        return cluster < 0 ? ready_queues[static_cast<int32_t>(shape)] :
+                             cluster_ready_queues[cluster][static_cast<int32_t>(shape)];
     }
 
     ChipReadyQueue &dummy_queue_for(const ChipTaskSlotState &slot_state) {
@@ -573,73 +573,41 @@ struct SchedulerState {
     // =========================================================================
 
     void stamp_ready_queue(ChipTaskSlotState &slot_state) {
-        bool adaptive = slot_state.payload->placement.scope != 0;
-        bool sample = adaptive && !placement_feedback.calibration_done.load(std::memory_order_acquire);
+        auto &metadata = slot_state.payload->placement;
+        [[maybe_unused]] uint64_t begin = 0;
 #if SIMPLER_DFX
-        uint64_t binding_begin =
-            adaptive && get_chip_swimlane_level() >= ChipSwimlaneLevel::SCHED_PHASES ? get_sys_cnt_aicpu() : 0;
+        if (metadata.scope && get_chip_swimlane_level() >= ChipSwimlaneLevel::SCHED_PHASES) begin = get_sys_cnt_aicpu();
 #endif
-        if (adaptive) {
-            auto &metadata = slot_state.payload->placement;
-            if (sample && metadata.ready_writer == simpler::tmr::PARTITION_THREADS - 1 &&
-                metadata.release_cluster < 0) {
-                metadata.release_tick = get_sys_cnt_aicpu();
-                metadata.release_cluster = placement_feedback.orchestrator_cluster;
-                metadata.reserved |= simpler::tmr::PARTITION_FROM_O;
-            }
-            ResourceShape shape = slot_state.active_mask.to_shape();
-            if (!(metadata.reserved & simpler::tmr::PARTITION_READY)) {
-                int pref = metadata.preferred_cluster;
-                if (pref < 0) pref = slot_state.task->target_aicpu_cluster;
-                uint64_t depth[2]{};
-                for (int side = 0; side < 2; ++side)
-                    depth[side] =
-                        placement_feedback.side_queue[side][static_cast<int>(shape)].load(std::memory_order_relaxed) &
-                        0xffffffffu;
-                int source = metadata.reserved & simpler::tmr::PARTITION_FROM_O ? -1 : metadata.release_cluster;
-                slot_state.task->target_aicpu_cluster =
-                    simpler::tmr::partition_ready_side(pref, source, depth, placement_feedback.schedulers);
-                uint64_t units = shape == ResourceShape::DUMMY ? 1 : slot_state.logical_block_num;
-                auto &row = placement_feedback.threads[metadata.ready_writer].summary[static_cast<int>(shape)];
-                row.begin_write();
-                simpler::tmr::PartitionSummary::add(row.released[pref], units);
-                simpler::tmr::PartitionSummary::add(row.queued[slot_state.task->target_aicpu_cluster], units);
-                row.end_write();
-                metadata.reserved |= simpler::tmr::PARTITION_READY;
-            }
-            int c = slot_state.task->target_aicpu_cluster;
-            if (sample) {
-                uint64_t hint =
-                    placement_feedback.side_queue[c][static_cast<int>(shape)].load(std::memory_order_relaxed);
-                uint64_t depth = hint & 0xffffffffu;
-                metadata.ready_depth = static_cast<uint32_t>(depth);
-                if (depth == 0 && (hint >> 32)) metadata.reserved |= simpler::tmr::PARTITION_IDLE_AT_PUBLISH;
-            }
+        if (metadata.scope && !metadata.bound) {
+            int shape = static_cast<int>(slot_state.active_mask.to_shape());
+            uint64_t units =
+                slot_state.active_mask.to_shape() == ResourceShape::DUMMY ? 1 : slot_state.logical_block_num;
+            int side = ready_feedback.bind(metadata.ready_writer, shape, metadata, units);
+            slot_state.task->target_aicpu_cluster = side;
+            simpler::tmr::ReadyRow::add(
+                ready_feedback.writers[metadata.ready_writer].rows[shape].enqueued[side], units
+            );
+            metadata.bound = true;
         }
 #if SIMPLER_DFX
-        if (sample || get_chip_swimlane_level() >= ChipSwimlaneLevel::SCHED_PHASES) {
+        if (get_chip_swimlane_level() >= ChipSwimlaneLevel::SCHED_PHASES) {
             slot_state.payload->ready_queue_timestamp.store(get_sys_cnt_aicpu(), std::memory_order_relaxed);
-        }
-#else
-        if (sample) slot_state.payload->ready_queue_timestamp.store(get_sys_cnt_aicpu(), std::memory_order_relaxed);
-#endif
-#if SIMPLER_DFX
-        if (binding_begin) {
-            auto &trace = placement_feedback.threads[slot_state.payload->placement.ready_writer].trace;
-            trace.ticks[6] += get_sys_cnt_aicpu() - binding_begin;
-            ++trace.calls[6];
+            if (begin) {
+                auto &trace = ready_feedback.writers[metadata.ready_writer].trace;
+                trace.ticks[6] += get_sys_cnt_aicpu() - begin;
+                ++trace.calls[6];
+            }
         }
 #endif
     }
 
     static void
-    record_ready_origin(ChipTaskSlotState &slot_state, const ChipTaskSlotState *producer, uint64_t tick, int writer) {
-        if (!slot_state.payload->placement.scope || producer == nullptr) return;
+    record_ready_origin(ChipTaskSlotState &slot_state, const ChipTaskSlotState *producer, uint64_t, int writer) {
+        if (!slot_state.payload->placement.scope || !producer) return;
         auto &record = slot_state.payload->placement;
         record.ready_writer = writer;
-        record.release_tick = tick;
-        int c = producer->payload->placement.dispatch_cluster.load(std::memory_order_acquire);
-        record.release_cluster = c >= 0 ? c : producer->task->target_aicpu_cluster;
+        int side = producer->payload->placement.dispatch_cluster.load(std::memory_order_acquire);
+        record.release_cluster = side >= 0 ? side : producer->task->target_aicpu_cluster;
     }
 
     // Route a ready slot to the right global queue. Dep-only tasks — DUMMY-shaped
@@ -1203,7 +1171,7 @@ struct SchedulerState {
     bool route_ready_once(
         ChipTaskSlotState &slot_state, EarlyDispatchReleaseSink *sink = nullptr,
         const ChipTaskSlotState *producer = nullptr, uint64_t release_tick = 0,
-        int writer = simpler::tmr::PARTITION_THREADS - 1
+        int writer = simpler::tmr::READY_THREADS - 1
     ) {
         if (!try_claim_ready_once(slot_state)) return false;
         record_ready_origin(slot_state, producer, release_tick, writer);
@@ -1235,7 +1203,7 @@ struct SchedulerState {
     bool route_ready_once(
         ChipTaskSlotState &slot_state, uint64_t &atomic_count, uint64_t &push_wait,
         EarlyDispatchReleaseSink *sink = nullptr, const ChipTaskSlotState *producer = nullptr,
-        uint64_t release_tick = 0, int writer = simpler::tmr::PARTITION_THREADS - 1
+        uint64_t release_tick = 0, int writer = simpler::tmr::READY_THREADS - 1
     ) {
         uint8_t flags = slot_state.lifecycle_flags.load(std::memory_order_acquire);
         atomic_count += 1;  // lifecycle_flags load
@@ -1279,7 +1247,7 @@ struct SchedulerState {
     bool release_fanin_and_check_ready(
         ChipTaskSlotState &slot_state, EarlyDispatchReleaseSink *sink = nullptr,
         const ChipTaskSlotState *producer = nullptr, uint64_t release_tick = 0,
-        int writer = simpler::tmr::PARTITION_THREADS - 1
+        int writer = simpler::tmr::READY_THREADS - 1
     ) {
         // Atomically increment fanin_refcount and check if all producers are done
         // ACQ_REL on fanin_refcount already synchronizes with the orchestrator's
@@ -1296,7 +1264,7 @@ struct SchedulerState {
     bool release_fanin_and_check_ready(
         ChipTaskSlotState &slot_state, uint64_t &atomic_count, uint64_t &push_wait,
         EarlyDispatchReleaseSink *sink = nullptr, const ChipTaskSlotState *producer = nullptr,
-        uint64_t release_tick = 0, int writer = simpler::tmr::PARTITION_THREADS - 1
+        uint64_t release_tick = 0, int writer = simpler::tmr::READY_THREADS - 1
     ) {
         int32_t new_refcount = slot_state.fanin_refcount.fetch_add(1, std::memory_order_acq_rel) + 1;
         atomic_count += 1;  // fanin_refcount.fetch_add
@@ -1368,7 +1336,7 @@ struct SchedulerState {
 #else
     uint32_t
 #endif
-    on_task_complete(ChipTaskSlotState &slot_state, int thread_idx = simpler::tmr::PARTITION_THREADS - 1) {
+    on_task_complete(ChipTaskSlotState &slot_state, int thread_idx = simpler::tmr::READY_THREADS - 1) {
 #if SIMPLER_SCHED_PROFILING
         CompletionStats stats = {0, 0, 0, true};
 #else
@@ -1418,9 +1386,8 @@ struct SchedulerState {
         // below; their dispatch_fanin propagation is collected here and replayed
         // after the walk, so no consumer's doorbell waits on a sibling's propagate.
         EarlyDispatchReleaseSink rel_sink;
-        uint64_t placement_release_tick = placement_feedback.enabled.load(std::memory_order_acquire) &&
-                                                  !placement_feedback.calibration_done.load(std::memory_order_acquire) ?
-                                              get_sys_cnt_aicpu() : 0;
+        if (ready_feedback.enabled.load(std::memory_order_acquire)) ready_feedback.begin_batch(thread_idx);
+        uint64_t placement_release_tick = 0;
         while (current != nullptr) {
             ChipTaskSlotState &consumer_slot = *current->slot_state;
 #if SIMPLER_SCHED_PROFILING

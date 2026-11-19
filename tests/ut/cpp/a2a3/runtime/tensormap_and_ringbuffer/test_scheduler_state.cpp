@@ -442,7 +442,8 @@ TEST_F(SchedulerStateTest, AutomaticSingleBlockAndStrictTasksHaveSeparateQueues)
     automatic.task->target_aicpu_cluster = 0;
     strict.task->target_aicpu_cluster = 0;
     automatic.payload->placement.scope = 1;
-    sched.placement_feedback.calibration_done.store(true);
+    automatic.payload->placement.preferred_cluster = 0;
+    sched.ready_feedback.schedulers[0] = 1;
     sched.push_ready_routed(&automatic);
     sched.push_ready_routed(&strict);
 
@@ -455,18 +456,18 @@ TEST_F(SchedulerStateTest, AutomaticSingleBlockAndStrictTasksHaveSeparateQueues)
     EXPECT_EQ(out[0], &strict);
 }
 
-TEST_F(SchedulerStateTest, FrozenCalibrationKeepsReadyAccountingWithoutSampleStamp) {
+TEST_F(SchedulerStateTest, ReadyAccountingIsOncePerTaskWithoutTimingSamples) {
     alignas(64) ChipTaskSlotState slot;
     init_slot(slot, CHIP_TASK_PENDING, 1, 1);
     slot.task->target_aicpu_cluster = 1;
     slot.logical_block_num = 16;
     slot.payload->placement.scope = 1;
-    sched.placement_feedback.calibration_done.store(true);
+    slot.payload->placement.preferred_cluster = 1;
+    sched.ready_feedback.schedulers[1] = 1;
     sched.stamp_ready_queue(slot);
     sched.stamp_ready_queue(slot);
-    EXPECT_EQ(sched.placement_feedback.threads[simpler::tmr::PARTITION_THREADS - 1].summary[0].queued[1].load(), 16u);
+    EXPECT_EQ(sched.ready_feedback.writers[simpler::tmr::READY_THREADS - 1].rows[0].enqueued[1].load(), 16u);
     EXPECT_EQ(slot.payload->ready_queue_timestamp.load(), 0u);
-    EXPECT_EQ(slot.payload->placement.release_tick, 0u);
 }
 
 TEST(CoreTrackerTest, MixPartiallyRunningClusterAdmittedAsPerCorePlacement) {
@@ -683,24 +684,22 @@ TEST_F(SchedulerStateTest, DeferredBindingUsesActualProducerAndAccountsExactlyOn
     alignas(64) ChipTaskSlotState producer, consumer;
     init_slot(producer, CHIP_TASK_COMPLETED, 1, 1);
     init_slot(consumer, CHIP_TASK_PENDING, 1, 1);
-    sched.placement_feedback.schedulers[0] = 2;
-    sched.placement_feedback.schedulers[1] = 3;
-    sched.placement_feedback.calibration_done.store(true);
+    sched.ready_feedback.schedulers[0] = 2;
+    sched.ready_feedback.schedulers[1] = 3;
     producer.payload->placement.preferred_cluster = 0;
     producer.payload->placement.dispatch_cluster.store(1);
     consumer.payload->placement.scope = 1;
-    consumer.payload->placement.preferred_cluster = 0;
+    consumer.payload->placement.preferred_cluster = -1;
     consumer.task->target_aicpu_cluster = -1;
-    // Sampling is frozen (tick=0); actual release origin is still required.
+    // Release origin remains available without timing samples.
     sched.record_ready_origin(consumer, &producer, 0, 2);
     sched.stamp_ready_queue(consumer);
     sched.stamp_ready_queue(consumer);
-    EXPECT_EQ(consumer.payload->placement.preferred_cluster, 0);
+    EXPECT_EQ(consumer.payload->placement.preferred_cluster, -1);
     EXPECT_EQ(consumer.task->target_aicpu_cluster, 1);
-    auto &row = sched.placement_feedback.threads[2].summary[0];
-    EXPECT_EQ(row.released[0].load(), 1u);
-    EXPECT_EQ(row.queued[1].load(), 1u);
-    EXPECT_EQ(row.queued[0].load(), 0u);
+    auto &row = sched.ready_feedback.writers[2].rows[0];
+    EXPECT_EQ(row.enqueued[1].load(), 1u);
+    EXPECT_EQ(row.enqueued[0].load(), 0u);
     // A subsequent foreign pickup changes execution affinity, never queue debit.
     consumer.payload->placement.dispatch_cluster.store(0);
     EXPECT_EQ(consumer.task->target_aicpu_cluster, 1);
@@ -723,17 +722,15 @@ TEST_F(SchedulerStateTest, UnknownReleaseTimestampDoesNotChangeSchedulerOriginTo
     alignas(64) ChipTaskSlotState producer, consumer;
     init_slot(producer, CHIP_TASK_COMPLETED, 1, 1);
     init_slot(consumer, CHIP_TASK_PENDING, 1, 1);
-    sched.placement_feedback.schedulers[0] = 2;
-    sched.placement_feedback.schedulers[1] = 3;
-    sched.placement_feedback.orchestrator_cluster = 1;
+    sched.ready_feedback.schedulers[0] = 2;
+    sched.ready_feedback.schedulers[1] = 3;
     producer.payload->placement.dispatch_cluster.store(0);
     consumer.payload->placement.scope = 1;
-    consumer.payload->placement.preferred_cluster = 1;
+    consumer.payload->placement.preferred_cluster = -1;
     // A shared producer can start its fanout walk before feedback is enabled.
     // Its missing sample timestamp does not make it an O-origin publication.
     sched.record_ready_origin(consumer, &producer, 0, 2);
     sched.stamp_ready_queue(consumer);
-    EXPECT_EQ(consumer.payload->placement.reserved & simpler::tmr::PARTITION_FROM_O, 0u);
     EXPECT_EQ(consumer.payload->placement.release_cluster, 0);
     EXPECT_EQ(consumer.task->target_aicpu_cluster, 0);
 }

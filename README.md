@@ -1,10 +1,6 @@
-> 本分支保存 AICPU cluster 放置实验的完整 runtime 源码快照。
-> 请从 [main 分支](https://github.com/JJyun-ustc/PyPTO-tmr_partition/tree/main)
-> 使用递归子模块方式克隆完整 PyPTO 系统。
-> [中文实验说明](https://github.com/JJyun-ustc/PyPTO-tmr_partition/blob/main/docs/zh/experiments/tmr-cluster/experiment.md)
-> 、[完整算法与记账](https://github.com/JJyun-ustc/PyPTO-tmr_partition/blob/main/docs/zh/experiments/tmr-cluster/algorithm.md)
-> 和 [环境复现](https://github.com/JJyun-ustc/PyPTO-tmr_partition/blob/main/docs/zh/experiments/tmr-cluster/environment.md)
-> 位于 main。以下保留上游 runtime 说明。
+> 本分支 `runtime-ready-affinity` 保存独立重写的 v11 ready 亲和运行库。
+> 旧 v8 原样保留在 [`runtime-snapshot`](https://github.com/JJyun-ustc/PyPTO-tmr_partition/tree/runtime-snapshot)。
+> [当前算法说明](docs/user/how-to/use-aicpu-cluster-placement.md) · [实验记录](docs/investigations/2026-11-aicpu-cluster-ready-affinity.md)。
 
 # simpler — Simple Runtime
 

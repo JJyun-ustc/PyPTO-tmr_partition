@@ -762,7 +762,8 @@ int32_t AicpuExecutor::run_orchestration(Runtime *runtime, int32_t thread_idx) {
             // the core-type-classified count post_handshake_init produces on
             // the serial path.
             runtime_finalize_after_wire(rt, sched_ctx_.aic_count(), sched_ctx_.aiv_count());
-            rt->scheduler.placement_feedback.orchestrator_cluster = runtime->dev.aicpu_cluster_ids[sched_thread_num_];
+            for (int t = 0; t < aicpu_thread_num_; ++t)
+                rt->scheduler.ready_feedback.cluster[t] = runtime->dev.aicpu_cluster_ids[t];
             rt->orchestrator.aicpu_cluster_sched_count[0] = 0;
             rt->orchestrator.aicpu_cluster_sched_count[1] = 0;
             for (int32_t t = 0; t < sched_thread_num_; t++) {
@@ -1064,111 +1065,46 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         // alive — they are loaded once by register_callable and consumed by
         // every subsequent run.
         if (rt != nullptr) {
-            auto &model = rt->orchestrator.cluster_partitioner;
-            if (model.decisions[0] + model.decisions[1] != 0) {
-                uint64_t started[2]{};
-                for (const auto &thread : rt->scheduler.placement_feedback.threads) {
-                    int c = thread.cluster.load(std::memory_order_relaxed);
-                    if (c < 0 || c > 1) continue;
-                    for (int shape = 0; shape < simpler::tmr::PARTITION_SHAPES; ++shape) {
-                        started[c] += thread.started[shape].load(std::memory_order_relaxed);
-                    }
-                }
+            auto &model = rt->orchestrator.affinity_builder;
+            if (model.tasks) {
                 LOG_INFO(
-                    "AICPU_ADAPTIVE_FINAL version=4 decisions=%llu,%llu started=%llu,%llu "
-                    "cold=%llu learned=%llu calibrations=%llu updates=%llu,%llu batch_size=%llu snapshots=%llu",
-                    static_cast<unsigned long long>(model.decisions[0]),
-                    static_cast<unsigned long long>(model.decisions[1]), static_cast<unsigned long long>(started[0]),
-                    static_cast<unsigned long long>(started[1]), static_cast<unsigned long long>(model.cold_decisions),
-                    static_cast<unsigned long long>(model.learned_decisions),
-                    static_cast<unsigned long long>(model.calibrations),
-                    static_cast<unsigned long long>(model.updates[0]),
-                    static_cast<unsigned long long>(model.updates[1]),
-                    static_cast<unsigned long long>(simpler::tmr::PARTITION_BATCH_NODES),
-                    static_cast<unsigned long long>(model.snapshots)
+                    "AICPU_READY_AFFINITY version=11 pickup=%d tasks=%llu neutral=%llu weak=%llu strong=%llu",
+                    int(simpler::tmr::READY_REMOTE_PICKUP), static_cast<unsigned long long>(model.tasks),
+                    static_cast<unsigned long long>(model.neutral), static_cast<unsigned long long>(model.weak),
+                    static_cast<unsigned long long>(model.strong)
                 );
-                LOG_INFO(
-                    "AICPU_PLACEMENT_GROUP full=%llu inherited=%llu",
-                    static_cast<unsigned long long>(model.full_decisions),
-                    static_cast<unsigned long long>(model.inherited_decisions)
-                );
-                for (int shape = 0; shape < simpler::tmr::PARTITION_SHAPES; ++shape) {
-                    uint64_t released[2]{}, queued[2]{}, taken[2]{}, actual[2]{};
-                    for (const auto &thread : rt->scheduler.placement_feedback.threads) {
-                        int cluster = thread.cluster.load(std::memory_order_relaxed);
-                        if (cluster >= 0 && cluster < 2)
-                            actual[cluster] += thread.started[shape].load(std::memory_order_relaxed);
-                        const auto &row = thread.summary[shape];
-                        for (int c = 0; c < 2; ++c) {
-                            released[c] += row.released[c].load(std::memory_order_relaxed);
-                            queued[c] += row.queued[c].load(std::memory_order_relaxed);
-                            taken[c] += row.taken[c].load(std::memory_order_relaxed);
+                for (int shape = 0; shape < simpler::tmr::READY_SHAPES; ++shape) {
+                    uint64_t q[2]{}, c[2]{}, x[2]{};
+                    for (const auto &writer : rt->scheduler.ready_feedback.writers)
+                        for (int side = 0; side < 2; ++side) {
+                            q[side] += writer.rows[shape].enqueued[side].load();
+                            c[side] += writer.rows[shape].claimed[side].load();
+                            x[side] += writer.rows[shape].executed[side].load();
                         }
-                    }
                     LOG_INFO(
-                        "AICPU_PLACEMENT_LEDGER shape=%d preferred=%llu,%llu released=%llu,%llu queued=%llu,%llu "
-                        "taken=%llu,%llu actual=%llu,%llu",
-                        shape, static_cast<unsigned long long>(model.assigned[0][shape]),
-                        static_cast<unsigned long long>(model.assigned[1][shape]),
-                        static_cast<unsigned long long>(released[0]), static_cast<unsigned long long>(released[1]),
-                        static_cast<unsigned long long>(queued[0]), static_cast<unsigned long long>(queued[1]),
-                        static_cast<unsigned long long>(taken[0]), static_cast<unsigned long long>(taken[1]),
-                        static_cast<unsigned long long>(actual[0]), static_cast<unsigned long long>(actual[1])
+                        "AICPU_READY_LEDGER shape=%d queued=%llu,%llu claimed=%llu,%llu executed=%llu,%llu", shape,
+                        static_cast<unsigned long long>(q[0]), static_cast<unsigned long long>(q[1]),
+                        static_cast<unsigned long long>(c[0]), static_cast<unsigned long long>(c[1]),
+                        static_cast<unsigned long long>(x[0]), static_cast<unsigned long long>(x[1])
                     );
                 }
-                for (int t = 0; t < sched_thread_num_; ++t) {
-                    const auto &row = rt->scheduler.placement_feedback.threads[t];
+                for (int t = 0; t < simpler::tmr::READY_THREADS; ++t) {
+                    const auto &writer = rt->scheduler.ready_feedback.writers[t];
                     LOG_INFO(
-                        "AICPU_PLACEMENT_PICKUP scheduler=%d checks=%llu attempts=%llu remote_blocks=%llu", t,
-                        static_cast<unsigned long long>(row.steal_checks),
-                        static_cast<unsigned long long>(row.steal_attempts),
-                        static_cast<unsigned long long>(row.remote_blocks)
+                        "AICPU_READY_FEEDBACK writer=%d refreshes=%llu probes=%llu attempts=%llu remote=%llu", t,
+                        static_cast<unsigned long long>(writer.refreshes),
+                        static_cast<unsigned long long>(writer.probes),
+                        static_cast<unsigned long long>(writer.attempts),
+                        static_cast<unsigned long long>(writer.remote_blocks)
                     );
                 }
-                for (int shape = 0; shape < simpler::tmr::PARTITION_SHAPES; ++shape) {
-                    const auto &w = model.weights[shape];
-                    LOG_INFO(
-                        "AICPU_ADAPTIVE_MODEL shape=%d queue=%llu,%llu publish=%llu,%llu,%llu,%llu "
-                        "dependency=%llu,%llu,%llu,%llu observed=%llu,%llu",
-                        shape, static_cast<unsigned long long>(w.queue[0]), static_cast<unsigned long long>(w.queue[1]),
-                        static_cast<unsigned long long>(w.publish[0][0]),
-                        static_cast<unsigned long long>(w.publish[0][1]),
-                        static_cast<unsigned long long>(w.publish[1][0]),
-                        static_cast<unsigned long long>(w.publish[1][1]),
-                        static_cast<unsigned long long>(w.dependency[0][0]),
-                        static_cast<unsigned long long>(w.dependency[0][1]),
-                        static_cast<unsigned long long>(w.dependency[1][0]),
-                        static_cast<unsigned long long>(w.dependency[1][1]),
-                        static_cast<unsigned long long>(model.observed[shape][0]),
-                        static_cast<unsigned long long>(model.observed[shape][1])
-                    );
-                    for (int c = 0; c < 2; ++c) {
-                        auto *u = model.channel_updates[shape][c];
-                        LOG_INFO(
-                            "AICPU_ADAPTIVE_UPDATES shape=%d cluster=%d queue=%llu o0=%llu o1=%llu s0=%llu s1=%llu",
-                            shape, c, static_cast<unsigned long long>(u[0]), static_cast<unsigned long long>(u[1]),
-                            static_cast<unsigned long long>(u[2]), static_cast<unsigned long long>(u[3]),
-                            static_cast<unsigned long long>(u[4])
-                        );
-                    }
-                }
-                LOG_INFO(
-                    "AICPU_ADAPTIVE_COST decision_ns=%llu max_decision_ns=%llu",
-                    static_cast<unsigned long long>(
-                        sys_cnt_ticks_to_ns(model.decision_ticks, get_sys_cnt_aicpu_frequency_hz())
-                    ),
-                    static_cast<unsigned long long>(
-                        sys_cnt_ticks_to_ns(model.max_decision_ticks, get_sys_cnt_aicpu_frequency_hz())
-                    )
-                );
             }
-
 #if SIMPLER_DFX
             if (get_chip_swimlane_level() >= ChipSwimlaneLevel::SCHED_PHASES) {
-                const char *o_names[] = {"poll", "queue_depth", "fanin", "load", "choose_commit", "wire_ready"};
+                const char *o_names[] = {"affinity", "unused", "unused", "unused", "unused", "wire_ready"};
                 const char *s_names[] = {"resource_feedback", "observe",       "auto_dispatch", "strict_dispatch",
                                          "shared_dispatch",   "sync_dispatch", "ready_binding", "cross_pickup"};
-                for (int i = 0; i < 6; ++i)
+                for (int i : {0, 5})
                     LOG_INFO(
                         "AICPU_PARTITION_TRACE owner=O stage=%s calls=%llu ns=%llu", o_names[i],
                         static_cast<unsigned long long>(model.trace.calls[i]),
@@ -1176,9 +1112,9 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                             sys_cnt_ticks_to_ns(model.trace.ticks[i], get_sys_cnt_aicpu_frequency_hz())
                         )
                     );
-                for (int t = 0; t < sched_thread_num_; ++t) {
-                    const auto &trace = rt->scheduler.placement_feedback.threads[t].trace;
-                    for (int i = 0; i < 8; ++i)
+                for (int t = 0; t < simpler::tmr::READY_THREADS; ++t)
+                    for (int i = 0; i < 8; ++i) {
+                        const auto &trace = rt->scheduler.ready_feedback.writers[t].trace;
                         LOG_INFO(
                             "AICPU_PARTITION_TRACE owner=S%d stage=%s calls=%llu ns=%llu", t, s_names[i],
                             static_cast<unsigned long long>(trace.calls[i]),
@@ -1186,7 +1122,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                                 sys_cnt_ticks_to_ns(trace.ticks[i], get_sys_cnt_aicpu_frequency_hz())
                             )
                         );
-                }
+                    }
             }
 #endif
             // Clear g_current_runtime in this DSO and in the orchestration SO before destroying rt.

@@ -120,3 +120,6 @@ Newest first.
 - [2026-06 — Sanitizer rollout scope: macOS, TSAN gating, LSan](2026-06-sanitizer-scope.md)
 - [2026-06 — chip swimlane: defer per-task wmb to rotation](2026-06-chip-swimlane-defer-wmb.md)
 - [2026-11 — AICPU cluster：Paged Attention 等长与长短混合配对测试](2026-11-aicpu-cluster-paged-attention.md)
+
+- [A1–A4累积 block 压力实验](2026-11-aicpu-cluster-block-pressure.md)
+- [v11 ready 亲和实验](2026-11-aicpu-cluster-ready-affinity.md)
