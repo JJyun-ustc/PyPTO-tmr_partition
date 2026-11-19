@@ -125,3 +125,5 @@ Newest first.
 - [v11 ready 亲和实验](2026-11-aicpu-cluster-ready-affinity.md)
 
 - [v12 组合压力与多block领取实验](2026-11-aicpu-cluster-ready-pressure.md)
+
+- [v13 O预测预留与轻量ready实验](2026-11-aicpu-cluster-orchestrator-pressure.md)
