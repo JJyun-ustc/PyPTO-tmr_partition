@@ -1071,10 +1071,13 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             auto &model = rt->orchestrator.affinity_builder;
             if (model.tasks) {
                 LOG_INFO(
-                    "AICPU_READY_AFFINITY version=13 pickup=%d tasks=%llu neutral=%llu weak=%llu strong=%llu",
-                    int(simpler::tmr::READY_REMOTE_PICKUP), static_cast<unsigned long long>(model.tasks),
-                    static_cast<unsigned long long>(model.neutral), static_cast<unsigned long long>(model.weak),
-                    static_cast<unsigned long long>(model.strong)
+                    "AICPU_READY_AFFINITY version=14 pickup=0 tasks=%llu neutral=%llu weak=%llu strong=%llu",
+                    static_cast<unsigned long long>(model.tasks), static_cast<unsigned long long>(model.neutral),
+                    static_cast<unsigned long long>(model.weak), static_cast<unsigned long long>(model.strong)
+                );
+                LOG_INFO(
+                    "AICPU_QUOTA_SPLITS tasks=%llu",
+                    static_cast<unsigned long long>(rt->scheduler.ready_feedback.split_tasks)
                 );
                 for (int shape = 0; shape < simpler::tmr::READY_SHAPES; ++shape) {
                     uint64_t q[2]{}, c[2]{}, x[2]{}, released[2]{};
@@ -1083,7 +1086,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                             q[side] += writer.rows[shape].enqueued[side].load();
                             c[side] += writer.rows[shape].claimed[side].load();
                             x[side] += writer.executed[shape][side];
-                            released[side] += writer.rows[shape].revoked[side].load();
+                            released[side] += writer.rows[shape].enqueued[side].load();
                         }
                     LOG_INFO(
                         "AICPU_READY_LEDGER shape=%d queued=%llu,%llu claimed=%llu,%llu executed=%llu,%llu", shape,
@@ -1098,16 +1101,14 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                         static_cast<unsigned long long>(released[0]), static_cast<unsigned long long>(released[1])
                     );
                 }
-                for (int t = 0; t < simpler::tmr::READY_THREADS; ++t) {
-                    const auto &writer = rt->scheduler.ready_feedback.writers[t];
+                for (int shape = 0; shape < simpler::tmr::READY_SHAPES; ++shape) {
+                    uint64_t f[2]{};
+                    for (const auto &w : rt->scheduler.ready_feedback.writers)
+                        for (int c = 0; c < 2; ++c)
+                            f[c] += w.rows[shape].finished[c].load();
                     LOG_INFO(
-                        "AICPU_READY_FEEDBACK writer=%d refreshes=%llu probes=%llu attempts=%llu remote=%llu "
-                        "remote_multi=%llu",
-                        t, static_cast<unsigned long long>(writer.refreshes),
-                        static_cast<unsigned long long>(writer.probes),
-                        static_cast<unsigned long long>(writer.attempts),
-                        static_cast<unsigned long long>(writer.remote_blocks),
-                        static_cast<unsigned long long>(writer.remote_multi_blocks)
+                        "AICPU_QUOTA_FINISHED shape=%d units=%llu,%llu", shape, static_cast<unsigned long long>(f[0]),
+                        static_cast<unsigned long long>(f[1])
                     );
                 }
             }

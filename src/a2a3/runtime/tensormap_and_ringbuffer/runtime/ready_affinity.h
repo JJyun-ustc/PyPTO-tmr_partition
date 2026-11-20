@@ -19,14 +19,11 @@ constexpr int READY_SHAPES = 4;
 constexpr int READY_SCOPE_DEPTH = 64;
 constexpr uint32_t READY_REFRESH_TASKS = 64;
 constexpr uint32_t READY_FEEDBACK_LOOPS = 64;
-constexpr uint32_t READY_PROBE_LOOPS = 32;
-constexpr uint32_t READY_PROBE_COOLDOWN = 128;
-// Fixed policy prices; no measured duration, calibration or price learning.
-constexpr uint64_t READY_LOCAL_PRICE = 250;
-constexpr uint64_t READY_REMOTE_PRICE = 750;
-constexpr uint64_t READY_QUEUE_PRICE = 2000;
-constexpr uint64_t READY_FUTURE_PRICE = 500;
-constexpr bool READY_REMOTE_PICKUP = true;
+
+// Scores use waves, scaled by 256. These are fixed policy prices, not durations.
+constexpr uint64_t QUOTA_SCALE = 256;
+constexpr uint64_t QUOTA_AFFINITY = 128;
+constexpr uint64_t QUOTA_SPLIT_COST = 32;
 
 enum class AffinityStrength : uint8_t { NEUTRAL, WEAK, STRONG };
 inline uint64_t pack_votes(uint32_t a, uint32_t b) { return uint64_t(a) | (uint64_t(b) << 32); }
@@ -49,7 +46,24 @@ struct ReadyTaskState {
     int8_t predicted_cluster{-1};
     std::atomic<int32_t> dispatch_cluster{-1};
     uint64_t affinity_votes{0};
-    std::atomic<uint64_t> completed_votes{0};
+    int16_t quota[2]{};
+    std::atomic<int16_t> next[2]{};
+    int32_t claim(int side, int32_t count, int32_t &start) {
+        int32_t end = side ? quota[0] + quota[1] : quota[0];
+        int16_t current = next[side].load(std::memory_order_relaxed);
+        while (current < end && count > 0) {
+            int32_t n = end - current;
+            if (n > count) n = count;
+            if (next[side].compare_exchange_weak(
+                    current, static_cast<int16_t>(current + n), std::memory_order_relaxed
+                )) {
+                start = current;
+                return n;
+            }
+        }
+        start = current;
+        return 0;
+    }
     std::atomic<uint32_t> dispatched[2]{};
     void reset() {
         scope = 0;
@@ -60,7 +74,9 @@ struct ReadyTaskState {
         ready_writer = READY_THREADS - 1;
         dispatch_cluster.store(-1, std::memory_order_relaxed);
         affinity_votes = 0;
-        completed_votes.store(0, std::memory_order_relaxed);
+        quota[0] = quota[1] = 0;
+        next[0].store(0, std::memory_order_relaxed);
+        next[1].store(0, std::memory_order_relaxed);
         for (auto &count : dispatched)
             count.store(0, std::memory_order_relaxed);
     }
@@ -86,7 +102,7 @@ struct AffinityVote {
         if (side < 0 && !parent.scope) side = strict_side;
         uint32_t weight = 256;
         if (side < 0 && parent.scope == scope && parent.hops < 7 && parent.preferred_cluster >= 0) {
-            side = parent.preferred_cluster;
+            side = static_cast<uint8_t>(parent.preferred_cluster);
             weight = 64;
             inferred = true;
             if (parent.hops + 1 > hops) hops = parent.hops + 1;
@@ -123,269 +139,188 @@ struct AffinityBuilder {
     }
 };
 
+// Each row has exactly one writer. Finished units use six units per logical
+// block, so MIX subtasks retire fractions without another shared block counter.
 struct ReadySample {
-    uint64_t revoked[2]{}, enqueued[2]{}, claimed[2]{};
+    uint64_t enqueued[2]{}, claimed[2]{}, finished[2]{}, capacity{0};
 };
-// R and E form one single-writer transaction. C is an independent monotone atomic observation.
 struct alignas(64) ReadyRow {
-    std::atomic<uint64_t> version{0}, capacity{0};
-    std::atomic<uint64_t> revoked[2]{}, enqueued[2]{}, claimed[2]{};
+    std::atomic<uint64_t> enqueued[2]{}, claimed[2]{}, finished[2]{}, capacity{0};
     static void add(std::atomic<uint64_t> &counter, uint64_t n) {
         counter.store(counter.load(std::memory_order_relaxed) + n, std::memory_order_relaxed);
     }
-    void publish(int predicted, int queue, uint64_t units) {
-        uint64_t v = version.load(std::memory_order_relaxed);
-        version.store(v + 1, std::memory_order_relaxed);
-        std::atomic_thread_fence(std::memory_order_seq_cst);
-        add(revoked[predicted], units);
-        add(enqueued[queue], units);
-        version.store(v + 2, std::memory_order_release);
-    }
-    bool read(ReadySample &out) const {
-        uint64_t v = version.load(std::memory_order_acquire);
-        if (v & 1) return false;
-        ReadySample next;
+    ReadySample read() const {
+        ReadySample s;
         for (int c = 0; c < 2; ++c) {
-            next.revoked[c] = revoked[c].load(std::memory_order_relaxed);
-            next.enqueued[c] = enqueued[c].load(std::memory_order_relaxed);
-            next.claimed[c] = claimed[c].load(std::memory_order_relaxed);
+            s.enqueued[c] = enqueued[c].load(std::memory_order_relaxed);
+            s.claimed[c] = claimed[c].load(std::memory_order_relaxed);
+            s.finished[c] = finished[c].load(std::memory_order_relaxed);
         }
-        std::atomic_thread_fence(std::memory_order_acquire);
-        if (v != version.load(std::memory_order_relaxed)) return false;
-        out = next;
-        return true;
-    }
-    int64_t queue(int c) const {
-        return int64_t(enqueued[c].load(std::memory_order_relaxed)) -
-               int64_t(claimed[c].load(std::memory_order_relaxed));
+        s.capacity = capacity.load(std::memory_order_relaxed);
+        return s;
     }
     void reset() {
-        version.store(0);
-        capacity.store(0);
         for (int c = 0; c < 2; ++c) {
-            revoked[c].store(0);
             enqueued[c].store(0);
             claimed[c].store(0);
+            finished[c].store(0);
         }
-    }
-};
-static_assert(sizeof(ReadyRow) == 64);
-
-struct ReadyHintSample {
-    ReadySample schedulers, orchestrator;
-    uint64_t capacity{0};
-    int64_t own_cut[2]{};
-};
-// Each hint owns only its side's S rows. O is a separate sidecar on O's side, never part of S totals.
-struct alignas(64) ReadyHint {
-    std::atomic<uint64_t> version{0}, capacity{0};
-    std::atomic<uint64_t> revoked[2]{}, enqueued[2]{}, claimed[2]{};
-    std::atomic<uint64_t> o_revoked[2]{}, o_enqueued[2]{}, o_claimed[2]{};
-    std::atomic<int64_t> queue_cut[READY_THREADS - 1][2]{};
-    bool read(int writer, ReadyHintSample &out) const {
-        uint64_t v = version.load(std::memory_order_acquire);
-        if (v & 1) return false;
-        ReadyHintSample next;
-        next.capacity = capacity.load(std::memory_order_relaxed);
-        for (int c = 0; c < 2; ++c) {
-            next.schedulers.revoked[c] = revoked[c].load(std::memory_order_relaxed);
-            next.schedulers.enqueued[c] = enqueued[c].load(std::memory_order_relaxed);
-            next.schedulers.claimed[c] = claimed[c].load(std::memory_order_relaxed);
-            next.orchestrator.revoked[c] = o_revoked[c].load(std::memory_order_relaxed);
-            next.orchestrator.enqueued[c] = o_enqueued[c].load(std::memory_order_relaxed);
-            next.orchestrator.claimed[c] = o_claimed[c].load(std::memory_order_relaxed);
-            if (writer < READY_THREADS - 1) next.own_cut[c] = queue_cut[writer][c].load(std::memory_order_relaxed);
-        }
-        std::atomic_thread_fence(std::memory_order_acquire);
-        if (v != version.load(std::memory_order_relaxed)) return false;
-        out = next;
-        return true;
-    }
-    void reset() {
-        version.store(0);
         capacity.store(0);
-        for (int c = 0; c < 2; ++c) {
-            revoked[c].store(0);
-            enqueued[c].store(0);
-            claimed[c].store(0);
-            o_revoked[c].store(0);
-            o_enqueued[c].store(0);
-            o_claimed[c].store(0);
-            for (auto &cut : queue_cut)
-                cut[c].store(0);
-        }
     }
-};
-static_assert(sizeof(ReadyHint) == 192);
-struct ReadyView {
-    ReadyHintSample sides[2];
 };
 struct alignas(64) ReadyWriter {
     ReadyRow rows[READY_SHAPES];
-    ReadyView views[READY_SHAPES];
-    ReadySample collected[READY_SHAPES][READY_THREADS];
     uint64_t executed[READY_SHAPES][2]{};
-    uint64_t refreshes{0}, probes{0}, attempts{0}, remote_blocks{0}, remote_multi_blocks{0};
-    uint32_t probe_clock{0}, probe_next{READY_PROBE_LOOPS};
+    uint64_t refreshes{0};
     ReadyTrace trace;
     void reset() {
         for (auto &row : rows)
             row.reset();
-        for (auto &view : views)
-            view = ReadyView{};
-        for (auto &shape : collected)
-            for (auto &sample : shape)
-                sample = ReadySample{};
         for (auto &shape : executed)
             for (auto &n : shape)
                 n = 0;
-        refreshes = probes = attempts = remote_blocks = remote_multi_blocks = 0;
-        probe_clock = 0;
-        probe_next = READY_PROBE_LOOPS;
+        refreshes = 0;
         trace = ReadyTrace{};
     }
 };
+// Leaders publish S-only cumulative snapshots. O's row is read directly by O,
+// so an O ready event cannot be counted both directly and through a snapshot.
+struct alignas(64) ReadySummary {
+    std::atomic<uint64_t> version{0};
+    ReadyRow rows[READY_SHAPES];
+    void reset() {
+        version.store(0);
+        for (auto &row : rows)
+            row.reset();
+    }
+};
 inline uint64_t positive(int64_t n) { return n > 0 ? uint64_t(n) : 0; }
-inline int
-light_ready_side(int predicted, uint64_t votes, bool actual, const uint64_t queue[2], const int32_t schedulers[2]) {
-    if (!schedulers[predicted]) return schedulers[1 - predicted] ? 1 - predicted : predicted;
-    int other = 1 - predicted;
-    if (!schedulers[other]) return predicted;
-    uint64_t a = side_vote(votes, predicted), b = side_vote(votes, other), total = a + b;
-    if (!total || b <= a || (b - a) * (actual ? 4 : 2) <= total) return predicted;
-    // More than two additional queued blocks per S, with an absolute floor, protects the candidate side.
-    bool congested =
-        queue[other] >= 4 && queue[other] * schedulers[predicted] >
-                                 queue[predicted] * schedulers[other] + 2u * schedulers[predicted] * schedulers[other];
-    return congested ? predicted : other;
-}
 struct ReadyFeedback {
     std::atomic<bool> enabled{false};
     int32_t schedulers[2]{};
     int32_t cluster[READY_THREADS]{-1, -1, -1, -1, -1, -1};
-    ReadyHint hints[2][READY_SHAPES];
     ReadyWriter writers[READY_THREADS];
-    uint64_t assigned[READY_SHAPES][2]{}, creations{0};
+    ReadySummary summaries[2];
+    ReadySample views[2][READY_SHAPES];
+    uint64_t assigned[READY_SHAPES][2]{}, creations{0}, split_tasks{0};
     void reset() {
         enabled.store(false);
         schedulers[0] = schedulers[1] = 0;
         for (auto &c : cluster)
             c = -1;
-        for (auto &side : hints)
-            for (auto &hint : side)
-                hint.reset();
-        for (auto &writer : writers)
-            writer.reset();
+        for (auto &w : writers)
+            w.reset();
+        for (auto &s : summaries)
+            s.reset();
+        for (auto &side : views)
+            for (auto &v : side)
+                v = ReadySample{};
         for (auto &shape : assigned)
             for (auto &n : shape)
                 n = 0;
-        creations = 0;
+        creations = split_tasks = 0;
     }
-    void refresh(int writer, int shape) {
-        auto &owner = writers[writer];
-        for (int side = 0; side < 2; ++side)
-            hints[side][shape].read(writer, owner.views[shape].sides[side]);
-        ++owner.refreshes;
-    }
-    void refresh_all(int writer) {
-        for (int shape = 0; shape < READY_SHAPES; ++shape)
-            refresh(writer, shape);
-    }
-    void publish_side(int leader, int shape) {
-        int side = cluster[leader];
-        auto &owner = writers[leader];
-        auto &cache = owner.collected[shape];
-        ReadySample sum;
-        uint64_t cap = 0;
-        for (int t = 0; t < READY_THREADS - 1; ++t)
-            if (cluster[t] == side) {
-                writers[t].rows[shape].read(cache[t]);
-                cap += writers[t].rows[shape].capacity.load(std::memory_order_relaxed);
+    void publish_side(int leader) {
+        auto &out = summaries[cluster[leader]];
+        uint64_t v = out.version.load(std::memory_order_relaxed);
+        out.version.store(v + 1, std::memory_order_relaxed);
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        for (int shape = 0; shape < READY_SHAPES; ++shape) {
+            ReadySample sum;
+            for (int t = 0; t < READY_THREADS - 1; ++t) {
+                if (cluster[t] != cluster[leader]) continue;
+                auto s = writers[t].rows[shape].read();
+                sum.capacity += s.capacity;
                 for (int c = 0; c < 2; ++c) {
-                    sum.revoked[c] += cache[t].revoked[c];
-                    sum.enqueued[c] += cache[t].enqueued[c];
-                    sum.claimed[c] += cache[t].claimed[c];
+                    sum.enqueued[c] += s.enqueued[c];
+                    sum.claimed[c] += s.claimed[c];
+                    sum.finished[c] += s.finished[c];
                 }
             }
-        ReadySample o;
-        if (cluster[READY_THREADS - 1] == side) {
-            writers[READY_THREADS - 1].rows[shape].read(cache[READY_THREADS - 1]);
-            o = cache[READY_THREADS - 1];
-        }
-        auto &hint = hints[side][shape];
-        uint64_t v = hint.version.load(std::memory_order_relaxed);
-        hint.version.store(v + 1, std::memory_order_relaxed);
-        std::atomic_thread_fence(std::memory_order_seq_cst);
-        hint.capacity.store(cap, std::memory_order_relaxed);
-        for (int c = 0; c < 2; ++c) {
-            hint.revoked[c].store(sum.revoked[c], std::memory_order_relaxed);
-            hint.enqueued[c].store(sum.enqueued[c], std::memory_order_relaxed);
-            hint.claimed[c].store(sum.claimed[c], std::memory_order_relaxed);
-            hint.o_revoked[c].store(o.revoked[c], std::memory_order_relaxed);
-            hint.o_enqueued[c].store(o.enqueued[c], std::memory_order_relaxed);
-            hint.o_claimed[c].store(o.claimed[c], std::memory_order_relaxed);
-            for (int t = 0; t < READY_THREADS - 1; ++t)
-                hint.queue_cut[t][c].store(
-                    cluster[t] == side ? int64_t(cache[t].enqueued[c]) - int64_t(cache[t].claimed[c]) : 0,
-                    std::memory_order_relaxed
-                );
-        }
-        hint.version.store(v + 2, std::memory_order_release);
-    }
-    int64_t queued(int writer, int shape, int c) const {
-        const auto &owner = writers[writer];
-        int64_t q = owner.rows[shape].queue(c);
-        for (const auto &side : owner.views[shape].sides) {
-            q += int64_t(side.schedulers.enqueued[c]) - int64_t(side.schedulers.claimed[c]);
-            if (writer < READY_THREADS - 1)
-                q += int64_t(side.orchestrator.enqueued[c]) - int64_t(side.orchestrator.claimed[c]) - side.own_cut[c];
-        }
-        return q;
-    }
-    int64_t blocked(int shape, int c) const {
-        int64_t w = int64_t(assigned[shape][c]) -
-                    int64_t(writers[READY_THREADS - 1].rows[shape].revoked[c].load(std::memory_order_relaxed));
-        for (const auto &side : writers[READY_THREADS - 1].views[shape].sides)
-            w -= int64_t(side.schedulers.revoked[c]);
-        return w;
-    }
-    int predict(int shape, ReadyTaskState &task, uint64_t units, bool waiting) {
-        constexpr int O = READY_THREADS - 1;
-        if ((creations++ % READY_REFRESH_TASKS) == 0) refresh_all(O);
-        uint64_t votes = task.affinity_votes;
-        uint64_t total = uint64_t(side_vote(votes, 0)) + side_vote(votes, 1);
-        uint64_t score[2]{};
-        for (int c = 0; c < 2; ++c) {
-            if (!schedulers[c]) {
-                score[c] = ~uint64_t{0};
-                continue;
+            auto &row = out.rows[shape];
+            row.capacity.store(sum.capacity, std::memory_order_relaxed);
+            for (int c = 0; c < 2; ++c) {
+                row.enqueued[c].store(sum.enqueued[c], std::memory_order_relaxed);
+                row.claimed[c].store(sum.claimed[c], std::memory_order_relaxed);
+                row.finished[c].store(sum.finished[c], std::memory_order_relaxed);
             }
-            uint64_t price;
-            if (waiting && total)
-                price = READY_LOCAL_PRICE + (READY_REMOTE_PRICE - READY_LOCAL_PRICE) * side_vote(votes, 1 - c) / total;
-            else price = cluster[O] >= 0 && cluster[O] != c ? READY_REMOTE_PRICE : READY_LOCAL_PRICE;
-            uint64_t q = positive(queued(O, shape, c)) + (waiting ? 0 : units);
-            uint64_t cap = writers[O].views[shape].sides[c].capacity;
-            if (!cap) cap = schedulers[c];
-            uint64_t w = positive(blocked(shape, c)) + (waiting ? units : 0);
-            if (w > cap) w = cap;
-            score[c] = price + READY_QUEUE_PRICE * q / (2 * schedulers[c]) + READY_FUTURE_PRICE * w / cap;
         }
-        int chosen = score[0] < score[1] ? 0 : 1;
-        if (score[0] == score[1])
-            chosen = assigned[shape][0] * schedulers[1] <= assigned[shape][1] * schedulers[0] ? 0 : 1;
-        assigned[shape][chosen] += units;
-        task.predicted_cluster = chosen;
-        return chosen;
+        out.version.store(v + 2, std::memory_order_release);
+        ++writers[leader].refreshes;
     }
-    int bind(int writer, int shape, const ReadyTaskState &task, uint64_t units) {
-        uint64_t votes = task.completed_votes.load(std::memory_order_acquire);
-        bool actual = votes != 0;
-        if (!actual) votes = task.affinity_votes;
-        uint64_t q[2]{positive(queued(writer, shape, 0)), positive(queued(writer, shape, 1))};
-        int side = light_ready_side(task.predicted_cluster, votes, actual, q, schedulers);
-        writers[writer].rows[shape].publish(task.predicted_cluster, side, units);
-        return side;
+    void refresh() {
+        for (int side = 0; side < 2; ++side) {
+            auto &s = summaries[side];
+            uint64_t v = s.version.load(std::memory_order_acquire);
+            if (v & 1) continue;
+            ReadySample next[READY_SHAPES];
+            for (int r = 0; r < READY_SHAPES; ++r)
+                next[r] = s.rows[r].read();
+            std::atomic_thread_fence(std::memory_order_acquire);
+            if (v == s.version.load(std::memory_order_relaxed))
+                for (int r = 0; r < READY_SHAPES; ++r)
+                    views[side][r] = next[r];
+        }
+        ++writers[READY_THREADS - 1].refreshes;
+    }
+    void bind(int writer, int shape, const ReadyTaskState &task) {
+        for (int c = 0; c < 2; ++c)
+            ReadyRow::add(writers[writer].rows[shape].enqueued[c], task.quota[c]);
+    }
+    void predict(int shape, ReadyTaskState &task, uint64_t units, bool, bool allow_split = true) {
+        constexpr int O = READY_THREADS - 1;
+        if ((creations++ % READY_REFRESH_TASKS) == 0) refresh();
+        double base[2]{}, cap[2]{};
+        uint64_t votes = task.affinity_votes;
+        double total = uint64_t(side_vote(votes, 0)) + side_vote(votes, 1);
+        auto own = writers[O].rows[shape].read();
+        for (int c = 0; c < 2; ++c) {
+            uint64_t e = own.enqueued[c], claimed = 0, finished = 0;
+            for (auto &side : views) {
+                e += side[shape].enqueued[c];
+                claimed += side[shape].claimed[c];
+                finished += side[shape].finished[c];
+            }
+            double blocked = double(positive(int64_t(assigned[shape][c]) - int64_t(e)));
+            double queued = double(positive(int64_t(e) - int64_t(claimed)));
+            double inflight = double(positive(int64_t(claimed * 6) - int64_t(finished))) / 6;
+            cap[c] = double(views[c][shape].capacity);
+            if (!cap[c]) cap[c] = schedulers[c];
+            // The unready task contributes a full marginal allocation below;
+            // alpha discounts only the older, uncertain future reservations.
+            double affinity = total ? double(side_vote(votes, c)) / total : 0.5;
+            base[c] = cap[c] ?
+                          (queued + inflight + 0.5 * blocked) * QUOTA_SCALE / cap[c] + QUOTA_AFFINITY * (1 - affinity) :
+                          0;
+        }
+        int32_t n = static_cast<int32_t>(units), best = 0;
+        if (!cap[0]) best = 0;
+        else if (!cap[1]) best = n;
+        else {
+            double x = cap[0] * (n + cap[1] * (base[1] - base[0]) / QUOTA_SCALE) / (cap[0] + cap[1]);
+            if (x < 0) x = 0;
+            if (x > n) x = n;
+            int32_t candidates[4]{0, n, static_cast<int32_t>(x), static_cast<int32_t>(x) + 1};
+            double best_cost = 1e300;
+            for (int32_t left : candidates) {
+                if (left > n || (!allow_split && left && left < n)) continue;
+                double a = left ? base[0] + QUOTA_SCALE * left / cap[0] : 0;
+                double b = left < n ? base[1] + QUOTA_SCALE * (n - left) / cap[1] : 0;
+                double cost = (a > b ? a : b) + (left && left < n ? QUOTA_SPLIT_COST : 0);
+                if (cost < best_cost) {
+                    best_cost = cost;
+                    best = left;
+                }
+            }
+        }
+        if (best && best < n) ++split_tasks;
+        task.quota[0] = best;
+        task.quota[1] = n - best;
+        task.next[0].store(0, std::memory_order_relaxed);
+        task.next[1].store(best, std::memory_order_relaxed);
+        task.predicted_cluster = best ? 0 : 1;
+        for (int c = 0; c < 2; ++c)
+            assigned[shape][c] += task.quota[c];
     }
 };
 }  // namespace simpler::tmr

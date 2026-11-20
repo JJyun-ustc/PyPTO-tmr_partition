@@ -155,6 +155,12 @@ void SchedulerContext::complete_slot_task(
         }
     }
 
+    if (slot_state.payload->placement.scope) {
+        auto shape = slot_state.active_mask.to_shape();
+        int subtasks = slot_state.total_required_subtasks / slot_state.logical_block_num;
+        auto &row = sched_->ready_feedback.writers[thread_idx].rows[static_cast<int>(shape)];
+        simpler::tmr::ReadyRow::add(row.finished[aicpu_cluster_ids_[thread_idx]], 6 / subtasks);
+    }
     bool task_complete = sched_->on_subtask_complete(slot_state);
 
 #if SIMPLER_DFX

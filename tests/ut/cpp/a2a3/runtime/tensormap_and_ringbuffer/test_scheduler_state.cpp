@@ -443,6 +443,7 @@ TEST_F(SchedulerStateTest, AutomaticSingleBlockAndStrictTasksHaveSeparateQueues)
     strict.task->target_aicpu_cluster = 0;
     automatic.payload->placement.scope = 1;
     automatic.payload->placement.predicted_cluster = 0;
+    automatic.payload->placement.quota[0] = 1;
     automatic.payload->placement.preferred_cluster = 0;
     sched.ready_feedback.schedulers[0] = 1;
     sched.push_ready_routed(&automatic);
@@ -463,7 +464,8 @@ TEST_F(SchedulerStateTest, ReadyAccountingIsOncePerTaskWithoutTimingSamples) {
     slot.task->target_aicpu_cluster = 1;
     slot.logical_block_num = 16;
     slot.payload->placement.scope = 1;
-    slot.payload->placement.predicted_cluster = 0;
+    slot.payload->placement.predicted_cluster = 1;
+    slot.payload->placement.quota[1] = 16;
     slot.payload->placement.preferred_cluster = 1;
     sched.ready_feedback.schedulers[1] = 1;
     sched.stamp_ready_queue(slot);
@@ -682,7 +684,7 @@ TEST(CoreTrackerTest, CountAvailableBlocksMixIgnoresUnavailableUnusedCore) {
     EXPECT_EQ(tracker.count_available_blocks(ResourceShape::MIX, used_mask, true), 1);
 }
 
-TEST_F(SchedulerStateTest, DeferredBindingUsesActualProducerAndAccountsExactlyOnce) {
+TEST_F(SchedulerStateTest, ReadyPublicationKeepsOrchestratorQuotaAndAccountsExactlyOnce) {
     alignas(64) ChipTaskSlotState producer, consumer;
     init_slot(producer, CHIP_TASK_COMPLETED, 1, 1);
     init_slot(consumer, CHIP_TASK_PENDING, 1, 1);
@@ -695,23 +697,23 @@ TEST_F(SchedulerStateTest, DeferredBindingUsesActualProducerAndAccountsExactlyOn
     consumer.payload->placement.preferred_cluster = -1;
     consumer.task->target_aicpu_cluster = -1;
     sched.ready_feedback.cluster[2] = 0;
-    sched.record_completed_affinity(consumer, &producer);
+    consumer.payload->placement.quota[0] = 1;
     // Producer affinity and the publishing S's side are separate.
     sched.record_ready_origin(consumer, &producer, 0, 2);
     sched.stamp_ready_queue(consumer);
     sched.stamp_ready_queue(consumer);
     EXPECT_EQ(consumer.payload->placement.preferred_cluster, -1);
-    EXPECT_EQ(consumer.task->target_aicpu_cluster, 1);
+    EXPECT_EQ(consumer.task->target_aicpu_cluster, 0);
     auto &row = sched.ready_feedback.writers[2].rows[0];
-    EXPECT_EQ(row.enqueued[1].load(), 1u);
-    EXPECT_EQ(row.enqueued[0].load(), 0u);
-    // A subsequent foreign pickup changes execution affinity, never queue debit.
+    EXPECT_EQ(row.enqueued[1].load(), 0u);
+    EXPECT_EQ(row.enqueued[0].load(), 1u);
+    // Execution metadata cannot change the O-selected queue.
     consumer.payload->placement.dispatch_cluster.store(0);
-    EXPECT_EQ(consumer.task->target_aicpu_cluster, 1);
-    EXPECT_EQ(&sched.ready_queue_for(consumer, ResourceShape::AIC, false), &sched.auto_ready_queues[1][0]);
+    EXPECT_EQ(consumer.task->target_aicpu_cluster, 0);
+    EXPECT_EQ(&sched.ready_queue_for(consumer, ResourceShape::AIC, false), &sched.auto_ready_queues[0][0]);
 }
 
-TEST_F(SchedulerStateTest, AutomaticMultiblockIsBorrowableAndStrictTargetIsNot) {
+TEST_F(SchedulerStateTest, AutomaticMultiblockAndStrictTargetsUseSeparateQueues) {
     alignas(64) ChipTaskSlotState wide, strict;
     init_slot(wide, CHIP_TASK_PENDING, 1, 1);
     init_slot(strict, CHIP_TASK_PENDING, 1, 1);
@@ -740,4 +742,37 @@ TEST_F(SchedulerStateTest, UnknownReleaseTimestampDoesNotChangeSchedulerOriginTo
     sched.stamp_ready_queue(consumer);
     EXPECT_EQ(consumer.payload->placement.release_cluster, 0);
     EXPECT_EQ(consumer.task->target_aicpu_cluster, 0);
+}
+
+TEST_F(SchedulerStateTest, SplitQuotaPublishesBothQueuesOnceAndRetainsOneTask) {
+    alignas(64) ChipTaskSlotState task;
+    init_slot(task, CHIP_TASK_PENDING, 1, 1);
+    task.logical_block_num = 16;
+    auto &p = task.payload->placement;
+    p.scope = 1;
+    p.predicted_cluster = 0;
+    p.quota[0] = 6;
+    p.quota[1] = 10;
+    p.next[1].store(6);
+    sched.route_ready_once(task);
+    EXPECT_FALSE(sched.route_ready_once(task));
+    ChipTaskSlotState *out[2];
+    ASSERT_EQ(sched.get_ready_tasks_batch(sched.auto_ready_queues[0], ResourceShape::AIC, out, 2), 1);
+    EXPECT_EQ(out[0], &task);
+    ASSERT_EQ(sched.get_ready_tasks_batch(sched.auto_ready_queues[1], ResourceShape::AIC, out, 2), 1);
+    EXPECT_EQ(out[0], &task);
+    auto &r = sched.ready_feedback.writers[simpler::tmr::READY_THREADS - 1].rows[0];
+    EXPECT_EQ(r.enqueued[0].load(), 6u);
+    EXPECT_EQ(r.enqueued[1].load(), 10u);
+}
+
+TEST_F(SchedulerStateTest, QuotaTaskCannotEnterGlobalEarlyDispatchBeforeReady) {
+    alignas(64) ChipTaskSlotState task;
+    init_slot(task, CHIP_TASK_PENDING, 1, 1);
+    task.task->target_aicpu_cluster = -1;
+    task.payload->placement.scope = 1;
+    task.payload->placement.quota[0] = 1;
+    sched.try_enqueue_early_dispatch_candidate(task);
+    EXPECT_EQ(sched.early_dispatch_queues[0].size(), 0u);
+    EXPECT_EQ(task.payload->early_dispatch_state.load(), EARLY_DISPATCH_NONE);
 }

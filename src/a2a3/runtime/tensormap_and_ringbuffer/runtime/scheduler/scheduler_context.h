@@ -370,7 +370,7 @@ private:
 
     void dispatch_shape(
         int32_t thread_idx, ChipReadyQueue *disp_queues, ResourceShape shape, CoreTracker::DispatchPhase phase,
-        CoreTracker &tracker, bool &entered_drain, bool &made_progress, bool &try_pushed, bool remote = false
+        CoreTracker &tracker, bool &entered_drain, bool &made_progress, bool &try_pushed
     );
 
     // Early-dispatch (Hook 1). Mirrors dispatch_ready_tasks: owns its

@@ -574,7 +574,6 @@ void OrchestratorState::wire_fanin_task(ChipTaskSlotState &slot_state, int32_t w
                 early_disqualified = true;
             }
             if (pstate >= CHIP_TASK_COMPLETED) {
-                sched->record_completed_affinity(slot_state, producer);
                 completed_fanin++;
             } else {
                 producer->fanout_head = rss.dep_pool.prepend(producer->fanout_head, &slot_state);
@@ -1241,8 +1240,10 @@ static TaskOutputTensors submit_task_common(
             cur_slot_state.active_mask.to_shape() == ResourceShape::DUMMY ? 1 : cur_slot_state.logical_block_num;
         feedback.predict(
             static_cast<int>(cur_slot_state.active_mask.to_shape()), payload.placement, units,
-            fanin_builder.wait_count != 0
+            fanin_builder.wait_count != 0, !cur_slot_state.task_attrs.has_predicate()
         );
+        // Auto ranges use side queues exclusively, including before first ready.
+        task.target_aicpu_cluster = static_cast<uint8_t>(payload.placement.predicted_cluster);
 #if SIMPLER_DFX
         if (score_begin) {
             builder.trace.ticks[1] += get_sys_cnt_aicpu() - score_begin;
@@ -1309,7 +1310,6 @@ static TaskOutputTensors submit_task_common(
         // reduction-dropped DEP_NONE edge — drops its submit->wire pin so the
         // (already completed) producer can be CONSUMED.
         for_each_fanin_slot_state(payload, [&](ChipTaskSlotState *producer, DepFlags flags) {
-            if (dep_has_wait(flags)) sched->record_completed_affinity(cur_slot_state, producer);
             if (!dep_has_retain(flags)) {
                 sched->release_producer(*producer);  // wiring-phase atomic, not bucketed (see wire_fanin_task)
             }

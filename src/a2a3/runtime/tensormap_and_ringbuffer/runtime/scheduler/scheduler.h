@@ -580,11 +580,9 @@ struct SchedulerState {
 #endif
         if (metadata.scope && !metadata.bound) {
             int shape = static_cast<int>(slot_state.active_mask.to_shape());
-            uint64_t units =
-                slot_state.active_mask.to_shape() == ResourceShape::DUMMY ? 1 : slot_state.logical_block_num;
             always_assert(metadata.predicted_cluster >= 0 && metadata.predicted_cluster < 2);
-            int side = ready_feedback.bind(metadata.ready_writer, shape, metadata, units);
-            slot_state.task->target_aicpu_cluster = side;
+            ready_feedback.bind(metadata.ready_writer, shape, metadata);
+            slot_state.task->target_aicpu_cluster = static_cast<uint8_t>(metadata.predicted_cluster);
 
             metadata.bound = true;
         }
@@ -600,33 +598,6 @@ struct SchedulerState {
 #endif
     }
 
-    void record_completed_affinity(
-        ChipTaskSlotState &consumer, const ChipTaskSlotState *producer, int writer = simpler::tmr::READY_THREADS - 1
-    ) {
-        if (!consumer.payload->placement.scope || !producer) return;
-        [[maybe_unused]] uint64_t begin = 0;
-#if SIMPLER_DFX
-        if (get_chip_swimlane_level() >= ChipSwimlaneLevel::SCHED_PHASES) begin = get_sys_cnt_aicpu();
-#endif
-        const auto &parent = producer->payload->placement;
-        uint64_t votes = parent.actual_votes();
-        if (!votes) {
-            int side = parent.dispatch_cluster.load(std::memory_order_acquire);
-            if (side < 0) side = producer->task->target_aicpu_cluster;
-            if (side >= 0) votes = side ? simpler::tmr::pack_votes(0, 256) : simpler::tmr::pack_votes(256, 0);
-        }
-        // Each WAIT edge contributes once, before its existing acq_rel fanin increment.
-        if (votes) consumer.payload->placement.completed_votes.fetch_add(votes, std::memory_order_relaxed);
-#if SIMPLER_DFX
-        if (begin) {
-            auto &trace = ready_feedback.writers[writer].trace;
-            trace.ticks[8] += get_sys_cnt_aicpu() - begin;
-            ++trace.calls[8];
-        }
-#else
-        (void)writer;
-#endif
-    }
     void record_ready_origin(ChipTaskSlotState &slot_state, const ChipTaskSlotState *producer, uint64_t, int writer) {
         if (!slot_state.payload->placement.scope || !producer) return;
         auto &record = slot_state.payload->placement;
@@ -648,7 +619,12 @@ struct SchedulerState {
         } else if (slot_state->task_attrs.requires_sync_start()) {
             ready_queue_for(*slot_state, shape, true).push(slot_state);
         } else {
-            ready_queue_for(*slot_state, shape, false).push(slot_state);
+            if (slot_state->payload->placement.scope) {
+                const bool left = slot_state->payload->placement.quota[0] != 0;
+                const bool right = slot_state->payload->placement.quota[1] != 0;
+                if (left) auto_ready_queues[0][static_cast<int>(shape)].push(slot_state);
+                if (right) auto_ready_queues[1][static_cast<int>(shape)].push(slot_state);
+            } else ready_queue_for(*slot_state, shape, false).push(slot_state);
         }
     }
 
@@ -1021,7 +997,7 @@ struct SchedulerState {
     inline void try_enqueue_early_dispatch_candidate(ChipTaskSlotState &consumer) {
         // Early-dispatch queues are global. A targeted consumer must wait for its
         // cluster-specific ready queue, regardless of its producers' hints.
-        if (consumer.task->target_aicpu_cluster >= 0) return;
+        if (consumer.task->target_aicpu_cluster >= 0 || consumer.payload->placement.scope) return;
         // Predicated tasks resolve at the ready point, never early-dispatch. The
         // wiring caller has no separate predicate filter, so the gate lives here.
         if (consumer.task_attrs.has_predicate()) return;
@@ -1218,7 +1194,12 @@ struct SchedulerState {
         } else if (slot_state.task_attrs.requires_sync_start()) {
             ready_queue_for(slot_state, shape, true).push(&slot_state);
         } else {
-            ready_queue_for(slot_state, shape, false).push(&slot_state);
+            if (slot_state.payload->placement.scope) {
+                const bool left = slot_state.payload->placement.quota[0] != 0;
+                const bool right = slot_state.payload->placement.quota[1] != 0;
+                if (left) auto_ready_queues[0][static_cast<int>(shape)].push(&slot_state);
+                if (right) auto_ready_queues[1][static_cast<int>(shape)].push(&slot_state);
+            } else ready_queue_for(slot_state, shape, false).push(&slot_state);
         }
         return true;
     }
@@ -1262,7 +1243,12 @@ struct SchedulerState {
         } else if (slot_state.task_attrs.requires_sync_start()) {
             ready_queue_for(slot_state, shape, true).push(&slot_state, atomic_count, push_wait);
         } else {
-            ready_queue_for(slot_state, shape, false).push(&slot_state, atomic_count, push_wait);
+            if (slot_state.payload->placement.scope) {
+                const bool left = slot_state.payload->placement.quota[0] != 0;
+                const bool right = slot_state.payload->placement.quota[1] != 0;
+                if (left) auto_ready_queues[0][static_cast<int>(shape)].push(&slot_state, atomic_count, push_wait);
+                if (right) auto_ready_queues[1][static_cast<int>(shape)].push(&slot_state, atomic_count, push_wait);
+            } else ready_queue_for(slot_state, shape, false).push(&slot_state, atomic_count, push_wait);
         }
         return true;
     }
@@ -1276,7 +1262,6 @@ struct SchedulerState {
         // Atomically increment fanin_refcount and check if all producers are done
         // ACQ_REL on fanin_refcount already synchronizes with the orchestrator's
         // init release, making fanin_count visible — plain load suffices.
-        record_completed_affinity(slot_state, producer, writer);
         int32_t new_refcount = slot_state.fanin_refcount.fetch_add(1, std::memory_order_acq_rel) + 1;
 
         if (new_refcount == slot_state.fanin_count) {
@@ -1291,7 +1276,6 @@ struct SchedulerState {
         EarlyDispatchReleaseSink *sink = nullptr, const ChipTaskSlotState *producer = nullptr,
         uint64_t release_tick = 0, int writer = simpler::tmr::READY_THREADS - 1
     ) {
-        record_completed_affinity(slot_state, producer, writer);
         int32_t new_refcount = slot_state.fanin_refcount.fetch_add(1, std::memory_order_acq_rel) + 1;
         atomic_count += 1;  // fanin_refcount.fetch_add
 
