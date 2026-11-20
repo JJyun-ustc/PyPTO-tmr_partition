@@ -1,0 +1,24 @@
+{
+  "method": "manual review of full runtime diff and test/benchmark changes; no subagents",
+  "blocking_findings": [],
+  "resolved_findings": [
+    "Auto consumers must be excluded from global early-dispatch before first ready; O marks predicted side before wiring and scheduler checks quota scope"
+  ],
+  "checked": [
+    "disjoint atomic range claims, no cross-side pickup",
+    "one ready publication ledger event and one queue entry per nonempty range",
+    "task lifetime retained until all subtasks complete",
+    "no WAIT vote field or per-WAIT accumulation",
+    "single-writer feedback, S-only snapshots, current O row excluded from summaries",
+    "claimed work stays in running pressure until FIN; MIX fractions sum to six units",
+    "predicates stay single-side; strict/sync paths retain original dispatch",
+    "TaskPayload fixed layout assertions and final source formatting",
+    "ordinary measurement separated from golden and instrumented diagnostics"
+  ],
+  "remaining_limits": [
+    "block-equivalent score is not a duration estimate",
+    "fixed quota cannot repair stale placement",
+    "resource-shape ledgers do not fully capture MIX interference",
+    "FIN counters do not cover asynchronous post-FIN work"
+  ]
+}

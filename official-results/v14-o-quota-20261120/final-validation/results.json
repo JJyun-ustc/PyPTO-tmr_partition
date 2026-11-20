@@ -1,0 +1,136 @@
+{
+  "quota-aiv": {
+    "returncode": 0,
+    "passed_cases": 1,
+    "split_counts": [
+      5
+    ],
+    "cmd": [
+      "/data/aicpu-cluster-study/o-quota-runtime/.venv/bin/python",
+      "-c",
+      "import multiprocessing,runpy,sys,torch; multiprocessing.cpu_count=lambda:2; torch.set_num_threads(2); sys.argv=sys.argv[1:]; runpy.run_path(sys.argv[0],run_name='__main__')",
+      "/data/aicpu-cluster-study/o-quota-runtime/tests/st/a2a3/tensormap_and_ringbuffer/o_quota_multiblock_aiv/test_spmd_multiblock_aiv.py",
+      "-p",
+      "a2a3",
+      "-d",
+      "0",
+      "--manual",
+      "include",
+      "--log-level",
+      "info",
+      "--enable-chip-swimlane",
+      "4"
+    ]
+  },
+  "quota-mix": {
+    "returncode": 0,
+    "passed_cases": 1,
+    "split_counts": [
+      5
+    ],
+    "cmd": [
+      "/data/aicpu-cluster-study/o-quota-runtime/.venv/bin/python",
+      "-c",
+      "import multiprocessing,runpy,sys,torch; multiprocessing.cpu_count=lambda:2; torch.set_num_threads(2); sys.argv=sys.argv[1:]; runpy.run_path(sys.argv[0],run_name='__main__')",
+      "/data/aicpu-cluster-study/o-quota-runtime/tests/st/a2a3/tensormap_and_ringbuffer/o_quota_multiblock_mix/test_spmd_multiblock_mix.py",
+      "-p",
+      "a2a3",
+      "-d",
+      "0",
+      "--manual",
+      "include",
+      "--log-level",
+      "info",
+      "--enable-chip-swimlane",
+      "4"
+    ]
+  },
+  "dummy": {
+    "returncode": 0,
+    "passed_cases": 8,
+    "split_counts": [
+      0
+    ],
+    "cmd": [
+      "/data/aicpu-cluster-study/o-quota-runtime/.venv/bin/python",
+      "-c",
+      "import multiprocessing,runpy,sys,torch; multiprocessing.cpu_count=lambda:2; torch.set_num_threads(2); sys.argv=sys.argv[1:]; runpy.run_path(sys.argv[0],run_name='__main__')",
+      "/data/aicpu-cluster-study/placement-dummy/test_dummy_task.py",
+      "-p",
+      "a2a3",
+      "-d",
+      "0",
+      "--manual",
+      "include",
+      "--log-level",
+      "info",
+      "--enable-chip-swimlane",
+      "4"
+    ]
+  },
+  "strict": {
+    "returncode": 0,
+    "passed_cases": 2,
+    "split_counts": [],
+    "cmd": [
+      "/data/aicpu-cluster-study/o-quota-runtime/.venv/bin/python",
+      "-c",
+      "import multiprocessing,runpy,sys,torch; multiprocessing.cpu_count=lambda:2; torch.set_num_threads(2); sys.argv=sys.argv[1:]; runpy.run_path(sys.argv[0],run_name='__main__')",
+      "/data/aicpu-cluster-study/placement-vector/test_vector_example.py",
+      "-p",
+      "a2a3",
+      "-d",
+      "0",
+      "--manual",
+      "include",
+      "--log-level",
+      "info",
+      "--enable-chip-swimlane",
+      "4"
+    ]
+  },
+  "early": {
+    "returncode": 0,
+    "passed_cases": 2,
+    "split_counts": [],
+    "cmd": [
+      "/data/aicpu-cluster-study/o-quota-runtime/.venv/bin/python",
+      "-c",
+      "import multiprocessing,runpy,sys,torch; multiprocessing.cpu_count=lambda:2; torch.set_num_threads(2); sys.argv=sys.argv[1:]; runpy.run_path(sys.argv[0],run_name='__main__')",
+      "/data/aicpu-cluster-study/placement-early/test_vector_example.py",
+      "-p",
+      "a2a3",
+      "-d",
+      "0",
+      "--manual",
+      "include",
+      "--log-level",
+      "info",
+      "--enable-chip-swimlane",
+      "4"
+    ]
+  },
+  "sync": {
+    "returncode": 0,
+    "passed_cases": 1,
+    "split_counts": [
+      1
+    ],
+    "cmd": [
+      "/data/aicpu-cluster-study/o-quota-runtime/.venv/bin/python",
+      "-c",
+      "import multiprocessing,runpy,sys,torch; multiprocessing.cpu_count=lambda:2; torch.set_num_threads(2); sys.argv=sys.argv[1:]; runpy.run_path(sys.argv[0],run_name='__main__')",
+      "/data/aicpu-cluster-study/runtime-regressions/spmd_sync_start/test_spmd_sync_start.py",
+      "-p",
+      "a2a3",
+      "-d",
+      "0",
+      "--manual",
+      "include",
+      "--log-level",
+      "info",
+      "--enable-chip-swimlane",
+      "4"
+    ]
+  }
+}

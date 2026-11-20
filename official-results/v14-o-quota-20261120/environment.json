@@ -1,0 +1,47 @@
+{
+  "architecture": "aarch64",
+  "python": "3.10.22 (main, Oct  9 2026, 15:20:35) [Clang 22.1.3 ]",
+  "platform": "a2a3 onboard / Ascend910B2",
+  "physical_card": 6,
+  "logical_device": 0,
+  "aicpu_threads": 6,
+  "O_cpu": 7,
+  "S_cpus": [
+    2,
+    3,
+    4,
+    5,
+    6
+  ],
+  "side_scheduler_indices": [
+    [
+      0,
+      1
+    ],
+    [
+      2,
+      3,
+      4
+    ]
+  ],
+  "torch_threads": 2,
+  "OMP_NUM_THREADS": 2,
+  "MKL_NUM_THREADS": 2,
+  "OPENBLAS_NUM_THREADS": 2,
+  "compile_workers": 2,
+  "jobs": 2,
+  "task_submit_available": false,
+  "exclusive_lock": false,
+  "Qwen": {
+    "layers": 40,
+    "batch": 16,
+    "seq_len": 3500,
+    "max_seq_len": 5500,
+    "lm_head": false,
+    "attention": "CANN fused"
+  },
+  "CANN": "9.0.0",
+  "DFX": "normal timings have no swimlane capture; separate level-4 diagnostics",
+  "restart": "see resume-record.json",
+  "build_policy": "independent builds in each checkout; controls unchanged"
+}

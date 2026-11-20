@@ -1,59 +1,50 @@
 # PyPTO TMR：AICPU cluster 放置研究
 
-当前发布 **v13 O预测预留研究版本**：完整压力评分回到O，S只做阈值式ready亲和修正；
-按writer归属低频汇总累计R/E/C，O维护有界预测预留，移除逐FIN压力更新，保留受限跨侧领取。
-不实现范围级亲和、kernel时长预测或价格学习。这里是AICPU cluster，不是AI Core组。
+当前版本 **v14：O 统一评分、双侧固定 block 配额**。删除 S 首次 ready 改侧、WAIT 票数累计和跨侧领取，
+由两侧 S 领取各自不重叠的范围，通过周期摘要向 O 反馈实际队列压力。
 
-**本轮未保住v8性能**：四项中位数均更慢；领取开关消融也没有证明稳定净收益。
-新版按要求原样保留全部结果，不根据中途成绩调参或改发最好候选。
-v8、v11、v12分支保留，v13独立位于 `runtime-orchestrator-pressure`。
+Qwen decode 相比 v8 改善，但仍慢于 Shared；Bgemm 和 Paged Attention 相比 v8 回退。
+全部结果保留，测量中未调参；v14 是机制验证版本。
 
-- [完整算法与累计账本](docs/zh/experiments/tmr-cluster/algorithm.md)
-- [v13中文实验报告：交错计时、O/S诊断、领取消融](docs/zh/experiments/tmr-cluster/orchestrator-pressure.md)
-- [全部样本与验证](official-results/v13-orchestrator-pressure-20261119/summary.json)
-- [中位数、p95与各交错组CSV](official-results/v13-orchestrator-pressure-20261119/results.csv)
-- [v12算法](docs/zh/experiments/tmr-cluster/algorithm-v12.md) / [v12报告](docs/zh/experiments/tmr-cluster/ready-pressure.md)
-- [v8算法](docs/zh/experiments/tmr-cluster/algorithm-v8.md)
+- [v14 算法](docs/zh/experiments/tmr-cluster/algorithm-v14.md)
+- [v14 完整报告与诊断](docs/zh/experiments/tmr-cluster/o-quota.md)
+- [全部样本与统计](official-results/v14-o-quota-20261120/summary.json)
+- [CSV](official-results/v14-o-quota-20261120/results.csv)
+- [v13 报告](docs/zh/experiments/tmr-cluster/orchestrator-pressure.md)
+- [v8 算法](docs/zh/experiments/tmr-cluster/algorithm-v8.md)
 - [源码来源](docs/zh/experiments/tmr-cluster/source-provenance.json)
 
-## 获取完整代码
+## 本轮结果
+
+device_wall 中位数，单位 ms，每项每版本 30 样本，正百分比表示更慢。
+
+| Case | Shared | v8 (ms) | v14 | v14 vs v8 | v14 vs Shared |
+| ---- | -----: | ------: | --: | --------: | ------------: |
+| Bgemm | 1.04637 | 1.00804 | 1.15184 | +14.27% | +10.08% |
+| Scale | 4.85766 | 3.86222 | 5.67701 | +46.99% | +16.87% |
+| Uniform | 2.45813 | 2.20300 | 2.93216 | +33.10% | +19.28% |
+| Skew | 3.28223 | 2.90045 | 3.87212 | +33.50% | +17.97% |
+| Qwen | 36.10933 | 46.00712 | 40.56889 | -11.82% | +12.35% |
+
+物理卡 6 / 逻辑 0，Ascend910B2，六种版本顺序、每进程五轮，全部首轮保留。
+450 个普通样本，15 次模型 golden，15 次独立诊断；184 个 CPU 用例和 15 个板上回归通过。
+未持独占设备锁；中断后保留 255 个样本续跑，全部批次和恢复记录公开。
+
+## 获取代码
 
 ```bash
 git clone --recurse-submodules https://github.com/JJyun-ustc/PyPTO-tmr_partition.git
 cd PyPTO-tmr_partition
 ```
 
-main保存完整PyPTO，runtime子模块固定到v13具体提交。旧分支 `runtime-snapshot`、
-`runtime-ready-affinity`、`runtime-ready-pressure` 分别保留v8、v11、v12。
-原始PyPTO与旧研究worktree均未覆盖。
-
-## 本轮结果
-
-同一张910B2物理卡0/逻辑0，PCIe 0000:C1:00.0；O=CPU7，S=CPU2–6，两个AICPU cluster。
-四组平衡Williams版本顺序，每组每版本8轮，每项32轮；所有进程首轮保留。
-下表为device_wall中位数，单位ms；正数表示更慢。
-
-|负载|v8|v12|v13关闭领取|v13开启领取|v13相对v8|
-|---|---:|---:|---:|---:|---:|
-|Bgemm|1.01090|1.00960|1.12555|1.11790|+10.58%|
-|Scale|3.80049|5.00003|5.48891|5.48853|+44.42%|
-|Uniform|2.20268|2.63624|2.66862|2.70676|+22.88%|
-|Skew|2.90953|3.68813|3.54387|3.56969|+22.69%|
-
-512个普通样本、16次golden、16次独立诊断；194个CPU用例、15个板上正确性用例和DFX关闭构建通过。
-Scale诊断中S ready略降，但背景反馈与O提交成本上升；WAIT票辅助独立测量，不能声称完成路径零新增开销。
-普通性能诊断已触发单block远端领取；多block板上回归未触发远端分支，范围唯一性由并发CPU用例覆盖。
-未持独占设备锁，小幅变化不作稳定收益；仿真因缺g++-15未运行；未做O位置对照。
-详细p95、交错组结果、全部诊断与限制见报告。
-
-Git保存完整项目、候选源码、指纹、原始研究结果及中文说明；不包含二进制、venv、
-缓存或凭据。环境记录是依赖与工具链说明，不是磁盘镜像。许可证见 [LICENSE](LICENSE)。
+main 的 runtime 子模块固定到 v14 提交，分支 `runtime-o-quota`。
+v8、v11、v12、v13 分别保留在 `runtime-snapshot`、`runtime-ready-affinity`、
+`runtime-ready-pressure`、`runtime-orchestrator-pressure`。
+发布标签 `v14-o-quota-20261120`；仓库不包含二进制、venv、缓存或凭据。
 
 ---
 
-以下保留上游 PyPTO 项目说明。
-
-# PyPTO
+## PyPTO
 
 [English](README.md) | **中文**
 

@@ -1,0 +1,78 @@
+{
+  "chip_swimlane_level": 4,
+  "metadata": {
+    "runtime": "tensormap_and_ringbuffer",
+    "clock_freq_hz": 50000000,
+    "num_cores": 72,
+    "core_types": ["aic", "aic", "aic", "aic", "aic", "aic", "aic", "aic", "aic", "aic", "aic", "aic", "aic", "aic", "aic", "aic", "aic", "aic", "aic", "aic", "aic", "aic", "aic", "aic", "aiv", "aiv", "aiv", "aiv", "aiv", "aiv", "aiv", "aiv", "aiv", "aiv", "aiv", "aiv", "aiv", "aiv", "aiv", "aiv", "aiv", "aiv", "aiv", "aiv", "aiv", "aiv", "aiv", "aiv", "aiv", "aiv", "aiv", "aiv", "aiv", "aiv", "aiv", "aiv", "aiv", "aiv", "aiv", "aiv", "aiv", "aiv", "aiv", "aiv", "aiv", "aiv", "aiv", "aiv", "aiv", "aiv", "aiv", "aiv"],
+    "core_to_thread": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+  },
+  "aicore_tasks": [
+    [0, 0, 1, 336777230740434, 336777230740498, 90, 6],
+    [0, 5, 2, 336777230740886, 336777230740930, 16, 6]
+  ],
+  "scheduler_tasks": {
+    "producer": "aicpu",
+    "records": [
+    [0, 1, 336777230740335, 336777230740521, 6],
+    [0, 2, 336777230740854, 336777230741011, 6]
+    ]
+  },
+  "scheduler_records": {
+    "streams": [
+      {"platform": "a2a3", "producer": "aicpu", "scheduler_id": 0, "worker_id": 0, "core_type": "aicpu", "physical_core_id": null, "capture": {"committed": 20, "dropped": 0, "truncated": false}, "records": [
+        {"start_cycles": 336777230739285, "end_cycles": 336777230740299, "run_epoch": 6, "loop_iter": 0, "kind": "ready_wait", "tasks_processed": 1, "task_id": 0},
+        {"start_cycles": 336777230740162, "end_cycles": 336777230740359, "run_epoch": 6, "loop_iter": 1, "kind": "dispatch", "tasks_processed": 1, "task_id": null},
+        {"start_cycles": 336777230740510, "end_cycles": 336777230740601, "run_epoch": 6, "loop_iter": 3, "kind": "complete", "tasks_processed": 1, "task_id": null},
+        {"start_cycles": 336777230740571, "end_cycles": 336777230740626, "run_epoch": 6, "loop_iter": 0, "kind": "ready_wait", "tasks_processed": 1, "task_id": 1},
+        {"start_cycles": 336777230740622, "end_cycles": 336777230740622, "run_epoch": 6, "loop_iter": 3, "kind": "dummy_task", "tasks_processed": 1, "task_id": 1},
+        {"start_cycles": 336777230740619, "end_cycles": 336777230740639, "run_epoch": 6, "loop_iter": 3, "kind": "dummy", "tasks_processed": 1, "task_id": null},
+        {"start_cycles": 336777230740632, "end_cycles": 336777230740694, "run_epoch": 6, "loop_iter": 0, "kind": "ready_wait", "tasks_processed": 1, "task_id": 2},
+        {"start_cycles": 336777230740692, "end_cycles": 336777230740692, "run_epoch": 6, "loop_iter": 4, "kind": "dummy_task", "tasks_processed": 1, "task_id": 2},
+        {"start_cycles": 336777230740691, "end_cycles": 336777230740706, "run_epoch": 6, "loop_iter": 4, "kind": "dummy", "tasks_processed": 1, "task_id": null},
+        {"start_cycles": 336777230740696, "end_cycles": 336777230740749, "run_epoch": 6, "loop_iter": 0, "kind": "ready_wait", "tasks_processed": 1, "task_id": 3},
+        {"start_cycles": 336777230740748, "end_cycles": 336777230740748, "run_epoch": 6, "loop_iter": 5, "kind": "dummy_task", "tasks_processed": 1, "task_id": 3},
+        {"start_cycles": 336777230740747, "end_cycles": 336777230740761, "run_epoch": 6, "loop_iter": 5, "kind": "dummy", "tasks_processed": 1, "task_id": null},
+        {"start_cycles": 336777230740751, "end_cycles": 336777230740801, "run_epoch": 6, "loop_iter": 0, "kind": "ready_wait", "tasks_processed": 1, "task_id": 4},
+        {"start_cycles": 336777230740800, "end_cycles": 336777230740800, "run_epoch": 6, "loop_iter": 6, "kind": "dummy_task", "tasks_processed": 1, "task_id": 4},
+        {"start_cycles": 336777230740799, "end_cycles": 336777230740821, "run_epoch": 6, "loop_iter": 6, "kind": "dummy", "tasks_processed": 1, "task_id": null},
+        {"start_cycles": 336777230740803, "end_cycles": 336777230740846, "run_epoch": 6, "loop_iter": 0, "kind": "ready_wait", "tasks_processed": 1, "task_id": 5},
+        {"start_cycles": 336777230740821, "end_cycles": 336777230740872, "run_epoch": 6, "loop_iter": 6, "kind": "dispatch", "tasks_processed": 1, "task_id": null},
+        {"start_cycles": 336777230740945, "end_cycles": 336777230740977, "run_epoch": 6, "loop_iter": 7, "kind": "release", "tasks_processed": 5, "task_id": null},
+        {"start_cycles": 336777230740979, "end_cycles": 336777230741021, "run_epoch": 6, "loop_iter": 8, "kind": "complete", "tasks_processed": 1, "task_id": null},
+        {"start_cycles": 336777230741571, "end_cycles": 336777230741571, "run_epoch": 6, "loop_iter": 9, "kind": "dispatch", "tasks_processed": 0, "task_id": null}
+      ], "metrics": [
+        {"record_index": 0, "shared_at_start": [0,0,0], "shared_at_end": [0,0,0]},
+        {"record_index": 1, "pop_hit": 1, "pop_miss": 8, "shared_at_start": [1,0,0], "shared_at_end": [0,0,0]},
+        {"record_index": 2, "shared_at_start": [0,0,0], "shared_at_end": [0,0,0]},
+        {"record_index": 3, "shared_at_start": [0,0,0], "shared_at_end": [0,0,0]},
+        {"record_index": 4, "shared_at_start": [0,0,0], "shared_at_end": [0,0,0]},
+        {"record_index": 5, "shared_at_start": [0,0,0], "shared_at_end": [0,0,0]},
+        {"record_index": 6, "shared_at_start": [0,0,0], "shared_at_end": [0,0,0]},
+        {"record_index": 7, "shared_at_start": [0,0,0], "shared_at_end": [0,0,0]},
+        {"record_index": 8, "shared_at_start": [0,0,0], "shared_at_end": [0,0,0]},
+        {"record_index": 9, "shared_at_start": [0,0,0], "shared_at_end": [0,0,0]},
+        {"record_index": 10, "shared_at_start": [0,0,0], "shared_at_end": [0,0,0]},
+        {"record_index": 11, "shared_at_start": [0,0,0], "shared_at_end": [0,0,0]},
+        {"record_index": 12, "shared_at_start": [0,0,0], "shared_at_end": [0,0,0]},
+        {"record_index": 13, "shared_at_start": [0,0,0], "shared_at_end": [0,0,0]},
+        {"record_index": 14, "shared_at_start": [0,0,0], "shared_at_end": [1,0,0]},
+        {"record_index": 15, "shared_at_start": [0,0,0], "shared_at_end": [0,0,0]},
+        {"record_index": 16, "pop_hit": 1, "pop_miss": 40, "shared_at_start": [1,0,0], "shared_at_end": [1,0,0]},
+        {"record_index": 17, "shared_at_start": [0,0,0], "shared_at_end": [0,0,0]},
+        {"record_index": 18, "shared_at_start": [1,0,0], "shared_at_end": [0,0,0]},
+        {"record_index": 19, "pop_hit": 0, "pop_miss": 18, "shared_at_start": [0,0,0], "shared_at_end": [0,0,0]}
+      ]}
+    ]
+  },
+  "aicpu_orchestrator_phases": [
+    [
+      {"submit_idx": 0, "task_id": 0, "start_cycles": 336777230739131, "end_cycles": 336777230739302, "run_epoch": 6},
+      {"submit_idx": 1, "task_id": 1, "start_cycles": 336777230739334, "end_cycles": 336777230739410, "run_epoch": 6},
+      {"submit_idx": 2, "task_id": 2, "start_cycles": 336777230739413, "end_cycles": 336777230739442, "run_epoch": 6},
+      {"submit_idx": 3, "task_id": 3, "start_cycles": 336777230739446, "end_cycles": 336777230739464, "run_epoch": 6},
+      {"submit_idx": 4, "task_id": 4, "start_cycles": 336777230739469, "end_cycles": 336777230739489, "run_epoch": 6},
+      {"submit_idx": 5, "task_id": 5, "start_cycles": 336777230739498, "end_cycles": 336777230739533, "run_epoch": 6}
+    ]
+  ]
+}
