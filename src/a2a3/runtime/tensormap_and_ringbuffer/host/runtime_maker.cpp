@@ -628,7 +628,9 @@ static bool copy_in_device_args(
 // image steps stay free of unrelated state.
 static void apply_orch_sched_env_flags(Runtime *runtime) {
     const char *qkv = std::getenv("SIMPLER_TMR_QKV_BATCH");
-    runtime->dev.qkv_batch = qkv && qkv[0] == '1';
+    runtime->dev.qkv_batch = qkv ? std::atoi(qkv) : 0;
+    const char *trace = std::getenv("SIMPLER_TMR_QKV_TRACE");
+    runtime->dev.qkv_trace_level = trace ? std::atoi(trace) : 0;
     LOG_INFO("QKV ready batch: %s", runtime->dev.qkv_batch ? "enabled" : "Shared");
     const char *serial_env = std::getenv("SIMPLER_TMR_SERIAL_ORCH_SCHED_ENABLE");
     runtime->dev.serial_orch_sched =
@@ -1054,10 +1056,8 @@ extern "C" int copy_back_run_outputs_impl(const Runtime *runtime, const HostApi 
     if (execution_rc != 0 && launched != 0) {
         runtime_status = read_published_run_status(api, &host_header);
         if (runtime_status == 0) {
-            LOG_WARN(
-                "this run published no terminal record; its execution status stands and the device-side detail is "
-                "in the device log"
-            );
+            LOG_WARN("this run published no terminal record; its execution status stands and the device-side detail is "
+                     "in the device log");
         }
     }
     if (runtime_status != 0) {

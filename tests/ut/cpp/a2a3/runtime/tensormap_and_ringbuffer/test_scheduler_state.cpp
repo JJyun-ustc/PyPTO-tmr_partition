@@ -25,6 +25,7 @@
 #include "utils/device_arena.h"
 #include "scheduler/scheduler_types.h"
 #include "scheduler/scheduler.h"
+#include "qkv_learned.h"
 
 TEST(AsyncWaitDiagnosticsTest, SeparatesTaskBodyAndCompletionPendingAndGuardsMailboxUnderflow) {
     auto wait_list = std::make_unique<AsyncWaitList>();
@@ -794,7 +795,8 @@ TEST_F(SchedulerStateTest, QkvQueueFullFallsBackOnce) {
     sched.qkv.capacity[0][0] = sched.qkv.capacity[1][0] = 8;
     // Occupy queue tickets with a sentinel; the tested task is never inserted.
     ChipTaskSlotState sentinel;
-    for (int i = 0; i < simpler::tmr::QKV_PENDING; ++i) EXPECT_TRUE(sched.qkv_pending.push(&sentinel));
+    for (int i = 0; i < simpler::tmr::QKV_PENDING; ++i)
+        EXPECT_TRUE(sched.qkv_pending.push(&sentinel));
     ChipTaskSlotState slot;
     init_slot(slot, CHIP_TASK_PENDING, 0, 0);
     EXPECT_TRUE(sched.route_ready_once(slot));
@@ -819,8 +821,9 @@ TEST_F(SchedulerStateTest, QkvUnavailableSnapshotAndNoCompatibleSide) {
     sched.service_qkv_batch();
     EXPECT_EQ(sched.qkv.fallback[1].load(), 1u);
     // A valid summary whose compatible capacity is smaller than this task.
-    for (int c = 0; c < 2; ++c) for (int r = 0; r < 2; ++r)
-        sched.qkv.threads[c].resources[r].store(1 | (1 << 16));
+    for (int c = 0; c < 2; ++c)
+        for (int r = 0; r < 2; ++r)
+            sched.qkv.threads[c].resources[r].store(1 | (1 << 16));
     EXPECT_TRUE(sched.route_ready_once(slots[1]));
     sched.service_qkv_batch();
     EXPECT_EQ(sched.qkv.fallback[2].load(), 1u);
@@ -846,10 +849,11 @@ TEST_F(SchedulerStateTest, QkvOversizeAndSyncPreserveOriginalQueues) {
 
 TEST(QkvFormula, KvStateOverridesLowerBaseLoadAndBatchChangesNextChoice) {
     simpler::tmr::QkvSnapshot s;
-    for (int c = 0; c < 2; ++c) for (int r = 0; r < 2; ++r) {
-        s.capacity[c][r] = 8;
-        s.idle[c][r] = 8;
-    }
+    for (int c = 0; c < 2; ++c)
+        for (int r = 0; r < 2; ++r) {
+            s.capacity[c][r] = 8;
+            s.idle[c][r] = 8;
+        }
     double reserved[2][2]{};
     EXPECT_EQ(simpler::tmr::qkv_choose(s, 0, 1, 0, reserved), 0);
     EXPECT_EQ(simpler::tmr::qkv_choose(s, 0, 1, 0, reserved), 1);
@@ -883,21 +887,24 @@ TEST_F(SchedulerStateTest, QkvConcurrentLocalRangeClaimsAreUnique) {
     std::atomic<int> seen[8]{};
     std::atomic<int> done{0};
     std::thread workers[4];
-    for (auto &worker : workers) worker = std::thread([&] {
-        while (done.load(std::memory_order_acquire) < 8) {
-            auto *next = queue.pop();
-            if (!next) continue;
-            int start = -1;
-            int count = next->claim_block_range(8, 1, start);
-            if (!count) continue;
-            // Requeue before recording completion, as production dispatch does.
-            if (start + count < 8) queue.push(next);
-            seen[start].fetch_add(1, std::memory_order_relaxed);
-            done.fetch_add(1, std::memory_order_release);
-        }
-    });
-    for (auto &worker : workers) worker.join();
-    for (auto &count : seen) EXPECT_EQ(count.load(), 1);
+    for (auto &worker : workers)
+        worker = std::thread([&] {
+            while (done.load(std::memory_order_acquire) < 8) {
+                auto *next = queue.pop();
+                if (!next) continue;
+                int start = -1;
+                int count = next->claim_block_range(8, 1, start);
+                if (!count) continue;
+                // Requeue before recording completion, as production dispatch does.
+                if (start + count < 8) queue.push(next);
+                seen[start].fetch_add(1, std::memory_order_relaxed);
+                done.fetch_add(1, std::memory_order_release);
+            }
+        });
+    for (auto &worker : workers)
+        worker.join();
+    for (auto &count : seen)
+        EXPECT_EQ(count.load(), 1);
     EXPECT_EQ(queue.size(), 0u);
     EXPECT_EQ(sched.qkv_pending.size(), 0u);
 }
@@ -923,4 +930,112 @@ TEST_F(SchedulerStateTest, QkvStrictPredicateAndEarlyRemainderStayOnOriginalPath
     EXPECT_EQ(sched.qkv_pending.size(), 0u);
     EXPECT_EQ(sched.qkv.eligible.load(), 0u);
     EXPECT_EQ(early.payload->placement.reserved, 0);
+}
+
+TEST(QkvFormula, ReducedLogitsPreservePressureAndSequentialChoices) {
+    using namespace simpler::tmr;
+    uint32_t rng = 1234;
+    auto next = [&]() {
+        rng = rng * 1664525u + 1013904223u;
+        return rng;
+    };
+    for (int trial = 0; trial < 2000; ++trial) {
+        QkvSnapshot snapshot;
+        for (int c = 0; c < 2; ++c) {
+            snapshot.capacity[c][0] = 8 + next() % 25;
+            snapshot.queued[c][0] = next() % 100;
+            snapshot.occupied[c][0] = double(next() % 101) / 100;
+            snapshot.idle[c][0] = next() % (int(snapshot.capacity[c][0]) + 1);
+        }
+        QkvBatchScorer fast;
+        double old_reserved[2][2]{}, new_reserved[2][QKV_CHANNELS]{};
+        for (int i = 0; i < 8; ++i) {
+            int blocks = 1 + next() % 8;
+            double age = double(next() % 1001) / 1000;
+            for (int c = 0; c < 2; ++c) {
+                QkvFastRow row;
+                row.init(snapshot, c, 0, blocks);
+                EXPECT_NEAR(row.pressure(age), qkv_pressure(snapshot, c, 0, blocks, age), 1e-12);
+            }
+            EXPECT_EQ(
+                qkv_choose(snapshot, 0, blocks, age, old_reserved), fast.choose(snapshot, 0, blocks, age, new_reserved)
+            );
+        }
+    }
+}
+
+TEST_F(SchedulerStateTest, QkvImprovedMixMasksUseDistinctCompatibleGroupLedgers) {
+    using namespace simpler::tmr;
+    sched.qkv.enabled = true;
+    sched.qkv.mode = 3;
+    sched.qkv.schedulers = 2;
+    auto stamp = get_sys_cnt_aicpu();
+    for (int c = 0; c < 2; ++c) {
+        sched.qkv.side[c] = c;
+        sched.qkv.threads[c].stamp.store(stamp);
+        sched.qkv.threads[c].version.store(2);
+        for (int r = 0; r < QKV_CHANNELS; ++r) {
+            sched.qkv.capacity[c][r] = 8;
+            sched.qkv.threads[c].resources[r].store(8 | (8 << 8) | (8 << 16));
+            sched.qkv.idle_hint[c][r].store((stamp << 8) | 8);
+        }
+    }
+    ChipTaskSlotState slots[4];
+    const int masks[4] = {3, 5, 6, 7};
+    for (int i = 0; i < 4; ++i) {
+        init_slot(slots[i], CHIP_TASK_PENDING, 0, 0);
+        slots[i].active_mask = ActiveMask(masks[i]);
+        EXPECT_TRUE(sched.route_ready_once(slots[i]));
+        EXPECT_FALSE(sched.route_ready_once(slots[i]));
+    }
+    EXPECT_EQ(sched.qkv_pending.size(), 4u);
+    sched.service_qkv_batch();
+    EXPECT_EQ(sched.qkv_pending.size(), 0u);
+    EXPECT_EQ(sched.qkv.shape_assigned[2], 4u);
+    EXPECT_EQ(sched.cluster_ready_queues[0][2].size(), 4u);
+    for (int mask : masks)
+        EXPECT_EQ(sched.qkv.assigned[0][qkv_channel(2, mask)], 1u);
+}
+
+TEST_F(SchedulerStateTest, QkvImprovedMissingStaleAndBusyHintsFallBackExactlyOnce) {
+    using namespace simpler::tmr;
+    sched.qkv.enabled = true;
+    sched.qkv.mode = 3;
+    sched.qkv.capacity[0][0] = sched.qkv.capacity[1][0] = 8;
+    ChipTaskSlotState slots[3];
+    for (int i = 0; i < 3; ++i) {
+        init_slot(slots[i], CHIP_TASK_PENDING, 0, 0);
+        uint64_t tick = get_sys_cnt_aicpu();
+        for (int c = 0; c < 2; ++c) {
+            uint64_t hint = i == 0 ? 0 : (i == 1 ? ((tick - 100000) << 8) | 8 : tick << 8);
+            sched.qkv.idle_hint[c][0].store(hint);
+        }
+        EXPECT_TRUE(sched.route_ready_once(slots[i]));
+        EXPECT_FALSE(sched.route_ready_once(slots[i]));
+    }
+    EXPECT_EQ(sched.qkv_pending.size(), 0u);
+    EXPECT_EQ(sched.ready_queues[0].size(), 3u);
+    EXPECT_EQ(sched.qkv.fallback[int(QkvFallback::Uninitialized)].load(), 1u);
+    EXPECT_EQ(sched.qkv.fallback[int(QkvFallback::Stale)].load(), 1u);
+    EXPECT_EQ(sched.qkv.fallback[int(QkvFallback::Busy)].load(), 1u);
+}
+
+TEST(QkvLearned, FrozenProjectionMatchesTorchAndMissingSpecUsesFormula) {
+    using namespace simpler::tmr;
+    QkvSnapshot s;
+    for (int c = 0; c < 2; ++c) {
+        s.capacity[c][1] = 30;
+        s.queued[c][1] = 30;
+        s.occupied[c][1] = .5;
+        s.idle[c][1] = 3;
+    }
+    int kernels[3] = {-1, 4, -1};
+    const double expected_pytorch_score = 136.84021918183097;
+    EXPECT_NEAR(qkv_learned_score(s, 0, 1, 1, 2, kernels, .1, 6), expected_pytorch_score, 1e-4);
+    int missing[3] = {999, -1, -1};
+    EXPECT_LT(learned::runtime(missing, 1, 1, 0), 0);
+    QkvBatchScorer formula, fallback;
+    double a[2][QKV_CHANNELS]{}, b[2][QKV_CHANNELS]{};
+    EXPECT_EQ(qkv_learned_choose(s, 1, 1, 2, missing, .1, a, fallback), formula.choose(s, 1, 1, .1, b));
+    EXPECT_EQ(a[0][1], b[0][1]);
 }

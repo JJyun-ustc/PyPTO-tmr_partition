@@ -1319,6 +1319,11 @@ static TaskOutputTensors submit_task_common(
 #if SIMPLER_DFX
     uint64_t wire_begin = orch->chip_swimlane_level >= ChipSwimlaneLevel::SCHED_PHASES ? get_sys_cnt_aicpu() : 0;
 #endif
+    sched->qkv_trace_create(cur_slot_state);
+    if (sched->qkv.trace.level == 2)
+        for_each_fanin_slot_state(payload, [&](ChipTaskSlotState *producer, DepFlags flags) {
+            if (dep_has_wait(flags)) sched->qkv_trace_edge(*producer, cur_slot_state);
+        });
     // === STEP 6: wire on the orchestrator side and publish readiness ===
     // Zero-fanin tasks and tasks whose claimed producers are already completed
     // do not need fanout links or dep_pool entries. Tasks with live producers
@@ -1613,6 +1618,15 @@ TaskOutputTensors OrchestratorState::alloc_tensors(const CoreTaskArgs &args) {
         // codegen task there is no Arg-driven hint to honor here, so mark it
         // unconditionally.
         prepared.slot_state->task_attrs.set_early_resolve(true);
+        orch->scheduler->qkv_trace_create(*prepared.slot_state);
+        if (auto *record = orch->scheduler->qkv_record(*prepared.slot_state)) {
+            uint64_t now = get_sys_cnt_aicpu();
+            record->ready = record->created;
+            record->completed = now;
+            record->start(record->created, 6);
+            record->fin.store(now);
+            record->scheduler.store(-1);
+        }
         prepared.slot_state->mark_completed();
     }
     orch->inline_completed_tasks++;

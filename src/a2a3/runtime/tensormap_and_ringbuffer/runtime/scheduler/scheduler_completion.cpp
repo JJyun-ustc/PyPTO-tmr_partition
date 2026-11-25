@@ -155,6 +155,9 @@ void SchedulerContext::complete_slot_task(
         }
     }
 
+    if (auto *r = sched_->qkv_record(slot_state)) {
+        if (!r->start_proxy.load(std::memory_order_relaxed)) r->start(get_sys_cnt_aicpu(), 4);
+    }
     bool task_complete = sched_->on_subtask_complete(slot_state);
 
 #if SIMPLER_DFX
@@ -451,10 +454,12 @@ void SchedulerContext::check_running_cores_for_completion(
                 // completed the cohort (and the producer already released).
                 ChipTaskSlotState *promoted = core.pending_slot_state;
                 bool sync_start_promote = pending_gated && promoted->task_attrs.requires_sync_start();
+                if (auto *r = sched_->qkv_record(*promoted)) r->start(get_sys_cnt_aicpu(), 2);
                 promote_pending_to_running(core);  // Case 2 or Case 3 (with pending)
                 if (sync_start_promote) {
                     promoted->payload->running_slot_count.fetch_add(1, std::memory_order_seq_cst);
                     if (sched_->try_launch_sync_start_cohort(*promoted)) {
+                        if (auto *r = sched_->qkv_record(*promoted)) r->start(get_sys_cnt_aicpu(), 3);
                         sched_->propagate_dispatch_fanin(*promoted);
                     }
                 }

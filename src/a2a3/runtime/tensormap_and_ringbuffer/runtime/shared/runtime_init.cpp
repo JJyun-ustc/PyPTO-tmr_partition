@@ -195,7 +195,10 @@ bool SchedulerState::init_data_from_layout(const SchedulerLayout &layout, Device
             return false;
         }
     }
-    if (!ready_queue_init_data_from_layout(&sched->qkv_pending, arena, layout.off_qkv_pending_slots, simpler::tmr::QKV_PENDING)) return false;
+    if (!ready_queue_init_data_from_layout(
+            &sched->qkv_pending, arena, layout.off_qkv_pending_slots, simpler::tmr::QKV_PENDING
+        ))
+        return false;
     if (!ready_queue_init_data_from_layout(
             &sched->dummy_ready_queue, arena, layout.off_dummy_ready_queue_slots, layout.ready_queue_capacity
         )) {
@@ -307,7 +310,9 @@ void SchedulerState::wire_arena_pointers(const SchedulerLayout &layout, DeviceAr
                 &sched->cluster_ready_queues[c][i], arena, layout.off_cluster_ready_queue_slots[c][i]
             );
         }
-        ready_queue_wire_arena_pointers(&sched->cluster_dummy_queues[c], arena, layout.off_cluster_dummy_queue_slots[c]);
+        ready_queue_wire_arena_pointers(
+            &sched->cluster_dummy_queues[c], arena, layout.off_cluster_dummy_queue_slots[c]
+        );
     }
     for (int i = 0; i < NUM_RESOURCE_SHAPES; i++) {
         ready_queue_wire_arena_pointers(
@@ -703,6 +708,10 @@ bool runtime_reset_for_reuse(DeviceArena &arena, const RuntimeArenaLayout &layou
         return false;
     }
     rt->scheduler.reset_for_reuse(layout.offsets.sched, rt->sm_handle->sm_base);
+    LOG_INFO(
+        "QKV_R2_RESET rt=%p scheduler=%p header=%p size=%zu", static_cast<void *>(rt),
+        static_cast<void *>(&rt->scheduler), static_cast<void *>(rt->scheduler.sm_header), sizeof(RuntimeContext)
+    );
     return true;
 }
 

@@ -12,6 +12,7 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <cstdio>
 #include <cerrno>
 #include <cinttypes>
 #include <cstdint>
@@ -125,6 +126,69 @@ struct OrchSoEntry {
     DeviceOrchestrationBindRuntimeFunc bind{nullptr};
     DeviceOrchestrationConfigFunc config_func{nullptr};
 };
+
+static void dump_qkv_round2(const simpler::tmr::QkvTrace &tr) {
+    LOG_INFO(
+        "QKV_R2_META level=%d tasks=%u edges=%u dropped=%u phase_samples=%llu early=%llu,%llu,%llu,%llu gap_max=%llu "
+        "actual_start=unavailable proxy=idle_publish_or_promotion_or_doorbell fin=aicpu_observed",
+        tr.level, tr.count, tr.edge_count, tr.dropped, (unsigned long long)tr.service_calls,
+        (unsigned long long)tr.early_candidate.load(), (unsigned long long)tr.early_hit.load(),
+        (unsigned long long)tr.early_fallback.load(), (unsigned long long)tr.early_release.load(),
+        (unsigned long long)tr.s0_max_gap
+    );
+    for (uint32_t i = 0; i < tr.count; i += 1) {
+        char buffer[4096];
+        size_t pos = 0;
+        for (uint32_t j = i; j < tr.count && j < i + 1; ++j) {
+            const auto &r = tr.tasks[j];
+            pos += std::snprintf(
+                buffer + pos, sizeof(buffer) - pos,
+                "%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%llu,%llu,%llu,%"
+                ".17g,%.17g,%.17g,%.17g,%.17g,%.17g,%.17g,%.17g,%.17g,%.17g;",
+                (unsigned long long)r.task, (unsigned long long)r.created, (unsigned long long)r.ready,
+                (unsigned long long)r.pop, (unsigned long long)r.publish, (unsigned long long)r.dispatch.load(),
+                (unsigned long long)r.start_proxy.load(), (unsigned long long)r.first_fin.load(),
+                (unsigned long long)r.fin.load(), (unsigned long long)r.completed, r.kernel[0], r.kernel[1],
+                r.kernel[2], r.blocks, r.shape, r.mask, r.sync, r.selected, r.dispatch_side.load(), r.proxy_kind.load(),
+                r.scheduler.load(), r.fanout, (unsigned long long)r.dummy_begin, (unsigned long long)r.dummy_end,
+                (unsigned long long)r.summary_age, r.features[0][0], r.features[0][1], r.features[0][2],
+                r.features[0][3], r.features[0][4], r.features[1][0], r.features[1][1], r.features[1][2],
+                r.features[1][3], r.features[1][4]
+            );
+        }
+        LOG_INFO("QKV_R2_TASKS %s", buffer);
+    }
+    for (uint32_t i = 0; i < tr.edge_count; i += 16) {
+        char buffer[4096];
+        size_t pos = 0;
+        for (uint32_t j = i; j < tr.edge_count && j < i + 16; ++j)
+            pos += std::snprintf(
+                buffer + pos, sizeof(buffer) - pos, "%llu,%llu;", (unsigned long long)tr.edges[j].producer,
+                (unsigned long long)tr.edges[j].consumer
+            );
+        LOG_INFO("QKV_R2_EDGES %s", buffer);
+    }
+    for (uint64_t i = 0; i < tr.service_calls && i < 4096; ++i)
+        LOG_INFO(
+            "QKV_R2_PHASE %llu,%llu,%llu,%llu", (unsigned long long)tr.phase_samples[i][0],
+            (unsigned long long)tr.phase_samples[i][1], (unsigned long long)tr.phase_samples[i][2],
+            (unsigned long long)tr.phase_samples[i][3]
+        );
+    for (uint64_t i = 0; i < tr.shadow_count; ++i)
+        LOG_INFO(
+            "QKV_R2_SHADOW candidates=16 ticks=%llu linear_ticks=%llu", (unsigned long long)tr.shadow_ticks[i],
+            (unsigned long long)tr.shadow_linear_ticks[i]
+        );
+    for (int i = 0; i < 32; ++i)
+        if (tr.s0_gaps[i]) LOG_INFO("QKV_R2_GAP bin=%d count=%llu", i, (unsigned long long)tr.s0_gaps[i]);
+    for (int i = 0; i < 6; ++i)
+        LOG_INFO(
+            "QKV_R2_EARLY thread=%d staged=%llu census=%llu running_max=%llu pending_max=%llu slot_sum=%llu", i,
+            (unsigned long long)tr.early_staged[i], (unsigned long long)tr.early_slots[i][0],
+            (unsigned long long)tr.early_slots[i][1], (unsigned long long)tr.early_slots[i][2],
+            (unsigned long long)tr.early_slots[i][3]
+        );
+}
 
 struct AicpuExecutor {
     int32_t sched_thread_num_;
@@ -763,6 +827,11 @@ int32_t AicpuExecutor::run_orchestration(Runtime *runtime, int32_t thread_idx) {
             // the serial path.
             runtime_finalize_after_wire(rt, sched_ctx_.aic_count(), sched_ctx_.aiv_count());
             sched_ctx_.init_qkv(runtime, &rt->scheduler);
+            LOG_INFO(
+                "QKV_R2_LAYOUT rt=%p scheduler=%p header=%p sm=%p size=%zu", static_cast<void *>(rt),
+                static_cast<void *>(&rt->scheduler), static_cast<void *>(rt->scheduler.sm_header),
+                rt->sm_handle->sm_base, sizeof(RuntimeContext)
+            );
             rt->scheduler.placement_feedback.orchestrator_cluster = runtime->dev.aicpu_cluster_ids[sched_thread_num_];
             rt->orchestrator.aicpu_cluster_sched_count[0] = 0;
             rt->orchestrator.aicpu_cluster_sched_count[1] = 0;
@@ -1066,34 +1135,69 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         // every subsequent run.
         if (rt != nullptr) {
             auto &q = rt->scheduler.qkv;
+            if (q.trace.level) {
+                dump_qkv_round2(q.trace);
+                LOG_INFO(
+                    "QKV_R2_AUDIT submitted=%lld traced=%u", static_cast<long long>(rt->orchestrator.tasks_submitted),
+                    q.trace.count
+                );
+            }
             if (q.enabled) {
-                uint64_t a0 = q.assigned[0][0] + q.assigned[0][1];
-                uint64_t a1 = q.assigned[1][0] + q.assigned[1][1];
+                uint64_t a0 = 0, a1 = 0;
+                for (int r = 0; r < simpler::tmr::QKV_CHANNELS; ++r) {
+                    a0 += q.assigned[0][r];
+                    a1 += q.assigned[1][r];
+                }
                 uint64_t claimed[2]{};
-                for (auto &row : q.threads) for (int c = 0; c < 2; ++c) for (int r = 0; r < 2; ++r)
-                    claimed[c] += row.taken[c][r].load(std::memory_order_relaxed);
-                LOG_INFO("QKV_SUMMARY eligible=%llu assigned_tasks=%llu,%llu batches=%llu ticks=%llu max_ticks=%llu freq=%llu assigned_blocks=%llu,%llu claimed_blocks=%llu,%llu pending=%llu",
+                for (auto &row : q.threads)
+                    for (int c = 0; c < 2; ++c)
+                        for (int r = 0; r < simpler::tmr::QKV_CHANNELS; ++r)
+                            claimed[c] += row.taken[c][r].load(std::memory_order_relaxed);
+                LOG_INFO(
+                    "QKV_SUMMARY eligible=%llu assigned_tasks=%llu,%llu batches=%llu ticks=%llu max_ticks=%llu "
+                    "freq=%llu assigned_blocks=%llu,%llu claimed_blocks=%llu,%llu pending=%llu",
                     (unsigned long long)q.eligible.load(), (unsigned long long)q.assigned_tasks[0],
                     (unsigned long long)q.assigned_tasks[1], (unsigned long long)q.decision_count,
                     (unsigned long long)q.ticks, (unsigned long long)q.max_ticks,
-                    (unsigned long long)PLATFORM_PROF_SYS_CNT_FREQ,
-                    (unsigned long long)a0, (unsigned long long)a1,
+                    (unsigned long long)PLATFORM_PROF_SYS_CNT_FREQ, (unsigned long long)a0, (unsigned long long)a1,
                     (unsigned long long)claimed[0], (unsigned long long)claimed[1],
-                    (unsigned long long)rt->scheduler.qkv_pending.size());
-                LOG_INFO("QKV_BATCHES sizes1to8=%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu fallback_full_snapshot_noside_budget_oversize=%llu,%llu,%llu,%llu,%llu",
+                    (unsigned long long)rt->scheduler.qkv_pending.size()
+                );
+                LOG_INFO(
+                    "QKV_BATCHES sizes1to8=%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu "
+                    "fallback_full_snapshot_noside_budget_oversize=%llu,%llu,%llu,%llu,%llu",
                     (unsigned long long)q.batches[1], (unsigned long long)q.batches[2],
                     (unsigned long long)q.batches[3], (unsigned long long)q.batches[4],
                     (unsigned long long)q.batches[5], (unsigned long long)q.batches[6],
                     (unsigned long long)q.batches[7], (unsigned long long)q.batches[8],
                     (unsigned long long)q.fallback[0].load(), (unsigned long long)q.fallback[1].load(),
                     (unsigned long long)q.fallback[2].load(), (unsigned long long)q.fallback[3].load(),
-                    (unsigned long long)q.fallback[4].load());
-                for (int b = 0; b < 32; ++b) if (q.tick_hist[b])
-                    LOG_INFO("QKV_TIME_BIN log2_ns=%d count=%llu", b, (unsigned long long)q.tick_hist[b]);
+                    (unsigned long long)q.fallback[4].load()
+                );
+                LOG_INFO(
+                    "QKV_R2_COVERAGE shape_eligible=%llu,%llu,%llu assigned=%llu,%llu,%llu uninitialized=%llu "
+                    "stale=%llu busy=%llu version=%llu",
+                    (unsigned long long)q.shape_eligible[0].load(), (unsigned long long)q.shape_eligible[1].load(),
+                    (unsigned long long)q.shape_eligible[2].load(), (unsigned long long)q.shape_assigned[0],
+                    (unsigned long long)q.shape_assigned[1], (unsigned long long)q.shape_assigned[2],
+                    (unsigned long long)q.fallback[5].load(), (unsigned long long)q.fallback[6].load(),
+                    (unsigned long long)q.fallback[7].load(), (unsigned long long)q.fallback[8].load()
+                );
+                if (q.mode == 4)
+                    LOG_INFO(
+                        "QKV_R2_LEARNED attempted=%llu missing_calibration=%llu", (unsigned long long)q.learned_tasks,
+                        (unsigned long long)q.learned_missing
+                    );
+                for (int b = 0; b < 32; ++b)
+                    if (q.tick_hist[b])
+                        LOG_INFO("QKV_TIME_BIN log2_ns=%d count=%llu", b, (unsigned long long)q.tick_hist[b]);
 #if SIMPLER_DFX
                 if (get_chip_swimlane_level() >= ChipSwimlaneLevel::SCHED_PHASES)
                     for (uint64_t b = 0; b < q.decision_count && b < 4096; ++b)
-                        LOG_INFO("QKV_DECISION batch=%llu ticks=%llu", (unsigned long long)b, (unsigned long long)q.decision_ticks[b]);
+                        LOG_INFO(
+                            "QKV_DECISION batch=%llu ticks=%llu", (unsigned long long)b,
+                            (unsigned long long)q.decision_ticks[b]
+                        );
 #endif
             }
             auto &model = rt->orchestrator.cluster_partitioner;

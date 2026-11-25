@@ -542,6 +542,68 @@ struct SchedulerState {
     ChipReadyQueue qkv_pending;
     simpler::tmr::QkvState qkv;
     void service_qkv_batch();
+    void refresh_qkv_hints() {
+        uint32_t active = qkv.active_channels.load(std::memory_order_relaxed);
+        for (int c = 0; c < 2; ++c)
+            for (int r = 0; r < simpler::tmr::QKV_CHANNELS; ++r) {
+                if (!(active & (1u << r))) continue;
+                uint64_t idle = 0, oldest = UINT64_MAX;
+                bool valid = true;
+                for (int t = 0; t < qkv.schedulers; ++t)
+                    if (qkv.side[t] == c) {
+                        uint64_t word = qkv.threads[t].resources[r].load(std::memory_order_acquire);
+                        uint64_t stamp = qkv.threads[t].stamp.load(std::memory_order_acquire);
+                        if (!word || !stamp) valid = false;
+                        idle += (word >> 16) & 255;
+                        if (stamp < oldest) oldest = stamp;
+                    }
+                qkv.idle_hint[c][r].store(valid ? (oldest << 8) | idle : 0, std::memory_order_release);
+            }
+    }
+    simpler::tmr::QkvTaskTrace *qkv_record(ChipTaskSlotState &slot) {
+        if (!qkv.trace.level || slot.payload->placement.scope) return nullptr;
+        uint32_t idx = slot.payload->placement.group;
+        return idx && idx <= simpler::tmr::QKV_TRACE_TASKS ? &qkv.trace.tasks[idx - 1] : nullptr;
+    }
+    void qkv_trace_create(ChipTaskSlotState &slot) {
+        if (!qkv.trace.level || slot.payload->placement.scope) return;
+        uint64_t id = TaskId::to_uint64(slot.task->task_id);
+        int shape = static_cast<int>(slot.active_mask.to_shape());
+        if (qkv.trace.level == 1 && (id & 31) && shape < 2) return;
+        if (qkv.trace.count == simpler::tmr::QKV_TRACE_TASKS) {
+            ++qkv.trace.dropped;
+            return;
+        }
+        uint32_t index = qkv.trace.count++;
+        auto &r = qkv.trace.tasks[index];
+        r.init(id, get_sys_cnt_aicpu());
+        r.shape = shape;
+        r.mask = slot.active_mask.core_mask();
+        r.blocks = slot.logical_block_num;
+        r.sync = slot.task_attrs.requires_sync_start();
+        for (int k = 0; k < 3; ++k)
+            r.kernel[k] = slot.task->kernel_id[k];
+        slot.payload->placement.group = index + 1;
+    }
+    void qkv_trace_ready(ChipTaskSlotState &slot) {
+        if (auto *r = qkv_record(slot)) r->ready = get_sys_cnt_aicpu();
+    }
+    void qkv_trace_publish(ChipTaskSlotState &slot) {
+        if (auto *r = qkv_record(slot)) {
+            r->publish = get_sys_cnt_aicpu();
+            r->selected = slot.task->target_aicpu_cluster;
+        }
+    }
+    void qkv_trace_edge(ChipTaskSlotState &p, ChipTaskSlotState &c) {
+        if (qkv.trace.level != 2) return;
+        if (qkv.trace.edge_count == simpler::tmr::QKV_TRACE_EDGES) {
+            ++qkv.trace.dropped;
+            return;
+        }
+        qkv.trace.edges[qkv.trace.edge_count++] = {
+            TaskId::to_uint64(p.task->task_id), TaskId::to_uint64(c.task->task_id)
+        };
+    }
 
     // READY_CLAIMED already admits one publisher. A successful pending push
     // transfers sole publication ownership to S0; no ready requeue enters here.
@@ -549,13 +611,47 @@ struct SchedulerState {
         if (!qkv.enabled || slot.task->target_aicpu_cluster >= 0 || slot.payload->placement.scope ||
             slot.task_attrs.requires_sync_start() || slot.task_attrs.has_predicate() ||
             slot.next_block_idx.load(std::memory_order_relaxed) != 0 ||
-            slot.payload->early_dispatch_state.load(std::memory_order_acquire) != EARLY_DISPATCH_DISPATCHED) return false;
+            slot.payload->early_dispatch_state.load(std::memory_order_acquire) != EARLY_DISPATCH_DISPATCHED)
+            return false;
         int r = static_cast<int>(slot.active_mask.to_shape());
-        if (r < 0 || r > 1) return false;
+        if (r < 0 || r > (qkv.mode >= 3 && qkv.mode != 6 ? 2 : 1)) return false;
+        qkv.shape_eligible[r].fetch_add(1, std::memory_order_relaxed);
+        r = simpler::tmr::qkv_channel(r, slot.active_mask.core_mask());
         qkv.eligible.fetch_add(1, std::memory_order_relaxed);
-        if (static_cast<uint32_t>(slot.logical_block_num) > qkv.capacity[0][r] || static_cast<uint32_t>(slot.logical_block_num) > qkv.capacity[1][r]) {
+        if (static_cast<uint32_t>(slot.logical_block_num) > qkv.capacity[0][r] ||
+            static_cast<uint32_t>(slot.logical_block_num) > qkv.capacity[1][r]) {
             qkv.fail(simpler::tmr::QkvFallback::Oversize);
             return false;
+        }
+        if (qkv.mode >= 3 && qkv.mode != 6) {
+            uint32_t bit = 1u << r;
+            if (!(qkv.active_channels.load(std::memory_order_relaxed) & bit))
+                qkv.active_channels.fetch_or(bit, std::memory_order_relaxed);
+            uint64_t hints[2] = {
+                qkv.idle_hint[0][r].load(std::memory_order_acquire), qkv.idle_hint[1][r].load(std::memory_order_acquire)
+            };
+            uint64_t now = get_sys_cnt_aicpu();
+            bool initialized = true, fresh = true;
+            uint64_t idle = 0;
+            for (auto hint : hints) {
+                uint64_t stamp = hint >> 8;
+                initialized &= stamp != 0;
+                fresh &= stamp && (now > stamp ? now - stamp : 0) * 1000000000ULL / PLATFORM_PROF_SYS_CNT_FREQ <=
+                                      simpler::tmr::QKV_SUMMARY_MAX_NS;
+                if ((hint & 255) > idle) idle = hint & 255;
+            }
+            if (!initialized) {
+                qkv.fail(simpler::tmr::QkvFallback::Uninitialized);
+                return false;
+            }
+            if (!fresh) {
+                qkv.fail(simpler::tmr::QkvFallback::Stale);
+                return false;
+            }
+            if (idle < static_cast<uint64_t>(slot.logical_block_num)) {
+                qkv.fail(simpler::tmr::QkvFallback::Busy);
+                return false;
+            }
         }
         slot.payload->placement.submit_tick = get_sys_cnt_aicpu();
         slot.payload->placement.reserved = 1;
@@ -579,8 +675,8 @@ struct SchedulerState {
         }
         if (cluster >= 0 && slot_state.payload->placement.scope && slot_state.logical_block_num == 1)
             return auto_ready_queues[cluster][static_cast<int32_t>(shape)];
-        return cluster < 0 ? ready_queues[static_cast<int32_t>(shape)]
-                           : cluster_ready_queues[cluster][static_cast<int32_t>(shape)];
+        return cluster < 0 ? ready_queues[static_cast<int32_t>(shape)] :
+                             cluster_ready_queues[cluster][static_cast<int32_t>(shape)];
     }
 
     ChipReadyQueue &dummy_queue_for(const ChipTaskSlotState &slot_state) {
@@ -590,11 +686,13 @@ struct SchedulerState {
 
     void note_qkv_shared(ChipTaskSlotState &slot, int writer) {
         int r = static_cast<int>(slot.active_mask.to_shape());
-        if (!qkv.enabled || r > 1 || slot.task->target_aicpu_cluster >= 0 ||
+        if (!qkv.enabled || r > (qkv.mode >= 3 && qkv.mode != 6 ? 2 : 1) || slot.task->target_aicpu_cluster >= 0 ||
             slot.task_attrs.requires_sync_start() || slot.task_attrs.has_predicate() ||
             slot.next_block_idx.load(std::memory_order_relaxed) != 0 ||
-            slot.payload->early_dispatch_state.load(std::memory_order_acquire) != EARLY_DISPATCH_DISPATCHED) return;
+            slot.payload->early_dispatch_state.load(std::memory_order_acquire) != EARLY_DISPATCH_DISPATCHED)
+            return;
         slot.payload->placement.reserved = 3;
+        r = simpler::tmr::qkv_channel(r, slot.active_mask.core_mask());
         auto &counter = qkv.threads[writer].shared_added[r];
         counter.store(counter.load(std::memory_order_relaxed) + slot.logical_block_num, std::memory_order_relaxed);
     }
@@ -1065,6 +1163,7 @@ struct SchedulerState {
     // Attempt to claim and enqueue a consumer after every direct producer becomes
     // launch-visible. Both propagation and wiring can complete dispatch_fanin.
     inline void try_enqueue_early_dispatch_candidate(ChipTaskSlotState &consumer) {
+        if (qkv.trace.level) qkv.trace.early_candidate.fetch_add(1, std::memory_order_relaxed);
         // Early-dispatch queues are global. A targeted consumer must wait for its
         // cluster-specific ready queue, regardless of its producers' hints.
         if (consumer.task->target_aicpu_cluster >= 0) return;
@@ -1089,6 +1188,10 @@ struct SchedulerState {
         bool queued = consumer.task_attrs.requires_sync_start() ?
                           early_sync_start_queue.push_tagged(&consumer, task_id) :
                           early_dispatch_queues[static_cast<int32_t>(shape)].push_tagged(&consumer, task_id);
+        if (qkv.trace.level) {
+            if (queued) qkv.trace.early_hit.fetch_add(1, std::memory_order_relaxed);
+            else qkv.trace.early_fallback.fetch_add(1, std::memory_order_relaxed);
+        }
         if (!queued) {
             // The candidate was never published to an early-dispatch drain, so
             // drop the speculative claim and let readiness take the ordinary
@@ -1178,7 +1281,9 @@ struct SchedulerState {
         }
     };
 
-    inline bool try_early_dispatch_release(ChipTaskSlotState &slot_state, EarlyDispatchReleaseSink *sink = nullptr, bool *ordinary = nullptr) {
+    inline bool try_early_dispatch_release(
+        ChipTaskSlotState &slot_state, EarlyDispatchReleaseSink *sink = nullptr, bool *ordinary = nullptr
+    ) {
         // A predicated task is evaluated at the ready point, never early-dispatched.
         if (slot_state.task_attrs.has_predicate()) return false;
         // Never staged => CAS NONE->DISPATCHED wins => dispatch normally.
@@ -1193,6 +1298,7 @@ struct SchedulerState {
         // duplicate that observes or loses an in-progress launch must never
         // route the same partial task a second time.
         if (expect != EARLY_DISPATCH_STAGING) return true;
+        if (qkv.trace.level) qkv.trace.early_release.fetch_add(1, std::memory_order_relaxed);
         bool sync_start = slot_state.task_attrs.requires_sync_start();
         if (!sync_start && !try_claim_early_dispatch_launch(*slot_state.payload)) return true;
         expect = EARLY_DISPATCH_STAGING;
@@ -1228,6 +1334,7 @@ struct SchedulerState {
         // delay the doorbells of later consumers in the same producer's fanout.
         // Fallback to inline if no sink / sink full.
         if (launched) {
+            if (auto *r = qkv_record(slot_state)) r->start(get_sys_cnt_aicpu(), 3);
             if (sink == nullptr || !sink->push(&slot_state)) {
                 propagate_dispatch_fanin(slot_state);
             }
@@ -1245,6 +1352,7 @@ struct SchedulerState {
         int writer = simpler::tmr::PARTITION_THREADS - 1
     ) {
         if (!try_claim_ready_once(slot_state)) return false;
+        qkv_trace_ready(slot_state);
         record_ready_origin(slot_state, producer, release_tick, writer);
 
         // Early-dispatch: pre-staged tasks are released by doorbell
@@ -1262,6 +1370,7 @@ struct SchedulerState {
 
         if (ordinary && try_qkv_pending(slot_state)) return true;
         if (ordinary) note_qkv_shared(slot_state, writer);
+        qkv_trace_publish(slot_state);
         stamp_ready_queue(slot_state);
         ResourceShape shape = slot_state.active_mask.to_shape();
         if (shape == ResourceShape::DUMMY ||
@@ -1311,6 +1420,7 @@ struct SchedulerState {
 
         if (ordinary && try_qkv_pending(slot_state)) return true;
         if (ordinary) note_qkv_shared(slot_state, writer);
+        qkv_trace_publish(slot_state);
         stamp_ready_queue(slot_state);
         ResourceShape shape = slot_state.active_mask.to_shape();
         if (shape == ResourceShape::DUMMY ||
@@ -1396,7 +1506,11 @@ struct SchedulerState {
      * @return true if this was the last subtask, completing the entire task.
      */
     bool on_subtask_complete(ChipTaskSlotState &slot_state) {
+        auto *record = qkv_record(slot_state);
+        uint64_t now = record ? get_sys_cnt_aicpu() : 0;
+        if (record) simpler::tmr::QkvTaskTrace::first(record->first_fin, now);
         int16_t prev = slot_state.completed_subtasks.fetch_add(1, std::memory_order_acq_rel);
+        if (record && prev + 1 == slot_state.total_required_subtasks) record->fin.store(now, std::memory_order_relaxed);
         return (prev + 1) == slot_state.total_required_subtasks;
     }
 
@@ -1418,6 +1532,7 @@ struct SchedulerState {
     uint32_t
 #endif
     on_task_complete(ChipTaskSlotState &slot_state, int thread_idx = simpler::tmr::PARTITION_THREADS - 1) {
+        if (auto *r = qkv_record(slot_state)) r->completed = get_sys_cnt_aicpu();
 #if SIMPLER_SCHED_PROFILING
         CompletionStats stats = {0, 0, 0, true};
 #else
@@ -1432,6 +1547,7 @@ struct SchedulerState {
 #endif
 
 #if SIMPLER_SCHED_PROFILING
+        if (auto *r = qkv_record(slot_state)) r->completed = get_sys_cnt_aicpu();
         slot_state.lock_fanout(lock_atomics, lock_wait);
 #else
         slot_state.lock_fanout();
@@ -1469,7 +1585,8 @@ struct SchedulerState {
         EarlyDispatchReleaseSink rel_sink;
         uint64_t placement_release_tick = placement_feedback.enabled.load(std::memory_order_acquire) &&
                                                   !placement_feedback.calibration_done.load(std::memory_order_acquire) ?
-                                              get_sys_cnt_aicpu() : 0;
+                                              get_sys_cnt_aicpu() :
+                                              0;
         while (current != nullptr) {
             ChipTaskSlotState &consumer_slot = *current->slot_state;
 #if SIMPLER_SCHED_PROFILING

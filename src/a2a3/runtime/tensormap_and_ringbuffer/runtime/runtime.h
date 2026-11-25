@@ -205,7 +205,8 @@ struct alignas(64) DeviceRuntimeLaunchDesc {
     // task graph before entering resolve_and_dispatch().
     // Controlled via SIMPLER_TMR_SERIAL_ORCH_SCHED_ENABLE environment variable.
     bool serial_orch_sched;
-    bool qkv_batch;
+    int32_t qkv_batch;
+    int32_t qkv_trace_level;
 
     void *gm_sm_ptr_;  // GM pointer to shared memory (device)
 

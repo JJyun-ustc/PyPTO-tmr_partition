@@ -307,11 +307,16 @@ private:
         int32_t core_offset;
         uint64_t *dispatch_timestamp_slot;
         int32_t task_timing_slot;  // TASK_TIMING_SLOT_NONE unless the task is tagged
+        simpler::tmr::QkvTaskTrace *qkv_record;
+        bool qkv_start_now;
+        int32_t qkv_side;
     };
 
     void publish_partition_resources(int32_t thread_idx);
+
 public:
     void init_qkv(Runtime *runtime, SchedulerState *state);
+
 private:
     uint64_t observe_partition_task(int32_t thread_idx, ChipTaskSlotState &slot_state, bool to_pending = false);
 
@@ -331,6 +336,29 @@ private:
         // never read the sys counter. Independent of chip swimlane level.
         if (h.task_timing_slot != TASK_TIMING_SLOT_NONE) {
             aicpu_task_timing_dispatch(h.task_timing_slot, thread_idx);
+        }
+        auto &trace = sched_->qkv.trace;
+        uint64_t now = (h.qkv_record || (trace.level && thread_idx == 0)) ? get_sys_cnt_aicpu() : 0;
+        if (h.qkv_record) {
+            if (simpler::tmr::QkvTaskTrace::first(h.qkv_record->dispatch, now)) {
+                h.qkv_record->dispatch_side.store(h.qkv_side);
+                h.qkv_record->scheduler.store(thread_idx);
+            }
+            if (h.qkv_start_now) h.qkv_record->start(now, 1);
+        }
+        if (trace.level && thread_idx == 0) {
+            if (trace.s0_last_dispatch) {
+                uint64_t gap = now - trace.s0_last_dispatch;
+                if (gap > trace.s0_max_gap) trace.s0_max_gap = gap;
+                uint64_t ns = gap * 1000000000ULL / PLATFORM_PROF_SYS_CNT_FREQ;
+                int bin = 0;
+                while (ns > 1 && bin < 31) {
+                    ns >>= 1;
+                    ++bin;
+                }
+                ++trace.s0_gaps[bin];
+            }
+            trace.s0_last_dispatch = now;
         }
         write_reg(h.reg_addr, RegId::DATA_MAIN_BASE, static_cast<uint64_t>(h.reg_task_id));
     }
