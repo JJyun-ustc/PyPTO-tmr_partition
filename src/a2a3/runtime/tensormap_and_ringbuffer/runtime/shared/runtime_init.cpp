@@ -141,7 +141,15 @@ SchedulerState::reserve_layout(DeviceArena &arena, const int32_t dep_pool_capaci
     for (int i = 0; i < NUM_RESOURCE_SHAPES; i++) {
         layout.off_ready_sync_queue_slots[i] = ready_queue_reserve_layout(arena, CHIP_READY_QUEUE_SIZE);
     }
+    layout.off_qkv_pending_slots = ready_queue_reserve_layout(arena, simpler::tmr::QKV_PENDING);
     layout.off_dummy_ready_queue_slots = ready_queue_reserve_layout(arena, CHIP_READY_QUEUE_SIZE);
+    for (int c = 0; c < 2; c++) {
+        for (int i = 0; i < NUM_RESOURCE_SHAPES; i++) {
+            layout.off_cluster_ready_queue_slots[c][i] = ready_queue_reserve_layout(arena, CHIP_READY_QUEUE_SIZE);
+            layout.off_auto_ready_queue_slots[c][i] = ready_queue_reserve_layout(arena, CHIP_READY_QUEUE_SIZE);
+        }
+        layout.off_cluster_dummy_queue_slots[c] = ready_queue_reserve_layout(arena, CHIP_READY_QUEUE_SIZE);
+    }
     for (int i = 0; i < NUM_RESOURCE_SHAPES; i++) {
         layout.off_early_dispatch_queue_slots[i] = ready_queue_reserve_layout(arena, CHIP_EARLY_DISPATCH_QUEUE_SIZE);
     }
@@ -159,6 +167,9 @@ bool SchedulerState::init_data_from_layout(const SchedulerLayout &layout, Device
     SchedulerState *sched = this;
     sched->sm_header = reinterpret_cast<SharedMemoryHeader *>(sm_dev_base);
     sched->advance_pending_mask.store(0, std::memory_order_relaxed);
+    sched->has_cluster_targets.store(false, std::memory_order_relaxed);
+    sched->placement_feedback.reset();
+    sched->qkv.reset();
 #if SIMPLER_SCHED_PROFILING
     sched->tasks_completed.store(0, std::memory_order_relaxed);
     sched->tasks_consumed.store(0, std::memory_order_relaxed);
@@ -184,10 +195,32 @@ bool SchedulerState::init_data_from_layout(const SchedulerLayout &layout, Device
             return false;
         }
     }
+    if (!ready_queue_init_data_from_layout(&sched->qkv_pending, arena, layout.off_qkv_pending_slots, simpler::tmr::QKV_PENDING)) return false;
     if (!ready_queue_init_data_from_layout(
             &sched->dummy_ready_queue, arena, layout.off_dummy_ready_queue_slots, layout.ready_queue_capacity
         )) {
         return false;
+    }
+    for (int c = 0; c < 2; c++) {
+        for (int i = 0; i < NUM_RESOURCE_SHAPES; i++) {
+            if (!ready_queue_init_data_from_layout(
+                    &sched->auto_ready_queues[c][i], arena, layout.off_auto_ready_queue_slots[c][i],
+                    layout.ready_queue_capacity
+                ))
+                return false;
+            if (!ready_queue_init_data_from_layout(
+                    &sched->cluster_ready_queues[c][i], arena, layout.off_cluster_ready_queue_slots[c][i],
+                    layout.ready_queue_capacity
+                )) {
+                return false;
+            }
+        }
+        if (!ready_queue_init_data_from_layout(
+                &sched->cluster_dummy_queues[c], arena, layout.off_cluster_dummy_queue_slots[c],
+                layout.ready_queue_capacity
+            )) {
+            return false;
+        }
     }
     for (int i = 0; i < NUM_RESOURCE_SHAPES; i++) {
         if (!ready_queue_init_data_from_layout(
@@ -218,6 +251,9 @@ void SchedulerState::reset_for_reuse(const SchedulerLayout &layout, void *sm_dev
     SchedulerState *sched = this;
     sched->sm_header = reinterpret_cast<SharedMemoryHeader *>(sm_dev_base);
     sched->advance_pending_mask.store(0, std::memory_order_relaxed);
+    sched->has_cluster_targets.store(false, std::memory_order_relaxed);
+    sched->placement_feedback.reset();
+    sched->qkv.reset();
 #if SIMPLER_SCHED_PROFILING
     sched->tasks_completed.store(0, std::memory_order_relaxed);
     sched->tasks_consumed.store(0, std::memory_order_relaxed);
@@ -235,6 +271,14 @@ void SchedulerState::reset_for_reuse(const SchedulerLayout &layout, void *sm_dev
         sched->ready_sync_queues[i].reset_for_reuse();
     }
     sched->dummy_ready_queue.reset_for_reuse();
+    sched->qkv_pending.reset_for_reuse();
+    for (int c = 0; c < 2; c++) {
+        for (int i = 0; i < NUM_RESOURCE_SHAPES; i++) {
+            sched->cluster_ready_queues[c][i].reset_for_reuse();
+            sched->auto_ready_queues[c][i].reset_for_reuse();
+        }
+        sched->cluster_dummy_queues[c].reset_for_reuse();
+    }
     for (int i = 0; i < NUM_RESOURCE_SHAPES; i++) {
         sched->early_dispatch_queues[i].reset_for_reuse();
     }
@@ -252,7 +296,19 @@ void SchedulerState::wire_arena_pointers(const SchedulerLayout &layout, DeviceAr
     for (int i = 0; i < NUM_RESOURCE_SHAPES; i++) {
         ready_queue_wire_arena_pointers(&sched->ready_sync_queues[i], arena, layout.off_ready_sync_queue_slots[i]);
     }
+    ready_queue_wire_arena_pointers(&sched->qkv_pending, arena, layout.off_qkv_pending_slots);
     ready_queue_wire_arena_pointers(&sched->dummy_ready_queue, arena, layout.off_dummy_ready_queue_slots);
+    for (int c = 0; c < 2; c++) {
+        for (int i = 0; i < NUM_RESOURCE_SHAPES; i++) {
+            ready_queue_wire_arena_pointers(
+                &sched->auto_ready_queues[c][i], arena, layout.off_auto_ready_queue_slots[c][i]
+            );
+            ready_queue_wire_arena_pointers(
+                &sched->cluster_ready_queues[c][i], arena, layout.off_cluster_ready_queue_slots[c][i]
+            );
+        }
+        ready_queue_wire_arena_pointers(&sched->cluster_dummy_queues[c], arena, layout.off_cluster_dummy_queue_slots[c]);
+    }
     for (int i = 0; i < NUM_RESOURCE_SHAPES; i++) {
         ready_queue_wire_arena_pointers(
             &sched->early_dispatch_queues[i], arena, layout.off_early_dispatch_queue_slots[i]
@@ -278,6 +334,14 @@ void SchedulerState::destroy() {
         ready_queue_destroy(&sched->ready_sync_queues[i]);
     }
     ready_queue_destroy(&sched->dummy_ready_queue);
+    ready_queue_destroy(&sched->qkv_pending);
+    for (int c = 0; c < 2; c++) {
+        for (int i = 0; i < NUM_RESOURCE_SHAPES; i++) {
+            ready_queue_destroy(&sched->cluster_ready_queues[c][i]);
+            ready_queue_destroy(&sched->auto_ready_queues[c][i]);
+        }
+        ready_queue_destroy(&sched->cluster_dummy_queues[c]);
+    }
     for (int i = 0; i < NUM_RESOURCE_SHAPES; i++) {
         ready_queue_destroy(&sched->early_dispatch_queues[i]);
     }
@@ -419,6 +483,7 @@ bool OrchestratorState::init_data_from_layout(
     orch->scope_tasks_size = 0;
     orch->scope_tasks_capacity = layout.scope_tasks_cap;
     orch->scope_stack_top = -1;
+    orch->cluster_partitioner.reset();
     orch->scope_stack_capacity = layout.scope_stack_capacity;
     orch->manual_begin_depth = CHIP_MAX_SCOPE_DEPTH;
 
@@ -443,6 +508,7 @@ bool OrchestratorState::reset_for_reuse(
     // bitmap before any submit can read it as a producer, so entries left from
     // a previous run are unreachable.
     orch->submit_seq = 0;
+    orch->cluster_partitioner.reset();
 
     uint32_t next_epoch = orch->fanin_seen_current_epoch + 1;
     if (next_epoch == 0) {

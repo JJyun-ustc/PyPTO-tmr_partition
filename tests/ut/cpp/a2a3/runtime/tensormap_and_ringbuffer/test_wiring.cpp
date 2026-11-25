@@ -96,6 +96,7 @@ protected:
         slot.payload = &slot_pl;
         TaskDescriptor &slot_task = slot_task_pool_[(slot_payload_pool_idx_ - 1) % kSlotPayloadPoolSize];
         memset(&slot_task, 0, sizeof(slot_task));
+        slot_task.target_aicpu_cluster = -1;
         slot.task = &slot_task;
     }
 
@@ -126,6 +127,7 @@ TEST_F(WiringTest, NoFaninTaskBecomesReady) {
     alignas(64) TaskPayload payload;
     memset(&payload, 0, sizeof(payload));
     TaskDescriptor desc{};
+    desc.target_aicpu_cluster = -1;
 
     init_slot(task_slot, CHIP_TASK_PENDING, 0, 1);
     payload.fanin_actual_count = 0;
@@ -156,6 +158,7 @@ TEST_F(WiringTest, WireTaskAllProducersEarlyFinished) {
     alignas(64) TaskPayload payload;
     memset(&payload, 0, sizeof(payload));
     TaskDescriptor desc{};
+    desc.target_aicpu_cluster = -1;
 
     // Set up 2 producers that are already COMPLETED
     for (int i = 0; i < 2; i++) {
@@ -195,6 +198,7 @@ TEST_F(WiringTest, WireTaskProducersPendingTaskNotReady) {
     alignas(64) TaskPayload payload;
     memset(&payload, 0, sizeof(payload));
     TaskDescriptor desc{};
+    desc.target_aicpu_cluster = -1;
 
     // Producers are PENDING (not yet completed)
     for (int i = 0; i < 2; i++) {
@@ -259,6 +263,7 @@ TEST_F(WiringTest, WireTaskMixedProducerStates) {
     alignas(64) TaskPayload payload;
     memset(&payload, 0, sizeof(payload));
     TaskDescriptor desc{};
+    desc.target_aicpu_cluster = -1;
 
     init_slot(producers[0], CHIP_TASK_COMPLETED, 1, 2);  // early finished
     init_slot(producers[1], CHIP_TASK_PENDING, 1, 2);    // in flight (< COMPLETED)
@@ -302,6 +307,7 @@ TEST_F(WiringTest, WireTaskAllFlaggedPrecompletedSeedsDispatchFanin) {
     alignas(64) TaskPayload payload;
     memset(&payload, 0, sizeof(payload));
     TaskDescriptor desc{};
+    desc.target_aicpu_cluster = -1;
 
     for (int i = 0; i < 2; i++) {
         init_slot(producer_slots[i], CHIP_TASK_COMPLETED, 1, 2);
@@ -333,6 +339,7 @@ TEST_F(WiringTest, WireTaskUnflaggedPrecompletedProducerDoesNotSeed) {
     alignas(64) TaskPayload payload;
     memset(&payload, 0, sizeof(payload));
     TaskDescriptor desc{};
+    desc.target_aicpu_cluster = -1;
 
     init_slot(producer, CHIP_TASK_COMPLETED, 1, 1);
     producer.task_attrs.set_early_resolve(false);  // unflagged
@@ -357,6 +364,7 @@ TEST_F(WiringTest, WireTaskOneUnflaggedProducerDisqualifiesSeed) {
     alignas(64) TaskPayload payload;
     memset(&payload, 0, sizeof(payload));
     TaskDescriptor desc{};
+    desc.target_aicpu_cluster = -1;
 
     init_slot(producers[0], CHIP_TASK_COMPLETED, 1, 2);
     producers[0].task_attrs.set_early_resolve(true);  // flagged
@@ -386,6 +394,7 @@ TEST_F(WiringTest, ReducedEdgeToUnflaggedProducerStillBlocksEarlyDispatch) {
     alignas(64) TaskPayload payload;
     memset(&payload, 0, sizeof(payload));
     TaskDescriptor desc{};
+    desc.target_aicpu_cluster = -1;
 
     init_slot(p_flagged, CHIP_TASK_PENDING, 1, 1);
     p_flagged.task_attrs.set_early_resolve(true);
@@ -419,6 +428,7 @@ TEST_F(WiringTest, ReducedEdgeToFlaggedProducerKeepsEarlyDispatch) {
     alignas(64) TaskPayload payload;
     memset(&payload, 0, sizeof(payload));
     TaskDescriptor desc{};
+    desc.target_aicpu_cluster = -1;
 
     init_slot(p_flagged, CHIP_TASK_PENDING, 1, 1);
     p_flagged.task_attrs.set_early_resolve(true);
@@ -452,6 +462,7 @@ TEST_F(WiringTest, EarlyDispatchWaitsForAllProducerBlocksPublished) {
     alignas(64) TaskPayload payload;
     memset(&payload, 0, sizeof(payload));
     TaskDescriptor desc{};
+    desc.target_aicpu_cluster = -1;
 
     init_slot(producer, CHIP_TASK_PENDING, 1, 1);
     producer.task_attrs.set_early_resolve(true);
@@ -582,6 +593,7 @@ TEST_F(WiringTest, LateWiredFullyPublishedProducerStillSeedsEarlyDispatch) {
     alignas(64) TaskPayload consumer_payload;
     memset(&consumer_payload, 0, sizeof(consumer_payload));
     TaskDescriptor consumer_desc{};
+    consumer_desc.target_aicpu_cluster = -1;
 
     init_slot(producer, CHIP_TASK_PENDING, 1, 1);
     producer.task_attrs.set_early_resolve(true);
@@ -610,6 +622,7 @@ TEST_F(WiringTest, WiringSeedEnqueuesAfterConcurrentPropagation) {
     alignas(64) TaskPayload consumer_payload;
     memset(&consumer_payload, 0, sizeof(consumer_payload));
     TaskDescriptor consumer_desc{};
+    consumer_desc.target_aicpu_cluster = -1;
 
     init_slot(producers[0], CHIP_TASK_COMPLETED, 1, 1);
     init_slot(producers[1], CHIP_TASK_PENDING, 1, 1);
@@ -1075,6 +1088,7 @@ TEST_F(WiringTest, EarlyDispatchBlockedByUnflaggedProducer) {
     alignas(64) TaskPayload payload;
     memset(&payload, 0, sizeof(payload));
     TaskDescriptor desc{};
+    desc.target_aicpu_cluster = -1;
 
     init_slot(p_flagged, CHIP_TASK_PENDING, 1, 1);
     p_flagged.task_attrs.set_early_resolve(true);
@@ -1138,6 +1152,7 @@ TEST_F(WiringTest, FlaggedPrecompletedCreatorTransparentToEarlyDispatch) {
     alignas(64) TaskPayload payload;
     memset(&payload, 0, sizeof(payload));
     TaskDescriptor desc{};
+    desc.target_aicpu_cluster = -1;
 
     init_slot(creator, CHIP_TASK_COMPLETED, 1, 1);
     creator.task_attrs.set_early_resolve(true);  // alloc creator: flagged -> transparent
@@ -1170,6 +1185,7 @@ TEST_F(WiringTest, OnMixedTaskCompleteNotifiesConsumers) {
     alignas(64) TaskPayload prod_payload;
     memset(&prod_payload, 0, sizeof(prod_payload));
     TaskDescriptor desc{};
+    desc.target_aicpu_cluster = -1;
 
     // Producer in flight (PENDING, not yet COMPLETED) with 2 consumers in fanout chain
     init_slot(producer, CHIP_TASK_PENDING, 1, 1);
@@ -1220,6 +1236,7 @@ TEST_F(WiringTest, OnTaskReleaseReleasesProducers) {
     alignas(64) TaskPayload payload;
     memset(&payload, 0, sizeof(payload));
     TaskDescriptor desc{};
+    desc.target_aicpu_cluster = -1;
 
     // 2 producers, each COMPLETED with fanout_count=1
     for (int i = 0; i < 2; i++) {
@@ -1265,6 +1282,7 @@ TEST_F(WiringTest, OrderingOnlyReleasedAtWiringRetentionHeldUntilRelease) {
     alignas(64) TaskPayload payload;
     memset(&payload, 0, sizeof(payload));
     TaskDescriptor desc{};
+    desc.target_aicpu_cluster = -1;
 
     // Both live (PENDING) with a single submit pin (fanout_count = 1).
     init_slot(wait_producer, CHIP_TASK_PENDING, 1, 1);
@@ -1308,6 +1326,7 @@ TEST_F(WiringTest, ReleaseHonorsRetainFlagInSpillRegion) {
     alignas(64) TaskPayload payload;
     memset(&payload, 0, sizeof(payload));
     TaskDescriptor desc{};
+    desc.target_aicpu_cluster = -1;
 
     // filler carries a large fanout_count so releasing it can never consume it.
     init_slot(filler, CHIP_TASK_COMPLETED, 1, 100);
@@ -1411,6 +1430,7 @@ TEST_F(WiringTest, NoEdgePublishRecordsDepPoolMark) {
     alignas(64) TaskPayload payload;
     memset(&payload, 0, sizeof(payload));
     TaskDescriptor desc{};
+    desc.target_aicpu_cluster = -1;
 
     init_slot(task_slot, CHIP_TASK_PENDING, 0, 1);
     payload.fanin_actual_count = 0;

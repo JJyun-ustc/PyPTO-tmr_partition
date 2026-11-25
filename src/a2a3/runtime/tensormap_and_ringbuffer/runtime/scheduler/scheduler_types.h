@@ -477,6 +477,11 @@ public:
 
     const int32_t *core_ids() const { return core_id_map_; }
     int32_t core_num() const { return cluster_count_ * PLATFORM_CORES_PER_BLOCKDIM; }
+    int32_t resource_capacity(ResourceShape shape) const {
+        if (shape == ResourceShape::AIV) return aiv_mask_.count();
+        if (shape == ResourceShape::DUMMY) return 1;
+        return aic_mask_.count();
+    }
 
 private:
     int32_t cluster_count_;

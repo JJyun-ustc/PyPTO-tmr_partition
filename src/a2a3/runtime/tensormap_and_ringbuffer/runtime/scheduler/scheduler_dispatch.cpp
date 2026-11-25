@@ -121,6 +121,144 @@ int SchedulerContext::pop_ready_tasks_batch(
     return count;
 }
 
+void SchedulerContext::init_qkv(Runtime *runtime, SchedulerState *state) {
+    auto &q = state->qkv;
+    q.enabled = runtime->dev.qkv_batch;
+    q.schedulers = sched_thread_num_;
+    if (!q.enabled) return;
+    always_assert(q.schedulers <= simpler::tmr::QKV_THREADS);
+    for (int t = 0; t < q.schedulers; ++t) {
+        int c = aicpu_cluster_ids_[t];
+        q.side[t] = c;
+        always_assert(c >= 0 && c < 2);
+        // O may run before S has handshaked and initialized its CoreTracker.
+        // Derive the static assignment from the same round-robin contract as
+        // assign_own_clusters; dynamic words remain unavailable until S writes.
+        uint32_t clusters = 0;
+        for (int ci = t; ci < cores_total_num_ / PLATFORM_CORES_PER_BLOCKDIM; ci += active_sched_threads_)
+            ++clusters;
+        q.capacity[c][0] += clusters;
+        q.capacity[c][1] += 2 * clusters;
+    }
+}
+
+void SchedulerContext::publish_partition_resources(int32_t thread_idx) {
+    bool tracing = false;
+#if SIMPLER_DFX
+    tracing = chip_swimlane_level_ >= ChipSwimlaneLevel::SCHED_PHASES;
+#endif
+    uint64_t begin = tracing ? get_sys_cnt_aicpu() : 0;
+    auto &feedback = sched_->placement_feedback.threads[thread_idx];
+    auto &tracker = core_trackers_[thread_idx];
+    const int side = aicpu_cluster_ids_[thread_idx];
+    feedback.cluster.store(side, std::memory_order_relaxed);
+    bool leader = true;
+    for (int t = 0; t < thread_idx; ++t)
+        if (aicpu_cluster_ids_[t] == side) leader = false;
+    for (int i = 0; i < simpler::tmr::PARTITION_SHAPES; ++i) {
+        ResourceShape shape = static_cast<ResourceShape>(i);
+        uint64_t capacity = tracker.resource_capacity(shape);
+        uint64_t idle = shape == ResourceShape::DUMMY ?
+                            1 :
+                            tracker.get_dispatchable_cores(shape, CoreTracker::DispatchPhase::IDLE).count();
+        uint64_t pending = shape == ResourceShape::DUMMY ?
+                               0 :
+                               tracker.get_dispatchable_cores(shape, CoreTracker::DispatchPhase::PENDING).count();
+        feedback.summary[i].resources.store(
+            capacity | ((idle + pending) << 8) | (idle << 16), std::memory_order_relaxed
+        );
+        if (leader) {
+            uint64_t depth = shape == ResourceShape::DUMMY ? sched_->cluster_dummy_queues[side].size() :
+                                                             sched_->cluster_ready_queues[side][i].size() +
+                                                                 sched_->auto_ready_queues[side][i].size();
+            uint64_t common =
+                shape == ResourceShape::DUMMY ? sched_->dummy_ready_queue.size() : sched_->ready_queues[i].size();
+            int total = sched_->placement_feedback.schedulers[0] + sched_->placement_feedback.schedulers[1];
+            if (total) depth += common * sched_->placement_feedback.schedulers[side] / total;
+            sched_->placement_feedback.side_queue[side][i].store(
+                depth | (uint64_t(idle != 0) << 32), std::memory_order_relaxed
+            );
+        }
+    }
+    if (tracing) {
+        feedback.trace.ticks[0] += get_sys_cnt_aicpu() - begin;
+        ++feedback.trace.calls[0];
+    }
+}
+
+uint64_t SchedulerContext::observe_partition_task(int32_t thread_idx, ChipTaskSlotState &slot_state, bool to_pending) {
+    bool tracing = false;
+#if SIMPLER_DFX
+    tracing = chip_swimlane_level_ >= ChipSwimlaneLevel::SCHED_PHASES;
+#endif
+    uint64_t begin = tracing ? get_sys_cnt_aicpu() : 0;
+    auto observe = [&]() -> uint64_t {
+        auto &metadata = slot_state.payload->placement;
+        bool adaptive = metadata.scope != 0;
+        bool sample = adaptive && !sched_->placement_feedback.calibration_done.load(std::memory_order_acquire);
+        bool record = sample;
+#if SIMPLER_DFX
+        record = record || chip_swimlane_level_ >= ChipSwimlaneLevel::SCHED_PHASES;
+#endif
+        // Actual first pickup is independent of the original placement preference.
+        // Single-block tasks have one execution side; multi-block stay bound.
+        if (adaptive || sched_->placement_feedback.enabled.load(std::memory_order_acquire)) {
+            int expected = -1;
+            metadata.dispatch_cluster.compare_exchange_strong(
+                expected, aicpu_cluster_ids_[thread_idx], std::memory_order_release
+            );
+        }
+        if (!record) return 0;
+        uint64_t ready = slot_state.payload->ready_queue_timestamp.exchange(0, std::memory_order_relaxed);
+        if (!ready) return 0;
+        uint64_t now = get_sys_cnt_aicpu();
+        if (sample && !(metadata.reserved & simpler::tmr::PARTITION_OBSERVED)) {
+            metadata.reserved |= simpler::tmr::PARTITION_OBSERVED;
+            int cluster = aicpu_cluster_ids_[thread_idx];
+            uint64_t n = static_cast<uint64_t>(sched_->placement_feedback.schedulers[cluster]);
+            if (n == 0) n = 1;
+            uint64_t wait_ns = sys_cnt_ticks_to_ns(now - ready, get_sys_cnt_aicpu_frequency_hz());
+            int metric = -1;
+            uint64_t cost = 0;
+            if (metadata.ready_depth > 0) {
+                metric = 0;
+                cost = wait_ns * n / (n + metadata.ready_depth);
+            } else if (
+                (metadata.reserved & simpler::tmr::PARTITION_IDLE_AT_PUBLISH) && !to_pending && wait_ns <= 5000 &&
+                metadata.release_tick && ready >= metadata.release_tick && metadata.release_cluster >= 0 &&
+                metadata.release_cluster < 2
+            ) {
+                uint64_t preparation =
+                    sys_cnt_ticks_to_ns(ready - metadata.release_tick, get_sys_cnt_aicpu_frequency_hz());
+                if (preparation <= 20000) {
+                    metric =
+                        ((metadata.reserved & simpler::tmr::PARTITION_FROM_O) ? 1 : 3) + metadata.release_cluster;
+                    cost = preparation + wait_ns;
+                }
+            }
+            auto &bucket = sched_->placement_feedback.threads[thread_idx]
+                               .samples[static_cast<int>(slot_state.active_mask.to_shape())];
+            bucket.add(metric, cost);
+            if (metric >= 1 && metric <= 4) bucket.add(5, wait_ns, false);
+        }
+#if SIMPLER_DFX
+        if (chip_swimlane_level_ >= ChipSwimlaneLevel::SCHED_PHASES) {
+            chip_swimlane_aicpu_record_task_phase(
+                thread_idx, SchedPhaseKind::ReadyWait, ready, now, 0, slot_state.task->task_id
+            );
+        }
+#endif
+        return ready;
+    };
+    uint64_t result = observe();
+    if (tracing) {
+        auto &trace = sched_->placement_feedback.threads[thread_idx].trace;
+        trace.ticks[1] += get_sys_cnt_aicpu() - begin;
+        ++trace.calls[1];
+    }
+    return result;
+}
+
 void SchedulerContext::build_payload(
     DispatchPayload &dispatch_payload, ChipTaskSlotState &slot_state, SubtaskSlot subslot, int32_t block_idx,
     bool force_gate
@@ -168,6 +306,7 @@ SchedulerContext::PublishHandle SchedulerContext::prepare_subtask_to_core(
 ) {
     CoreTracker &tracker = core_trackers_[thread_idx];
     auto core_id = tracker.get_core_id_by_offset(core_offset);
+    (void)observe_partition_task(thread_idx, slot_state, to_pending);
     CoreExecState &core_exec_state = core_exec_states_[core_id];
 
     core_exec_state.dispatch_seq++;
@@ -307,7 +446,7 @@ int SchedulerContext::prepare_block_for_dispatch(
 
 void SchedulerContext::dispatch_shape(
     int32_t thread_idx, ChipReadyQueue *disp_queues, ResourceShape shape, CoreTracker::DispatchPhase phase,
-    CoreTracker &tracker, bool &entered_drain, bool &made_progress, bool &try_pushed
+    CoreTracker &tracker, bool &entered_drain, bool &made_progress, bool &try_pushed, bool remote
 ) {
 #if SIMPLER_SCHED_PROFILING
     auto &chip_swimlane = sched_chip_swimlane_[thread_idx];
@@ -320,7 +459,7 @@ void SchedulerContext::dispatch_shape(
     if (!cores.has_value()) return;
 
     while (cores.has_value() && !entered_drain) {
-        int want = cores.count();
+        int want = remote ? 1 : cores.count();
         ChipTaskSlotState *batch[CoreTracker::MAX_CLUSTERS * 3];
         int got = pop_ready_tasks_batch(disp_queues, shape, thread_idx, batch, want);
         if (got == 0) break;
@@ -390,6 +529,14 @@ void SchedulerContext::dispatch_shape(
 
         for (int bi = 0; bi < got; bi++) {
             ChipTaskSlotState *slot_state = batch[bi];
+            if (slot_state->task->target_aicpu_cluster >= 0 && !slot_state->payload->placement.scope &&
+                slot_state->payload->placement.reserved != 2) {
+                LOG_DEBUG(
+                    "AICPU_PLACEMENT task=%llu target=%d actual=%d scheduler=%d",
+                    static_cast<unsigned long long>(TaskId::to_uint64(slot_state->task->task_id)),
+                    slot_state->task->target_aicpu_cluster, aicpu_cluster_ids_[thread_idx], thread_idx
+                );
+            }
             CoreTracker::BitStates selected_mix_clusters(0ULL);
 
             if (is_mix) {
@@ -451,6 +598,18 @@ void SchedulerContext::dispatch_shape(
             int32_t start = 0;
             int32_t claim = slot_state->claim_block_range(slot_state->logical_block_num, available, start);
             if (claim == 0) continue;
+            if (slot_state->payload->placement.reserved == 2) {
+                auto &row = sched_->qkv.threads[thread_idx];
+                int side = slot_state->task->target_aicpu_cluster;
+                always_assert(side == aicpu_cluster_ids_[thread_idx]);
+                auto &taken = row.taken[side][static_cast<int>(shape)];
+                taken.store(taken.load(std::memory_order_relaxed) + claim, std::memory_order_relaxed);
+                ++row.dispatched[side];
+            }
+            if (slot_state->payload->placement.reserved == 3) {
+                auto &counter = sched_->qkv.threads[thread_idx].shared_taken[static_cast<int>(shape)];
+                counter.store(counter.load(std::memory_order_relaxed) + claim, std::memory_order_relaxed);
+            }
             dispatched_any = true;
             try_pushed = true;
 
@@ -483,6 +642,16 @@ void SchedulerContext::dispatch_shape(
 
         flush_publish();
         for (int i = 0; i < published_n; i++) {
+            if (published_list[i]->payload->placement.scope) {
+                auto &thread = sched_->placement_feedback.threads[thread_idx];
+                int index = static_cast<int>(shape);
+                simpler::tmr::PartitionSummary::add(thread.started[index], published_counts[i]);
+                int queue_side = published_list[i]->task->target_aicpu_cluster;
+                if (queue_side != aicpu_cluster_ids_[thread_idx]) thread.remote_blocks += published_counts[i];
+                thread.summary[index].begin_write();
+                simpler::tmr::PartitionSummary::add(thread.summary[index].taken[queue_side], published_counts[i]);
+                thread.summary[index].end_write();
+            }
             sched_->record_published_blocks(*published_list[i], published_counts[i]);
             sched_->propagate_dispatch_fanin(*published_list[i]);
         }
@@ -490,7 +659,7 @@ void SchedulerContext::dispatch_shape(
         chip_swimlane.sched_dispatch_setup_cycle += (get_sys_cnt_aicpu() - t_setup_start);
 #endif
 
-        if (!dispatched_any) break;
+        if (!dispatched_any || remote) break;
 
         if (!cores.has_value()) {
             cores = is_mix ? tracker.get_cluster_offset_states() : tracker.get_dispatchable_cores(shape, phase);
@@ -565,6 +734,20 @@ void SchedulerContext::dispatch_ready_tasks(
     // Normal ready dispatch (is_ready): dispatch_shape places each block on pickup and
     // signals a stop by setting entered_drain when it enters a sync_start drain.
     bool entered_drain = false;
+    const int32_t cluster = aicpu_cluster_ids_[thread_idx];
+    bool tracing = false;
+#if SIMPLER_DFX
+    tracing = chip_swimlane_level_ >= ChipSwimlaneLevel::SCHED_PHASES;
+#endif
+    uint64_t trace_start = tracing ? get_sys_cnt_aicpu() : 0;
+    auto trace_stage = [&](int stage) {
+        if (!tracing) return;
+        uint64_t now = get_sys_cnt_aicpu();
+        auto &trace = sched_->placement_feedback.threads[thread_idx].trace;
+        trace.ticks[stage] += now - trace_start;
+        ++trace.calls[stage];
+        trace_start = now;
+    };
 
     // Tier 0: ready sync_start cohorts take cores before any regular ready task
     // (sync_start > MIX > C/V within the normal source). Same order and machinery,
@@ -582,21 +765,71 @@ void SchedulerContext::dispatch_ready_tasks(
             return has_residual_sync_mix();
         }
     );
+    trace_stage(5);
     if (entered_drain) return;
 
+    auto has_work = [](ChipReadyQueue *queues) {
+        return queues[static_cast<int>(ResourceShape::AIC)].size() ||
+               queues[static_cast<int>(ResourceShape::AIV)].size() ||
+               queues[static_cast<int>(ResourceShape::MIX)].size();
+    };
+    bool adaptive = sched_->placement_feedback.enabled.load(std::memory_order_acquire);
+    // An empty snapshot can defer a concurrent arrival until the next loop.
     // Tier 1: regular ready work.
-    run_staging_order(
-        thread_idx, pmu_active,
-        [&](ResourceShape shape, CoreTracker::DispatchPhase phase) {
-            dispatch_shape(
-                thread_idx, sched_->ready_queues, shape, phase, tracker, entered_drain, made_progress, try_pushed
+    if (sched_->has_cluster_targets.load(std::memory_order_acquire)) {
+        if (has_work(sched_->cluster_ready_queues[cluster])) {
+            run_staging_order(
+                thread_idx, pmu_active,
+                [&](ResourceShape shape, CoreTracker::DispatchPhase phase) {
+                    dispatch_shape(
+                        thread_idx, sched_->cluster_ready_queues[cluster], shape, phase, tracker, entered_drain,
+                        made_progress, try_pushed
+                    );
+                    return entered_drain;
+                },
+                [&] {
+                    return sched_->cluster_ready_queues[cluster][static_cast<int32_t>(ResourceShape::MIX)].size() > 0;
+                }
             );
-            return entered_drain;
-        },
-        [&] {
-            return has_residual_mix();
         }
-    );
+        trace_stage(3);
+        if (entered_drain) return;
+    }
+
+    if (adaptive && has_work(sched_->auto_ready_queues[cluster])) {
+        run_staging_order(
+            thread_idx, pmu_active,
+            [&](ResourceShape shape, CoreTracker::DispatchPhase phase) {
+                dispatch_shape(
+                    thread_idx, sched_->auto_ready_queues[cluster], shape, phase, tracker, entered_drain, made_progress,
+                    try_pushed
+                );
+                return entered_drain;
+            },
+            [&] {
+                return sched_->auto_ready_queues[cluster][static_cast<int>(ResourceShape::MIX)].size() > 0;
+            }
+        );
+    }
+    trace_stage(2);
+    if (entered_drain) return;
+
+    if (!adaptive || has_work(sched_->ready_queues)) {
+        run_staging_order(
+            thread_idx, pmu_active,
+            [&](ResourceShape shape, CoreTracker::DispatchPhase phase) {
+                dispatch_shape(
+                    thread_idx, sched_->ready_queues, shape, phase, tracker, entered_drain, made_progress, try_pushed
+                );
+                return entered_drain;
+            },
+            [&] {
+                return has_residual_mix();
+            }
+        );
+    }
+    trace_stage(4);
+
 }
 
 // Stage the ALREADY-CLAIMED range [start, start+count) of consumer `c` onto
@@ -814,7 +1047,12 @@ int32_t SchedulerContext::try_early_dispatch(
     //     to delay only when every normal queue is drained.
     if (pmu_active || !tracker.has_any_free_slot()) return 0;
     for (int s = 0; s < NUM_RESOURCE_SHAPES; s++) {
-        if (sched_->ready_sync_queues[s].size() > 0 || sched_->ready_queues[s].size() > 0) return 0;
+        if (sched_->ready_sync_queues[s].size() > 0 || sched_->ready_queues[s].size() > 0 ||
+            (sched_->has_cluster_targets.load(std::memory_order_acquire) &&
+             (sched_->cluster_ready_queues[aicpu_cluster_ids_[thread_idx]][s].size() > 0 ||
+              sched_->auto_ready_queues[aicpu_cluster_ids_[thread_idx]][s].size() > 0))) {
+            return 0;
+        }
     }
 
     int32_t total_staged = 0;
@@ -832,10 +1070,12 @@ int32_t SchedulerContext::try_early_dispatch(
         if (current_sync_task && SchedulerState::try_claim_early_sync_drain(*c->payload)) {
             if (c->payload->early_dispatch_state.load(std::memory_order_seq_cst) != EARLY_DISPATCH_STAGING) {
                 sched_->cancel_early_sync_drain(*c);
-            } else if (drain_state_.sync_start_pending.load(std::memory_order_acquire) == 0 &&
-                       tracker.count_available_blocks(
-                           c->active_mask.to_shape(), c->active_mask.core_mask(), /*include_pending=*/true
-                       ) >= c->logical_block_num) {
+            } else if (
+                drain_state_.sync_start_pending.load(std::memory_order_acquire) == 0 &&
+                tracker.count_available_blocks(
+                    c->active_mask.to_shape(), c->active_mask.core_mask(), /*include_pending=*/true
+                ) >= c->logical_block_num
+            ) {
                 // From this point onward the operation is all-or-nothing. Only this
                 // scheduler mutates its tracker, and global drain coordinators must
                 // wait for this scheduler's generation-tagged ack before inspecting it.
@@ -964,7 +1204,11 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             for (int s = 0; s < CHIP_SWIMLANE_NUM_QUEUE_SHAPES; s++) {
                 // Total normal-source ready depth of shape `s` = regular ready lane + the
                 // sync_start Tier-0 lane; both feed dispatch_ready_tasks for this shape.
-                const size_t qsize = sched_->ready_queues[s].size() + sched_->ready_sync_queues[s].size();
+                size_t qsize = sched_->ready_queues[s].size() + sched_->ready_sync_queues[s].size();
+                for (int cluster = 0; cluster < 2; cluster++) {
+                    qsize +=
+                        sched_->cluster_ready_queues[cluster][s].size() + sched_->auto_ready_queues[cluster][s].size();
+                }
                 iter_shared_snapshot[s] = static_cast<int16_t>(std::min(qsize, kMax));
             }
             iter_shared_sampled = true;
@@ -1007,7 +1251,28 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             static_cast<uint64_t>(scheduler_timeout_ms_override) * (PLATFORM_PROF_SYS_CNT_FREQ / 1000);
     }
 
+    uint32_t placement_iteration = 0;
     while (true) {
+        if (sched_->qkv.enabled && thread_idx < sched_thread_num_) {
+            // Sampling before the drain continue preserves pending-queue service
+            // during sync drain; assignment only publishes queues, never cores.
+            if ((placement_iteration & 63u) == 0) {
+                for (int r = 0; r < 2; ++r) {
+                    auto shape = static_cast<ResourceShape>(r);
+                    auto &ct = core_trackers_[thread_idx];
+                    uint64_t cap = ct.resource_capacity(shape);
+                    uint64_t idle = ct.get_dispatchable_cores(shape, CoreTracker::DispatchPhase::IDLE).count();
+                    uint64_t pending = ct.get_dispatchable_cores(shape, CoreTracker::DispatchPhase::PENDING).count();
+                    sched_->qkv.threads[thread_idx].resources[r].store(cap | (pending << 8) | (idle << 16), std::memory_order_release);
+                }
+            }
+            ++placement_iteration;
+            if (thread_idx == 0) sched_->service_qkv_batch();
+        }
+        if (thread_idx < sched_thread_num_ && sched_->placement_feedback.enabled.load(std::memory_order_acquire) &&
+            ((placement_iteration++ & 63u) == 0)) {
+            publish_partition_resources(thread_idx);
+        }
         if (completed_.load(std::memory_order_acquire)) {
             break;
         }
@@ -1102,11 +1367,8 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         if (rt_ != nullptr && rt_->aicore_mailbox != nullptr &&
             (sched_->async_wait_list.count > 0 || rt_->aicore_mailbox->has_pending())) {
             AsyncPollResult poll_result = sched_->async_wait_list.poll_and_complete<false>(
-                rt_->aicore_mailbox, sched_, deferred_release_slot_states, deferred_release_count, DEFERRED_RELEASE_CAP
-#if SIMPLER_SCHED_PROFILING
-                ,
+                rt_->aicore_mailbox, sched_, deferred_release_slot_states, deferred_release_count, DEFERRED_RELEASE_CAP,
                 thread_idx
-#endif
             );
             if (poll_result.error_code != SIMPLER_ERROR_NONE) {
                 int32_t expected = SIMPLER_ERROR_NONE;
@@ -1196,7 +1458,15 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         if (thread_idx < PLATFORM_MAX_AICPU_THREADS - 1) {
             constexpr int DUMMY_DRAIN_BATCH = 8;
             ChipTaskSlotState *dummy_batch[DUMMY_DRAIN_BATCH];
-            int dummy_got = sched_->dummy_ready_queue.pop_batch(dummy_batch, DUMMY_DRAIN_BATCH);
+            int dummy_got = 0;
+            if (sched_->has_cluster_targets.load(std::memory_order_acquire)) {
+                dummy_got = sched_->cluster_dummy_queues[aicpu_cluster_ids_[thread_idx]].pop_batch(
+                    dummy_batch, DUMMY_DRAIN_BATCH
+                );
+            }
+            if (dummy_got == 0) {
+                dummy_got = sched_->dummy_ready_queue.pop_batch(dummy_batch, DUMMY_DRAIN_BATCH);
+            }
 #if SIMPLER_DFX
             // Dummy outer phase: covers all dependency-only items popped this
             // iter. Per-item identity markers are emitted to a SEPARATE lane
@@ -1208,6 +1478,13 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 #endif
             for (int di = 0; di < dummy_got; di++) {
                 ChipTaskSlotState &dummy_slot = *dummy_batch[di];
+                if (dummy_slot.task->target_aicpu_cluster >= 0) {
+                    LOG_DEBUG(
+                        "AICPU_PLACEMENT_DUMMY task=%llu target=%d actual=%d scheduler=%d",
+                        static_cast<unsigned long long>(TaskId::to_uint64(dummy_slot.task->task_id)),
+                        dummy_slot.task->target_aicpu_cluster, aicpu_cluster_ids_[thread_idx], thread_idx
+                    );
+                }
 
                 // ----- Resolve work: walk this dummy's consumer list. ------
                 // Same 1 µs filter as the main-path Resolve emit suppresses
@@ -1220,10 +1497,23 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
                 // the profiling-flags-smoke build path where SIMPLER_DFX is
                 // OFF and the Resolve emit below is excluded.
                 [[maybe_unused]] uint32_t dummy_consumers = 0;
+                (void)observe_partition_task(thread_idx, dummy_slot);
+                if (dummy_slot.payload->placement.scope) {
+                    ResourceShape original_shape = dummy_slot.active_mask.to_shape();
+                    uint64_t units = original_shape == ResourceShape::DUMMY ? 1 : dummy_slot.logical_block_num;
+                    auto &thread = sched_->placement_feedback.threads[thread_idx];
+                    int index = static_cast<int>(original_shape);
+                    simpler::tmr::PartitionSummary::add(thread.started[index], units);
+                    thread.summary[index].begin_write();
+                    simpler::tmr::PartitionSummary::add(
+                        thread.summary[index].taken[dummy_slot.task->target_aicpu_cluster], units
+                    );
+                    thread.summary[index].end_write();
+                }
 #if SIMPLER_SCHED_PROFILING
                 dummy_consumers = sched_->on_task_complete(dummy_slot, thread_idx).fanout_edges;
 #else
-                dummy_consumers = sched_->on_task_complete(dummy_slot);
+                dummy_consumers = sched_->on_task_complete(dummy_slot, thread_idx);
 #endif
 #if SIMPLER_DFX
                 if (dummy_resolve_t0 != 0) {

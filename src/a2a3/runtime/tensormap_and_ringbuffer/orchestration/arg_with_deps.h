@@ -59,6 +59,9 @@ public:
     using CoreTaskArgs::set_allow_early_resolve;  // early-dispatch hint (setter)
     using CoreTaskArgs::set_task_timing_slot;     // selective task-timing slot (setter)
     using CoreTaskArgs::task_timing_slot;         // selective task-timing slot (getter)
+    using CoreTaskArgs::set_aicpu_cluster;
+    using CoreTaskArgs::set_aicpu_cluster_auto;
+    using CoreTaskArgs::aicpu_cluster;
 
     // Error / status — forward to Arg
     using CoreTaskArgs::error_msg;

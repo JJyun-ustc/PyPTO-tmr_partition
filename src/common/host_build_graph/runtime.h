@@ -283,6 +283,7 @@ struct alignas(64) DeviceRuntimeLaunchDesc {
     // deterministic exec_idx used by AicpuExecutor for scheduler-thread
     // assignment; the highest active index additionally runs the host-orch boot.
     int32_t aicpu_allowed_cpus[MAX_GATE_THREADS];
+    int32_t aicpu_cluster_ids[MAX_GATE_THREADS];
     int32_t aicpu_allowed_cpu_count;
     int32_t aicpu_launch_count;
 

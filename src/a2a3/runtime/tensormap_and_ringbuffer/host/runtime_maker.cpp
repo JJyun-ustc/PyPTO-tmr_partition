@@ -627,6 +627,9 @@ static bool copy_in_device_args(
 // runtime. Behavior-only env reads (no new gates); kept here so the args and
 // image steps stay free of unrelated state.
 static void apply_orch_sched_env_flags(Runtime *runtime) {
+    const char *qkv = std::getenv("SIMPLER_TMR_QKV_BATCH");
+    runtime->dev.qkv_batch = qkv && qkv[0] == '1';
+    LOG_INFO("QKV ready batch: %s", runtime->dev.qkv_batch ? "enabled" : "Shared");
     const char *serial_env = std::getenv("SIMPLER_TMR_SERIAL_ORCH_SCHED_ENABLE");
     runtime->dev.serial_orch_sched =
         serial_env && (serial_env[0] == '1' || serial_env[0] == 't' || serial_env[0] == 'T');

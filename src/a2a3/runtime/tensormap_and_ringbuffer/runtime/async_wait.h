@@ -183,9 +183,7 @@ struct AsyncWaitList {
         int32_t *deferred_release_count{nullptr};
         int32_t deferred_release_capacity{0};
         int32_t inline_completed{0};
-#if SIMPLER_SCHED_PROFILING
         int32_t thread_idx{0};
-#endif
 
         bool can_inline_complete() const { return sched != nullptr; }
     };
@@ -300,11 +298,7 @@ struct AsyncWaitList {
     AsyncPollResult poll_and_complete(
         AICoreCompletionMailbox *aicore_mailbox, SchedulerState *sched,
         ChipTaskSlotState **deferred_release_slot_states, int32_t &deferred_release_count,
-        int32_t deferred_release_capacity
-#if SIMPLER_SCHED_PROFILING
-        ,
-        int thread_idx
-#endif
+        int32_t deferred_release_capacity, int thread_idx = 0
     );
 
     // Report a bounded snapshot of completions that can still block a task.

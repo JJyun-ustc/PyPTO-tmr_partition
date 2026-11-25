@@ -38,6 +38,7 @@
 #include "submit_types.h"
 #include "tensormap_and_ringbuffer/task_id.h"
 #include "types.h"
+#include "aicpu_cluster_partition.h"
 
 // Spin-wait hint for AICPU threads.  On real hardware the AICPU has dedicated
 // ARM A55 cores — no OS yield is needed, so the hint is a no-op.  In simulation
@@ -234,6 +235,9 @@ struct TaskDescriptor {
     // Per-slot kernel IDs (INVALID_KERNEL_ID = inactive)
     int32_t kernel_id[SUBTASK_SLOT_COUNT];
 
+    // Occupies the descriptor's four-byte alignment gap; -1 means shared scheduling.
+    int32_t target_aicpu_cluster;
+
     // Packed output buffer (all outputs packed into single contiguous buffer)
     void *packed_buffer_base;  // Start of packed buffer in GM Heap
     void *packed_buffer_end;   // End of packed buffer (for heap reclamation)
@@ -242,6 +246,7 @@ struct TaskDescriptor {
 // A 4-byte alignment pad follows kernel_id[3]; the scheduler and shared-memory
 // ABI depend on the descriptor size and packed_buffer_base offset staying fixed.
 static_assert(sizeof(TaskDescriptor) == 40, "TaskDescriptor size is part of the shared-memory ABI");
+static_assert(offsetof(TaskDescriptor, target_aicpu_cluster) == 20);
 static_assert(offsetof(TaskDescriptor, packed_buffer_base) == 24, "packed_buffer_base offset must be unchanged");
 
 // =============================================================================
@@ -352,6 +357,8 @@ struct TaskPayload {
     // between the early-dispatch block and the 64B-aligned predicate, so the
     // payload layout is unchanged.
     int32_t fanin_wait_count{0};
+    // Ready-queue publication to first resource preparation, in sys-counter cycles.
+    std::atomic<uint64_t> ready_queue_timestamp{0};
     // The count dispatch_fanin must hit for this task to be an early-dispatch
     // candidate. Only producers linked onto a fanout_head ever bump
     // dispatch_fanin, so it can reach at most fanin_wait_count: a nonzero
@@ -365,6 +372,7 @@ struct TaskPayload {
     // / scalars offsets only. Resolved at submit; evaluated by the scheduler at
     // dispatch.
     alignas(64) DispatchPredicate predicate;
+    simpler::tmr::AdaptiveTaskState placement;
     // === Cache lines 10-73 (4096B) — tensors (alignas(64) forces alignment) ===
     simpler::tmr::Tensor tensors[MAX_TENSOR_ARGS];
     // === Cache lines 74-75 (128B) — scalars ===
@@ -446,10 +454,14 @@ struct TaskPayload {
         early_dispatch_launch_state.store(EARLY_DISPATCH_LAUNCH_NONE, std::memory_order_relaxed);
         running_slot_count.store(0, std::memory_order_relaxed);
         early_sync_drain_state.store(EARLY_SYNC_DRAIN_NONE, std::memory_order_relaxed);
+        ready_queue_timestamp.store(0, std::memory_order_relaxed);
+        placement.reset();
     }
 };
 
 // TaskPayload layout verification (offsetof requires complete type).
+static_assert(offsetof(TaskPayload, ready_queue_timestamp) == 568, "ready timestamp occupies metadata padding");
+static_assert(offsetof(TaskPayload, placement) == 600, "adaptive metadata occupies predicate-line padding");
 static_assert(offsetof(TaskPayload, fanin_spill_pool) == 16, "spill pool pointer layout drift");
 static_assert(offsetof(TaskPayload, fanin_inline_edges) == 24, "inline fanin array must follow spill metadata");
 static_assert(

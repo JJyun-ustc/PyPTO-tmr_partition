@@ -103,6 +103,8 @@ struct OrchestratorState {
     // Same runtime-arena scheduler object; Orch-side wiring mutates dep_pool
     // and publishes ready tasks through it before scheduler workers dispatch.
     SchedulerState *scheduler;
+    int32_t aicpu_cluster_sched_count[2]{};
+    simpler::tmr::ClusterPartitioner cluster_partitioner;
 
     // Total core counts set once at executor init; used for submit-time deadlock detection.
     int32_t total_cluster_count{0};  // AIC cores = MIX clusters

@@ -12,13 +12,13 @@
  * Unit tests for a2a3 host-side AICPU affinity selection
  * (src/a2a3/platform/onboard/host/aicpu_affinity_select.cpp).
  *
- * This is the regression barrier for issue #1045: AICPU survivors must all
- * land in one NUMA cluster. Moving selection host-side (PR #1119) made it a
- * pure, deterministic function, so the property is testable without hardware.
+ * Selection is host-side and deterministic. Requests that fit in one cluster
+ * stay together; a full-pool request uses both clusters.
  *
  * Covered:
  * - the standard 0xfc pool (cpu_id 2..7): active=4 (tensormap) and active=3
  *   (host_build_graph) both land entirely in the high cluster (cpu 4..7);
+ * - active=6 uses the full pool in physical CPU order;
  * - determinism (same input → same output);
  * - the cross-cluster fallback when no single cluster fits;
  * - invalid-input rejection.
@@ -68,6 +68,17 @@ TEST(A2a3AffinitySelect, TensormapFourThreadsLandInHighCluster) {
     EXPECT_EQ(allowed, (std::vector<int32_t>{4, 5, 6, 7}));
     for (int32_t id : allowed)
         EXPECT_EQ(cluster_of(id), 1) << "cpu " << id << " crossed a cluster";
+}
+
+TEST(A2a3AffinitySelect, SixThreadsUseBothClustersWithOrchestratorLast) {
+    std::vector<int32_t> allowed;
+    ASSERT_TRUE(compute_allowed_cpus(standard_pool(), /*active_count=*/6, allowed));
+    EXPECT_EQ(allowed, (std::vector<int32_t>{2, 3, 4, 5, 6, 7}));
+    ASSERT_EQ(allowed.size(), 6u);
+    EXPECT_EQ(cluster_of(allowed[0]), 0);
+    EXPECT_EQ(cluster_of(allowed[1]), 0);
+    for (size_t i = 2; i < allowed.size(); ++i)
+        EXPECT_EQ(cluster_of(allowed[i]), 1);
 }
 
 // host_build_graph needs only 3 active threads (2 sched + 1 orch). They must

@@ -208,6 +208,11 @@ private:
     int32_t active_sched_threads_{0};
     int32_t sched_thread_num_{0};
     int32_t aicpu_thread_num_{0};
+    int32_t aicpu_cluster_ids_[MAX_AICPU_THREADS]{};
+    struct alignas(64) StealClock {
+        uint32_t loop{0}, next{0};
+    };
+    StealClock steal_clocks_[MAX_AICPU_THREADS]{};
     int32_t cores_total_num_{0};
 
     // Cluster-ordered worker_id lists, populated by post_handshake_init().
@@ -304,6 +309,12 @@ private:
         int32_t task_timing_slot;  // TASK_TIMING_SLOT_NONE unless the task is tagged
     };
 
+    void publish_partition_resources(int32_t thread_idx);
+public:
+    void init_qkv(Runtime *runtime, SchedulerState *state);
+private:
+    uint64_t observe_partition_task(int32_t thread_idx, ChipTaskSlotState &slot_state, bool to_pending = false);
+
     PublishHandle prepare_subtask_to_core(
         int32_t thread_idx, int32_t core_offset, ChipTaskSlotState &slot_state, SubtaskSlot subslot, bool to_pending,
         int32_t block_idx, bool force_gate
@@ -366,7 +377,7 @@ private:
 
     void dispatch_shape(
         int32_t thread_idx, ChipReadyQueue *disp_queues, ResourceShape shape, CoreTracker::DispatchPhase phase,
-        CoreTracker &tracker, bool &entered_drain, bool &made_progress, bool &try_pushed
+        CoreTracker &tracker, bool &entered_drain, bool &made_progress, bool &try_pushed, bool remote = false
     );
 
     // Early-dispatch (Hook 1). Mirrors dispatch_ready_tasks: owns its

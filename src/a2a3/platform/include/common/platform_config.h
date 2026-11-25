@@ -46,10 +46,9 @@ constexpr int PLATFORM_AIC_CORES_PER_BLOCKDIM = 1;
 constexpr int PLATFORM_AIV_CORES_PER_BLOCKDIM = 2;
 
 /**
- * Maximum AICPU scheduling threads
- * Determines parallelism level of the AICPU task scheduler.
+ * Maximum active AICPU threads, including the orchestrator.
  */
-constexpr int PLATFORM_MAX_AICPU_THREADS = 4;
+constexpr int PLATFORM_MAX_AICPU_THREADS = 6;
 
 /**
  * Default active AICPU thread count when aicpu_thread_num is left at 0 (auto):

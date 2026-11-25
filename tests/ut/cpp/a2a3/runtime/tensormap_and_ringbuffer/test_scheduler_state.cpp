@@ -118,6 +118,7 @@ protected:
     // payload, and the scheduler's release/propagate paths dereference it.
     static constexpr int kSlotPayloadPoolSize = 16;
     TaskPayload slot_payload_pool_[kSlotPayloadPoolSize];
+    TaskDescriptor slot_task_pool_[kSlotPayloadPoolSize];
     int slot_payload_pool_idx_ = 0;
 
     void SetUp() override {
@@ -151,9 +152,15 @@ protected:
         slot.completed_subtasks.store(0);
         slot.total_required_subtasks = 1;
         slot.logical_block_num = 1;
-        TaskPayload &slot_pl = slot_payload_pool_[slot_payload_pool_idx_++ % kSlotPayloadPoolSize];
+        int pool_index = slot_payload_pool_idx_++ % kSlotPayloadPoolSize;
+        TaskPayload &slot_pl = slot_payload_pool_[pool_index];
         memset(&slot_pl, 0, sizeof(slot_pl));
+        slot_pl.placement.reset();
         slot.payload = &slot_pl;
+        TaskDescriptor &task = slot_task_pool_[pool_index];
+        memset(&task, 0, sizeof(task));
+        task.target_aicpu_cluster = -1;
+        slot.task = &task;
     }
 
     void init_ring_slot(
@@ -166,6 +173,7 @@ protected:
         memset(&slot, 0, sizeof(slot));
         memset(&payload, 0, sizeof(payload));
         memset(&task, 0, sizeof(task));
+        task.target_aicpu_cluster = -1;
         slot.task_state.store(state, std::memory_order_relaxed);
         slot.fanin_count = 0;
         slot.fanin_refcount.store(0, std::memory_order_relaxed);
@@ -427,6 +435,40 @@ TEST_F(SchedulerStateTest, GetReadyTasksBatchDrainsSharedQueue) {
     EXPECT_EQ(out[1], &slot_b);
 }
 
+TEST_F(SchedulerStateTest, AutomaticSingleBlockAndStrictTasksHaveSeparateQueues) {
+    alignas(64) ChipTaskSlotState automatic, strict;
+    init_slot(automatic, CHIP_TASK_PENDING, 1, 1);
+    init_slot(strict, CHIP_TASK_PENDING, 1, 1);
+    automatic.task->target_aicpu_cluster = 0;
+    strict.task->target_aicpu_cluster = 0;
+    automatic.payload->placement.scope = 1;
+    sched.placement_feedback.calibration_done.store(true);
+    sched.push_ready_routed(&automatic);
+    sched.push_ready_routed(&strict);
+
+    ChipTaskSlotState *out[2];
+    EXPECT_EQ(sched.get_ready_tasks_batch(sched.ready_queues, ResourceShape::AIC, out, 2), 0);
+    EXPECT_EQ(sched.get_ready_tasks_batch(sched.cluster_ready_queues[1], ResourceShape::AIC, out, 2), 0);
+    ASSERT_EQ(sched.get_ready_tasks_batch(sched.auto_ready_queues[0], ResourceShape::AIC, out, 2), 1);
+    EXPECT_EQ(out[0], &automatic);
+    ASSERT_EQ(sched.get_ready_tasks_batch(sched.cluster_ready_queues[0], ResourceShape::AIC, out, 2), 1);
+    EXPECT_EQ(out[0], &strict);
+}
+
+TEST_F(SchedulerStateTest, FrozenCalibrationKeepsReadyAccountingWithoutSampleStamp) {
+    alignas(64) ChipTaskSlotState slot;
+    init_slot(slot, CHIP_TASK_PENDING, 1, 1);
+    slot.task->target_aicpu_cluster = 1;
+    slot.logical_block_num = 16;
+    slot.payload->placement.scope = 1;
+    sched.placement_feedback.calibration_done.store(true);
+    sched.stamp_ready_queue(slot);
+    sched.stamp_ready_queue(slot);
+    EXPECT_EQ(sched.placement_feedback.threads[simpler::tmr::PARTITION_THREADS - 1].summary[0].queued[1].load(), 16u);
+    EXPECT_EQ(slot.payload->ready_queue_timestamp.load(), 0u);
+    EXPECT_EQ(slot.payload->placement.release_tick, 0u);
+}
+
 TEST(CoreTrackerTest, MixPartiallyRunningClusterAdmittedAsPerCorePlacement) {
     CoreTracker tracker;
     tracker.init(1);
@@ -635,4 +677,250 @@ TEST(CoreTrackerTest, CountAvailableBlocksMixIgnoresUnavailableUnusedCore) {
 
     EXPECT_EQ(tracker.count_available_blocks(ResourceShape::MIX, used_mask, false), 1);
     EXPECT_EQ(tracker.count_available_blocks(ResourceShape::MIX, used_mask, true), 1);
+}
+
+TEST_F(SchedulerStateTest, DeferredBindingUsesActualProducerAndAccountsExactlyOnce) {
+    alignas(64) ChipTaskSlotState producer, consumer;
+    init_slot(producer, CHIP_TASK_COMPLETED, 1, 1);
+    init_slot(consumer, CHIP_TASK_PENDING, 1, 1);
+    sched.placement_feedback.schedulers[0] = 2;
+    sched.placement_feedback.schedulers[1] = 3;
+    sched.placement_feedback.calibration_done.store(true);
+    producer.payload->placement.preferred_cluster = 0;
+    producer.payload->placement.dispatch_cluster.store(1);
+    consumer.payload->placement.scope = 1;
+    consumer.payload->placement.preferred_cluster = 0;
+    consumer.task->target_aicpu_cluster = -1;
+    // Sampling is frozen (tick=0); actual release origin is still required.
+    sched.record_ready_origin(consumer, &producer, 0, 2);
+    sched.stamp_ready_queue(consumer);
+    sched.stamp_ready_queue(consumer);
+    EXPECT_EQ(consumer.payload->placement.preferred_cluster, 0);
+    EXPECT_EQ(consumer.task->target_aicpu_cluster, 1);
+    auto &row = sched.placement_feedback.threads[2].summary[0];
+    EXPECT_EQ(row.released[0].load(), 1u);
+    EXPECT_EQ(row.queued[1].load(), 1u);
+    EXPECT_EQ(row.queued[0].load(), 0u);
+    // A subsequent foreign pickup changes execution affinity, never queue debit.
+    consumer.payload->placement.dispatch_cluster.store(0);
+    EXPECT_EQ(consumer.task->target_aicpu_cluster, 1);
+    EXPECT_EQ(&sched.ready_queue_for(consumer, ResourceShape::AIC, false), &sched.auto_ready_queues[1][0]);
+}
+
+TEST_F(SchedulerStateTest, AutomaticMultiblockAndStrictTargetsCannotEnterBorrowableQueues) {
+    alignas(64) ChipTaskSlotState wide, strict;
+    init_slot(wide, CHIP_TASK_PENDING, 1, 1);
+    init_slot(strict, CHIP_TASK_PENDING, 1, 1);
+    wide.logical_block_num = 16;
+    wide.payload->placement.scope = 1;
+    wide.task->target_aicpu_cluster = 1;
+    strict.task->target_aicpu_cluster = 1;
+    EXPECT_EQ(&sched.ready_queue_for(wide, ResourceShape::AIV, false), &sched.cluster_ready_queues[1][1]);
+    EXPECT_EQ(&sched.ready_queue_for(strict, ResourceShape::AIV, false), &sched.cluster_ready_queues[1][1]);
+}
+
+TEST_F(SchedulerStateTest, UnknownReleaseTimestampDoesNotChangeSchedulerOriginToOrchestrator) {
+    alignas(64) ChipTaskSlotState producer, consumer;
+    init_slot(producer, CHIP_TASK_COMPLETED, 1, 1);
+    init_slot(consumer, CHIP_TASK_PENDING, 1, 1);
+    sched.placement_feedback.schedulers[0] = 2;
+    sched.placement_feedback.schedulers[1] = 3;
+    sched.placement_feedback.orchestrator_cluster = 1;
+    producer.payload->placement.dispatch_cluster.store(0);
+    consumer.payload->placement.scope = 1;
+    consumer.payload->placement.preferred_cluster = 1;
+    // A shared producer can start its fanout walk before feedback is enabled.
+    // Its missing sample timestamp does not make it an O-origin publication.
+    sched.record_ready_origin(consumer, &producer, 0, 2);
+    sched.stamp_ready_queue(consumer);
+    EXPECT_EQ(consumer.payload->placement.reserved & simpler::tmr::PARTITION_FROM_O, 0u);
+    EXPECT_EQ(consumer.payload->placement.release_cluster, 0);
+    EXPECT_EQ(consumer.task->target_aicpu_cluster, 0);
+}
+
+// QKV owns a ready slot only after the lifecycle CAS. Each test exercises the
+// production queues and production allocator, including the Shared escape.
+TEST_F(SchedulerStateTest, QkvSingletonAndDuplicateReady) {
+    sched.qkv.enabled = true;
+    sched.qkv.schedulers = 2;
+    for (int c = 0; c < 2; ++c) {
+        sched.qkv.side[c] = c;
+        for (int r = 0; r < 2; ++r) {
+            sched.qkv.capacity[c][r] = 8;
+            sched.qkv.threads[c].resources[r].store(8 | (8 << 16));
+        }
+    }
+    ChipTaskSlotState slot;
+    init_slot(slot, CHIP_TASK_PENDING, 0, 0);
+    EXPECT_TRUE(sched.route_ready_once(slot));
+    EXPECT_FALSE(sched.route_ready_once(slot));
+    EXPECT_EQ(sched.qkv_pending.size(), 1u);
+    sched.service_qkv_batch();
+    EXPECT_EQ(sched.qkv.batches[1], 1u);
+    EXPECT_EQ(sched.qkv_pending.size(), 0u);
+    EXPECT_EQ(sched.cluster_ready_queues[0][0].size(), 1u);
+    EXPECT_EQ(sched.ready_queues[0].size(), 0u);
+    int start = -1;
+    EXPECT_EQ(slot.claim_block_range(1, 8, start), 1);
+    EXPECT_EQ(start, 0);
+    EXPECT_EQ(slot.claim_block_range(1, 8, start), 0);
+}
+
+TEST_F(SchedulerStateTest, QkvFullBatchUpdatesReservations) {
+    sched.qkv.enabled = true;
+    sched.qkv.schedulers = 2;
+    for (int c = 0; c < 2; ++c) {
+        sched.qkv.side[c] = c;
+        for (int r = 0; r < 2; ++r) {
+            sched.qkv.capacity[c][r] = 8;
+            sched.qkv.threads[c].resources[r].store(8 | (8 << 16));
+        }
+    }
+    ChipTaskSlotState slots[8];
+    for (auto &slot : slots) {
+        init_slot(slot, CHIP_TASK_PENDING, 0, 0);
+        EXPECT_TRUE(sched.route_ready_once(slot));
+    }
+    sched.service_qkv_batch();
+    EXPECT_EQ(sched.qkv.batches[8], 1u);
+    EXPECT_EQ(sched.cluster_ready_queues[0][0].size(), 4u);
+    EXPECT_EQ(sched.cluster_ready_queues[1][0].size(), 4u);
+    EXPECT_EQ(slots[0].task->target_aicpu_cluster, 0);
+    EXPECT_EQ(slots[1].task->target_aicpu_cluster, 1);
+}
+
+TEST_F(SchedulerStateTest, QkvQueueFullFallsBackOnce) {
+    sched.qkv.enabled = true;
+    sched.qkv.capacity[0][0] = sched.qkv.capacity[1][0] = 8;
+    // Occupy queue tickets with a sentinel; the tested task is never inserted.
+    ChipTaskSlotState sentinel;
+    for (int i = 0; i < simpler::tmr::QKV_PENDING; ++i) EXPECT_TRUE(sched.qkv_pending.push(&sentinel));
+    ChipTaskSlotState slot;
+    init_slot(slot, CHIP_TASK_PENDING, 0, 0);
+    EXPECT_TRUE(sched.route_ready_once(slot));
+    EXPECT_FALSE(sched.route_ready_once(slot));
+    EXPECT_EQ(sched.ready_queues[0].size(), 1u);
+    EXPECT_EQ(sched.qkv.fallback[0].load(), 1u);
+    EXPECT_EQ(sched.qkv_pending.size(), 64u);
+}
+
+TEST_F(SchedulerStateTest, QkvUnavailableSnapshotAndNoCompatibleSide) {
+    sched.qkv.enabled = true;
+    sched.qkv.schedulers = 2;
+    sched.qkv.side[0] = 0;
+    sched.qkv.side[1] = 1;
+    sched.qkv.capacity[0][0] = sched.qkv.capacity[1][0] = 8;
+    ChipTaskSlotState slots[2];
+    for (auto &slot : slots) {
+        init_slot(slot, CHIP_TASK_PENDING, 0, 0);
+        slot.logical_block_num = 2;
+    }
+    EXPECT_TRUE(sched.route_ready_once(slots[0]));
+    sched.service_qkv_batch();
+    EXPECT_EQ(sched.qkv.fallback[1].load(), 1u);
+    // A valid summary whose compatible capacity is smaller than this task.
+    for (int c = 0; c < 2; ++c) for (int r = 0; r < 2; ++r)
+        sched.qkv.threads[c].resources[r].store(1 | (1 << 16));
+    EXPECT_TRUE(sched.route_ready_once(slots[1]));
+    sched.service_qkv_batch();
+    EXPECT_EQ(sched.qkv.fallback[2].load(), 1u);
+    EXPECT_EQ(sched.ready_queues[0].size(), 2u);
+    EXPECT_EQ(sched.qkv_pending.size(), 0u);
+}
+
+TEST_F(SchedulerStateTest, QkvOversizeAndSyncPreserveOriginalQueues) {
+    sched.qkv.enabled = true;
+    sched.qkv.capacity[0][0] = sched.qkv.capacity[1][0] = 8;
+    ChipTaskSlotState wide, sync;
+    init_slot(wide, CHIP_TASK_PENDING, 0, 0);
+    wide.logical_block_num = 9;
+    EXPECT_TRUE(sched.route_ready_once(wide));
+    init_slot(sync, CHIP_TASK_PENDING, 0, 0);
+    sync.task_attrs.set_sync_start();
+    EXPECT_TRUE(sched.route_ready_once(sync));
+    EXPECT_EQ(sched.qkv_pending.size(), 0u);
+    EXPECT_EQ(sched.ready_queues[0].size(), 1u);
+    EXPECT_EQ(sched.ready_sync_queues[0].size(), 1u);
+    EXPECT_EQ(sched.qkv.fallback[4].load(), 1u);
+}
+
+TEST(QkvFormula, KvStateOverridesLowerBaseLoadAndBatchChangesNextChoice) {
+    simpler::tmr::QkvSnapshot s;
+    for (int c = 0; c < 2; ++c) for (int r = 0; r < 2; ++r) {
+        s.capacity[c][r] = 8;
+        s.idle[c][r] = 8;
+    }
+    double reserved[2][2]{};
+    EXPECT_EQ(simpler::tmr::qkv_choose(s, 0, 1, 0, reserved), 0);
+    EXPECT_EQ(simpler::tmr::qkv_choose(s, 0, 1, 0, reserved), 1);
+    reserved[0][0] = reserved[1][0] = 0;
+    s.queued[1][0] = 1;  // base load prefers side 0 by 1/8
+    s.occupied[0][0] = 1;
+    s.idle[0][0] = 0;
+    EXPECT_EQ(simpler::tmr::qkv_choose(s, 0, 1, 0, reserved), 1);
+    s.occupied[0][0] = 0;
+    s.idle[0][0] = 8;
+    reserved[0][0] = reserved[1][0] = 0;
+    EXPECT_EQ(simpler::tmr::qkv_choose(s, 0, 1, 0, reserved), 0);
+}
+
+TEST_F(SchedulerStateTest, QkvConcurrentLocalRangeClaimsAreUnique) {
+    sched.qkv.enabled = true;
+    sched.qkv.schedulers = 2;
+    for (int c = 0; c < 2; ++c) {
+        sched.qkv.side[c] = c;
+        for (int r = 0; r < 2; ++r) {
+            sched.qkv.capacity[c][r] = 8;
+            sched.qkv.threads[c].resources[r].store(8 | (8 << 16));
+        }
+    }
+    ChipTaskSlotState slot;
+    init_slot(slot, CHIP_TASK_PENDING, 0, 0);
+    slot.logical_block_num = 8;
+    EXPECT_TRUE(sched.route_ready_once(slot));
+    sched.service_qkv_batch();
+    auto &queue = sched.cluster_ready_queues[0][0];
+    std::atomic<int> seen[8]{};
+    std::atomic<int> done{0};
+    std::thread workers[4];
+    for (auto &worker : workers) worker = std::thread([&] {
+        while (done.load(std::memory_order_acquire) < 8) {
+            auto *next = queue.pop();
+            if (!next) continue;
+            int start = -1;
+            int count = next->claim_block_range(8, 1, start);
+            if (!count) continue;
+            // Requeue before recording completion, as production dispatch does.
+            if (start + count < 8) queue.push(next);
+            seen[start].fetch_add(1, std::memory_order_relaxed);
+            done.fetch_add(1, std::memory_order_release);
+        }
+    });
+    for (auto &worker : workers) worker.join();
+    for (auto &count : seen) EXPECT_EQ(count.load(), 1);
+    EXPECT_EQ(queue.size(), 0u);
+    EXPECT_EQ(sched.qkv_pending.size(), 0u);
+}
+
+TEST_F(SchedulerStateTest, QkvStrictPredicateAndEarlyRemainderStayOnOriginalPaths) {
+    sched.qkv.enabled = true;
+    sched.qkv.capacity[0][0] = sched.qkv.capacity[1][0] = 8;
+    ChipTaskSlotState strict, predicated, early;
+    init_slot(strict, CHIP_TASK_PENDING, 0, 0);
+    strict.task->target_aicpu_cluster = 1;
+    EXPECT_TRUE(sched.route_ready_once(strict));
+    EXPECT_EQ(sched.cluster_ready_queues[1][0].size(), 1u);
+    init_slot(predicated, CHIP_TASK_PENDING, 0, 0);
+    predicated.task_attrs.set_predicate();
+    EXPECT_TRUE(sched.route_ready_once(predicated));
+    init_slot(early, CHIP_TASK_PENDING, 0, 0);
+    early.logical_block_num = 2;
+    early.next_block_idx.store(1);
+    early.payload->early_dispatch_state.store(EARLY_DISPATCH_STAGING);
+    // No staged mask: this represents an early remainder after a prior claim.
+    EXPECT_TRUE(sched.route_ready_once(early));
+    EXPECT_FALSE(sched.route_ready_once(early));
+    EXPECT_EQ(sched.qkv_pending.size(), 0u);
+    EXPECT_EQ(sched.qkv.eligible.load(), 0u);
+    EXPECT_EQ(early.payload->placement.reserved, 0);
 }

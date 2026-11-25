@@ -38,8 +38,12 @@
 #include "ring_buffer.h"
 #include "runtime_types.h"
 #include "shared_memory.h"
+#include "qkv_batch.h"
 
 #include "aicpu/device_time.h"  // get_sys_cnt_aicpu (weak; used by early-dispatch doorbell timing too)
+#if SIMPLER_DFX
+#include "aicpu/chip_swimlane_collector_aicpu.h"
+#endif
 #if SIMPLER_SCHED_PROFILING
 #define SCHED_CYCLE_START() uint64_t _st0 = get_sys_cnt_aicpu(), _st1
 #define SCHED_CYCLE_LAP(acc)        \
@@ -431,6 +435,10 @@ struct SchedulerLayout {
     size_t off_ready_queue_slots[NUM_RESOURCE_SHAPES];
     size_t off_ready_sync_queue_slots[NUM_RESOURCE_SHAPES];
     size_t off_dummy_ready_queue_slots;
+    size_t off_qkv_pending_slots;
+    size_t off_cluster_ready_queue_slots[2][NUM_RESOURCE_SHAPES];
+    size_t off_cluster_dummy_queue_slots[2];
+    size_t off_auto_ready_queue_slots[2][NUM_RESOURCE_SHAPES];
     size_t off_early_dispatch_queue_slots[NUM_RESOURCE_SHAPES];
     size_t off_early_sync_start_queue_slots;
     size_t off_dep_pool_entries[CHIP_MAX_RING_DEPTH];
@@ -517,6 +525,9 @@ struct SchedulerState {
 
     // Ready queues remain global (scheduling is ring-agnostic)
     ChipReadyQueue ready_queues[NUM_RESOURCE_SHAPES];
+    ChipReadyQueue cluster_ready_queues[2][NUM_RESOURCE_SHAPES];
+    // Only movable automatic single-block compute tasks enter these queues.
+    ChipReadyQueue auto_ready_queues[2][NUM_RESOURCE_SHAPES];
 
     // Ready sync_start queues, one per shape. A ready sync_start cohort parks here
     // instead of ready_queues[] so the dispatch loop can drain it as a strict Tier-0
@@ -528,6 +539,65 @@ struct SchedulerState {
     // Dependency-only tasks (active_mask is empty, shape == DUMMY). Drained by
     // the dispatch loop and completed inline -- never goes to AICore.
     ChipReadyQueue dummy_ready_queue;
+    ChipReadyQueue qkv_pending;
+    simpler::tmr::QkvState qkv;
+    void service_qkv_batch();
+
+    // READY_CLAIMED already admits one publisher. A successful pending push
+    // transfers sole publication ownership to S0; no ready requeue enters here.
+    bool try_qkv_pending(ChipTaskSlotState &slot) {
+        if (!qkv.enabled || slot.task->target_aicpu_cluster >= 0 || slot.payload->placement.scope ||
+            slot.task_attrs.requires_sync_start() || slot.task_attrs.has_predicate() ||
+            slot.next_block_idx.load(std::memory_order_relaxed) != 0 ||
+            slot.payload->early_dispatch_state.load(std::memory_order_acquire) != EARLY_DISPATCH_DISPATCHED) return false;
+        int r = static_cast<int>(slot.active_mask.to_shape());
+        if (r < 0 || r > 1) return false;
+        qkv.eligible.fetch_add(1, std::memory_order_relaxed);
+        if (static_cast<uint32_t>(slot.logical_block_num) > qkv.capacity[0][r] || static_cast<uint32_t>(slot.logical_block_num) > qkv.capacity[1][r]) {
+            qkv.fail(simpler::tmr::QkvFallback::Oversize);
+            return false;
+        }
+        slot.payload->placement.submit_tick = get_sys_cnt_aicpu();
+        slot.payload->placement.reserved = 1;
+        if (qkv_pending.push(&slot)) return true;
+        slot.payload->placement.reserved = 0;
+        qkv.fail(simpler::tmr::QkvFallback::Full);
+        return false;
+    }
+    ChipReadyQueue cluster_dummy_queues[2];
+    std::atomic<bool> has_cluster_targets{false};
+    simpler::tmr::PartitionShared placement_feedback;
+    static_assert(simpler::tmr::PARTITION_THREADS >= PLATFORM_MAX_AICPU_THREADS);
+    static_assert(simpler::tmr::PARTITION_SCOPE_DEPTH >= CHIP_MAX_SCOPE_DEPTH);
+    static_assert(simpler::tmr::PARTITION_SHAPES == static_cast<int>(ResourceShape::DUMMY) + 1);
+
+    ChipReadyQueue &ready_queue_for(const ChipTaskSlotState &slot_state, ResourceShape shape, bool sync) {
+        int32_t cluster = slot_state.task->target_aicpu_cluster;
+        if (sync) {
+            always_assert(cluster < 0);
+            return ready_sync_queues[static_cast<int32_t>(shape)];
+        }
+        if (cluster >= 0 && slot_state.payload->placement.scope && slot_state.logical_block_num == 1)
+            return auto_ready_queues[cluster][static_cast<int32_t>(shape)];
+        return cluster < 0 ? ready_queues[static_cast<int32_t>(shape)]
+                           : cluster_ready_queues[cluster][static_cast<int32_t>(shape)];
+    }
+
+    ChipReadyQueue &dummy_queue_for(const ChipTaskSlotState &slot_state) {
+        int32_t cluster = slot_state.task->target_aicpu_cluster;
+        return cluster < 0 ? dummy_ready_queue : cluster_dummy_queues[cluster];
+    }
+
+    void note_qkv_shared(ChipTaskSlotState &slot, int writer) {
+        int r = static_cast<int>(slot.active_mask.to_shape());
+        if (!qkv.enabled || r > 1 || slot.task->target_aicpu_cluster >= 0 ||
+            slot.task_attrs.requires_sync_start() || slot.task_attrs.has_predicate() ||
+            slot.next_block_idx.load(std::memory_order_relaxed) != 0 ||
+            slot.payload->early_dispatch_state.load(std::memory_order_acquire) != EARLY_DISPATCH_DISPATCHED) return;
+        slot.payload->placement.reserved = 3;
+        auto &counter = qkv.threads[writer].shared_added[r];
+        counter.store(counter.load(std::memory_order_relaxed) + slot.logical_block_num, std::memory_order_relaxed);
+    }
 
     alignas(64) AsyncWaitList async_wait_list;
 
@@ -540,20 +610,91 @@ struct SchedulerState {
     // Inline hot-path methods
     // =========================================================================
 
+    void stamp_ready_queue(ChipTaskSlotState &slot_state) {
+        bool adaptive = slot_state.payload->placement.scope != 0;
+        bool sample = adaptive && !placement_feedback.calibration_done.load(std::memory_order_acquire);
+#if SIMPLER_DFX
+        uint64_t binding_begin =
+            adaptive && get_chip_swimlane_level() >= ChipSwimlaneLevel::SCHED_PHASES ? get_sys_cnt_aicpu() : 0;
+#endif
+        if (adaptive) {
+            auto &metadata = slot_state.payload->placement;
+            if (sample && metadata.ready_writer == simpler::tmr::PARTITION_THREADS - 1 &&
+                metadata.release_cluster < 0) {
+                metadata.release_tick = get_sys_cnt_aicpu();
+                metadata.release_cluster = placement_feedback.orchestrator_cluster;
+                metadata.reserved |= simpler::tmr::PARTITION_FROM_O;
+            }
+            ResourceShape shape = slot_state.active_mask.to_shape();
+            if (!(metadata.reserved & simpler::tmr::PARTITION_READY)) {
+                int pref = metadata.preferred_cluster;
+                if (pref < 0) pref = slot_state.task->target_aicpu_cluster;
+                uint64_t depth[2]{};
+                for (int side = 0; side < 2; ++side)
+                    depth[side] =
+                        placement_feedback.side_queue[side][static_cast<int>(shape)].load(std::memory_order_relaxed) &
+                        0xffffffffu;
+                int source = metadata.reserved & simpler::tmr::PARTITION_FROM_O ? -1 : metadata.release_cluster;
+                slot_state.task->target_aicpu_cluster =
+                    simpler::tmr::partition_ready_side(pref, source, depth, placement_feedback.schedulers);
+                uint64_t units = shape == ResourceShape::DUMMY ? 1 : slot_state.logical_block_num;
+                auto &row = placement_feedback.threads[metadata.ready_writer].summary[static_cast<int>(shape)];
+                row.begin_write();
+                simpler::tmr::PartitionSummary::add(row.released[pref], units);
+                simpler::tmr::PartitionSummary::add(row.queued[slot_state.task->target_aicpu_cluster], units);
+                row.end_write();
+                metadata.reserved |= simpler::tmr::PARTITION_READY;
+            }
+            int c = slot_state.task->target_aicpu_cluster;
+            if (sample) {
+                uint64_t hint =
+                    placement_feedback.side_queue[c][static_cast<int>(shape)].load(std::memory_order_relaxed);
+                uint64_t depth = hint & 0xffffffffu;
+                metadata.ready_depth = static_cast<uint32_t>(depth);
+                if (depth == 0 && (hint >> 32)) metadata.reserved |= simpler::tmr::PARTITION_IDLE_AT_PUBLISH;
+            }
+        }
+#if SIMPLER_DFX
+        if (sample || get_chip_swimlane_level() >= ChipSwimlaneLevel::SCHED_PHASES) {
+            slot_state.payload->ready_queue_timestamp.store(get_sys_cnt_aicpu(), std::memory_order_relaxed);
+        }
+#else
+        if (sample) slot_state.payload->ready_queue_timestamp.store(get_sys_cnt_aicpu(), std::memory_order_relaxed);
+#endif
+#if SIMPLER_DFX
+        if (binding_begin) {
+            auto &trace = placement_feedback.threads[slot_state.payload->placement.ready_writer].trace;
+            trace.ticks[6] += get_sys_cnt_aicpu() - binding_begin;
+            ++trace.calls[6];
+        }
+#endif
+    }
+
+    static void
+    record_ready_origin(ChipTaskSlotState &slot_state, const ChipTaskSlotState *producer, uint64_t tick, int writer) {
+        if (!slot_state.payload->placement.scope || producer == nullptr) return;
+        auto &record = slot_state.payload->placement;
+        record.ready_writer = writer;
+        record.release_tick = tick;
+        int c = producer->payload->placement.dispatch_cluster.load(std::memory_order_acquire);
+        record.release_cluster = c >= 0 ? c : producer->task->target_aicpu_cluster;
+    }
+
     // Route a ready slot to the right global queue. Dep-only tasks — DUMMY-shaped
     // (empty active_mask) or a task whose dispatch predicate fails — live in
     // dummy_ready_queue and are retired inline; a ready sync_start cohort goes to
     // the per-shape ready_sync_queues[] (drained as Tier-0); everything else to
     // ready_queues[].
     void push_ready_routed(ChipTaskSlotState *slot_state) {
+        stamp_ready_queue(*slot_state);
         ResourceShape shape = slot_state->active_mask.to_shape();
         if (shape == ResourceShape::DUMMY ||
             (slot_state->task_attrs.has_predicate() && !slot_state->payload->predicate.pass())) {
-            dummy_ready_queue.push(slot_state);
+            dummy_queue_for(*slot_state).push(slot_state);
         } else if (slot_state->task_attrs.requires_sync_start()) {
-            ready_sync_queues[static_cast<int32_t>(shape)].push(slot_state);
+            ready_queue_for(*slot_state, shape, true).push(slot_state);
         } else {
-            ready_queues[static_cast<int32_t>(shape)].push(slot_state);
+            ready_queue_for(*slot_state, shape, false).push(slot_state);
         }
     }
 
@@ -924,6 +1065,9 @@ struct SchedulerState {
     // Attempt to claim and enqueue a consumer after every direct producer becomes
     // launch-visible. Both propagation and wiring can complete dispatch_fanin.
     inline void try_enqueue_early_dispatch_candidate(ChipTaskSlotState &consumer) {
+        // Early-dispatch queues are global. A targeted consumer must wait for its
+        // cluster-specific ready queue, regardless of its producers' hints.
+        if (consumer.task->target_aicpu_cluster >= 0) return;
         // Predicated tasks resolve at the ready point, never early-dispatch. The
         // wiring caller has no separate predicate filter, so the gate lives here.
         if (consumer.task_attrs.has_predicate()) return;
@@ -1034,7 +1178,7 @@ struct SchedulerState {
         }
     };
 
-    inline bool try_early_dispatch_release(ChipTaskSlotState &slot_state, EarlyDispatchReleaseSink *sink = nullptr) {
+    inline bool try_early_dispatch_release(ChipTaskSlotState &slot_state, EarlyDispatchReleaseSink *sink = nullptr, bool *ordinary = nullptr) {
         // A predicated task is evaluated at the ready point, never early-dispatched.
         if (slot_state.task_attrs.has_predicate()) return false;
         // Never staged => CAS NONE->DISPATCHED wins => dispatch normally.
@@ -1042,6 +1186,7 @@ struct SchedulerState {
         if (slot_state.payload->early_dispatch_state.compare_exchange_strong(
                 expect, EARLY_DISPATCH_DISPATCHED, std::memory_order_seq_cst, std::memory_order_seq_cst
             )) {
+            if (ordinary) *ordinary = true;
             return false;
         }
         // route_ready_once admits one caller, but keep the helper defensive: a
@@ -1094,12 +1239,20 @@ struct SchedulerState {
         return slot_state.next_block_idx.load(std::memory_order_seq_cst) >= slot_state.logical_block_num;
     }
 
-    bool route_ready_once(ChipTaskSlotState &slot_state, EarlyDispatchReleaseSink *sink = nullptr) {
+    bool route_ready_once(
+        ChipTaskSlotState &slot_state, EarlyDispatchReleaseSink *sink = nullptr,
+        const ChipTaskSlotState *producer = nullptr, uint64_t release_tick = 0,
+        int writer = simpler::tmr::PARTITION_THREADS - 1
+    ) {
         if (!try_claim_ready_once(slot_state)) return false;
+        record_ready_origin(slot_state, producer, release_tick, writer);
 
         // Early-dispatch: pre-staged tasks are released by doorbell
         // here, skipping the ready-queue round-trip entirely.
-        bool early_handled = try_early_dispatch_release(slot_state, sink);
+        // Only the successful NONE->DISPATCHED CAS certifies no early stager
+        // owns this task. A separate pre-load would race an early candidate.
+        bool ordinary = false;
+        bool early_handled = try_early_dispatch_release(slot_state, sink, &ordinary);
         if (slot_state.task_attrs.requires_sync_start()) {
             bool drain_owned = publish_ready_to_early_sync_drain(*slot_state.payload);
             if (early_handled || drain_owned) return true;
@@ -1107,14 +1260,17 @@ struct SchedulerState {
             return true;
         }
 
+        if (ordinary && try_qkv_pending(slot_state)) return true;
+        if (ordinary) note_qkv_shared(slot_state, writer);
+        stamp_ready_queue(slot_state);
         ResourceShape shape = slot_state.active_mask.to_shape();
         if (shape == ResourceShape::DUMMY ||
             (slot_state.task_attrs.has_predicate() && !slot_state.payload->predicate.pass())) {
-            dummy_ready_queue.push(&slot_state);
+            dummy_queue_for(slot_state).push(&slot_state);
         } else if (slot_state.task_attrs.requires_sync_start()) {
-            ready_sync_queues[static_cast<int32_t>(shape)].push(&slot_state);
+            ready_queue_for(slot_state, shape, true).push(&slot_state);
         } else {
-            ready_queues[static_cast<int32_t>(shape)].push(&slot_state);
+            ready_queue_for(slot_state, shape, false).push(&slot_state);
         }
         return true;
     }
@@ -1122,7 +1278,8 @@ struct SchedulerState {
 #if SIMPLER_ORCH_PROFILING || SIMPLER_SCHED_PROFILING
     bool route_ready_once(
         ChipTaskSlotState &slot_state, uint64_t &atomic_count, uint64_t &push_wait,
-        EarlyDispatchReleaseSink *sink = nullptr
+        EarlyDispatchReleaseSink *sink = nullptr, const ChipTaskSlotState *producer = nullptr,
+        uint64_t release_tick = 0, int writer = simpler::tmr::PARTITION_THREADS - 1
     ) {
         uint8_t flags = slot_state.lifecycle_flags.load(std::memory_order_acquire);
         atomic_count += 1;  // lifecycle_flags load
@@ -1138,9 +1295,13 @@ struct SchedulerState {
             atomic_count += 1;  // failed lifecycle_flags CAS
         }
 
+        record_ready_origin(slot_state, producer, release_tick, writer);
         // Early-dispatch: pre-staged tasks are released by doorbell
         // here, skipping the ready-queue round-trip entirely.
-        bool early_handled = try_early_dispatch_release(slot_state, sink);
+        // Only the successful NONE->DISPATCHED CAS certifies no early stager
+        // owns this task. A separate pre-load would race an early candidate.
+        bool ordinary = false;
+        bool early_handled = try_early_dispatch_release(slot_state, sink, &ordinary);
         if (slot_state.task_attrs.requires_sync_start()) {
             bool drain_owned = publish_ready_to_early_sync_drain(*slot_state.payload);
             if (early_handled || drain_owned) return true;
@@ -1148,27 +1309,34 @@ struct SchedulerState {
             return true;
         }
 
+        if (ordinary && try_qkv_pending(slot_state)) return true;
+        if (ordinary) note_qkv_shared(slot_state, writer);
+        stamp_ready_queue(slot_state);
         ResourceShape shape = slot_state.active_mask.to_shape();
         if (shape == ResourceShape::DUMMY ||
             (slot_state.task_attrs.has_predicate() && !slot_state.payload->predicate.pass())) {
-            dummy_ready_queue.push(&slot_state, atomic_count, push_wait);
+            dummy_queue_for(slot_state).push(&slot_state, atomic_count, push_wait);
         } else if (slot_state.task_attrs.requires_sync_start()) {
-            ready_sync_queues[static_cast<int32_t>(shape)].push(&slot_state, atomic_count, push_wait);
+            ready_queue_for(slot_state, shape, true).push(&slot_state, atomic_count, push_wait);
         } else {
-            ready_queues[static_cast<int32_t>(shape)].push(&slot_state, atomic_count, push_wait);
+            ready_queue_for(slot_state, shape, false).push(&slot_state, atomic_count, push_wait);
         }
         return true;
     }
 #endif
 
-    bool release_fanin_and_check_ready(ChipTaskSlotState &slot_state, EarlyDispatchReleaseSink *sink = nullptr) {
+    bool release_fanin_and_check_ready(
+        ChipTaskSlotState &slot_state, EarlyDispatchReleaseSink *sink = nullptr,
+        const ChipTaskSlotState *producer = nullptr, uint64_t release_tick = 0,
+        int writer = simpler::tmr::PARTITION_THREADS - 1
+    ) {
         // Atomically increment fanin_refcount and check if all producers are done
         // ACQ_REL on fanin_refcount already synchronizes with the orchestrator's
         // init release, making fanin_count visible — plain load suffices.
         int32_t new_refcount = slot_state.fanin_refcount.fetch_add(1, std::memory_order_acq_rel) + 1;
 
         if (new_refcount == slot_state.fanin_count) {
-            return route_ready_once(slot_state, sink);
+            return route_ready_once(slot_state, sink, producer, release_tick, writer);
         }
         return false;
     }
@@ -1176,13 +1344,14 @@ struct SchedulerState {
 #if SIMPLER_ORCH_PROFILING || SIMPLER_SCHED_PROFILING
     bool release_fanin_and_check_ready(
         ChipTaskSlotState &slot_state, uint64_t &atomic_count, uint64_t &push_wait,
-        EarlyDispatchReleaseSink *sink = nullptr
+        EarlyDispatchReleaseSink *sink = nullptr, const ChipTaskSlotState *producer = nullptr,
+        uint64_t release_tick = 0, int writer = simpler::tmr::PARTITION_THREADS - 1
     ) {
         int32_t new_refcount = slot_state.fanin_refcount.fetch_add(1, std::memory_order_acq_rel) + 1;
         atomic_count += 1;  // fanin_refcount.fetch_add
 
         if (new_refcount == slot_state.fanin_count) {
-            return route_ready_once(slot_state, atomic_count, push_wait, sink);
+            return route_ready_once(slot_state, atomic_count, push_wait, sink, producer, release_tick, writer);
         }
         return false;
     }
@@ -1248,13 +1417,7 @@ struct SchedulerState {
 #else
     uint32_t
 #endif
-    on_task_complete(
-        ChipTaskSlotState &slot_state
-#if SIMPLER_SCHED_PROFILING
-        ,
-        int thread_idx
-#endif
-    ) {
+    on_task_complete(ChipTaskSlotState &slot_state, int thread_idx = simpler::tmr::PARTITION_THREADS - 1) {
 #if SIMPLER_SCHED_PROFILING
         CompletionStats stats = {0, 0, 0, true};
 #else
@@ -1304,16 +1467,21 @@ struct SchedulerState {
         // below; their dispatch_fanin propagation is collected here and replayed
         // after the walk, so no consumer's doorbell waits on a sibling's propagate.
         EarlyDispatchReleaseSink rel_sink;
+        uint64_t placement_release_tick = placement_feedback.enabled.load(std::memory_order_acquire) &&
+                                                  !placement_feedback.calibration_done.load(std::memory_order_acquire) ?
+                                              get_sys_cnt_aicpu() : 0;
         while (current != nullptr) {
             ChipTaskSlotState &consumer_slot = *current->slot_state;
 #if SIMPLER_SCHED_PROFILING
             stats.fanout_edges++;
-            if (release_fanin_and_check_ready(consumer_slot, fanout_atomics, push_wait, &rel_sink)) {
+            if (release_fanin_and_check_ready(
+                    consumer_slot, fanout_atomics, push_wait, &rel_sink, &slot_state, placement_release_tick, thread_idx
+                )) {
                 stats.tasks_enqueued++;
             }
 #else
             consumer_walk_count++;
-            release_fanin_and_check_ready(consumer_slot, &rel_sink);
+            release_fanin_and_check_ready(consumer_slot, &rel_sink, &slot_state, placement_release_tick, thread_idx);
 #endif
             current = current->next;
         }
@@ -1429,11 +1597,7 @@ inline bool
 AsyncWaitList::try_inline_complete_locked(AsyncWaitList::DrainCompletionSink &sink, ChipTaskSlotState &slot_state) {
     // Return value (CompletionStats / consumer-walk count) discarded:
     // async-wait drain path has no Resolve swimlane bar attached.
-#if SIMPLER_SCHED_PROFILING
     (void)sink.sched->on_task_complete(slot_state, sink.thread_idx);
-#else
-    (void)sink.sched->on_task_complete(slot_state);
-#endif
     if (*sink.deferred_release_count >= sink.deferred_release_capacity) {
         while (*sink.deferred_release_count > 0) {
 #if SIMPLER_SCHED_PROFILING
@@ -1453,11 +1617,7 @@ AsyncWaitList::try_inline_complete_locked(AsyncWaitList::DrainCompletionSink &si
 template <bool Profiling>
 inline AsyncPollResult AsyncWaitList::poll_and_complete(
     AICoreCompletionMailbox *aicore_mailbox, SchedulerState *sched, ChipTaskSlotState **deferred_release_slot_states,
-    int32_t &deferred_release_count, int32_t deferred_release_capacity
-#if SIMPLER_SCHED_PROFILING
-    ,
-    int thread_idx
-#endif
+    int32_t &deferred_release_count, int32_t deferred_release_capacity, int thread_idx
 ) {
     AsyncPollResult result;
     if (!try_lock()) return result;
@@ -1467,9 +1627,7 @@ inline AsyncPollResult AsyncWaitList::poll_and_complete(
     sink.deferred_release_slot_states = deferred_release_slot_states;
     sink.deferred_release_count = &deferred_release_count;
     sink.deferred_release_capacity = deferred_release_capacity;
-#if SIMPLER_SCHED_PROFILING
     sink.thread_idx = thread_idx;
-#endif
 
     int32_t drain_err = SIMPLER_ERROR_NONE;
     drain_aicore_completion_mailbox_locked(aicore_mailbox, sink, drain_err);
@@ -1510,11 +1668,7 @@ inline AsyncPollResult AsyncWaitList::poll_and_complete(
         if (entry.normal_done && entry.waiting_completion_count <= 0) {
             // Return value (CompletionStats / consumer-walk count) discarded:
             // deferred-completion drain has no Resolve swimlane bar attached.
-#if SIMPLER_SCHED_PROFILING
             (void)sched->on_task_complete(*entry.slot_state, thread_idx);
-#else
-            (void)sched->on_task_complete(*entry.slot_state);
-#endif
             // Drain deferred_release in place when the buffer fills — same
             // overflow-drain idiom used by complete_slot_task's inline path
             // and by try_inline_complete_locked. Without this, large bursts

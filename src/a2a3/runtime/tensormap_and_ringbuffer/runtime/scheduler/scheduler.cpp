@@ -308,8 +308,102 @@ void SchedulerState::print_queues() {
 
     for (int i = 0; i < NUM_RESOURCE_SHAPES; i++) {
         LOG_DEBUG("  %s: count=%" PRIu64, shape_names[i], sched->ready_queues[i].size());
+        for (int cluster = 0; cluster < 2; cluster++) {
+            LOG_DEBUG(
+                "  cluster %d %s: count=%" PRIu64, cluster, shape_names[i],
+                sched->cluster_ready_queues[cluster][i].size() + sched->auto_ready_queues[cluster][i].size()
+            );
+        }
     }
     LOG_DEBUG("  DUMMY: count=%" PRIu64, sched->dummy_ready_queue.size());
+    for (int cluster = 0; cluster < 2; cluster++) {
+        LOG_DEBUG("  cluster %d DUMMY: count=%" PRIu64, cluster, sched->cluster_dummy_queues[cluster].size());
+    }
 
     LOG_DEBUG("====================");
+}
+
+void SchedulerState::service_qkv_batch() {
+    using namespace simpler::tmr;
+    auto &q = this->qkv;
+    ChipTaskSlotState *batch[QKV_BATCH];
+    // pop_batch consumes only currently published tickets; no wait to fill 8.
+    int n = this->qkv_pending.pop_batch(batch, QKV_BATCH);
+    if (!n) return;
+    uint64_t begin = get_sys_cnt_aicpu();
+    ++q.batches[n];
+    QkvSnapshot snapshot;
+    bool valid = true;
+    for (int t = 0; t < q.schedulers; ++t) {
+        int c = q.side[t];
+        for (int r = 0; r < 2; ++r) {
+            uint64_t word = q.threads[t].resources[r].load(std::memory_order_acquire);
+            double cap = word & 255, idle = (word >> 16) & 255, pending_free = (word >> 8) & 255;
+            if (!cap) valid = false;
+            snapshot.capacity[c][r] += cap;
+            snapshot.idle[c][r] += idle;
+            snapshot.occupied[c][r] += 2 * cap - 2 * idle - pending_free;
+        }
+    }
+    for (int c = 0; c < 2; ++c) for (int r = 0; r < 2; ++r) {
+        uint64_t taken = 0;
+        for (int t = 0; t < q.schedulers; ++t) taken += q.threads[t].taken[c][r].load(std::memory_order_relaxed);
+        snapshot.queued[c][r] = q.assigned[c][r] > taken ? q.assigned[c][r] - taken : 0;
+        if (snapshot.capacity[c][r] > 0) snapshot.occupied[c][r] /= 2 * snapshot.capacity[c][r];
+    }
+    for (int r = 0; r < 2; ++r) {
+        uint64_t added = 0, taken = 0;
+        for (int t = 0; t < QKV_THREADS; ++t) {
+            added += q.threads[t].shared_added[r].load(std::memory_order_relaxed);
+            taken += q.threads[t].shared_taken[r].load(std::memory_order_relaxed);
+        }
+        double backlog = added > taken ? added - taken : 0;
+        double total = snapshot.capacity[0][r] + snapshot.capacity[1][r];
+        if (total > 0) for (int c = 0; c < 2; ++c)
+            snapshot.queued[c][r] += backlog * snapshot.capacity[c][r] / total;
+    }
+    double reserved[2][2]{};
+    for (int i = 0; i < n; ++i) {
+        auto *slot = batch[i];
+        int r = static_cast<int>(slot->active_mask.to_shape());
+        int c = -1;
+        if (!valid) q.fail(QkvFallback::Snapshot);
+        else if ((get_sys_cnt_aicpu() - begin) * 1000000000ULL / PLATFORM_PROF_SYS_CNT_FREQ >= QKV_BUDGET_NS)
+            q.fail(QkvFallback::Budget);
+        else {
+            // Wait age saturates at 1ms to keep all Q features dimensionless.
+            double age = double(begin - slot->payload->placement.submit_tick) /
+                         (PLATFORM_PROF_SYS_CNT_FREQ / 1000.0);
+            if (age > 1) age = 1;
+            c = qkv_choose(snapshot, r, slot->logical_block_num, age, reserved);
+            if (c < 0) q.fail(QkvFallback::NoSide);
+            else if ((get_sys_cnt_aicpu() - begin) * 1000000000ULL / PLATFORM_PROF_SYS_CNT_FREQ >= QKV_BUDGET_NS) {
+                // A score that crosses the deadline has no publication rights.
+                reserved[c][r] -= slot->logical_block_num;
+                c = -1;
+                q.fail(QkvFallback::Budget);
+            }
+        }
+        if (c < 0) {
+            slot->payload->placement.reserved = 0;
+            this->note_qkv_shared(*slot, 0);
+            this->ready_queues[r].push(slot);
+        } else {
+            ++q.assigned_tasks[c];
+            q.assigned[c][r] += slot->logical_block_num;
+            slot->payload->placement.reserved = 2;
+            slot->task->target_aicpu_cluster = c;
+            this->has_cluster_targets.store(true, std::memory_order_release);
+            this->cluster_ready_queues[c][r].push(slot);
+        }
+    }
+    uint64_t elapsed = get_sys_cnt_aicpu() - begin;
+    uint64_t ns = elapsed * 1000000000ULL / PLATFORM_PROF_SYS_CNT_FREQ;
+    int bin = 0;
+    while (ns > 1 && bin < 31) { ns >>= 1; ++bin; }
+    ++q.tick_hist[bin];
+    q.ticks += elapsed;
+    if (elapsed > q.max_ticks) q.max_ticks = elapsed;
+    if (q.decision_count < 4096) q.decision_ticks[q.decision_count] = elapsed;
+    ++q.decision_count;
 }

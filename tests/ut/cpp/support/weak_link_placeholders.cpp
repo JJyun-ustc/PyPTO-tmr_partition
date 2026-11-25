@@ -9,7 +9,7 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 /**
- * Definitions that only have to resolve, never to run.
+ * Minimal stand-ins for subsystems a unit-test target does not link.
  *
  * All are weak: a target that links the real translation unit gets the real
  * behaviour, and one that does not still links. Grouped because they share
@@ -19,6 +19,11 @@
 #include <cstdint>
 
 #include "host/host_graph_runs.h"
+
+// Zero is ChipSwimlaneLevel::DISABLED. This stand-in has no runtime-specific
+// include paths and runtime-only tests without the collector have no capture.
+enum class ChipSwimlaneLevel : uint32_t;
+__attribute__((weak)) ChipSwimlaneLevel get_chip_swimlane_level() { return static_cast<ChipSwimlaneLevel>(0); }
 
 // A recorder worker stands its recording storage up as it starts
 // (host/graph_recorder_pool.h). The real one is in orchestrator.cpp, which the

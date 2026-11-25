@@ -66,17 +66,15 @@ bool compute_allowed_cpus(
         return true;
     }
 
-    // No single cluster fits the request (for example a pathological 3+3 pool
-    // with active_count=4). Keep deterministic behavior rather than doing
-    // device-side majority classification again. This crosses a NUMA boundary
-    // and reintroduces the cross-cluster penalty issue #1045 is about, so warn
-    // loudly — the only reason to be here is active_count exceeding a single
-    // cluster, which is outside the supported topology.
-    LOG_WARN(
-        "A2A3 AICPU: no single cluster holds %d active threads (user_cpus=%zu); "
-        "falling back to cross-cluster selection — expect NUMA-crossing slowdown",
-        active_count, user_cpus.size()
-    );
+    // The full six-CPU pool intentionally spans both clusters. Smaller
+    // requests that spill across clusters still warrant a topology warning.
+    if (active_count < static_cast<int32_t>(user_cpus.size())) {
+        LOG_WARN(
+            "A2A3 AICPU: no single cluster holds %d active threads (user_cpus=%zu); "
+            "falling back to cross-cluster selection — expect NUMA-crossing slowdown",
+            active_count, user_cpus.size()
+        );
+    }
     std::vector<AicpuLogicalCpu> ordered = user_cpus;
     std::sort(ordered.begin(), ordered.end(), [](const AicpuLogicalCpu &a, const AicpuLogicalCpu &b) {
         return a.cpu_id < b.cpu_id;

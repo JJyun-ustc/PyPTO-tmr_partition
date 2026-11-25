@@ -316,6 +316,18 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MaxT, MaxS, TensorArgType> {
     }
     int32_t task_timing_slot() const { return task_timing_slot_; }
 
+    // -2 requests automatic placement; -1 is shared; 0 and 1 are strict cluster targets.
+    int32_t aicpu_cluster_{-1};
+    void set_aicpu_cluster(int32_t cluster) {
+        if (cluster < -1 || cluster > 1) {
+            set_error("aicpu_cluster out of range (valid: -1..1)");
+            return;
+        }
+        aicpu_cluster_ = cluster;
+    }
+    int32_t aicpu_cluster() const { return aicpu_cluster_; }
+    void set_aicpu_cluster_auto() { aicpu_cluster_ = -2; }
+
     void clear() {
         Base::clear();
 #if SIMPLER_DFX
@@ -327,6 +339,7 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MaxT, MaxS, TensorArgType> {
         allow_early_resolve_ = false;
         predicate_ = CoreTaskPredicate{};
         task_timing_slot_ = TASK_TIMING_SLOT_NONE;
+        aicpu_cluster_ = -1;
     }
 
     void reset() {

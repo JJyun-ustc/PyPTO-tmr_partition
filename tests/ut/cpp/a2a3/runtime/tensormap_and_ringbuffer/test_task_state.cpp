@@ -43,6 +43,7 @@ protected:
     // payload, and the scheduler's release/propagate paths dereference it.
     static constexpr int kSlotPayloadPoolSize = 16;
     TaskPayload slot_payload_pool_[kSlotPayloadPoolSize];
+    TaskDescriptor slot_descriptors_[kSlotPayloadPoolSize]{};
     int slot_payload_pool_idx_ = 0;
 
     void SetUp() override {
@@ -74,7 +75,11 @@ protected:
         slot.completed_subtasks.store(0);
         slot.total_required_subtasks = 1;
         slot.logical_block_num = 1;
-        TaskPayload &slot_pl = slot_payload_pool_[slot_payload_pool_idx_++ % kSlotPayloadPoolSize];
+        int index = slot_payload_pool_idx_++ % kSlotPayloadPoolSize;
+        TaskPayload &slot_pl = slot_payload_pool_[index];
+        // Ready routing requires a real descriptor, including the shared sentinel.
+        slot.task = &slot_descriptors_[index];
+        slot.task->target_aicpu_cluster = -1;
         memset(&slot_pl, 0, sizeof(slot_pl));
         slot.payload = &slot_pl;
     }

@@ -726,6 +726,8 @@ static bool prepare_task(
     out->task_id = TaskId::make(ring_id, out->alloc_result.task_id);
     out->slot_state = &orch->sm_header->rings[ring_id].get_slot_state_by_slot(out->alloc_result.slot);
     out->task = &orch->sm_header->rings[ring_id].task_descriptors[out->alloc_result.slot];
+    out->task->target_aicpu_cluster = args.aicpu_cluster() >= 0 ? args.aicpu_cluster() : -1;
+    if (args.aicpu_cluster() >= 0) orch->scheduler->has_cluster_targets.store(true, std::memory_order_release);
     out->payload = &orch->sm_header->rings[ring_id].task_payloads[out->alloc_result.slot];
 
     // Reset the fanout/fanin bookkeeping for this reuse. The allocator only
@@ -827,6 +829,7 @@ void OrchestratorState::begin_scope(ScopeMode mode) {
 
     bool already_in_manual_scope = orch->in_manual_scope();
     ++orch->scope_stack_top;
+    orch->cluster_partitioner.open_scope(orch->scope_stack_top);
     orch->scope_begins[orch->scope_stack_top] = orch->scope_tasks_size;
     if (mode == ScopeMode::MANUAL && !already_in_manual_scope) {
         orch->manual_begin_depth = orch->scope_stack_top;
@@ -884,6 +887,7 @@ void OrchestratorState::end_scope() {
 #endif
 
     bool ending_manual_scope = orch->scope_stack_top == orch->manual_begin_depth;
+    orch->cluster_partitioner.close_scope(orch->scope_stack_top);
     int32_t begin = orch->scope_begins[orch->scope_stack_top--];
     int32_t count = orch->scope_tasks_size - begin;
     if (ending_manual_scope) {
@@ -1197,6 +1201,87 @@ static TaskOutputTensors submit_task_common(
 
     payload.init(args, result, prepared.alloc_result, layout);
 
+    if (args.aicpu_cluster() == -2 && !cur_slot_state.task_attrs.requires_sync_start()) {
+        uint64_t decision_begin = 0;
+        auto &feedback = sched->placement_feedback;
+        auto &partitioner = orch->cluster_partitioner;
+        bool tracing = false;
+#if SIMPLER_DFX
+        tracing = orch->chip_swimlane_level >= ChipSwimlaneLevel::SCHED_PHASES;
+#endif
+        if (tracing) decision_begin = get_sys_cnt_aicpu();
+        uint64_t trace_start = decision_begin;
+        auto trace_stage = [&](int stage) {
+            if (!tracing) return;
+            uint64_t now = get_sys_cnt_aicpu();
+            partitioner.trace.ticks[stage] += now - trace_start;
+            ++partitioner.trace.calls[stage];
+            trace_start = now;
+        };
+
+        if (partitioner.decision_count() == 0) {
+            feedback.schedulers[0] = orch->aicpu_cluster_sched_count[0];
+            feedback.schedulers[1] = orch->aicpu_cluster_sched_count[1];
+            feedback.enabled.store(true, std::memory_order_release);
+            sched->has_cluster_targets.store(true, std::memory_order_release);
+        }
+        partitioner.calibrate_once(feedback);
+        trace_stage(0);
+        ResourceShape shape = active_mask.to_shape();
+        int shape_index = static_cast<int>(shape);
+        int depth = orch->scope_stack_top < 0 ? 0 : orch->scope_stack_top;
+        if (!partitioner.scope_ids[depth]) partitioner.open_scope(depth);
+        uint64_t scope = partitioner.scope_ids[depth];
+        uint32_t units = shape == ResourceShape::DUMMY ? 1 : cur_slot_state.logical_block_num;
+        uint32_t pending = 0, sources[2]{};
+        uint64_t parent_group = 0;
+        int inherited = -1;
+        // The existing reduced fanin list supplies online group membership.
+        // Once a usable parent is found, avoid further shared-state reads.
+        fanin_builder.for_each([&](ChipTaskSlotState *producer, DepFlags flags) {
+            if (!dep_has_wait(flags) || inherited >= 0) return;
+            const auto &parent = producer->payload->placement;
+            if (partitioner.can_inherit(parent, scope)) {
+                int actual = parent.dispatch_cluster.load(std::memory_order_acquire);
+                inherited = actual >= 0 ? actual : parent.preferred_cluster;
+                if (inherited >= 0 && feedback.schedulers[inherited]) parent_group = parent.group;
+                else inherited = -1;
+            }
+            if (inherited >= 0 || producer->task_state.load(std::memory_order_acquire) != CHIP_TASK_PENDING) return;
+            ++pending;
+            int c = parent.dispatch_cluster.load(std::memory_order_acquire);
+            if (c < 0) c = parent.scope ? parent.preferred_cluster : producer->task->target_aicpu_cluster;
+            if (c >= 0 && c < 2) ++sources[c];
+        });
+        trace_stage(2);
+        simpler::tmr::PartitionDecision decision;
+        if (inherited >= 0) {
+            decision = partitioner.inherit(inherited);
+        } else {
+            trace_stage(1);
+            auto load = partitioner.load(feedback, shape_index);
+            trace_stage(3);
+            decision = partitioner.choose(load, pending, sources, shape_index, feedback.orchestrator_cluster, units);
+        }
+        if (decision.cluster >= 0) {
+            // Unbound automatic tasks carry only a preference until ready.
+            task.target_aicpu_cluster = -1;
+            payload.placement.scope = scope;
+            payload.placement.preferred_cluster = decision.cluster;
+            partitioner.join_group(payload.placement, parent_group, scope);
+            if (tracing) {
+                payload.placement.submit_tick = get_sys_cnt_aicpu();
+                uint64_t ticks = payload.placement.submit_tick - decision_begin;
+                partitioner.decision_ticks += ticks;
+                if (ticks > partitioner.max_decision_ticks) partitioner.max_decision_ticks = ticks;
+            }
+            partitioner.scope_assignments[depth]++;
+            partitioner.commit(decision.cluster, shape_index, units);
+            cur_slot_state.task_attrs.set_early_resolve(false);
+        }
+        trace_stage(4);
+    }
+
     // Dispatch predicate: resolve the (tensor, indices) to an absolute GM address
     // now so the scheduler can read it at the dispatch point with a single load,
     // no Arg/simpler::tmr::Tensor access. Both branches write predicate.op explicitly because
@@ -1231,6 +1316,9 @@ static TaskOutputTensors submit_task_common(
 
     CYCLE_COUNT_LAP(g_orch_args_cycle);
 
+#if SIMPLER_DFX
+    uint64_t wire_begin = orch->chip_swimlane_level >= ChipSwimlaneLevel::SCHED_PHASES ? get_sys_cnt_aicpu() : 0;
+#endif
     // === STEP 6: wire on the orchestrator side and publish readiness ===
     // Zero-fanin tasks and tasks whose claimed producers are already completed
     // do not need fanout links or dep_pool entries. Tasks with live producers
@@ -1264,6 +1352,12 @@ static TaskOutputTensors submit_task_common(
         }
     }
 
+#if SIMPLER_DFX
+    if (wire_begin) {
+        orch->cluster_partitioner.trace.ticks[5] += get_sys_cnt_aicpu() - wire_begin;
+        ++orch->cluster_partitioner.trace.calls[5];
+    }
+#endif
     CYCLE_COUNT_LAP(g_orch_fanin_cycle);
     CYCLE_COUNT_ORCH_SUBMIT_RECORD(task_id);
 
@@ -1318,11 +1412,22 @@ TaskOutputTensors OrchestratorState::submit_task(const MixedKernels &mixed_kerne
 
     always_assert(orch->scheduler != nullptr);
     // === Validate submit inputs ===
+    if (args.aicpu_cluster() >= 0 && orch->aicpu_cluster_sched_count[args.aicpu_cluster()] == 0) {
+        report_fatal(SIMPLER_ERROR_INVALID_ARGS, __FUNCTION__, "No scheduler on requested AICPU cluster");
+        return TaskOutputTensors{};
+    }
     ActiveMask active_mask = mixed_kernels.to_active_mask();
     always_assert(static_cast<bool>(active_mask) && "MixedKernels must have at least one active slot");
 
     int16_t block_num = args.launch_spec.block_num();
     always_assert(block_num >= 1 && "block_num must be >= 1");
+    if (args.aicpu_cluster() >= 0 && block_num > 1 && args.launch_spec.require_sync_start()) {
+        report_fatal(
+            SIMPLER_ERROR_INVALID_ARGS, __FUNCTION__,
+            "AICPU cluster placement does not support multi-block require_sync_start tasks"
+        );
+        return TaskOutputTensors{};
+    }
 
     // Normalize single-AIV tasks: if only aiv1 is set (no aic, no aiv0), move
     // it to the aiv0 slot.  This guarantees the dispatch path can always use
@@ -1340,7 +1445,7 @@ TaskOutputTensors OrchestratorState::submit_task(const MixedKernels &mixed_kerne
     }
 
     TaskAttrs task_attrs;
-    task_attrs.set_early_resolve(args.allow_early_resolve());
+    task_attrs.set_early_resolve(args.allow_early_resolve() && args.aicpu_cluster() == -1);
     task_attrs.set_timing_slot(args.task_timing_slot());
 
     // sync_start is only meaningful for tasks with block_num > 1.
@@ -1394,11 +1499,15 @@ TaskOutputTensors OrchestratorState::submit_dummy_task(const CoreTaskArgs &args)
         return TaskOutputTensors{};
     }
     always_assert(orch->scheduler != nullptr);
+    if (args.aicpu_cluster() >= 0 && orch->aicpu_cluster_sched_count[args.aicpu_cluster()] == 0) {
+        report_fatal(SIMPLER_ERROR_INVALID_ARGS, __FUNCTION__, "No scheduler on requested AICPU cluster");
+        return TaskOutputTensors{};
+    }
 
     // Dummy tasks never dispatch to an AICore, so sync_start / has_predicate do
     // not apply; only the early-dispatch hint and timing tag carry over.
     TaskAttrs task_attrs;
-    task_attrs.set_early_resolve(args.allow_early_resolve());
+    task_attrs.set_early_resolve(args.allow_early_resolve() && args.aicpu_cluster() == -1);
     task_attrs.set_timing_slot(args.task_timing_slot());
 
     return submit_task_common(

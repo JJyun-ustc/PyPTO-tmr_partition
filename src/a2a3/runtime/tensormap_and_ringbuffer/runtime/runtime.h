@@ -186,6 +186,7 @@ struct alignas(64) DeviceRuntimeLaunchDesc {
     // deterministic exec_idx used by AicpuExecutor for sched/orch role
     // assignment; the highest active index is the orchestrator slot.
     int32_t aicpu_allowed_cpus[MAX_GATE_THREADS];
+    int32_t aicpu_cluster_ids[MAX_GATE_THREADS];
     int32_t aicpu_allowed_cpu_count;
     int32_t aicpu_launch_count;
 
@@ -204,6 +205,7 @@ struct alignas(64) DeviceRuntimeLaunchDesc {
     // task graph before entering resolve_and_dispatch().
     // Controlled via SIMPLER_TMR_SERIAL_ORCH_SCHED_ENABLE environment variable.
     bool serial_orch_sched;
+    bool qkv_batch;
 
     void *gm_sm_ptr_;  // GM pointer to shared memory (device)
 

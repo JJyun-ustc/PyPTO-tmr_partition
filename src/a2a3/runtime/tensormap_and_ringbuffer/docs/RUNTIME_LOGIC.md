@@ -86,7 +86,7 @@ Two platform implementations exist under `src/platform/`, sharing a common inter
 | Constant | Value | Description |
 | -------- | ----- | ----------- |
 | `PLATFORM_MAX_BLOCKDIM` | 24 | Maximum blocks (each = 1 AIC + 2 AIV) |
-| `PLATFORM_MAX_AICPU_THREADS` | 4 | AICPU thread count (3 schedulers + 1 orchestrator) |
+| `PLATFORM_MAX_AICPU_THREADS` | 6 | Maximum active AICPU thread count (5 schedulers + 1 orchestrator); default remains 4 |
 | `PLATFORM_MAX_AIC_PER_THREAD` | 24 | Max AIC cores per scheduler thread |
 | `PLATFORM_MAX_AIV_PER_THREAD` | 48 | Max AIV cores per scheduler thread |
 | `PLATFORM_PROF_SYS_CNT_FREQ` | 50 MHz | System counter frequency for profiling |

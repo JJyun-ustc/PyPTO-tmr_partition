@@ -445,8 +445,25 @@ int DeviceRunner::prepare_execution(
             return PTO_RUNTIME_ERR_INTERNAL;
         }
         int32_t *allowed_cpus = runtime.get_aicpu_allowed_cpus();
-        for (size_t i = 0; i < allowed.size(); ++i)
+        for (size_t i = 0; i < allowed.size(); ++i) {
             allowed_cpus[i] = allowed[i];
+            bool found = false;
+            for (const auto &cpu : user_cpus) {
+                if (cpu.cpu_id == allowed[i]) {
+                    if (cpu.cluster_id < 0 || cpu.cluster_id >= 2) {
+                        LOG_ERROR("Unsupported AICPU cluster ID %d for CPU %d", cpu.cluster_id, cpu.cpu_id);
+                        return PTO_RUNTIME_ERR_INTERNAL;
+                    }
+                    runtime.dev.aicpu_cluster_ids[i] = cpu.cluster_id;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                LOG_ERROR("AICPU CPU %d missing from topology", allowed[i]);
+                return PTO_RUNTIME_ERR_INTERNAL;
+            }
+        }
         runtime.set_aicpu_allowed_cpu_count(static_cast<int32_t>(allowed.size()));
         int32_t launch_n = static_cast<int32_t>(user_cpus.size());
         if (launch_n > PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH) {
