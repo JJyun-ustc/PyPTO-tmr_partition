@@ -1,0 +1,107 @@
+Running main() from ${EXPERIMENT_WORKTREE}/tests/ut/cpp/build/_deps/googletest-src/googletest/src/gtest_main.cc
+[==========] Running 43 tests from 5 test suites.
+[----------] Global test environment set-up.
+[----------] 2 tests from AsyncWaitDiagnosticsTest
+[ RUN      ] AsyncWaitDiagnosticsTest.SeparatesTaskBodyAndCompletionPendingAndGuardsMailboxUnderflow
+[       OK ] AsyncWaitDiagnosticsTest.SeparatesTaskBodyAndCompletionPendingAndGuardsMailboxUnderflow (0 ms)
+[ RUN      ] AsyncWaitDiagnosticsTest.CapsDetailRowsAtSixteen
+[       OK ] AsyncWaitDiagnosticsTest.CapsDetailRowsAtSixteen (0 ms)
+[----------] 2 tests from AsyncWaitDiagnosticsTest (0 ms total)
+
+[----------] 1 test from SyncStartDrainAttemptTest
+[ RUN      ] SyncStartDrainAttemptTest.LateAckCannotSatisfyNextAttemptBarrier
+[       OK ] SyncStartDrainAttemptTest.LateAckCannotSatisfyNextAttemptBarrier (0 ms)
+[----------] 1 test from SyncStartDrainAttemptTest (0 ms total)
+
+[----------] 25 tests from SchedulerStateTest
+[ RUN      ] SchedulerStateTest.ConsumedNotReady
+[       OK ] SchedulerStateTest.ConsumedNotReady (77 ms)
+[ RUN      ] SchedulerStateTest.ConsumedTransition
+[       OK ] SchedulerStateTest.ConsumedTransition (77 ms)
+[ RUN      ] SchedulerStateTest.ConsumedHeadAdvancesAfterContendedAdvanceLock
+[       OK ] SchedulerStateTest.ConsumedHeadAdvancesAfterContendedAdvanceLock (76 ms)
+[ RUN      ] SchedulerStateTest.ConsumedNotCompletedState
+[       OK ] SchedulerStateTest.ConsumedNotCompletedState (78 ms)
+[ RUN      ] SchedulerStateTest.ConsumedIdempotent
+[       OK ] SchedulerStateTest.ConsumedIdempotent (78 ms)
+[ RUN      ] SchedulerStateTest.ContendedConsumedHeadSetsPendingAndIdleDrainAdvances
+[       OK ] SchedulerStateTest.ContendedConsumedHeadSetsPendingAndIdleDrainAdvances (77 ms)
+[ RUN      ] SchedulerStateTest.ContendedConsumedHeadIdleDrainStress
+[       OK ] SchedulerStateTest.ContendedConsumedHeadIdleDrainStress (77 ms)
+[ RUN      ] SchedulerStateTest.ReleaseProducerIncrements
+[       OK ] SchedulerStateTest.ReleaseProducerIncrements (77 ms)
+[ RUN      ] SchedulerStateTest.ReleaseProducerTriggersConsumed
+[       OK ] SchedulerStateTest.ReleaseProducerTriggersConsumed (77 ms)
+[ RUN      ] SchedulerStateTest.SubtaskCompleteSingle
+[       OK ] SchedulerStateTest.SubtaskCompleteSingle (78 ms)
+[ RUN      ] SchedulerStateTest.SubtaskCompleteMultiBlock
+[       OK ] SchedulerStateTest.SubtaskCompleteMultiBlock (86 ms)
+[ RUN      ] SchedulerStateTest.ScopeEndBatchRelease
+[       OK ] SchedulerStateTest.ScopeEndBatchRelease (77 ms)
+[ RUN      ] SchedulerStateTest.GetReadyTasksBatchDrainsSharedQueue
+[       OK ] SchedulerStateTest.GetReadyTasksBatchDrainsSharedQueue (77 ms)
+[ RUN      ] SchedulerStateTest.AutomaticSingleBlockAndStrictTasksHaveSeparateQueues
+[       OK ] SchedulerStateTest.AutomaticSingleBlockAndStrictTasksHaveSeparateQueues (80 ms)
+[ RUN      ] SchedulerStateTest.FrozenCalibrationKeepsReadyAccountingWithoutSampleStamp
+[       OK ] SchedulerStateTest.FrozenCalibrationKeepsReadyAccountingWithoutSampleStamp (81 ms)
+[ RUN      ] SchedulerStateTest.DeferredBindingUsesActualProducerAndAccountsExactlyOnce
+[       OK ] SchedulerStateTest.DeferredBindingUsesActualProducerAndAccountsExactlyOnce (82 ms)
+[ RUN      ] SchedulerStateTest.AutomaticMultiblockAndStrictTargetsCannotEnterBorrowableQueues
+[       OK ] SchedulerStateTest.AutomaticMultiblockAndStrictTargetsCannotEnterBorrowableQueues (82 ms)
+[ RUN      ] SchedulerStateTest.UnknownReleaseTimestampDoesNotChangeSchedulerOriginToOrchestrator
+[       OK ] SchedulerStateTest.UnknownReleaseTimestampDoesNotChangeSchedulerOriginToOrchestrator (82 ms)
+[ RUN      ] SchedulerStateTest.QkvSingletonAndDuplicateReady
+[       OK ] SchedulerStateTest.QkvSingletonAndDuplicateReady (77 ms)
+[ RUN      ] SchedulerStateTest.QkvFullBatchUpdatesReservations
+[       OK ] SchedulerStateTest.QkvFullBatchUpdatesReservations (82 ms)
+[ RUN      ] SchedulerStateTest.QkvQueueFullFallsBackOnce
+[       OK ] SchedulerStateTest.QkvQueueFullFallsBackOnce (77 ms)
+[ RUN      ] SchedulerStateTest.QkvUnavailableSnapshotAndNoCompatibleSide
+[       OK ] SchedulerStateTest.QkvUnavailableSnapshotAndNoCompatibleSide (82 ms)
+[ RUN      ] SchedulerStateTest.QkvOversizeAndSyncPreserveOriginalQueues
+[       OK ] SchedulerStateTest.QkvOversizeAndSyncPreserveOriginalQueues (81 ms)
+[ RUN      ] SchedulerStateTest.QkvConcurrentLocalRangeClaimsAreUnique
+[       OK ] SchedulerStateTest.QkvConcurrentLocalRangeClaimsAreUnique (82 ms)
+[ RUN      ] SchedulerStateTest.QkvStrictPredicateAndEarlyRemainderStayOnOriginalPaths
+[       OK ] SchedulerStateTest.QkvStrictPredicateAndEarlyRemainderStayOnOriginalPaths (81 ms)
+[----------] 25 tests from SchedulerStateTest (1994 ms total)
+
+[----------] 14 tests from CoreTrackerTest
+[ RUN      ] CoreTrackerTest.MixPartiallyRunningClusterAdmittedAsPerCorePlacement
+[       OK ] CoreTrackerTest.MixPartiallyRunningClusterAdmittedAsPerCorePlacement (0 ms)
+[ RUN      ] CoreTrackerTest.MixPendingAcceptsFullyRunningClusterWithFreePendingSlots
+[       OK ] CoreTrackerTest.MixPendingAcceptsFullyRunningClusterWithFreePendingSlots (0 ms)
+[ RUN      ] CoreTrackerTest.MixPendingRejectsFullyRunningClusterWithOccupiedPendingSlot
+[       OK ] CoreTrackerTest.MixPendingRejectsFullyRunningClusterWithOccupiedPendingSlot (0 ms)
+[ RUN      ] CoreTrackerTest.MixIdleAndPendingDoNotDoubleAdmitFullyIdleCluster
+[       OK ] CoreTrackerTest.MixIdleAndPendingDoNotDoubleAdmitFullyIdleCluster (0 ms)
+[ RUN      ] CoreTrackerTest.MixClassifyIgnoresUnusedBusyCoreForRunningPlacement
+[       OK ] CoreTrackerTest.MixClassifyIgnoresUnusedBusyCoreForRunningPlacement (0 ms)
+[ RUN      ] CoreTrackerTest.MixClassifyAllowsPendingForUsedRunningCoresOnly
+[       OK ] CoreTrackerTest.MixClassifyAllowsPendingForUsedRunningCoresOnly (0 ms)
+[ RUN      ] CoreTrackerTest.MixClassifyAdmitsMixedUsedCoresAsPending
+[       OK ] CoreTrackerTest.MixClassifyAdmitsMixedUsedCoresAsPending (0 ms)
+[ RUN      ] CoreTrackerTest.MixClassifyRejectsOccupiedPendingSlotInUsedMask
+[       OK ] CoreTrackerTest.MixClassifyRejectsOccupiedPendingSlotInUsedMask (0 ms)
+[ RUN      ] CoreTrackerTest.MixRunningClusterHelpersUseActiveMask
+[       OK ] CoreTrackerTest.MixRunningClusterHelpersUseActiveMask (0 ms)
+[ RUN      ] CoreTrackerTest.MixRunningClusterHelpersRejectOccupiedUsedPendingSlot
+[       OK ] CoreTrackerTest.MixRunningClusterHelpersRejectOccupiedUsedPendingSlot (0 ms)
+[ RUN      ] CoreTrackerTest.CountAvailableBlocksAivIncludesFreePendingSlots
+[       OK ] CoreTrackerTest.CountAvailableBlocksAivIncludesFreePendingSlots (0 ms)
+[ RUN      ] CoreTrackerTest.CountAvailableBlocksMixCountsLogicalClusters
+[       OK ] CoreTrackerTest.CountAvailableBlocksMixCountsLogicalClusters (0 ms)
+[ RUN      ] CoreTrackerTest.CountAvailableBlocksMixRejectsOccupiedUsedPendingSlot
+[       OK ] CoreTrackerTest.CountAvailableBlocksMixRejectsOccupiedUsedPendingSlot (0 ms)
+[ RUN      ] CoreTrackerTest.CountAvailableBlocksMixIgnoresUnavailableUnusedCore
+[       OK ] CoreTrackerTest.CountAvailableBlocksMixIgnoresUnavailableUnusedCore (0 ms)
+[----------] 14 tests from CoreTrackerTest (0 ms total)
+
+[----------] 1 test from QkvFormula
+[ RUN      ] QkvFormula.KvStateOverridesLowerBaseLoadAndBatchChangesNextChoice
+[       OK ] QkvFormula.KvStateOverridesLowerBaseLoadAndBatchChangesNextChoice (0 ms)
+[----------] 1 test from QkvFormula (0 ms total)
+
+[----------] Global test environment tear-down
+[==========] 43 tests from 5 test suites ran. (1995 ms total)
+[  PASSED  ] 43 tests.

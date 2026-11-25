@@ -1,6 +1,23 @@
 # PyPTO TMR：AICPU cluster 放置研究
 
-当前版本 **v14：O 统一评分、双侧固定 block 配额**。删除 S 首次 ready 改侧、WAIT 票数累计和跨侧领取，
+## 最新实验：固定 QKV 自然 ready 批量调度
+
+A2A3 Qwen3-14B decode 上，QKV 相对 Shared 的中位数从 **36.697 增至 39.307 ms（回退 7.11%）**，
+p95 从 **36.829 增至 39.463 ms（回退 7.15%）**，每种模式各 30 个正式样本。
+两种模式的输出和全部层 KV golden 通过，37 个实际加载 kernel 指纹一致。
+原型覆盖 96.55% 的符合条件任务，处理 40,325 个自然多任务批。全部样本、warm-up 与失败采集尝试保留。
+
+- [最新机制、所有权证明与完整复现流程](docs/zh/experiments/tmr-cluster/algorithm-qkv-ready-batch.md)
+- [结果报告、采样协议与限制](docs/zh/experiments/tmr-cluster/qkv-ready-batch.md)
+- [English mechanism and workflow](docs/en/experiments/tmr-cluster/algorithm-qkv-ready-batch.md)
+- [原始证据与冻结指纹](official-results/qkv-ready-batch-20261125/)
+
+`runtime` 子模块固定到 `runtime-qkv-ready-batch`。策略冻结，本轮不补调参或消融。
+发布不包含二进制、venv、缓存及通用驱动日志。
+
+## 历史实验：v14
+
+历史版本 **v14：O 统一评分、双侧固定 block 配额**。删除 S 首次 ready 改侧、WAIT 票数累计和跨侧领取，
 由两侧 S 领取各自不重叠的范围，通过周期摘要向 O 反馈实际队列压力。
 
 Qwen decode 相比 v8 改善，但仍慢于 Shared；Bgemm 和 Paged Attention 相比 v8 回退。
@@ -37,7 +54,7 @@ git clone --recurse-submodules https://github.com/JJyun-ustc/PyPTO-tmr_partition
 cd PyPTO-tmr_partition
 ```
 
-main 的 runtime 子模块固定到 v14 提交，分支 `runtime-o-quota`。
+历史 v14 提交保留在 `runtime-o-quota` 分支。
 v8、v11、v12、v13 分别保留在 `runtime-snapshot`、`runtime-ready-affinity`、
 `runtime-ready-pressure`、`runtime-orchestrator-pressure`。
 发布标签 `v14-o-quota-20261120`；仓库不包含二进制、venv、缓存或凭据。

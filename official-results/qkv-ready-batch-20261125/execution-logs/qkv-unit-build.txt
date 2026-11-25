@@ -1,0 +1,38 @@
+[  0%] Building CXX object _deps/googletest-build/googletest/CMakeFiles/gtest.dir/src/gtest-all.cc.o
+[  0%] Building CXX object support/CMakeFiles/a2a3_ut_support.dir/unified_log_stubs.cpp.o
+[  0%] Building CXX object support/CMakeFiles/a2a3_ut_support.dir/device_time_stub.cpp.o
+[  0%] Building CXX object support/CMakeFiles/a2a3_ut_support.dir/cache_maintenance_stub.cpp.o
+[  0%] Building CXX object support/CMakeFiles/a2a3_ut_support.dir/weak_link_placeholders.cpp.o
+[100%] Building CXX object support/CMakeFiles/a2a3_ut_support.dir/assert_stubs.cpp.o
+[100%] Building CXX object support/CMakeFiles/a2a3_ut_support.dir/platform_regs_stub.cpp.o
+[100%] Linking CXX static library liba2a3_ut_support.a
+[100%] Built target a2a3_ut_support
+[100%] Building CXX object common/tensormap_and_ringbuffer/CMakeFiles/a2a3_tmr_objs.dir${EXPERIMENT_WORKTREE}/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/ring_buffer.cpp.o
+[100%] Building CXX object common/tensormap_and_ringbuffer/CMakeFiles/a2a3_tmr_objs.dir${EXPERIMENT_WORKTREE}/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/shared/shared_memory.cpp.o
+[100%] Building CXX object common/tensormap_and_ringbuffer/CMakeFiles/a2a3_tmr_objs.dir${EXPERIMENT_WORKTREE}/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler.cpp.o
+[100%] Building CXX object common/tensormap_and_ringbuffer/CMakeFiles/a2a3_tmr_objs.dir${EXPERIMENT_WORKTREE}/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/shared/tensormap.cpp.o
+[100%] Linking CXX static library ../../../lib/libgtest.a
+[100%] Built target gtest
+[100%] Building CXX object common/tensormap_and_ringbuffer/CMakeFiles/a2a3_tmr_objs.dir${EXPERIMENT_WORKTREE}/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/shared/runtime_init.cpp.o
+[100%] Building CXX object _deps/googletest-build/googletest/CMakeFiles/gtest_main.dir/src/gtest_main.cc.o
+[100%] Linking CXX static library ../../../lib/libgtest_main.a
+[100%] Built target gtest_main
+[100%] Building CXX object common/tensormap_and_ringbuffer/CMakeFiles/a2a3_tmr_objs.dir${EXPERIMENT_WORKTREE}/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/orchestrator.cpp.o
+[100%] Building CXX object common/tensormap_and_ringbuffer/CMakeFiles/a2a3_tmr_objs.dir${EXPERIMENT_WORKTREE}/src/common/platform/shared/aicpu/scope_stats_collector_aicpu.cpp.o
+[100%] Building CXX object common/tensormap_and_ringbuffer/CMakeFiles/a2a3_tmr_objs.dir${EXPERIMENT_WORKTREE}/src/common/platform/shared/aicpu/device_run_result_base_aicpu.cpp.o
+[100%] Building CXX object common/tensormap_and_ringbuffer/CMakeFiles/a2a3_tmr_objs.dir${EXPERIMENT_WORKTREE}/src/common/platform/shared/aicpu/args_dump_aicpu.cpp.o
+[100%] Building CXX object common/tensormap_and_ringbuffer/CMakeFiles/a2a3_tmr_objs.dir/__/__/support/device_time_stub.cpp.o
+[100%] Built target a2a3_tmr_objs
+[100%] Building CXX object a2a3/runtime/tensormap_and_ringbuffer/CMakeFiles/test_a2a3_tmr_scheduler_state.dir/test_scheduler_state.cpp.o
+${EXPERIMENT_WORKTREE}/tests/ut/cpp/a2a3/runtime/tensormap_and_ringbuffer/test_scheduler_state.cpp: In member function ‘virtual void SchedulerStateTest_QkvOversizeAndSyncPreserveOriginalQueues_Test::TestBody()’:
+${EXPERIMENT_WORKTREE}/tests/ut/cpp/a2a3/runtime/tensormap_and_ringbuffer/test_scheduler_state.cpp:839:38: error: ‘TASK_ATTR_REQUIRE_SYNC_START’ was not declared in this scope
+  839 |     sync.task_attrs = TaskAttributes(TASK_ATTR_REQUIRE_SYNC_START);
+      |                                      ^~~~~~~~~~~~~~~~~~~~~~~~~~~~
+${EXPERIMENT_WORKTREE}/tests/ut/cpp/a2a3/runtime/tensormap_and_ringbuffer/test_scheduler_state.cpp:839:23: error: ‘TaskAttributes’ was not declared in this scope; did you mean ‘TaskAttrs’?
+  839 |     sync.task_attrs = TaskAttributes(TASK_ATTR_REQUIRE_SYNC_START);
+      |                       ^~~~~~~~~~~~~~
+      |                       TaskAttrs
+gmake[3]: *** [a2a3/runtime/tensormap_and_ringbuffer/CMakeFiles/test_a2a3_tmr_scheduler_state.dir/build.make:79: a2a3/runtime/tensormap_and_ringbuffer/CMakeFiles/test_a2a3_tmr_scheduler_state.dir/test_scheduler_state.cpp.o] Error 1
+gmake[2]: *** [CMakeFiles/Makefile2:12682: a2a3/runtime/tensormap_and_ringbuffer/CMakeFiles/test_a2a3_tmr_scheduler_state.dir/all] Error 2
+gmake[1]: *** [CMakeFiles/Makefile2:12689: a2a3/runtime/tensormap_and_ringbuffer/CMakeFiles/test_a2a3_tmr_scheduler_state.dir/rule] Error 2
+gmake: *** [Makefile:4334: test_a2a3_tmr_scheduler_state] Error 2

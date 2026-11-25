@@ -1,0 +1,215 @@
+Test project ${EXPERIMENT_WORKTREE}/tests/ut/cpp/build
+    Start 300: test_a2a3_tmr_scheduler_state
+1/1 Test #300: test_a2a3_tmr_scheduler_state ....***Failed    1.79 sec
+Running main() from ${EXPERIMENT_WORKTREE}/tests/ut/cpp/build/_deps/googletest-src/googletest/src/gtest_main.cc
+[==========] Running 41 tests from 5 test suites.
+[----------] Global test environment set-up.
+[----------] 2 tests from AsyncWaitDiagnosticsTest
+[ RUN      ] AsyncWaitDiagnosticsTest.SeparatesTaskBodyAndCompletionPendingAndGuardsMailboxUnderflow
+[       OK ] AsyncWaitDiagnosticsTest.SeparatesTaskBodyAndCompletionPendingAndGuardsMailboxUnderflow (0 ms)
+[ RUN      ] AsyncWaitDiagnosticsTest.CapsDetailRowsAtSixteen
+[       OK ] AsyncWaitDiagnosticsTest.CapsDetailRowsAtSixteen (0 ms)
+[----------] 2 tests from AsyncWaitDiagnosticsTest (0 ms total)
+
+[----------] 1 test from SyncStartDrainAttemptTest
+[ RUN      ] SyncStartDrainAttemptTest.LateAckCannotSatisfyNextAttemptBarrier
+[       OK ] SyncStartDrainAttemptTest.LateAckCannotSatisfyNextAttemptBarrier (0 ms)
+[----------] 1 test from SyncStartDrainAttemptTest (0 ms total)
+
+[----------] 23 tests from SchedulerStateTest
+[ RUN      ] SchedulerStateTest.ConsumedNotReady
+[       OK ] SchedulerStateTest.ConsumedNotReady (77 ms)
+[ RUN      ] SchedulerStateTest.ConsumedTransition
+[       OK ] SchedulerStateTest.ConsumedTransition (77 ms)
+[ RUN      ] SchedulerStateTest.ConsumedHeadAdvancesAfterContendedAdvanceLock
+[       OK ] SchedulerStateTest.ConsumedHeadAdvancesAfterContendedAdvanceLock (77 ms)
+[ RUN      ] SchedulerStateTest.ConsumedNotCompletedState
+[       OK ] SchedulerStateTest.ConsumedNotCompletedState (77 ms)
+[ RUN      ] SchedulerStateTest.ConsumedIdempotent
+[       OK ] SchedulerStateTest.ConsumedIdempotent (77 ms)
+[ RUN      ] SchedulerStateTest.ContendedConsumedHeadSetsPendingAndIdleDrainAdvances
+[       OK ] SchedulerStateTest.ContendedConsumedHeadSetsPendingAndIdleDrainAdvances (77 ms)
+[ RUN      ] SchedulerStateTest.ContendedConsumedHeadIdleDrainStress
+[       OK ] SchedulerStateTest.ContendedConsumedHeadIdleDrainStress (77 ms)
+[ RUN      ] SchedulerStateTest.ReleaseProducerIncrements
+[       OK ] SchedulerStateTest.ReleaseProducerIncrements (77 ms)
+[ RUN      ] SchedulerStateTest.ReleaseProducerTriggersConsumed
+[       OK ] SchedulerStateTest.ReleaseProducerTriggersConsumed (77 ms)
+[ RUN      ] SchedulerStateTest.SubtaskCompleteSingle
+[       OK ] SchedulerStateTest.SubtaskCompleteSingle (77 ms)
+[ RUN      ] SchedulerStateTest.SubtaskCompleteMultiBlock
+[       OK ] SchedulerStateTest.SubtaskCompleteMultiBlock (77 ms)
+[ RUN      ] SchedulerStateTest.ScopeEndBatchRelease
+[       OK ] SchedulerStateTest.ScopeEndBatchRelease (77 ms)
+[ RUN      ] SchedulerStateTest.GetReadyTasksBatchDrainsSharedQueue
+[       OK ] SchedulerStateTest.GetReadyTasksBatchDrainsSharedQueue (77 ms)
+[ RUN      ] SchedulerStateTest.AutomaticSingleBlockAndStrictTasksHaveSeparateQueues
+[       OK ] SchedulerStateTest.AutomaticSingleBlockAndStrictTasksHaveSeparateQueues (77 ms)
+[ RUN      ] SchedulerStateTest.FrozenCalibrationKeepsReadyAccountingWithoutSampleStamp
+[       OK ] SchedulerStateTest.FrozenCalibrationKeepsReadyAccountingWithoutSampleStamp (77 ms)
+[ RUN      ] SchedulerStateTest.DeferredBindingUsesActualProducerAndAccountsExactlyOnce
+[       OK ] SchedulerStateTest.DeferredBindingUsesActualProducerAndAccountsExactlyOnce (77 ms)
+[ RUN      ] SchedulerStateTest.AutomaticMultiblockAndStrictTargetsCannotEnterBorrowableQueues
+[       OK ] SchedulerStateTest.AutomaticMultiblockAndStrictTargetsCannotEnterBorrowableQueues (77 ms)
+[ RUN      ] SchedulerStateTest.UnknownReleaseTimestampDoesNotChangeSchedulerOriginToOrchestrator
+[       OK ] SchedulerStateTest.UnknownReleaseTimestampDoesNotChangeSchedulerOriginToOrchestrator (77 ms)
+[ RUN      ] SchedulerStateTest.QkvSingletonAndDuplicateReady
+${EXPERIMENT_WORKTREE}/tests/ut/cpp/a2a3/runtime/tensormap_and_ringbuffer/test_scheduler_state.cpp:757: Failure
+Expected equality of these values:
+  sched.qkv_pending.size()
+    Which is: 0
+  1u
+    Which is: 1
+
+${EXPERIMENT_WORKTREE}/tests/ut/cpp/a2a3/runtime/tensormap_and_ringbuffer/test_scheduler_state.cpp:759: Failure
+Expected equality of these values:
+  sched.qkv.batches[1]
+    Which is: 0
+  1u
+    Which is: 1
+
+${EXPERIMENT_WORKTREE}/tests/ut/cpp/a2a3/runtime/tensormap_and_ringbuffer/test_scheduler_state.cpp:761: Failure
+Expected equality of these values:
+  sched.cluster_ready_queues[0][0].size()
+    Which is: 0
+  1u
+    Which is: 1
+
+${EXPERIMENT_WORKTREE}/tests/ut/cpp/a2a3/runtime/tensormap_and_ringbuffer/test_scheduler_state.cpp:762: Failure
+Expected equality of these values:
+  sched.ready_queues[0].size()
+    Which is: 1
+  0u
+    Which is: 0
+
+[  FAILED  ] SchedulerStateTest.QkvSingletonAndDuplicateReady (77 ms)
+[ RUN      ] SchedulerStateTest.QkvFullBatchUpdatesReservations
+${EXPERIMENT_WORKTREE}/tests/ut/cpp/a2a3/runtime/tensormap_and_ringbuffer/test_scheduler_state.cpp:785: Failure
+Expected equality of these values:
+  sched.qkv.batches[8]
+    Which is: 0
+  1u
+    Which is: 1
+
+${EXPERIMENT_WORKTREE}/tests/ut/cpp/a2a3/runtime/tensormap_and_ringbuffer/test_scheduler_state.cpp:786: Failure
+Expected equality of these values:
+  sched.cluster_ready_queues[0][0].size()
+    Which is: 0
+  4u
+    Which is: 4
+
+${EXPERIMENT_WORKTREE}/tests/ut/cpp/a2a3/runtime/tensormap_and_ringbuffer/test_scheduler_state.cpp:787: Failure
+Expected equality of these values:
+  sched.cluster_ready_queues[1][0].size()
+    Which is: 0
+  4u
+    Which is: 4
+
+${EXPERIMENT_WORKTREE}/tests/ut/cpp/a2a3/runtime/tensormap_and_ringbuffer/test_scheduler_state.cpp:788: Failure
+Expected equality of these values:
+  slots[0].task->target_aicpu_cluster
+    Which is: -1
+  0
+
+${EXPERIMENT_WORKTREE}/tests/ut/cpp/a2a3/runtime/tensormap_and_ringbuffer/test_scheduler_state.cpp:789: Failure
+Expected equality of these values:
+  slots[1].task->target_aicpu_cluster
+    Which is: -1
+  1
+
+[  FAILED  ] SchedulerStateTest.QkvFullBatchUpdatesReservations (77 ms)
+[ RUN      ] SchedulerStateTest.QkvQueueFullFallsBackOnce
+${EXPERIMENT_WORKTREE}/tests/ut/cpp/a2a3/runtime/tensormap_and_ringbuffer/test_scheduler_state.cpp:803: Failure
+Expected equality of these values:
+  sched.qkv.fallback[0].load()
+    Which is: 0
+  1u
+    Which is: 1
+
+[  FAILED  ] SchedulerStateTest.QkvQueueFullFallsBackOnce (79 ms)
+[ RUN      ] SchedulerStateTest.QkvUnavailableSnapshotAndNoCompatibleSide
+${EXPERIMENT_WORKTREE}/tests/ut/cpp/a2a3/runtime/tensormap_and_ringbuffer/test_scheduler_state.cpp:820: Failure
+Expected equality of these values:
+  sched.qkv.fallback[1].load()
+    Which is: 0
+  1u
+    Which is: 1
+
+${EXPERIMENT_WORKTREE}/tests/ut/cpp/a2a3/runtime/tensormap_and_ringbuffer/test_scheduler_state.cpp:826: Failure
+Expected equality of these values:
+  sched.qkv.fallback[2].load()
+    Which is: 0
+  1u
+    Which is: 1
+
+[  FAILED  ] SchedulerStateTest.QkvUnavailableSnapshotAndNoCompatibleSide (78 ms)
+[ RUN      ] SchedulerStateTest.QkvOversizeAndSyncPreserveOriginalQueues
+${EXPERIMENT_WORKTREE}/tests/ut/cpp/a2a3/runtime/tensormap_and_ringbuffer/test_scheduler_state.cpp:844: Failure
+Expected equality of these values:
+  sched.qkv.fallback[4].load()
+    Which is: 0
+  1u
+    Which is: 1
+
+[  FAILED  ] SchedulerStateTest.QkvOversizeAndSyncPreserveOriginalQueues (78 ms)
+[----------] 23 tests from SchedulerStateTest (1784 ms total)
+
+[----------] 14 tests from CoreTrackerTest
+[ RUN      ] CoreTrackerTest.MixPartiallyRunningClusterAdmittedAsPerCorePlacement
+[       OK ] CoreTrackerTest.MixPartiallyRunningClusterAdmittedAsPerCorePlacement (0 ms)
+[ RUN      ] CoreTrackerTest.MixPendingAcceptsFullyRunningClusterWithFreePendingSlots
+[       OK ] CoreTrackerTest.MixPendingAcceptsFullyRunningClusterWithFreePendingSlots (0 ms)
+[ RUN      ] CoreTrackerTest.MixPendingRejectsFullyRunningClusterWithOccupiedPendingSlot
+[       OK ] CoreTrackerTest.MixPendingRejectsFullyRunningClusterWithOccupiedPendingSlot (0 ms)
+[ RUN      ] CoreTrackerTest.MixIdleAndPendingDoNotDoubleAdmitFullyIdleCluster
+[       OK ] CoreTrackerTest.MixIdleAndPendingDoNotDoubleAdmitFullyIdleCluster (0 ms)
+[ RUN      ] CoreTrackerTest.MixClassifyIgnoresUnusedBusyCoreForRunningPlacement
+[       OK ] CoreTrackerTest.MixClassifyIgnoresUnusedBusyCoreForRunningPlacement (0 ms)
+[ RUN      ] CoreTrackerTest.MixClassifyAllowsPendingForUsedRunningCoresOnly
+[       OK ] CoreTrackerTest.MixClassifyAllowsPendingForUsedRunningCoresOnly (0 ms)
+[ RUN      ] CoreTrackerTest.MixClassifyAdmitsMixedUsedCoresAsPending
+[       OK ] CoreTrackerTest.MixClassifyAdmitsMixedUsedCoresAsPending (0 ms)
+[ RUN      ] CoreTrackerTest.MixClassifyRejectsOccupiedPendingSlotInUsedMask
+[       OK ] CoreTrackerTest.MixClassifyRejectsOccupiedPendingSlotInUsedMask (0 ms)
+[ RUN      ] CoreTrackerTest.MixRunningClusterHelpersUseActiveMask
+[       OK ] CoreTrackerTest.MixRunningClusterHelpersUseActiveMask (0 ms)
+[ RUN      ] CoreTrackerTest.MixRunningClusterHelpersRejectOccupiedUsedPendingSlot
+[       OK ] CoreTrackerTest.MixRunningClusterHelpersRejectOccupiedUsedPendingSlot (0 ms)
+[ RUN      ] CoreTrackerTest.CountAvailableBlocksAivIncludesFreePendingSlots
+[       OK ] CoreTrackerTest.CountAvailableBlocksAivIncludesFreePendingSlots (0 ms)
+[ RUN      ] CoreTrackerTest.CountAvailableBlocksMixCountsLogicalClusters
+[       OK ] CoreTrackerTest.CountAvailableBlocksMixCountsLogicalClusters (0 ms)
+[ RUN      ] CoreTrackerTest.CountAvailableBlocksMixRejectsOccupiedUsedPendingSlot
+[       OK ] CoreTrackerTest.CountAvailableBlocksMixRejectsOccupiedUsedPendingSlot (0 ms)
+[ RUN      ] CoreTrackerTest.CountAvailableBlocksMixIgnoresUnavailableUnusedCore
+[       OK ] CoreTrackerTest.CountAvailableBlocksMixIgnoresUnavailableUnusedCore (0 ms)
+[----------] 14 tests from CoreTrackerTest (0 ms total)
+
+[----------] 1 test from QkvFormula
+[ RUN      ] QkvFormula.KvStateOverridesLowerBaseLoadAndBatchChangesNextChoice
+[       OK ] QkvFormula.KvStateOverridesLowerBaseLoadAndBatchChangesNextChoice (0 ms)
+[----------] 1 test from QkvFormula (0 ms total)
+
+[----------] Global test environment tear-down
+[==========] 41 tests from 5 test suites ran. (1785 ms total)
+[  PASSED  ] 36 tests.
+[  FAILED  ] 5 tests, listed below:
+[  FAILED  ] SchedulerStateTest.QkvSingletonAndDuplicateReady
+[  FAILED  ] SchedulerStateTest.QkvFullBatchUpdatesReservations
+[  FAILED  ] SchedulerStateTest.QkvQueueFullFallsBackOnce
+[  FAILED  ] SchedulerStateTest.QkvUnavailableSnapshotAndNoCompatibleSide
+[  FAILED  ] SchedulerStateTest.QkvOversizeAndSyncPreserveOriginalQueues
+
+ 5 FAILED TESTS
+
+
+0% tests passed, 1 tests failed out of 1
+
+Label Time Summary:
+no_hardware    =   1.79 sec*proc (1 test)
+
+Total Test time (real) =   1.80 sec
+
+The following tests FAILED:
+	300 - test_a2a3_tmr_scheduler_state (Failed)            no_hardware
+Errors while running CTest

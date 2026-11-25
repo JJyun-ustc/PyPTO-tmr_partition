@@ -1,0 +1,11 @@
+unlocked; tool absent
+START shared golden
+Traceback (most recent call last):
+  File "${EXPERIMENT_WORKTREE}/examples/a2a3/tensormap_and_ringbuffer/benchmark_qkv/run_study.py", line 150, in <module>
+    main()
+  File "${EXPERIMENT_WORKTREE}/examples/a2a3/tensormap_and_ringbuffer/benchmark_qkv/run_study.py", line 127, in main
+    invoke("shared", "golden", 1, golden=True)
+  File "${EXPERIMENT_WORKTREE}/examples/a2a3/tensormap_and_ringbuffer/benchmark_qkv/run_study.py", line 105, in invoke
+    assert run.returncode == 0 and "[qwen] PASSED" in host, dest
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: ${EXPERIMENT_WORKTREE}/results/qkv-ready-batch-20261125/shared/golden

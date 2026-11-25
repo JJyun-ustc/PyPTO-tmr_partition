@@ -1,0 +1,22 @@
+{
+  "formal_log_level": "info",
+  "chip_swimlane": 0,
+  "periods": 6,
+  "formal_samples_per_mode_per_period": 5,
+  "warmup_rounds_per_process": 1,
+  "order": [
+    "Shared,QKV",
+    "QKV,Shared",
+    "Shared,QKV",
+    "QKV,Shared",
+    "Shared,QKV",
+    "QKV,Shared"
+  ],
+  "retained_excluded_attempt": "attempts/measurement-timing-loglevel",
+  "exclusion_reason": "Aggregate scheduler telemetry was suppressed; collection assertion failed. Both modes restarted together; no strategy, parameter, source, binary or kernel changes.",
+  "scripts": {
+    "run_regressions.py": "4d7452322fec44744ac76e45100124b8c859cf142efb2fc3586e766f7941be6a",
+    "run_study.py": "a92ad0827194371134b7c1f0e9330bff728ecc8273138e0f99a0b4dba0fdee72",
+    "analyze_results.py": "bd38ca17c7fc3d83d3f734cc11aa708ac0d1e63f1951b1f0a5818bfbca190bfc"
+  }
+}

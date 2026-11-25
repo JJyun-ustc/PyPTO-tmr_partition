@@ -1,5 +1,24 @@
 # PyPTO TMR: AICPU cluster placement study
 
+## Latest experiment: fixed QKV natural ready batches
+
+QKV versus Shared on A2A3 Qwen3-14B decode: **36.697 → 39.307 ms median
+(+7.11%)**, p95 **36.829 → 39.463 ms (+7.15%)**, 30 formal samples per mode.
+Both output/all-layer KV goldens pass; 37 loaded kernel fingerprints match.
+The prototype assigns 96.55% of eligible tasks and processes 40,325 natural
+multi-task batches. All samples, warmups and failed collection attempts remain available.
+
+- [Mechanism, ownership and complete reproduction](docs/en/experiments/tmr-cluster/algorithm-qkv-ready-batch.md)
+- [Results, protocol and limitations](docs/en/experiments/tmr-cluster/qkv-ready-batch.md)
+- [Chinese mechanism and workflow](docs/zh/experiments/tmr-cluster/algorithm-qkv-ready-batch.md)
+- [Raw evidence and frozen fingerprints](official-results/qkv-ready-batch-20261125/)
+
+The `runtime` submodule pins `runtime-qkv-ready-batch`. The policy is frozen;
+no additional tuning or ablation follows this result. Compiled binaries,
+virtual environments, caches and generic driver logs are excluded from publication.
+
+## Previous experiment: v14
+
 **v14: O scoring and immutable per-side block quotas.** First-ready side correction,
 WAIT consumer voting, and cross-side pickup are removed. S executes its own range and
 periodically publishes actual queue pressure to O.
@@ -37,7 +56,7 @@ git clone --recurse-submodules https://github.com/JJyun-ustc/PyPTO-tmr_partition
 cd PyPTO-tmr_partition
 ```
 
-The runtime submodule pins v14 on `runtime-o-quota`; prior study branches remain intact.
+The previous v14 snapshot is preserved on `runtime-o-quota`; prior study branches remain intact.
 Release tag: `v14-o-quota-20261120`. Binaries, environments, caches, and credentials are excluded.
 
 ---

@@ -1,0 +1,13 @@
+unlocked; tool absent
+START shared block0
+PASS shared block0 [36.5607, 36.197439, 36.25632, 36.11374, 36.1792, 36.208299]
+START qkv block0
+Traceback (most recent call last):
+  File "${EXPERIMENT_WORKTREE}/examples/a2a3/tensormap_and_ringbuffer/benchmark_qkv/run_study.py", line 152, in <module>
+    main()
+  File "${EXPERIMENT_WORKTREE}/examples/a2a3/tensormap_and_ringbuffer/benchmark_qkv/run_study.py", line 137, in main
+    invoke(mode, f"block{b}", 6)
+  File "${EXPERIMENT_WORKTREE}/examples/a2a3/tensormap_and_ringbuffer/benchmark_qkv/run_study.py", line 121, in invoke
+    assert summaries and all(int(s[1]) + int(s[2]) > 0 and s[4:6] == s[6:8] and s[8] == "0" for s in summaries), dest
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: ${EXPERIMENT_WORKTREE}/results/qkv-ready-batch-20261125/qkv/block0
