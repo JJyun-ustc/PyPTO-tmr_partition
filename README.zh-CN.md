@@ -1,6 +1,24 @@
 # PyPTO TMR：AICPU cluster 放置研究
 
-## 最新实验：固定 QKV 自然 ready 批量调度
+## 最新实验：QKV 第二轮，MIX、反馈与离线训练
+
+同轮重测 Shared，中位数 **36.831 ms**；原 QKV **40.005 ms（+8.62%）**，
+改进 QKV **37.668 ms（+2.27%）**，训练型 QKV **37.616 ms（+2.13%）**。
+每策略 30 个正式样本及 6 个 warm-up，四策略输出与全部 40 层 KV golden 通过，37 个 kernel 指纹一致。
+
+主要开销指向集中 pending / S0 等待。普通 MIX 在同步共存用例真实选侧 20/23 个任务，
+但短链存在大量未初始化/过旧摘要回退。学习型 QKV 的留出综合 MAE 改善 14.31%，
+AICPU 影子推理通过预算；相对改进版仅快约 0.14%，未证明稳定净收益。
+Qwen 的同步 attention 保留原协议，性能回退与失败尝试全部保留。
+
+- [一页结论与正式结果](docs/zh/experiments/tmr-cluster/qkv-round2.md)
+- [最新机制与完整实验流程](docs/zh/experiments/tmr-cluster/algorithm-qkv-round2.md)
+- [English report](docs/en/experiments/tmr-cluster/qkv-round2.md)
+- [全部样本、训练权重、校准表、回放、诊断与复现命令](official-results/qkv-round2-20261125/)
+
+`runtime` 子模块固定到 `8ebbff773`；数据于 2026-11-25 采集，2026-11-26 发布。
+
+## 历史实验：QKV 初版
 
 A2A3 Qwen3-14B decode 上，QKV 相对 Shared 的中位数从 **36.697 增至 39.307 ms（回退 7.11%）**，
 p95 从 **36.829 增至 39.463 ms（回退 7.15%）**，每种模式各 30 个正式样本。

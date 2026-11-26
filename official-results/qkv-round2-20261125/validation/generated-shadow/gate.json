@@ -1,0 +1,19 @@
+{
+  "predeclared": "test composite MAE at least 2% better than ridge; neither target worse; batch8 p95<=50us",
+  "quality_pass": true,
+  "cpu_budget_pass": true,
+  "deploy": true,
+  "cpu_python_shadow_us": {
+    "n": 1000,
+    "mean": 959.99604,
+    "median": 948.84,
+    "p95": 1006.4319999999999,
+    "max": 2011.92
+  },
+  "warning": "proxy-time prediction quality does not guarantee a scheduling speedup",
+  "native_cpu_budget_pass": true,
+  "requires_actual_aicpu_shadow_before_dispatch": true,
+  "python_wrapper_budget_pass": false,
+  "actual_aicpu_budget_pass": true,
+  "actual_aicpu_evidence": "aicpu-shadow.json"
+}

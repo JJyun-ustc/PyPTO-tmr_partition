@@ -1,6 +1,27 @@
 # PyPTO TMR: AICPU cluster placement study
 
-## Latest experiment: fixed QKV natural ready batches
+## Latest experiment: QKV round two — MIX, feedback and offline training
+
+Same-round Shared median: **36.831 ms**. Original QKV: **40.005 ms (+8.62%)**;
+improved QKV: **37.668 ms (+2.27%)**; learned QKV: **37.616 ms (+2.13%)**.
+Thirty formal samples and six retained warm-ups per policy. All four pass output
+and complete forty-layer KV golden; all 37 loaded compute-kernel fingerprints match.
+
+Evidence points to centralized pending/S0 waiting as the main original cost.
+Ordinary MIX actually assigns 20/23 tasks in the sync-coexistence test, while short
+chains expose missing/stale-summary fallbacks. Learned-QKV holdout composite MAE
+improves by 14.31% and AICPU shadow inference passes its budget, but its 0.14%
+median gain over improved QKV does not establish a stable net scheduling benefit.
+Qwen synchronous attention retains its protocol. Regressions and failed attempts remain public.
+
+- [One-page conclusion and formal results](docs/en/experiments/tmr-cluster/qkv-round2.md)
+- [Mechanism and complete experiment workflow](docs/en/experiments/tmr-cluster/algorithm-qkv-round2.md)
+- [Chinese report](docs/zh/experiments/tmr-cluster/qkv-round2.md)
+- [Samples, weights, calibration, replay, diagnostics and commands](official-results/qkv-round2-20261125/)
+
+The `runtime` submodule pins `8ebbff773`. Data collected 2026-11-25; published 2026-11-26.
+
+## Historical experiment: first QKV prototype
 
 QKV versus Shared on A2A3 Qwen3-14B decode: **36.697 → 39.307 ms median
 (+7.11%)**, p95 **36.829 → 39.463 ms (+7.15%)**, 30 formal samples per mode.

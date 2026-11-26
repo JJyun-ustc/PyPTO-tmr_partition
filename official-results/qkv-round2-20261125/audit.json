@@ -1,0 +1,196 @@
+{
+  "formal_n": 120,
+  "warmup_n": 24,
+  "policies": 4,
+  "goldens": 4,
+  "same_loaded_kernel_ids": 37,
+  "first_round_kernel_match": true,
+  "source_and_runtime_frozen": true,
+  "calibration_weights_gate_frozen": true,
+  "periods": [
+    {
+      "block": 0,
+      "shared_ms": 36.956,
+      "improved_ms": 37.711479,
+      "trained_ms": 37.3213,
+      "trained_vs_improved_percent": -1.034642528870311
+    },
+    {
+      "block": 1,
+      "shared_ms": 36.7114,
+      "improved_ms": 37.68042,
+      "trained_ms": 37.66168,
+      "trained_vs_improved_percent": -0.04973405285823018
+    },
+    {
+      "block": 2,
+      "shared_ms": 36.763079,
+      "improved_ms": 37.48262,
+      "trained_ms": 37.66572,
+      "trained_vs_improved_percent": 0.48849306692009264
+    },
+    {
+      "block": 3,
+      "shared_ms": 36.93492,
+      "improved_ms": 37.6383,
+      "trained_ms": 37.5985,
+      "trained_vs_improved_percent": -0.10574335185170591
+    },
+    {
+      "block": 4,
+      "shared_ms": 36.84542,
+      "improved_ms": 37.7292,
+      "trained_ms": 37.64296,
+      "trained_vs_improved_percent": -0.22857627513966916
+    },
+    {
+      "block": 5,
+      "shared_ms": 36.775479,
+      "improved_ms": 37.54664,
+      "trained_ms": 37.67102,
+      "trained_vs_improved_percent": 0.3312679909573957
+    }
+  ],
+  "exploratory_period_bootstrap": {
+    "unit": "whole period, six periods",
+    "seed": 1234,
+    "resamples": 10000,
+    "statistic": "median of within-period median percent changes, trained versus improved",
+    "ci95_percent": [
+      -0.63160940200499,
+      0.40988052893874416
+    ]
+  },
+  "formal_scheduler_body_median_ms": {
+    "shared": 36.25929,
+    "original": 39.372699999999995,
+    "improved": 37.017649500000005,
+    "trained": 36.97621
+  },
+  "learned_attempts_formal": 33750,
+  "learned_missing_calibration_formal": 0,
+  "complete_dags": [
+    {
+      "run_id": "improved/replay-len2625",
+      "tasks": 11166,
+      "edges": 23605,
+      "integrity": {
+        "submitted_traced_audit": [
+          [
+            "11166",
+            "11166"
+          ]
+        ],
+        "dangling_endpoint_count": 0,
+        "dangling_ids": []
+      }
+    },
+    {
+      "run_id": "improved/replay-len3500",
+      "tasks": 11166,
+      "edges": 23605,
+      "integrity": {
+        "submitted_traced_audit": [
+          [
+            "11166",
+            "11166"
+          ]
+        ],
+        "dangling_endpoint_count": 0,
+        "dangling_ids": []
+      }
+    },
+    {
+      "run_id": "original/replay-len1750",
+      "tasks": 11166,
+      "edges": 23605,
+      "integrity": {
+        "submitted_traced_audit": [
+          [
+            "11166",
+            "11166"
+          ]
+        ],
+        "dangling_endpoint_count": 0,
+        "dangling_ids": []
+      }
+    },
+    {
+      "run_id": "original/replay-len3500",
+      "tasks": 11166,
+      "edges": 23605,
+      "integrity": {
+        "submitted_traced_audit": [
+          [
+            "11166",
+            "11166"
+          ]
+        ],
+        "dangling_endpoint_count": 0,
+        "dangling_ids": []
+      }
+    },
+    {
+      "run_id": "original/replay-len512",
+      "tasks": 11166,
+      "edges": 23605,
+      "integrity": {
+        "submitted_traced_audit": [
+          [
+            "11166",
+            "11166"
+          ]
+        ],
+        "dangling_endpoint_count": 0,
+        "dangling_ids": []
+      }
+    },
+    {
+      "run_id": "trained/replay-len3500",
+      "tasks": 11166,
+      "edges": 23605,
+      "integrity": {
+        "submitted_traced_audit": [
+          [
+            "11166",
+            "11166"
+          ]
+        ],
+        "dangling_endpoint_count": 0,
+        "dangling_ids": []
+      }
+    }
+  ],
+  "placement": [
+    {
+      "run_id": "improved/replay-len2625",
+      "bound_tasks": 1082,
+      "all_observed_on_selected_side": true
+    },
+    {
+      "run_id": "improved/replay-len3500",
+      "bound_tasks": 1077,
+      "all_observed_on_selected_side": true
+    },
+    {
+      "run_id": "original/replay-len1750",
+      "bound_tasks": 9499,
+      "all_observed_on_selected_side": true
+    },
+    {
+      "run_id": "original/replay-len3500",
+      "bound_tasks": 9599,
+      "all_observed_on_selected_side": true
+    },
+    {
+      "run_id": "original/replay-len512",
+      "bound_tasks": 9415,
+      "all_observed_on_selected_side": true
+    },
+    {
+      "run_id": "trained/replay-len3500",
+      "bound_tasks": 1157,
+      "all_observed_on_selected_side": true
+    }
+  ]
+}

@@ -1,0 +1,49 @@
+{
+  "mode": "shared",
+  "label": "block4",
+  "rounds": 6,
+  "seq_len": 3500,
+  "seed": 1234,
+  "trace": 0,
+  "golden": false,
+  "returncode": 0,
+  "passed": true,
+  "elapsed_s": 35.92186427116394,
+  "cmd": [
+    "<RUNTIME_WORKTREE>/.venv/bin/python",
+    "-c",
+    "import multiprocessing,runpy,sys,torch; multiprocessing.cpu_count=lambda:2; torch.set_num_threads(2);sys.argv=sys.argv[1:];runpy.run_path(sys.argv[0],run_name=\"__main__\")",
+    "<RUNTIME_WORKTREE>/examples/a2a3/tensormap_and_ringbuffer/benchmark_qwen_cluster/main.py",
+    "-p",
+    "a2a3",
+    "-d",
+    "0",
+    "--seq-len",
+    "3500",
+    "--seed",
+    "1234",
+    "--compile-workers",
+    "2",
+    "--rounds",
+    "6",
+    "--log-level",
+    "info",
+    "--skip-golden"
+  ],
+  "all_ms": [
+    37.1741,
+    37.00052,
+    36.9735,
+    36.81638,
+    36.84542,
+    36.81172
+  ],
+  "formal_ms": [
+    37.00052,
+    36.9735,
+    36.81638,
+    36.84542,
+    36.81172
+  ],
+  "run_id": "shared/block4"
+}
