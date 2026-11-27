@@ -26,6 +26,7 @@
 #include "scheduler/scheduler_types.h"
 #include "scheduler/scheduler.h"
 #include "qkv_learned.h"
+#include "streaming_action.h"
 
 TEST(AsyncWaitDiagnosticsTest, SeparatesTaskBodyAndCompletionPendingAndGuardsMailboxUnderflow) {
     auto wait_list = std::make_unique<AsyncWaitList>();
@@ -1038,4 +1039,188 @@ TEST(QkvLearned, FrozenProjectionMatchesTorchAndMissingSpecUsesFormula) {
     double a[2][QKV_CHANNELS]{}, b[2][QKV_CHANNELS]{};
     EXPECT_EQ(qkv_learned_choose(s, 1, 1, 2, missing, .1, a, fallback), formula.choose(s, 1, 1, .1, b));
     EXPECT_EQ(a[0][1], b[0][1]);
+}
+
+TEST(StreamingQueueTest, ObservationDoesNotClaimAndOldTicketCannotConsumeRecycledSlot) {
+    ChipReadyQueue queue{};
+    ChipReadyQueueSlot slots[2];
+    queue.slots = slots;
+    queue.capacity = 2;
+    queue.mask = 1;
+    for (int i = 0; i < 2; ++i)
+        slots[i].sequence.store(i);
+    ChipTaskSlotState items[4]{};
+    ASSERT_TRUE(queue.push(&items[0]));
+    ChipReadyQueue::HeadToken old;
+    ASSERT_TRUE(queue.observe_head(old));
+    EXPECT_EQ(queue.size(), 1u);
+    EXPECT_EQ(queue.consume_exact(old), &items[0]);
+    ASSERT_TRUE(queue.push(&items[1]));
+    EXPECT_EQ(queue.pop(), &items[1]);
+    ASSERT_TRUE(queue.push(&items[2]));
+    EXPECT_EQ(queue.consume_exact(old), nullptr);
+    EXPECT_EQ(queue.pop(), &items[2]);
+    EXPECT_EQ(queue.pop(), nullptr);
+}
+
+TEST(StreamingQueueTest, CompetingConsumersAcquireExactlyOneTicket) {
+    ChipReadyQueue queue{};
+    ChipReadyQueueSlot slots[2];
+    queue.slots = slots;
+    queue.capacity = 2;
+    queue.mask = 1;
+    for (int i = 0; i < 2; ++i)
+        slots[i].sequence.store(i);
+    ChipTaskSlotState item{};
+    ASSERT_TRUE(queue.push(&item));
+    ChipReadyQueue::HeadToken token;
+    ASSERT_TRUE(queue.observe_head(token));
+    std::atomic<int> wins{0};
+    std::thread a([&] {
+        if (queue.consume_exact(token)) ++wins;
+    });
+    std::thread b([&] {
+        if (queue.consume_exact(token)) ++wins;
+    });
+    a.join();
+    b.join();
+    EXPECT_EQ(wins.load(), 1);
+    EXPECT_EQ(queue.size(), 0u);
+}
+
+TEST(StreamingQueueTest, FullFallbackPublishesOnlyToOneQueue) {
+    ChipReadyQueue queues[2]{};
+    ChipReadyQueueSlot slots[2][2];
+    ChipTaskSlotState items[3]{};
+    for (int q = 0; q < 2; ++q) {
+        queues[q].slots = slots[q];
+        queues[q].capacity = 2;
+        queues[q].mask = 1;
+        for (int i = 0; i < 2; ++i)
+            slots[q][i].sequence.store(i);
+    }
+    ASSERT_TRUE(queues[1].push(&items[0]));
+    ASSERT_TRUE(queues[1].push(&items[1]));
+    if (!queues[1].push(&items[2])) ASSERT_TRUE(queues[0].push(&items[2]));
+    EXPECT_EQ(queues[0].pop(), &items[2]);
+    EXPECT_EQ(queues[0].pop(), nullptr);
+    EXPECT_EQ(queues[1].pop(), &items[0]);
+    EXPECT_EQ(queues[1].pop(), &items[1]);
+    EXPECT_EQ(queues[1].pop(), nullptr);
+}
+
+TEST(StreamingQueueTest, ConcurrentObservationSurvivesWrapAndOrdinaryConsumers) {
+    ChipReadyQueue queue{};
+    ChipReadyQueueSlot slots[8];
+    ChipTaskSlotState items[8]{};
+    auto payloads = std::make_unique<TaskPayload[]>(8);
+    queue.slots = slots;
+    queue.capacity = 8;
+    queue.mask = 7;
+    queue.observe_metadata = 1;
+    for (int i = 0; i < 8; ++i) {
+        slots[i].sequence.store(i);
+        items[i].payload = &payloads[i];
+        payloads[i].placement.group = i + 1;
+    }
+    constexpr int total = 20000;
+    std::atomic<int> consumed{0}, bad_record{0};
+    std::thread producer([&] {
+        for (int i = 0; i < total; ++i)
+            while (!queue.push(&items[i % 8])) {}
+    });
+    std::thread observer([&] {
+        while (consumed.load() < total) {
+            ChipReadyQueue::HeadToken token;
+            if (!queue.observe_head(token)) continue;
+            auto *owned = queue.consume_exact(token);
+            if (owned) {
+                if (owned->payload->placement.group != token.record) ++bad_record;
+                ++consumed;
+            }
+        }
+    });
+    std::thread ordinary([&] {
+        while (consumed.load() < total)
+            if (queue.pop()) ++consumed;
+    });
+    producer.join();
+    observer.join();
+    ordinary.join();
+    EXPECT_EQ(consumed.load(), total);
+    EXPECT_EQ(bad_record.load(), 0);
+    EXPECT_EQ(queue.size(), 0u);
+}
+
+TEST(StreamingActionTest, VisibleDiamondChangesChoiceButUnknownAndIncompleteDoNot) {
+    using namespace simpler::tmr;
+    StreamCandidate tasks[2] = {{1, 0, {2, 10}, 0}, {2, 0, {4, 14}, 0}};
+    StreamSlot slots[2] = {{14, 0, 0}, {0, 1, 0}};
+    StreamJoin unknown;
+    auto local = stream_compare(tasks, 2, 1, slots, 2, 1, 0, unknown);
+    ASSERT_TRUE(local.valid);
+    EXPECT_DOUBLE_EQ(local.default_end, 24);
+    EXPECT_DOUBLE_EQ(local.alternative_end, 16);
+    EXPECT_TRUE(stream_admit(local.gain, 0, 30, 0));
+    StreamJoin pending;
+    pending.count = 2;
+    pending.candidate[0] = 1;
+    pending.committed_finish_us[1] = 30;
+    auto incomplete = stream_compare(tasks, 2, 1, slots, 2, 1, 0, pending);
+    EXPECT_DOUBLE_EQ(incomplete.gain, local.gain);
+    pending.complete = true;
+    auto slow = stream_compare(tasks, 2, 1, slots, 2, 1, 0, pending);
+    EXPECT_DOUBLE_EQ(slow.gain, 0);
+    EXPECT_TRUE(slow.used_join);
+    EXPECT_FALSE(stream_admit(slow.gain, 0, 30, 0));
+    pending.committed_finish_us[1] = 12;
+    auto fast = stream_compare(tasks, 2, 1, slots, 2, 1, 0, pending);
+    EXPECT_DOUBLE_EQ(fast.gain, 8);
+    EXPECT_FALSE(stream_admit(fast.gain, 0, 6, 0));
+}
+
+TEST_F(SchedulerStateTest, StreamingFastReadyAndNotificationHaveOnePublicationOwner) {
+    sched.qkv.mode = 7;
+    alignas(64) ChipTaskSlotState slot;
+    init_slot(slot, CHIP_TASK_PENDING, 1, 1);
+    slot.task->task_id = TaskId::make(0, 1);
+    sched.qkv_trace_create(slot);
+    sched.qkv_registration_complete(slot);
+    sched.push_ready_routed(&slot);
+    sched.push_ready_routed(&slot);
+    EXPECT_FALSE(sched.route_ready_once(slot));
+    EXPECT_EQ(sched.ready_queues[0].size(), 1u);
+    EXPECT_EQ(sched.qkv.eligible.load(), 1u);
+    EXPECT_GT(sched.qkv.trace.tasks[0].registered_epoch.load(), sched.qkv.trace.tasks[0].submit_epoch);
+    EXPECT_EQ(sched.ready_queues[0].pop(), &slot);
+    int32_t start = -1;
+    EXPECT_EQ(slot.claim_block_range(1, 1, start), 1);
+    EXPECT_EQ(slot.claim_block_range(1, 1, start), 0);
+}
+
+TEST_F(SchedulerStateTest, StreamingPreservesStrictAndSyncQueues) {
+    sched.qkv.mode = 7;
+    alignas(64) ChipTaskSlotState strict, sync;
+    init_slot(strict, CHIP_TASK_PENDING, 1, 1);
+    init_slot(sync, CHIP_TASK_PENDING, 1, 1);
+    strict.task->target_aicpu_cluster = 1;
+    sync.task_attrs.set_sync_start();
+    sched.push_ready_routed(&strict);
+    sched.push_ready_routed(&sync);
+    EXPECT_EQ(sched.cluster_ready_queues[1][0].pop(), &strict);
+    EXPECT_EQ(sched.ready_sync_queues[0].pop(), &sync);
+    EXPECT_EQ(sched.ready_queues[0].size(), 0u);
+    EXPECT_EQ(sched.qkv.eligible.load(), 0u);
+}
+
+TEST_F(SchedulerStateTest, StreamingPreferenceCannotConsumeLegacyAutomaticWork) {
+    sched.qkv.mode = 7;
+    alignas(64) ChipTaskSlotState legacy;
+    init_slot(legacy, CHIP_TASK_PENDING, 1, 1);
+    legacy.payload->placement.scope = 1;
+    legacy.task->target_aicpu_cluster = 1;
+    ASSERT_TRUE(sched.auto_ready_queues[1][0].push(&legacy));
+    ChipReadyQueue::HeadToken token;
+    EXPECT_FALSE(sched.streaming_lane(ResourceShape::AIC, 2).observe_head(token));
+    EXPECT_EQ(sched.auto_ready_queues[1][0].size(), 1u);
 }

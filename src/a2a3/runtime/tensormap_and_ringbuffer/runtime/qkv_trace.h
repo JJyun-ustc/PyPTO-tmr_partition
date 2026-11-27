@@ -18,9 +18,17 @@ constexpr uint32_t QKV_TRACE_EDGES = 131072;
 // All timestamps are AICPU counter ticks. Actual kernel start is unavailable;
 // start_proxy distinguishes idle publication, promotion and gated release.
 struct QkvTaskTrace {
-    uint64_t task{0}, created{0}, ready{0}, pop{0}, publish{0}, completed{0};
+    uint64_t task{0}, created{0}, pop{0}, publish{0}, completed{0};
+    std::atomic<uint64_t> ready{0}, registered_at{0}, claim{0};
+    uint32_t predecessors[4]{};
+    uint32_t predecessor_count{0};
+    std::atomic<uint32_t> successors[2]{};
+    std::atomic<uint64_t> successor_overflow{0};
+    uint64_t visible_join{0}, observation_ts{0}, visibility_state{0}, submit_epoch{0}, captured_epoch{0};
+    std::atomic<uint64_t> registered_epoch{0};
+    uint64_t observed_successor[2]{}, observed_registration[2]{};
     std::atomic<uint64_t> dispatch{0}, start_proxy{0}, first_fin{0}, fin{0};
-    std::atomic<int> proxy_kind{0}, dispatch_side{-1}, scheduler{-1};
+    std::atomic<int> proxy_kind{0}, dispatch_side{-1}, scheduler{-1}, physical_group{-1};
     int kernel[3]{}, blocks{0}, shape{0}, mask{0}, sync{0}, selected{-1}, fanout{0};
     uint64_t dummy_begin{0}, dummy_end{0};
     double features[2][5]{};  // queued/capacity, occupied, idle fraction, capacity, reservations/capacity
@@ -28,7 +36,23 @@ struct QkvTaskTrace {
     void init(uint64_t id, uint64_t now) {
         task = id;
         created = now;
-        ready = pop = publish = completed = dummy_begin = dummy_end = summary_age = 0;
+        pop = publish = completed = dummy_begin = dummy_end = summary_age = 0;
+        ready.store(0);
+        registered_at.store(0);
+        registered_epoch.store(0);
+        submit_epoch = captured_epoch = 0;
+        for (auto &x : observed_successor)
+            x = 0;
+        for (auto &x : observed_registration)
+            x = 0;
+        claim.store(0);
+        predecessor_count = 0;
+        for (auto &p : predecessors)
+            p = 0;
+        for (auto &p : successors)
+            p.store(0);
+        successor_overflow.store(0);
+        visible_join = observation_ts = visibility_state = 0;
         dispatch.store(0);
         start_proxy.store(0);
         first_fin.store(0);
@@ -36,6 +60,7 @@ struct QkvTaskTrace {
         proxy_kind.store(0);
         dispatch_side.store(-1);
         scheduler.store(-1);
+        physical_group.store(-1);
         selected = -1;
         fanout = 0;
         for (auto &side : features)
@@ -53,7 +78,16 @@ struct QkvTaskTrace {
 struct QkvTraceEdge {
     uint64_t producer{0}, consumer{0};
 };
+struct alignas(64) StreamCounters {
+    uint64_t pops{0}, heads{0}, single{0}, multiple{0}, race{0}, empty{0}, claimed{0}, eligible_claimed{0};
+    uint64_t comparisons{0}, overrides{0}, no_calibration{0};
+    uint64_t sample_count{0}, samples[2048]{};
+};
 struct QkvTrace {
+    uint32_t calibration_seen[37]{};
+    uint64_t next_epoch{0};  // one orchestrator writer
+    std::atomic<uint64_t> published_epoch{0};
+    StreamCounters streaming[6];
     int level{0};                                  // 0 off, 1 deterministic 1/32 plus MIX/DUMMY, 2 full DAG diagnostics
     uint32_t count{0}, edge_count{0}, dropped{0};  // creation/wiring has one O writer
     QkvTaskTrace tasks[QKV_TRACE_TASKS];
@@ -67,7 +101,13 @@ struct QkvTrace {
     uint64_t early_slots[6][4]{};  // S0: pop, snapshot, score, publication
     uint64_t service_hist[4][32]{};
     void reset() {
+        for (auto &row : streaming)
+            row = StreamCounters{};
         level = 0;
+        for (auto &x : calibration_seen)
+            x = 0;
+        next_epoch = 0;
+        published_epoch.store(0);
         count = edge_count = dropped = 0;
         service_calls = 0;
         shadow_count = 0;

@@ -59,6 +59,7 @@ bool ready_queue_init_data_from_layout(ChipReadyQueue *queue, DeviceArena &arena
     // Address the slots region for data writes without storing the pointer in
     // queue->slots — that field is set by ready_queue_wire_arena_pointers.
     auto *slots_arena = static_cast<ChipReadyQueueSlot *>(arena.region_ptr(slots_off));
+    queue->observe_metadata = 0;
     queue->capacity = capacity;
     queue->mask = capacity - 1;
     queue->enqueue_pos.store(0, std::memory_order_relaxed);
@@ -67,6 +68,7 @@ bool ready_queue_init_data_from_layout(ChipReadyQueue *queue, DeviceArena &arena
     for (uint64_t i = 0; i < capacity; i++) {
         slots_arena[i].sequence.store((int64_t)i, std::memory_order_relaxed);
         slots_arena[i].slot_state = nullptr;
+        slots_arena[i].observation.store(0, std::memory_order_relaxed);
     }
 
     return true;
@@ -147,6 +149,9 @@ SchedulerState::reserve_layout(DeviceArena &arena, const int32_t dep_pool_capaci
         for (int i = 0; i < NUM_RESOURCE_SHAPES; i++) {
             layout.off_cluster_ready_queue_slots[c][i] = ready_queue_reserve_layout(arena, CHIP_READY_QUEUE_SIZE);
             layout.off_auto_ready_queue_slots[c][i] = ready_queue_reserve_layout(arena, CHIP_READY_QUEUE_SIZE);
+            if (i < 2)
+                layout.off_streaming_preference_slots[c][i] =
+                    ready_queue_reserve_layout(arena, SchedulerState::STREAM_PREFERENCE_CAPACITY);
         }
         layout.off_cluster_dummy_queue_slots[c] = ready_queue_reserve_layout(arena, CHIP_READY_QUEUE_SIZE);
     }
@@ -218,6 +223,13 @@ bool SchedulerState::init_data_from_layout(const SchedulerLayout &layout, Device
                 return false;
             }
         }
+        for (int r = 0; r < 2; ++r) {
+            if (!ready_queue_init_data_from_layout(
+                    &sched->streaming_preference_queues[c][r], arena, layout.off_streaming_preference_slots[c][r],
+                    SchedulerState::STREAM_PREFERENCE_CAPACITY
+                ))
+                return false;
+        }
         if (!ready_queue_init_data_from_layout(
                 &sched->cluster_dummy_queues[c], arena, layout.off_cluster_dummy_queue_slots[c],
                 layout.ready_queue_capacity
@@ -280,6 +292,8 @@ void SchedulerState::reset_for_reuse(const SchedulerLayout &layout, void *sm_dev
             sched->cluster_ready_queues[c][i].reset_for_reuse();
             sched->auto_ready_queues[c][i].reset_for_reuse();
         }
+        for (int r = 0; r < 2; ++r)
+            sched->streaming_preference_queues[c][r].reset_for_reuse();
         sched->cluster_dummy_queues[c].reset_for_reuse();
     }
     for (int i = 0; i < NUM_RESOURCE_SHAPES; i++) {
@@ -310,6 +324,10 @@ void SchedulerState::wire_arena_pointers(const SchedulerLayout &layout, DeviceAr
                 &sched->cluster_ready_queues[c][i], arena, layout.off_cluster_ready_queue_slots[c][i]
             );
         }
+        for (int r = 0; r < 2; ++r)
+            ready_queue_wire_arena_pointers(
+                &sched->streaming_preference_queues[c][r], arena, layout.off_streaming_preference_slots[c][r]
+            );
         ready_queue_wire_arena_pointers(
             &sched->cluster_dummy_queues[c], arena, layout.off_cluster_dummy_queue_slots[c]
         );
@@ -344,6 +362,7 @@ void SchedulerState::destroy() {
         for (int i = 0; i < NUM_RESOURCE_SHAPES; i++) {
             ready_queue_destroy(&sched->cluster_ready_queues[c][i]);
             ready_queue_destroy(&sched->auto_ready_queues[c][i]);
+            if (i < 2) ready_queue_destroy(&sched->streaming_preference_queues[c][i]);
         }
         ready_queue_destroy(&sched->cluster_dummy_queues[c]);
     }

@@ -95,6 +95,59 @@ bool SchedulerContext::has_idle_in_other_threads(int32_t self_thread_idx, Resour
 int SchedulerContext::pop_ready_tasks_batch(
     ChipReadyQueue *queues, ResourceShape shape, int32_t thread_idx, ChipTaskSlotState **out, int max_count
 ) {
+    if (sched_->qkv.mode >= 7 && sched_->qkv.mode <= 9 && queues == sched_->ready_queues &&
+        static_cast<int>(shape) < 2) {
+        auto &stats = sched_->qkv.trace.streaming[thread_idx];
+        int count = 0;
+        bool sample = sched_->qkv.trace.level && (stats.pops & 31) == 0;
+        uint64_t begin = sample ? get_sys_cnt_aicpu() : 0;
+        ++stats.pops;
+        ChipReadyQueue *lanes[3] = {
+            &sched_->streaming_lane(shape, 0), &sched_->streaming_lane(shape, 1), &sched_->streaming_lane(shape, 2)
+        };
+        for (int bi = 0; bi < max_count; ++bi) {
+            ChipReadyQueue::HeadToken heads[3];
+            int best = -1, visible = 0;
+            uint64_t oldest = UINT64_MAX;
+            for (int q = 0; q < 3; ++q) {
+                if (!lanes[q]->observe_head(heads[q])) continue;
+                ++visible;
+                uint64_t ready = 0;
+                if (heads[q].record && heads[q].record <= simpler::tmr::QKV_TRACE_TASKS)
+                    ready = sched_->qkv.trace.tasks[heads[q].record - 1].ready.load(std::memory_order_acquire);
+                if (best < 0 || ready < oldest) {
+                    best = q;
+                    oldest = ready;
+                }
+            }
+            stats.heads += visible;
+            if (best < 0) {
+                ++stats.empty;
+                break;
+            }
+            if (visible == 1) ++stats.single;
+            else {
+                ++stats.multiple;
+                if (sched_->qkv.mode != 7) ++stats.no_calibration;
+            }
+            // No class passed locality admission. C/D retain the common B
+            // default; an uncalibrated action difference cannot grant an override.
+            auto *owned = lanes[best]->consume_exact(heads[best]);
+            if (!owned) {
+                ++stats.race;
+                break;
+            }
+            if (heads[best].record && heads[best].record <= simpler::tmr::QKV_TRACE_TASKS) {
+                const auto &record = sched_->qkv.trace.tasks[heads[best].record - 1];
+                always_assert(record.task == TaskId::to_uint64(owned->task->task_id));
+                always_assert(owned->payload->placement.group == heads[best].record);
+            }
+            out[count++] = owned;
+            ++stats.claimed;
+        }
+        if (sample && stats.sample_count < 2048) stats.samples[stats.sample_count++] = get_sys_cnt_aicpu() - begin;
+        return count;
+    }
 #if SIMPLER_DFX
     auto &chip_swimlane = sched_chip_swimlane_[thread_idx];
 #if SIMPLER_SCHED_PROFILING
@@ -118,13 +171,55 @@ int SchedulerContext::pop_ready_tasks_batch(
     (void)thread_idx;
     int count = sched_->get_ready_tasks_batch(queues, shape, out, max_count);
 #endif
+    if (sched_->qkv.trace.level == 2 && queues == sched_->ready_queues && static_cast<int>(shape) < 2) {
+        for (int i = 0; i < count; ++i) {
+            auto &task = *out[i];
+            if (task.logical_block_num != 1 || task.task_attrs.requires_sync_start() ||
+                task.task_attrs.has_predicate() || task.task->target_aicpu_cluster >= 0)
+                continue;
+            auto *record = sched_->qkv_record(task);
+            if (record == nullptr || record->observation_ts) continue;
+            record->observation_ts = get_sys_cnt_aicpu();
+            record->captured_epoch = sched_->qkv.trace.published_epoch.load(std::memory_order_acquire);
+            uint64_t overflow_epoch = record->successor_overflow.load(std::memory_order_acquire);
+            if (overflow_epoch && overflow_epoch <= record->captured_epoch) record->visibility_state = 3;
+            else
+                for (int k = 0; k < 2; ++k) {
+                    uint32_t index = record->successors[k].load(std::memory_order_acquire);
+                    if (!index || index > simpler::tmr::QKV_TRACE_TASKS) continue;
+                    const auto &join = sched_->qkv.trace.tasks[index - 1];
+                    // The successor index may publish before submission metadata commits.
+                    if (join.submit_epoch > record->captured_epoch) continue;
+                    uint64_t registered = join.registered_epoch.load(std::memory_order_acquire);
+                    record->observed_successor[k] = index;
+                    record->observed_registration[k] = registered <= record->captured_epoch ? registered : 0;
+                    if (!registered || registered > record->captured_epoch) {
+                        record->visibility_state = record->visibility_state ? record->visibility_state : 1;
+                        continue;
+                    }
+                    record->observed_successor[k] = index;
+                    record->observed_registration[k] = registered;
+                    if (join.predecessor_count <= 4) {
+                        record->visibility_state = 2;
+                        record->visible_join = index;
+                        break;
+                    }
+                    record->visibility_state = 4;  // complete but exceeds the explicit fanin budget
+                }
+        }
+    }
     return count;
 }
 
 void SchedulerContext::init_qkv(Runtime *runtime, SchedulerState *state) {
     auto &q = state->qkv;
     q.mode = runtime->dev.qkv_batch;
-    q.enabled = q.mode != 0;
+    q.enabled = q.mode > 0 && q.mode < 7;
+    for (int r = 0; r < 2; ++r) {
+        state->ready_queues[r].observe_metadata = q.mode >= 7 && q.mode <= 9;
+        for (int c = 0; c < 2; ++c)
+            state->streaming_preference_queues[c][r].observe_metadata = q.mode >= 7 && q.mode <= 9;
+    }
     q.trace.level = runtime->dev.qkv_trace_level;
     q.schedulers = sched_thread_num_;
     if (!q.enabled && !q.trace.level) return;
@@ -308,6 +403,38 @@ SchedulerContext::PublishHandle SchedulerContext::prepare_subtask_to_core(
     CoreTracker &tracker = core_trackers_[thread_idx];
     auto core_id = tracker.get_core_id_by_offset(core_offset);
     auto *qkv_record = sched_->qkv_record(slot_state);
+    if (qkv_record && slot_state.logical_block_num == 1 && qkv_record->shape < 2) {
+        int group_aic = tracker.get_core_id_by_offset((core_offset / 3) * 3);
+#if SIMPLER_DFX
+        int physical = physical_core_ids_[group_aic];
+#else
+        int physical = core_exec_states_[group_aic].physical_core_id;
+#endif
+        qkv_record->physical_group.store(physical);
+    }
+    if (qkv_record && sched_->qkv.trace.level == 3 && qkv_record->shape < 2) {
+        auto shape = static_cast<ResourceShape>(qkv_record->shape);
+        qkv_record->features[0][0] = tracker.resource_capacity(shape);
+        qkv_record->features[0][1] = tracker.get_dispatchable_cores(shape, CoreTracker::DispatchPhase::IDLE).count();
+        qkv_record->features[0][2] = tracker.get_dispatchable_cores(shape, CoreTracker::DispatchPhase::PENDING).count();
+        qkv_record->features[0][3] = to_pending;
+        qkv_record->features[0][4] = static_cast<int>(subslot);
+        uint64_t oldest = get_sys_cnt_aicpu();
+        bool valid = true;
+        for (int t = 0; t < sched_->qkv.schedulers; ++t) {
+            auto &row = sched_->qkv.threads[t];
+            uint64_t stamp = row.stamp.load(std::memory_order_acquire);
+            int side = sched_->qkv.side[t];
+            for (int resource = 0; resource < 2; ++resource) {
+                uint64_t word = row.resources[resource].load(std::memory_order_acquire);
+                qkv_record->features[1][resource * 2 + side] += (word >> 16) & 255;
+                if (!stamp || !word) valid = false;
+            }
+            if (stamp < oldest) oldest = stamp;
+        }
+        qkv_record->summary_age = get_sys_cnt_aicpu() - oldest;
+        qkv_record->features[1][4] = valid;
+    }
     bool qkv_start_now =
         !to_pending && !force_gate &&
         slot_state.payload->early_dispatch_state.load(std::memory_order_relaxed) != EARLY_DISPATCH_STAGING;
@@ -610,6 +737,13 @@ void SchedulerContext::dispatch_shape(
             int32_t start = 0;
             int32_t claim = slot_state->claim_block_range(slot_state->logical_block_num, available, start);
             if (claim == 0) continue;
+            if (sched_->qkv.mode >= 7 && sched_->qkv.mode <= 9 && static_cast<int>(shape) < 2 &&
+                slot_state->logical_block_num == 1 && !slot_state->task_attrs.requires_sync_start() &&
+                !slot_state->task_attrs.has_predicate() && slot_state->task->target_aicpu_cluster < 0 &&
+                !slot_state->payload->placement.scope)
+                ++sched_->qkv.trace.streaming[thread_idx].eligible_claimed;
+            if (auto *record = sched_->qkv_record(*slot_state))
+                simpler::tmr::QkvTaskTrace::first(record->claim, get_sys_cnt_aicpu());
             if (slot_state->payload->placement.reserved == 2) {
                 auto &row = sched_->qkv.threads[thread_idx];
                 int side = slot_state->task->target_aicpu_cluster;

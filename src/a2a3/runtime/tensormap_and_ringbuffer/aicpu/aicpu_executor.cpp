@@ -157,6 +157,17 @@ static void dump_qkv_round2(const simpler::tmr::QkvTrace &tr) {
             );
         }
         LOG_INFO("QKV_R2_TASKS %s", buffer);
+        const auto &r = tr.tasks[i];
+        LOG_INFO(
+            "STREAM_VIS task=%llu registered=%llu observed=%llu state=%llu join_index=%llu fanin=%u physical_group=%d "
+            "claim=%llu epoch=%llu succ0=%llu reg0=%llu succ1=%llu reg1=%llu",
+            (unsigned long long)r.task, (unsigned long long)r.registered_at.load(),
+            (unsigned long long)r.observation_ts, (unsigned long long)r.visibility_state,
+            (unsigned long long)r.visible_join, r.predecessor_count, r.physical_group.load(),
+            (unsigned long long)r.claim.load(), (unsigned long long)r.captured_epoch,
+            (unsigned long long)r.observed_successor[0], (unsigned long long)r.observed_registration[0],
+            (unsigned long long)r.observed_successor[1], (unsigned long long)r.observed_registration[1]
+        );
     }
     for (uint32_t i = 0; i < tr.edge_count; i += 16) {
         char buffer[4096];
@@ -1135,6 +1146,42 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         // every subsequent run.
         if (rt != nullptr) {
             auto &q = rt->scheduler.qkv;
+            uint64_t stream_claimed = 0, stream_eligible_claimed = 0, stream_multi = 0, stream_race = 0;
+            for (const auto &row : q.trace.streaming) {
+                stream_claimed += row.claimed;
+                stream_eligible_claimed += row.eligible_claimed;
+                stream_multi += row.multiple;
+                stream_race += row.race;
+            }
+            LOG_INFO(
+                "STREAM_RUN mode=%d eligible=%llu claimed=%llu eligible_claimed=%llu multi=%llu race=%llu "
+                "tasks=%u dropped=%u overrides=0 calibration_admitted=0",
+                q.mode, (unsigned long long)q.eligible.load(), (unsigned long long)stream_claimed,
+                (unsigned long long)stream_eligible_claimed, (unsigned long long)stream_multi,
+                (unsigned long long)stream_race, q.trace.count, q.trace.dropped
+            );
+            if (q.mode >= 7 && q.mode <= 9 && q.trace.level) {
+                LOG_INFO(
+                    "STREAM_SUMMARY mode=%d eligible=%llu tasks=%u dropped=%u neutral_only=1 calibration_admitted=0",
+                    q.mode, (unsigned long long)q.eligible.load(), q.trace.count, q.trace.dropped
+                );
+                for (int t = 0; t < 6; ++t) {
+                    const auto &s = q.trace.streaming[t];
+                    LOG_INFO(
+                        "STREAM_THREAD t=%d pops=%llu heads=%llu single=%llu multi=%llu race=%llu empty=%llu "
+                        "comparisons=%llu overrides=%llu uncalibrated=%llu samples=%llu claimed=%llu "
+                        "eligible_claimed=%llu",
+                        t, (unsigned long long)s.pops, (unsigned long long)s.heads, (unsigned long long)s.single,
+                        (unsigned long long)s.multiple, (unsigned long long)s.race, (unsigned long long)s.empty,
+                        (unsigned long long)s.comparisons, (unsigned long long)s.overrides,
+                        (unsigned long long)s.no_calibration, (unsigned long long)s.sample_count,
+                        (unsigned long long)s.claimed, (unsigned long long)s.eligible_claimed
+                    );
+                    if (q.trace.level)
+                        for (uint64_t i = 0; i < s.sample_count; ++i)
+                            LOG_INFO("STREAM_COST t=%d ticks=%llu", t, (unsigned long long)s.samples[i]);
+                }
+            }
             if (q.trace.level) {
                 dump_qkv_round2(q.trace);
                 LOG_INFO(

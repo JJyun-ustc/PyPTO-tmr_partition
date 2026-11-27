@@ -1363,6 +1363,7 @@ static TaskOutputTensors submit_task_common(
         ++orch->cluster_partitioner.trace.calls[5];
     }
 #endif
+    sched->qkv_registration_complete(cur_slot_state);
     CYCLE_COUNT_LAP(g_orch_fanin_cycle);
     CYCLE_COUNT_ORCH_SUBMIT_RECORD(task_id);
 

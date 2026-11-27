@@ -65,6 +65,8 @@ struct ChipReadyQueueSlot {
     std::atomic<int64_t> sequence;
     ChipTaskSlotState *slot_state;
     TaskId task_id_snapshot;
+    // Scalar observation only; no speculative task-pointer access. Records live until quiescence.
+    std::atomic<uint64_t> observation{0};
 };
 
 /**
@@ -81,13 +83,43 @@ struct alignas(64) ChipReadyQueue {
     ChipReadyQueueSlot *slots;
     uint64_t capacity;
     uint64_t mask;        // capacity - 1
-    char _pad0[64 - 24];  // Pad to own cache line
+    uint64_t observe_metadata{0};
+    char _pad0[64 - 32];  // Pad to own cache line
 
     std::atomic<uint64_t> enqueue_pos;
     char _pad1[64 - sizeof(std::atomic<uint64_t>)];  // Own cache line
 
     std::atomic<uint64_t> dequeue_pos;
     char _pad2[64 - sizeof(std::atomic<uint64_t>)];  // Own cache line
+
+    struct HeadToken {
+        uint64_t ticket{0}, record{0};
+    };
+    bool observe_head(HeadToken &out) {
+        const uint64_t pos = dequeue_pos.load(std::memory_order_acquire);
+        auto &entry = slots[pos & mask];
+        if (entry.sequence.load(std::memory_order_acquire) != static_cast<int64_t>(pos + 1)) return false;
+        const uint64_t record = entry.observation.load(std::memory_order_acquire);
+        // Reading a recycled record synchronizes with its writer's release;
+        // its preceding sequence reset then invalidates this old ticket.
+        if (entry.sequence.load(std::memory_order_acquire) != static_cast<int64_t>(pos + 1) ||
+            dequeue_pos.load(std::memory_order_acquire) != pos)
+            return false;
+        out = {pos, record};
+        return true;
+    }
+    ChipTaskSlotState *consume_exact(const HeadToken &head) {
+        auto &entry = slots[head.ticket & mask];
+        if (entry.sequence.load(std::memory_order_acquire) != static_cast<int64_t>(head.ticket + 1)) return nullptr;
+        uint64_t expected = head.ticket;
+        if (!dequeue_pos.compare_exchange_strong(expected, expected + 1, std::memory_order_acq_rel)) return nullptr;
+        auto *result = entry.slot_state;
+        entry.sequence.store(static_cast<int64_t>(head.ticket + capacity), std::memory_order_release);
+        return result;
+    }
+    void publish_observation(ChipReadyQueueSlot &entry, ChipTaskSlotState *task) {
+        if (observe_metadata) entry.observation.store(task->payload->placement.group, std::memory_order_release);
+    }
 
     uint64_t size() {
         uint64_t e = enqueue_pos.load(std::memory_order_relaxed);
@@ -124,6 +156,7 @@ struct alignas(64) ChipReadyQueue {
 
         slot->slot_state = slot_state;
         slot->task_id_snapshot = task_id_snapshot;
+        publish_observation(*slot, slot_state);
         slot->sequence.store(static_cast<int64_t>(pos + 1), std::memory_order_release);
         return true;
     }
@@ -170,6 +203,7 @@ struct alignas(64) ChipReadyQueue {
             ChipReadyQueueSlot *slot = &slots[(pos + i) & mask];
             slot->slot_state = items[i];
             slot->task_id_snapshot = task_id_snapshots == nullptr ? TaskId::invalid() : task_id_snapshots[i];
+            publish_observation(*slot, items[i]);
             slot->sequence.store(static_cast<int64_t>(pos + i + 1), std::memory_order_release);
         }
         return true;
@@ -210,6 +244,7 @@ struct alignas(64) ChipReadyQueue {
         }
 
         slot->slot_state = slot_state;
+        publish_observation(*slot, slot_state);
         slot->sequence.store(static_cast<int64_t>(pos + 1), std::memory_order_release);
         return true;
     }
@@ -439,6 +474,7 @@ struct SchedulerLayout {
     size_t off_cluster_ready_queue_slots[2][NUM_RESOURCE_SHAPES];
     size_t off_cluster_dummy_queue_slots[2];
     size_t off_auto_ready_queue_slots[2][NUM_RESOURCE_SHAPES];
+    size_t off_streaming_preference_slots[2][2];
     size_t off_early_dispatch_queue_slots[NUM_RESOURCE_SHAPES];
     size_t off_early_sync_start_queue_slots;
     size_t off_dep_pool_entries[CHIP_MAX_RING_DEPTH];
@@ -454,6 +490,7 @@ struct SchedulerLayout {
  * Hot-path methods are defined inline (implicitly inline as member functions).
  */
 struct SchedulerState {
+    static constexpr uint64_t STREAM_PREFERENCE_CAPACITY = 64;
     // Shared memory access
     SharedMemoryHeader *sm_header;
 
@@ -528,6 +565,7 @@ struct SchedulerState {
     ChipReadyQueue cluster_ready_queues[2][NUM_RESOURCE_SHAPES];
     // Only movable automatic single-block compute tasks enter these queues.
     ChipReadyQueue auto_ready_queues[2][NUM_RESOURCE_SHAPES];
+    ChipReadyQueue streaming_preference_queues[2][2];
 
     // Ready sync_start queues, one per shape. A ready sync_start cohort parks here
     // instead of ready_queues[] so the dispatch loop can drain it as a strict Tier-0
@@ -561,15 +599,22 @@ struct SchedulerState {
             }
     }
     simpler::tmr::QkvTaskTrace *qkv_record(ChipTaskSlotState &slot) {
-        if (!qkv.trace.level || slot.payload->placement.scope) return nullptr;
+        if ((!qkv.trace.level && qkv.mode < 7) || slot.payload->placement.scope) return nullptr;
         uint32_t idx = slot.payload->placement.group;
         return idx && idx <= simpler::tmr::QKV_TRACE_TASKS ? &qkv.trace.tasks[idx - 1] : nullptr;
     }
     void qkv_trace_create(ChipTaskSlotState &slot) {
-        if (!qkv.trace.level || slot.payload->placement.scope) return;
+        if ((!qkv.trace.level && qkv.mode < 7) || slot.payload->placement.scope) return;
         uint64_t id = TaskId::to_uint64(slot.task->task_id);
         int shape = static_cast<int>(slot.active_mask.to_shape());
-        if (qkv.trace.level == 1 && (id & 31) && shape < 2) return;
+        if (qkv.mode < 7 && qkv.trace.level == 1 && (id & 31) && shape < 2) return;
+        if (qkv.trace.level == 3) {
+            int kernel = slot.task->kernel_id[0] >= 0 ? slot.task->kernel_id[0] : slot.task->kernel_id[1];
+            if (kernel < 31 || kernel > 34) return;
+            uint32_t occurrence = qkv.trace.calibration_seen[kernel]++;
+            uint32_t stride = kernel == 33 ? 17u : (kernel == 34 ? 85u : 55u);
+            if (occurrence % stride) return;
+        }
         if (qkv.trace.count == simpler::tmr::QKV_TRACE_TASKS) {
             ++qkv.trace.dropped;
             return;
@@ -584,9 +629,55 @@ struct SchedulerState {
         for (int k = 0; k < 3; ++k)
             r.kernel[k] = slot.task->kernel_id[k];
         slot.payload->placement.group = index + 1;
+        r.submit_epoch = ++qkv.trace.next_epoch;
+        if (qkv.trace.level == 2 || qkv.mode >= 7) {
+            for_each_fanin_slot_state(*slot.payload, [&](ChipTaskSlotState *producer, DepFlags flags) {
+                if (!dep_has_wait(flags)) return;
+                uint32_t pi = producer->payload->placement.group;
+                if (r.predecessor_count < 4) r.predecessors[r.predecessor_count] = pi;
+                ++r.predecessor_count;
+                auto *pr = qkv_record(*producer);
+                if (pr == nullptr) return;
+                uint32_t empty = 0;
+                if (!pr->successors[0].compare_exchange_strong(empty, index + 1)) {
+                    empty = 0;
+                    if (!pr->successors[1].compare_exchange_strong(empty, index + 1)) {
+                        uint64_t zero = 0;
+                        pr->successor_overflow.compare_exchange_strong(zero, r.submit_epoch);
+                    }
+                }
+            });
+        }
+        qkv.trace.published_epoch.store(r.submit_epoch, std::memory_order_release);
+    }
+    void qkv_registration_complete(ChipTaskSlotState &slot) {
+        if (auto *r = qkv_record(slot)) {
+            r->registered_at.store(get_sys_cnt_aicpu(), std::memory_order_release);
+            uint64_t epoch = ++qkv.trace.next_epoch;
+            r->registered_epoch.store(epoch, std::memory_order_release);
+            qkv.trace.published_epoch.store(epoch, std::memory_order_release);
+        }
+    }
+    ChipReadyQueue &streaming_lane(ResourceShape shape, int lane) {
+        int resource = static_cast<int>(shape);
+        always_assert(resource < 2 && lane >= 0 && lane < 3);
+        return lane == 0 ? ready_queues[resource] : streaming_preference_queues[lane - 1][resource];
+    }
+    bool push_streaming_ready(ChipTaskSlotState &slot) {
+        if (qkv.mode < 7 || qkv.mode > 9 || slot.payload->placement.scope || slot.task->target_aicpu_cluster >= 0 ||
+            slot.logical_block_num != 1 || slot.next_block_idx.load(std::memory_order_relaxed) != 0 ||
+            slot.task_attrs.requires_sync_start() || slot.task_attrs.has_predicate() ||
+            static_cast<int>(slot.active_mask.to_shape()) > 1)
+            return false;
+        // No placement class passed paired calibration's significance threshold.
+        // Unknown locality remains neutral; there is no assumed same-side bonus.
+        qkv.eligible.fetch_add(1, std::memory_order_relaxed);
+        // Publication remains in the original neutral lane and retains its
+        // original capacity/progress protocol. No second queue owns the task.
+        return false;
     }
     void qkv_trace_ready(ChipTaskSlotState &slot) {
-        if (auto *r = qkv_record(slot)) r->ready = get_sys_cnt_aicpu();
+        if (auto *r = qkv_record(slot)) simpler::tmr::QkvTaskTrace::first(r->ready, get_sys_cnt_aicpu());
     }
     void qkv_trace_publish(ChipTaskSlotState &slot) {
         if (auto *r = qkv_record(slot)) {
@@ -784,6 +875,9 @@ struct SchedulerState {
     // the per-shape ready_sync_queues[] (drained as Tier-0); everything else to
     // ready_queues[].
     void push_ready_routed(ChipTaskSlotState *slot_state) {
+        if (qkv.mode >= 7 && qkv.mode <= 9 && !try_claim_ready_once(*slot_state)) return;
+        qkv_trace_ready(*slot_state);
+        qkv_trace_publish(*slot_state);
         stamp_ready_queue(*slot_state);
         ResourceShape shape = slot_state->active_mask.to_shape();
         if (shape == ResourceShape::DUMMY ||
@@ -792,7 +886,7 @@ struct SchedulerState {
         } else if (slot_state->task_attrs.requires_sync_start()) {
             ready_queue_for(*slot_state, shape, true).push(slot_state);
         } else {
-            ready_queue_for(*slot_state, shape, false).push(slot_state);
+            if (!push_streaming_ready(*slot_state)) ready_queue_for(*slot_state, shape, false).push(slot_state);
         }
     }
 
@@ -1379,7 +1473,7 @@ struct SchedulerState {
         } else if (slot_state.task_attrs.requires_sync_start()) {
             ready_queue_for(slot_state, shape, true).push(&slot_state);
         } else {
-            ready_queue_for(slot_state, shape, false).push(&slot_state);
+            if (!push_streaming_ready(slot_state)) ready_queue_for(slot_state, shape, false).push(&slot_state);
         }
         return true;
     }
@@ -1429,7 +1523,8 @@ struct SchedulerState {
         } else if (slot_state.task_attrs.requires_sync_start()) {
             ready_queue_for(slot_state, shape, true).push(&slot_state, atomic_count, push_wait);
         } else {
-            ready_queue_for(slot_state, shape, false).push(&slot_state, atomic_count, push_wait);
+            if (!push_streaming_ready(slot_state))
+                ready_queue_for(slot_state, shape, false).push(&slot_state, atomic_count, push_wait);
         }
         return true;
     }
