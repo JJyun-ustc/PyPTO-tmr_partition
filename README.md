@@ -1,6 +1,13 @@
 # PyPTO TMR: AICPU cluster placement study
 
-## Latest experiment: QKV round two — MIX, feedback and offline training
+## Next experiment plan: streaming TMR action scheduling
+
+**Proposal only; no new implementation or measurements.** Compare default and alternative claims at a real idle slot using only the visible event prefix. Validate A–D and diamond submission timing before residual training.
+
+- [English plan](docs/en/experiments/tmr-cluster/streaming-action-plan.md)
+- [中文方案](docs/zh/experiments/tmr-cluster/streaming-action-plan.md)
+
+## Latest completed experiment: QKV round two — MIX, feedback and offline training
 
 Same-round Shared median: **36.831 ms**. Original QKV: **40.005 ms (+8.62%)**;
 improved QKV: **37.668 ms (+2.27%)**; learned QKV: **37.616 ms (+2.13%)**.

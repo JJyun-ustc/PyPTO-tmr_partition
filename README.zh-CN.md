@@ -1,6 +1,13 @@
 # PyPTO TMR：AICPU cluster 放置研究
 
-## 最新实验：QKV 第二轮，MIX、反馈与离线训练
+## 下一轮方案：流式 TMR 动作调度
+
+**仅为设计提案，尚无新实现或测量。** S 有真实空槽时，仅用可见事件前缀比较默认领取与替代领取；先完成 A–D 和菱形提交时序验证，再决定是否训练残差模型。
+
+- [中文方案](docs/zh/experiments/tmr-cluster/streaming-action-plan.md)
+- [English plan](docs/en/experiments/tmr-cluster/streaming-action-plan.md)
+
+## 最新已完成实验：QKV 第二轮，MIX、反馈与离线训练
 
 同轮重测 Shared，中位数 **36.831 ms**；原 QKV **40.005 ms（+8.62%）**，
 改进 QKV **37.668 ms（+2.27%）**，训练型 QKV **37.616 ms（+2.13%）**。
