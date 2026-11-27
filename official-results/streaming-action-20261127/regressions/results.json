@@ -1,0 +1,122 @@
+[
+  {
+    "scene": "qkv_sync_coexist",
+    "returncode": 0,
+    "cmd": [
+      "${RUNTIME_ROOT}/.venv/bin/python",
+      "-c",
+      "import copy,multiprocessing,runpy,sys,torch\nmultiprocessing.cpu_count=lambda:2\ntorch.set_num_threads(2)\nfrom simpler_setup import SceneTestCase\noriginal=SceneTestCase.run_module\ndef run(module_name):\n    for value in list(vars(sys.modules[module_name]).values()):\n        if isinstance(value,type) and issubclass(value,SceneTestCase) and value is not SceneTestCase:\n            value.CASES=copy.deepcopy(value.CASES)\n            for case in value.CASES:\n                case.setdefault(\"config\",{})[\"aicpu_thread_num\"]=6\n    original(module_name)\nSceneTestCase.run_module=staticmethod(run)\nsys.argv=sys.argv[1:]\nrunpy.run_path(sys.argv[0],run_name=\"__main__\")\n",
+      "${RUNTIME_ROOT}/tests/st/a2a3/tensormap_and_ringbuffer/qkv_sync_coexist/test_qkv_sync_coexist.py",
+      "-p",
+      "a2a3",
+      "-d",
+      "0",
+      "--manual",
+      "include",
+      "--log-level",
+      "info",
+      "--enable-chip-swimlane",
+      "4"
+    ]
+  },
+  {
+    "scene": "spmd_multiblock_mix",
+    "returncode": 0,
+    "cmd": [
+      "${RUNTIME_ROOT}/.venv/bin/python",
+      "-c",
+      "import copy,multiprocessing,runpy,sys,torch\nmultiprocessing.cpu_count=lambda:2\ntorch.set_num_threads(2)\nfrom simpler_setup import SceneTestCase\noriginal=SceneTestCase.run_module\ndef run(module_name):\n    for value in list(vars(sys.modules[module_name]).values()):\n        if isinstance(value,type) and issubclass(value,SceneTestCase) and value is not SceneTestCase:\n            value.CASES=copy.deepcopy(value.CASES)\n            for case in value.CASES:\n                case.setdefault(\"config\",{})[\"aicpu_thread_num\"]=6\n    original(module_name)\nSceneTestCase.run_module=staticmethod(run)\nsys.argv=sys.argv[1:]\nrunpy.run_path(sys.argv[0],run_name=\"__main__\")\n",
+      "${RUNTIME_ROOT}/tests/st/a2a3/tensormap_and_ringbuffer/spmd_multiblock_mix/test_spmd_multiblock_mix.py",
+      "-p",
+      "a2a3",
+      "-d",
+      "0",
+      "--manual",
+      "include",
+      "--log-level",
+      "info",
+      "--enable-chip-swimlane",
+      "4"
+    ]
+  },
+  {
+    "scene": "qkv_mix_chain",
+    "returncode": 0,
+    "cmd": [
+      "${RUNTIME_ROOT}/.venv/bin/python",
+      "-c",
+      "import copy,multiprocessing,runpy,sys,torch\nmultiprocessing.cpu_count=lambda:2\ntorch.set_num_threads(2)\nfrom simpler_setup import SceneTestCase\noriginal=SceneTestCase.run_module\ndef run(module_name):\n    for value in list(vars(sys.modules[module_name]).values()):\n        if isinstance(value,type) and issubclass(value,SceneTestCase) and value is not SceneTestCase:\n            value.CASES=copy.deepcopy(value.CASES)\n            for case in value.CASES:\n                case.setdefault(\"config\",{})[\"aicpu_thread_num\"]=6\n    original(module_name)\nSceneTestCase.run_module=staticmethod(run)\nsys.argv=sys.argv[1:]\nrunpy.run_path(sys.argv[0],run_name=\"__main__\")\n",
+      "${RUNTIME_ROOT}/tests/st/a2a3/tensormap_and_ringbuffer/qkv_mix_chain/test_qkv_mix_chain.py",
+      "-p",
+      "a2a3",
+      "-d",
+      "0",
+      "--manual",
+      "include",
+      "--log-level",
+      "info",
+      "--enable-chip-swimlane",
+      "4"
+    ]
+  },
+  {
+    "scene": "spmd_multiblock_aiv",
+    "returncode": 0,
+    "cmd": [
+      "${RUNTIME_ROOT}/.venv/bin/python",
+      "-c",
+      "import copy,multiprocessing,runpy,sys,torch\nmultiprocessing.cpu_count=lambda:2\ntorch.set_num_threads(2)\nfrom simpler_setup import SceneTestCase\noriginal=SceneTestCase.run_module\ndef run(module_name):\n    for value in list(vars(sys.modules[module_name]).values()):\n        if isinstance(value,type) and issubclass(value,SceneTestCase) and value is not SceneTestCase:\n            value.CASES=copy.deepcopy(value.CASES)\n            for case in value.CASES:\n                case.setdefault(\"config\",{})[\"aicpu_thread_num\"]=6\n    original(module_name)\nSceneTestCase.run_module=staticmethod(run)\nsys.argv=sys.argv[1:]\nrunpy.run_path(sys.argv[0],run_name=\"__main__\")\n",
+      "${RUNTIME_ROOT}/tests/st/a2a3/tensormap_and_ringbuffer/spmd_multiblock_aiv/test_spmd_multiblock_aiv.py",
+      "-p",
+      "a2a3",
+      "-d",
+      "0",
+      "--manual",
+      "include",
+      "--log-level",
+      "info",
+      "--enable-chip-swimlane",
+      "4"
+    ]
+  },
+  {
+    "scene": "dummy_task",
+    "returncode": 0,
+    "cmd": [
+      "${RUNTIME_ROOT}/.venv/bin/python",
+      "-c",
+      "import copy,multiprocessing,runpy,sys,torch\nmultiprocessing.cpu_count=lambda:2\ntorch.set_num_threads(2)\nfrom simpler_setup import SceneTestCase\noriginal=SceneTestCase.run_module\ndef run(module_name):\n    for value in list(vars(sys.modules[module_name]).values()):\n        if isinstance(value,type) and issubclass(value,SceneTestCase) and value is not SceneTestCase:\n            value.CASES=copy.deepcopy(value.CASES)\n            for case in value.CASES:\n                case.setdefault(\"config\",{})[\"aicpu_thread_num\"]=6\n    original(module_name)\nSceneTestCase.run_module=staticmethod(run)\nsys.argv=sys.argv[1:]\nrunpy.run_path(sys.argv[0],run_name=\"__main__\")\n",
+      "${RUNTIME_ROOT}/tests/st/a2a3/tensormap_and_ringbuffer/dummy_task/test_dummy_task.py",
+      "-p",
+      "a2a3",
+      "-d",
+      "0",
+      "--manual",
+      "include",
+      "--log-level",
+      "info",
+      "--enable-chip-swimlane",
+      "4"
+    ]
+  },
+  {
+    "scene": "spmd_sync_start_early_dispatch",
+    "returncode": 0,
+    "cmd": [
+      "${RUNTIME_ROOT}/.venv/bin/python",
+      "-c",
+      "import copy,multiprocessing,runpy,sys,torch\nmultiprocessing.cpu_count=lambda:2\ntorch.set_num_threads(2)\nfrom simpler_setup import SceneTestCase\noriginal=SceneTestCase.run_module\ndef run(module_name):\n    for value in list(vars(sys.modules[module_name]).values()):\n        if isinstance(value,type) and issubclass(value,SceneTestCase) and value is not SceneTestCase:\n            value.CASES=copy.deepcopy(value.CASES)\n            for case in value.CASES:\n                case.setdefault(\"config\",{})[\"aicpu_thread_num\"]=6\n    original(module_name)\nSceneTestCase.run_module=staticmethod(run)\nsys.argv=sys.argv[1:]\nrunpy.run_path(sys.argv[0],run_name=\"__main__\")\n",
+      "${RUNTIME_ROOT}/tests/st/a2a3/tensormap_and_ringbuffer/spmd_sync_start_early_dispatch/test_spmd_sync_start_early_dispatch.py",
+      "-p",
+      "a2a3",
+      "-d",
+      "0",
+      "--manual",
+      "include",
+      "--log-level",
+      "info",
+      "--enable-chip-swimlane",
+      "4"
+    ]
+  }
+]

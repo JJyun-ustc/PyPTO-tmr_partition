@@ -1,0 +1,20 @@
+[
+  [
+    "${RUNTIME_ROOT}/.venv/bin/python",
+    "${RUNTIME_ROOT}/examples/a2a3/tensormap_and_ringbuffer/benchmark_streaming_action/run_interleaved.py",
+    "diagnose",
+    "--output",
+    "${RUNTIME_ROOT}/results/streaming-action-20261127/final-diagnose-3500",
+    "--seq-len",
+    "3500"
+  ],
+  [
+    "${RUNTIME_ROOT}/.venv/bin/python",
+    "${RUNTIME_ROOT}/examples/a2a3/tensormap_and_ringbuffer/benchmark_streaming_action/run_interleaved.py",
+    "formal",
+    "--output",
+    "${RUNTIME_ROOT}/results/streaming-action-20261127/final-formal-3500",
+    "--seq-len",
+    "3500"
+  ]
+]

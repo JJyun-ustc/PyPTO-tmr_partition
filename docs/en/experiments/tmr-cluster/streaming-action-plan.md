@@ -1,5 +1,7 @@
 # Streaming TMR: slot-triggered action scheduling plan
 
+**Execution status (2026-11-27):** [Measurements are available](streaming-action-results.md). Visibility, calibration and A/B infrastructure cost are measured. Active C/D, independent action-gain calibration and new residual training remain incomplete. The specification below is a target, not a claim that every stage is implemented.
+
 **Status: proposal, 2026-11-27. Not implemented or measured.**
 
 [中文](../../../zh/experiments/tmr-cluster/streaming-action-plan.md) · [Completed round-two results](qkv-round2.md)

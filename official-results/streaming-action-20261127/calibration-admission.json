@@ -1,0 +1,239 @@
+{
+  "status": "calibration gate closed; default-only C/D controls, not active analytical evaluation",
+  "delta_us": 0.5,
+  "preference_expiry_us": 10,
+  "summary_max_age_us": 5,
+  "max_heads": 3,
+  "max_successors": 2,
+  "max_join_fanin": 4,
+  "formal_periods": 12,
+  "formal_per_policy_per_period": 5,
+  "warmup_per_policy_per_period": 1,
+  "target_seq_len": 3500,
+  "sealed_holdout_seq_lens": [
+    2250,
+    5000
+  ],
+  "layers": 40,
+  "batch": 16,
+  "seed": 1234,
+  "locality_calibration": [
+    {
+      "bytes": 4096,
+      "reuse": 1,
+      "consumer_side": 0,
+      "paired_periods": 6,
+      "period_differences_us": [
+        0.15000000000000002,
+        0.10499999999999987,
+        -0.039999999999999925,
+        -0.20999999999999996,
+        0.2500000000000001,
+        -0.1200000000000001
+      ],
+      "median_difference_us": 0.03249999999999997,
+      "consistent_nonzero_direction": false,
+      "scope": "combined producer-side/physical-group placement; custom reuse kernel only"
+    },
+    {
+      "bytes": 4096,
+      "reuse": 1,
+      "consumer_side": 1,
+      "paired_periods": 6,
+      "period_differences_us": [
+        0.010000000000000009,
+        -0.060000000000000275,
+        0.0,
+        -0.18999999999999995,
+        0.07000000000000028,
+        0.17999999999999972
+      ],
+      "median_difference_us": 0.0050000000000000044,
+      "consistent_nonzero_direction": false,
+      "scope": "combined producer-side/physical-group placement; custom reuse kernel only"
+    },
+    {
+      "bytes": 4096,
+      "reuse": 8,
+      "consumer_side": 0,
+      "paired_periods": 6,
+      "period_differences_us": [
+        0.050000000000000266,
+        -0.16000000000000014,
+        0.07500000000000018,
+        0.1499999999999999,
+        0.1200000000000001,
+        0.015000000000000124
+      ],
+      "median_difference_us": 0.06250000000000022,
+      "consistent_nonzero_direction": false,
+      "scope": "combined producer-side/physical-group placement; custom reuse kernel only"
+    },
+    {
+      "bytes": 4096,
+      "reuse": 8,
+      "consumer_side": 1,
+      "paired_periods": 6,
+      "period_differences_us": [
+        0.009999999999999787,
+        0.040000000000000036,
+        0.0,
+        0.020000000000000462,
+        0.04999999999999982,
+        0.0
+      ],
+      "median_difference_us": 0.015000000000000124,
+      "consistent_nonzero_direction": false,
+      "scope": "combined producer-side/physical-group placement; custom reuse kernel only"
+    },
+    {
+      "bytes": 65536,
+      "reuse": 1,
+      "consumer_side": 0,
+      "paired_periods": 6,
+      "period_differences_us": [
+        0.005000000000000782,
+        0.019999999999999574,
+        -0.09999999999999964,
+        -0.13999999999999968,
+        -0.02999999999999936,
+        0.06500000000000039
+      ],
+      "median_difference_us": -0.01249999999999929,
+      "consistent_nonzero_direction": false,
+      "scope": "combined producer-side/physical-group placement; custom reuse kernel only"
+    },
+    {
+      "bytes": 65536,
+      "reuse": 1,
+      "consumer_side": 1,
+      "paired_periods": 6,
+      "period_differences_us": [
+        0.02999999999999936,
+        0.009999999999999787,
+        -0.030000000000001137,
+        0.030000000000001137,
+        0.009999999999999787,
+        0.0
+      ],
+      "median_difference_us": 0.009999999999999787,
+      "consistent_nonzero_direction": false,
+      "scope": "combined producer-side/physical-group placement; custom reuse kernel only"
+    },
+    {
+      "bytes": 65536,
+      "reuse": 8,
+      "consumer_side": 0,
+      "paired_periods": 6,
+      "period_differences_us": [
+        -0.029999999999997584,
+        -0.23000000000000043,
+        -0.015000000000000568,
+        -0.18499999999999872,
+        -0.05500000000000327,
+        0.010000000000001563
+      ],
+      "median_difference_us": -0.042500000000000426,
+      "consistent_nonzero_direction": false,
+      "scope": "combined producer-side/physical-group placement; custom reuse kernel only"
+    },
+    {
+      "bytes": 65536,
+      "reuse": 8,
+      "consumer_side": 1,
+      "paired_periods": 6,
+      "period_differences_us": [
+        0.014999999999997016,
+        0.16000000000000725,
+        0.01999999999999602,
+        0.13999999999999346,
+        0.030000000000001137,
+        0.05999999999999517
+      ],
+      "median_difference_us": 0.04499999999999815,
+      "consistent_nonzero_direction": true,
+      "scope": "combined producer-side/physical-group placement; custom reuse kernel only"
+    },
+    {
+      "bytes": 1048576,
+      "reuse": 1,
+      "consumer_side": 0,
+      "paired_periods": 6,
+      "period_differences_us": [
+        0.060000000000002274,
+        0.04999999999999716,
+        0.11000000000000654,
+        0.07000000000000028,
+        0.125,
+        -0.009999999999990905
+      ],
+      "median_difference_us": 0.06500000000000128,
+      "consistent_nonzero_direction": false,
+      "scope": "combined producer-side/physical-group placement; custom reuse kernel only"
+    },
+    {
+      "bytes": 1048576,
+      "reuse": 1,
+      "consumer_side": 1,
+      "paired_periods": 6,
+      "period_differences_us": [
+        -0.020000000000010232,
+        -0.01999999999999602,
+        0.03999999999999204,
+        0.0899999999999963,
+        0.03999999999999204,
+        -0.05000000000001137
+      ],
+      "median_difference_us": 0.00999999999999801,
+      "consistent_nonzero_direction": false,
+      "scope": "combined producer-side/physical-group placement; custom reuse kernel only"
+    },
+    {
+      "bytes": 1048576,
+      "reuse": 8,
+      "consumer_side": 0,
+      "paired_periods": 6,
+      "period_differences_us": [
+        0.09000000000003183,
+        0.12000000000000455,
+        -0.10499999999996135,
+        -0.22499999999990905,
+        -0.11000000000001364,
+        -0.2900000000000773
+      ],
+      "median_difference_us": -0.1074999999999875,
+      "consistent_nonzero_direction": false,
+      "scope": "combined producer-side/physical-group placement; custom reuse kernel only"
+    },
+    {
+      "bytes": 1048576,
+      "reuse": 8,
+      "consumer_side": 1,
+      "paired_periods": 6,
+      "period_differences_us": [
+        0.13999999999998636,
+        0.10000000000002274,
+        -0.06000000000005912,
+        0.04000000000007731,
+        0.014999999999986358,
+        0.22000000000002728
+      ],
+      "median_difference_us": 0.07000000000005002,
+      "consistent_nonzero_direction": false,
+      "scope": "combined producer-side/physical-group placement; custom reuse kernel only"
+    }
+  ],
+  "admitted_classes": [],
+  "action_optimism_paired_blocks": 0,
+  "minimum_action_calibration_blocks": 30,
+  "C_D_active": false,
+  "training_admitted": false,
+  "scope": "A/B infrastructure cost is measured. C/D are guarded default-only arms; active analytical, join, or learned benefit is not established.",
+  "frozen_at_utc": "2026-11-27T04:45:10.194016+00:00",
+  "actual_qwen_calibration": "qwen-core-calibration/summary.json",
+  "actual_qwen_span_calibration": "qwen-core-calibration/span-calibration.json",
+  "actual_qwen_paired_runs": 144,
+  "actual_qwen_placement_findings": "No consumer-side placement class has six same-direction periods above 0.5 us after physical-core matching; strict occupancy matching leaves 43 tile pairs with mixed signs.",
+  "causal_gain_calibration": "Not collected: the factual placement experiment changes producer placement, and is not an a0/a1 intervention from an identical prepared resource state.",
+  "training_status": "Not started: no independent factual two-action gain labels or admitted runtime action classes. This is an unmet gate, not evidence that QKV underperforms linear."
+}

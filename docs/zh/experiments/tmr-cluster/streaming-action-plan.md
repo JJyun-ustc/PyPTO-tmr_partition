@@ -1,5 +1,7 @@
 # 流式 TMR：空槽触发的动作调度实验方案
 
+**执行状态（2026-11-27）**：[已有实测结果](streaming-action-results.md)。仅完成可见性、标定与 A/B 基础设施成本；主动 C/D、独立两动作收益标定和新残差训练尚未完成。以下仍为目标规格，不代表全部已实现。
+
 **状态：设计提案，2026-11-27。尚未实现或测量。**
 
 [English](../../../en/experiments/tmr-cluster/streaming-action-plan.md) · [已完成的第二轮结果](qkv-round2.md)

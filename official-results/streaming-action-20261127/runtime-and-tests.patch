@@ -1,0 +1,3391 @@
+diff --git a/src/a2a3/runtime/tensormap_and_ringbuffer/aicpu/aicpu_executor.cpp b/src/a2a3/runtime/tensormap_and_ringbuffer/aicpu/aicpu_executor.cpp
+index b814ca08d..915156285 100644
+--- a/src/a2a3/runtime/tensormap_and_ringbuffer/aicpu/aicpu_executor.cpp
++++ b/src/a2a3/runtime/tensormap_and_ringbuffer/aicpu/aicpu_executor.cpp
+@@ -157,6 +157,17 @@ static void dump_qkv_round2(const simpler::tmr::QkvTrace &tr) {
+             );
+         }
+         LOG_INFO("QKV_R2_TASKS %s", buffer);
++        const auto &r = tr.tasks[i];
++        LOG_INFO(
++            "STREAM_VIS task=%llu registered=%llu observed=%llu state=%llu join_index=%llu fanin=%u physical_group=%d "
++            "claim=%llu epoch=%llu succ0=%llu reg0=%llu succ1=%llu reg1=%llu",
++            (unsigned long long)r.task, (unsigned long long)r.registered_at.load(),
++            (unsigned long long)r.observation_ts, (unsigned long long)r.visibility_state,
++            (unsigned long long)r.visible_join, r.predecessor_count, r.physical_group.load(),
++            (unsigned long long)r.claim.load(), (unsigned long long)r.captured_epoch,
++            (unsigned long long)r.observed_successor[0], (unsigned long long)r.observed_registration[0],
++            (unsigned long long)r.observed_successor[1], (unsigned long long)r.observed_registration[1]
++        );
+     }
+     for (uint32_t i = 0; i < tr.edge_count; i += 16) {
+         char buffer[4096];
+@@ -1135,6 +1146,42 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
+         // every subsequent run.
+         if (rt != nullptr) {
+             auto &q = rt->scheduler.qkv;
++            uint64_t stream_claimed = 0, stream_eligible_claimed = 0, stream_multi = 0, stream_race = 0;
++            for (const auto &row : q.trace.streaming) {
++                stream_claimed += row.claimed;
++                stream_eligible_claimed += row.eligible_claimed;
++                stream_multi += row.multiple;
++                stream_race += row.race;
++            }
++            LOG_INFO(
++                "STREAM_RUN mode=%d eligible=%llu claimed=%llu eligible_claimed=%llu multi=%llu race=%llu "
++                "tasks=%u dropped=%u overrides=0 calibration_admitted=0",
++                q.mode, (unsigned long long)q.eligible.load(), (unsigned long long)stream_claimed,
++                (unsigned long long)stream_eligible_claimed, (unsigned long long)stream_multi,
++                (unsigned long long)stream_race, q.trace.count, q.trace.dropped
++            );
++            if (q.mode >= 7 && q.mode <= 9 && q.trace.level) {
++                LOG_INFO(
++                    "STREAM_SUMMARY mode=%d eligible=%llu tasks=%u dropped=%u neutral_only=1 calibration_admitted=0",
++                    q.mode, (unsigned long long)q.eligible.load(), q.trace.count, q.trace.dropped
++                );
++                for (int t = 0; t < 6; ++t) {
++                    const auto &s = q.trace.streaming[t];
++                    LOG_INFO(
++                        "STREAM_THREAD t=%d pops=%llu heads=%llu single=%llu multi=%llu race=%llu empty=%llu "
++                        "comparisons=%llu overrides=%llu uncalibrated=%llu samples=%llu claimed=%llu "
++                        "eligible_claimed=%llu",
++                        t, (unsigned long long)s.pops, (unsigned long long)s.heads, (unsigned long long)s.single,
++                        (unsigned long long)s.multiple, (unsigned long long)s.race, (unsigned long long)s.empty,
++                        (unsigned long long)s.comparisons, (unsigned long long)s.overrides,
++                        (unsigned long long)s.no_calibration, (unsigned long long)s.sample_count,
++                        (unsigned long long)s.claimed, (unsigned long long)s.eligible_claimed
++                    );
++                    if (q.trace.level)
++                        for (uint64_t i = 0; i < s.sample_count; ++i)
++                            LOG_INFO("STREAM_COST t=%d ticks=%llu", t, (unsigned long long)s.samples[i]);
++                }
++            }
+             if (q.trace.level) {
+                 dump_qkv_round2(q.trace);
+                 LOG_INFO(
+diff --git a/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/orchestrator.cpp b/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/orchestrator.cpp
+index f74c8c3ce..74850ab08 100644
+--- a/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/orchestrator.cpp
++++ b/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/orchestrator.cpp
+@@ -1363,6 +1363,7 @@ static TaskOutputTensors submit_task_common(
+         ++orch->cluster_partitioner.trace.calls[5];
+     }
+ #endif
++    sched->qkv_registration_complete(cur_slot_state);
+     CYCLE_COUNT_LAP(g_orch_fanin_cycle);
+     CYCLE_COUNT_ORCH_SUBMIT_RECORD(task_id);
+ 
+diff --git a/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/qkv_trace.h b/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/qkv_trace.h
+index 7712d9829..6d6edd91f 100644
+--- a/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/qkv_trace.h
++++ b/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/qkv_trace.h
+@@ -18,9 +18,17 @@ constexpr uint32_t QKV_TRACE_EDGES = 131072;
+ // All timestamps are AICPU counter ticks. Actual kernel start is unavailable;
+ // start_proxy distinguishes idle publication, promotion and gated release.
+ struct QkvTaskTrace {
+-    uint64_t task{0}, created{0}, ready{0}, pop{0}, publish{0}, completed{0};
++    uint64_t task{0}, created{0}, pop{0}, publish{0}, completed{0};
++    std::atomic<uint64_t> ready{0}, registered_at{0}, claim{0};
++    uint32_t predecessors[4]{};
++    uint32_t predecessor_count{0};
++    std::atomic<uint32_t> successors[2]{};
++    std::atomic<uint64_t> successor_overflow{0};
++    uint64_t visible_join{0}, observation_ts{0}, visibility_state{0}, submit_epoch{0}, captured_epoch{0};
++    std::atomic<uint64_t> registered_epoch{0};
++    uint64_t observed_successor[2]{}, observed_registration[2]{};
+     std::atomic<uint64_t> dispatch{0}, start_proxy{0}, first_fin{0}, fin{0};
+-    std::atomic<int> proxy_kind{0}, dispatch_side{-1}, scheduler{-1};
++    std::atomic<int> proxy_kind{0}, dispatch_side{-1}, scheduler{-1}, physical_group{-1};
+     int kernel[3]{}, blocks{0}, shape{0}, mask{0}, sync{0}, selected{-1}, fanout{0};
+     uint64_t dummy_begin{0}, dummy_end{0};
+     double features[2][5]{};  // queued/capacity, occupied, idle fraction, capacity, reservations/capacity
+@@ -28,7 +36,23 @@ struct QkvTaskTrace {
+     void init(uint64_t id, uint64_t now) {
+         task = id;
+         created = now;
+-        ready = pop = publish = completed = dummy_begin = dummy_end = summary_age = 0;
++        pop = publish = completed = dummy_begin = dummy_end = summary_age = 0;
++        ready.store(0);
++        registered_at.store(0);
++        registered_epoch.store(0);
++        submit_epoch = captured_epoch = 0;
++        for (auto &x : observed_successor)
++            x = 0;
++        for (auto &x : observed_registration)
++            x = 0;
++        claim.store(0);
++        predecessor_count = 0;
++        for (auto &p : predecessors)
++            p = 0;
++        for (auto &p : successors)
++            p.store(0);
++        successor_overflow.store(0);
++        visible_join = observation_ts = visibility_state = 0;
+         dispatch.store(0);
+         start_proxy.store(0);
+         first_fin.store(0);
+@@ -36,6 +60,7 @@ struct QkvTaskTrace {
+         proxy_kind.store(0);
+         dispatch_side.store(-1);
+         scheduler.store(-1);
++        physical_group.store(-1);
+         selected = -1;
+         fanout = 0;
+         for (auto &side : features)
+@@ -53,7 +78,16 @@ struct QkvTaskTrace {
+ struct QkvTraceEdge {
+     uint64_t producer{0}, consumer{0};
+ };
++struct alignas(64) StreamCounters {
++    uint64_t pops{0}, heads{0}, single{0}, multiple{0}, race{0}, empty{0}, claimed{0}, eligible_claimed{0};
++    uint64_t comparisons{0}, overrides{0}, no_calibration{0};
++    uint64_t sample_count{0}, samples[2048]{};
++};
+ struct QkvTrace {
++    uint32_t calibration_seen[37]{};
++    uint64_t next_epoch{0};  // one orchestrator writer
++    std::atomic<uint64_t> published_epoch{0};
++    StreamCounters streaming[6];
+     int level{0};                                  // 0 off, 1 deterministic 1/32 plus MIX/DUMMY, 2 full DAG diagnostics
+     uint32_t count{0}, edge_count{0}, dropped{0};  // creation/wiring has one O writer
+     QkvTaskTrace tasks[QKV_TRACE_TASKS];
+@@ -67,7 +101,13 @@ struct QkvTrace {
+     uint64_t early_slots[6][4]{};  // S0: pop, snapshot, score, publication
+     uint64_t service_hist[4][32]{};
+     void reset() {
++        for (auto &row : streaming)
++            row = StreamCounters{};
+         level = 0;
++        for (auto &x : calibration_seen)
++            x = 0;
++        next_epoch = 0;
++        published_epoch.store(0);
+         count = edge_count = dropped = 0;
+         service_calls = 0;
+         shadow_count = 0;
+diff --git a/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler.h b/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler.h
+index 5cd64eee7..be9f39974 100644
+--- a/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler.h
++++ b/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler.h
+@@ -65,6 +65,8 @@ struct ChipReadyQueueSlot {
+     std::atomic<int64_t> sequence;
+     ChipTaskSlotState *slot_state;
+     TaskId task_id_snapshot;
++    // Scalar observation only; no speculative task-pointer access. Records live until quiescence.
++    std::atomic<uint64_t> observation{0};
+ };
+ 
+ /**
+@@ -81,7 +83,8 @@ struct alignas(64) ChipReadyQueue {
+     ChipReadyQueueSlot *slots;
+     uint64_t capacity;
+     uint64_t mask;        // capacity - 1
+-    char _pad0[64 - 24];  // Pad to own cache line
++    uint64_t observe_metadata{0};
++    char _pad0[64 - 32];  // Pad to own cache line
+ 
+     std::atomic<uint64_t> enqueue_pos;
+     char _pad1[64 - sizeof(std::atomic<uint64_t>)];  // Own cache line
+@@ -89,6 +92,35 @@ struct alignas(64) ChipReadyQueue {
+     std::atomic<uint64_t> dequeue_pos;
+     char _pad2[64 - sizeof(std::atomic<uint64_t>)];  // Own cache line
+ 
++    struct HeadToken {
++        uint64_t ticket{0}, record{0};
++    };
++    bool observe_head(HeadToken &out) {
++        const uint64_t pos = dequeue_pos.load(std::memory_order_acquire);
++        auto &entry = slots[pos & mask];
++        if (entry.sequence.load(std::memory_order_acquire) != static_cast<int64_t>(pos + 1)) return false;
++        const uint64_t record = entry.observation.load(std::memory_order_acquire);
++        // Reading a recycled record synchronizes with its writer's release;
++        // its preceding sequence reset then invalidates this old ticket.
++        if (entry.sequence.load(std::memory_order_acquire) != static_cast<int64_t>(pos + 1) ||
++            dequeue_pos.load(std::memory_order_acquire) != pos)
++            return false;
++        out = {pos, record};
++        return true;
++    }
++    ChipTaskSlotState *consume_exact(const HeadToken &head) {
++        auto &entry = slots[head.ticket & mask];
++        if (entry.sequence.load(std::memory_order_acquire) != static_cast<int64_t>(head.ticket + 1)) return nullptr;
++        uint64_t expected = head.ticket;
++        if (!dequeue_pos.compare_exchange_strong(expected, expected + 1, std::memory_order_acq_rel)) return nullptr;
++        auto *result = entry.slot_state;
++        entry.sequence.store(static_cast<int64_t>(head.ticket + capacity), std::memory_order_release);
++        return result;
++    }
++    void publish_observation(ChipReadyQueueSlot &entry, ChipTaskSlotState *task) {
++        if (observe_metadata) entry.observation.store(task->payload->placement.group, std::memory_order_release);
++    }
++
+     uint64_t size() {
+         uint64_t e = enqueue_pos.load(std::memory_order_relaxed);
+         uint64_t d = dequeue_pos.load(std::memory_order_relaxed);
+@@ -124,6 +156,7 @@ struct alignas(64) ChipReadyQueue {
+ 
+         slot->slot_state = slot_state;
+         slot->task_id_snapshot = task_id_snapshot;
++        publish_observation(*slot, slot_state);
+         slot->sequence.store(static_cast<int64_t>(pos + 1), std::memory_order_release);
+         return true;
+     }
+@@ -170,6 +203,7 @@ struct alignas(64) ChipReadyQueue {
+             ChipReadyQueueSlot *slot = &slots[(pos + i) & mask];
+             slot->slot_state = items[i];
+             slot->task_id_snapshot = task_id_snapshots == nullptr ? TaskId::invalid() : task_id_snapshots[i];
++            publish_observation(*slot, items[i]);
+             slot->sequence.store(static_cast<int64_t>(pos + i + 1), std::memory_order_release);
+         }
+         return true;
+@@ -210,6 +244,7 @@ struct alignas(64) ChipReadyQueue {
+         }
+ 
+         slot->slot_state = slot_state;
++        publish_observation(*slot, slot_state);
+         slot->sequence.store(static_cast<int64_t>(pos + 1), std::memory_order_release);
+         return true;
+     }
+@@ -439,6 +474,7 @@ struct SchedulerLayout {
+     size_t off_cluster_ready_queue_slots[2][NUM_RESOURCE_SHAPES];
+     size_t off_cluster_dummy_queue_slots[2];
+     size_t off_auto_ready_queue_slots[2][NUM_RESOURCE_SHAPES];
++    size_t off_streaming_preference_slots[2][2];
+     size_t off_early_dispatch_queue_slots[NUM_RESOURCE_SHAPES];
+     size_t off_early_sync_start_queue_slots;
+     size_t off_dep_pool_entries[CHIP_MAX_RING_DEPTH];
+@@ -454,6 +490,7 @@ struct SchedulerLayout {
+  * Hot-path methods are defined inline (implicitly inline as member functions).
+  */
+ struct SchedulerState {
++    static constexpr uint64_t STREAM_PREFERENCE_CAPACITY = 64;
+     // Shared memory access
+     SharedMemoryHeader *sm_header;
+ 
+@@ -528,6 +565,7 @@ struct SchedulerState {
+     ChipReadyQueue cluster_ready_queues[2][NUM_RESOURCE_SHAPES];
+     // Only movable automatic single-block compute tasks enter these queues.
+     ChipReadyQueue auto_ready_queues[2][NUM_RESOURCE_SHAPES];
++    ChipReadyQueue streaming_preference_queues[2][2];
+ 
+     // Ready sync_start queues, one per shape. A ready sync_start cohort parks here
+     // instead of ready_queues[] so the dispatch loop can drain it as a strict Tier-0
+@@ -561,15 +599,22 @@ struct SchedulerState {
+             }
+     }
+     simpler::tmr::QkvTaskTrace *qkv_record(ChipTaskSlotState &slot) {
+-        if (!qkv.trace.level || slot.payload->placement.scope) return nullptr;
++        if ((!qkv.trace.level && qkv.mode < 7) || slot.payload->placement.scope) return nullptr;
+         uint32_t idx = slot.payload->placement.group;
+         return idx && idx <= simpler::tmr::QKV_TRACE_TASKS ? &qkv.trace.tasks[idx - 1] : nullptr;
+     }
+     void qkv_trace_create(ChipTaskSlotState &slot) {
+-        if (!qkv.trace.level || slot.payload->placement.scope) return;
++        if ((!qkv.trace.level && qkv.mode < 7) || slot.payload->placement.scope) return;
+         uint64_t id = TaskId::to_uint64(slot.task->task_id);
+         int shape = static_cast<int>(slot.active_mask.to_shape());
+-        if (qkv.trace.level == 1 && (id & 31) && shape < 2) return;
++        if (qkv.mode < 7 && qkv.trace.level == 1 && (id & 31) && shape < 2) return;
++        if (qkv.trace.level == 3) {
++            int kernel = slot.task->kernel_id[0] >= 0 ? slot.task->kernel_id[0] : slot.task->kernel_id[1];
++            if (kernel < 31 || kernel > 34) return;
++            uint32_t occurrence = qkv.trace.calibration_seen[kernel]++;
++            uint32_t stride = kernel == 33 ? 17u : (kernel == 34 ? 85u : 55u);
++            if (occurrence % stride) return;
++        }
+         if (qkv.trace.count == simpler::tmr::QKV_TRACE_TASKS) {
+             ++qkv.trace.dropped;
+             return;
+@@ -584,9 +629,55 @@ struct SchedulerState {
+         for (int k = 0; k < 3; ++k)
+             r.kernel[k] = slot.task->kernel_id[k];
+         slot.payload->placement.group = index + 1;
++        r.submit_epoch = ++qkv.trace.next_epoch;
++        if (qkv.trace.level == 2 || qkv.mode >= 7) {
++            for_each_fanin_slot_state(*slot.payload, [&](ChipTaskSlotState *producer, DepFlags flags) {
++                if (!dep_has_wait(flags)) return;
++                uint32_t pi = producer->payload->placement.group;
++                if (r.predecessor_count < 4) r.predecessors[r.predecessor_count] = pi;
++                ++r.predecessor_count;
++                auto *pr = qkv_record(*producer);
++                if (pr == nullptr) return;
++                uint32_t empty = 0;
++                if (!pr->successors[0].compare_exchange_strong(empty, index + 1)) {
++                    empty = 0;
++                    if (!pr->successors[1].compare_exchange_strong(empty, index + 1)) {
++                        uint64_t zero = 0;
++                        pr->successor_overflow.compare_exchange_strong(zero, r.submit_epoch);
++                    }
++                }
++            });
++        }
++        qkv.trace.published_epoch.store(r.submit_epoch, std::memory_order_release);
++    }
++    void qkv_registration_complete(ChipTaskSlotState &slot) {
++        if (auto *r = qkv_record(slot)) {
++            r->registered_at.store(get_sys_cnt_aicpu(), std::memory_order_release);
++            uint64_t epoch = ++qkv.trace.next_epoch;
++            r->registered_epoch.store(epoch, std::memory_order_release);
++            qkv.trace.published_epoch.store(epoch, std::memory_order_release);
++        }
++    }
++    ChipReadyQueue &streaming_lane(ResourceShape shape, int lane) {
++        int resource = static_cast<int>(shape);
++        always_assert(resource < 2 && lane >= 0 && lane < 3);
++        return lane == 0 ? ready_queues[resource] : streaming_preference_queues[lane - 1][resource];
++    }
++    bool push_streaming_ready(ChipTaskSlotState &slot) {
++        if (qkv.mode < 7 || qkv.mode > 9 || slot.payload->placement.scope || slot.task->target_aicpu_cluster >= 0 ||
++            slot.logical_block_num != 1 || slot.next_block_idx.load(std::memory_order_relaxed) != 0 ||
++            slot.task_attrs.requires_sync_start() || slot.task_attrs.has_predicate() ||
++            static_cast<int>(slot.active_mask.to_shape()) > 1)
++            return false;
++        // No placement class passed paired calibration's significance threshold.
++        // Unknown locality remains neutral; there is no assumed same-side bonus.
++        qkv.eligible.fetch_add(1, std::memory_order_relaxed);
++        // Publication remains in the original neutral lane and retains its
++        // original capacity/progress protocol. No second queue owns the task.
++        return false;
+     }
+     void qkv_trace_ready(ChipTaskSlotState &slot) {
+-        if (auto *r = qkv_record(slot)) r->ready = get_sys_cnt_aicpu();
++        if (auto *r = qkv_record(slot)) simpler::tmr::QkvTaskTrace::first(r->ready, get_sys_cnt_aicpu());
+     }
+     void qkv_trace_publish(ChipTaskSlotState &slot) {
+         if (auto *r = qkv_record(slot)) {
+@@ -784,6 +875,9 @@ struct SchedulerState {
+     // the per-shape ready_sync_queues[] (drained as Tier-0); everything else to
+     // ready_queues[].
+     void push_ready_routed(ChipTaskSlotState *slot_state) {
++        if (qkv.mode >= 7 && qkv.mode <= 9 && !try_claim_ready_once(*slot_state)) return;
++        qkv_trace_ready(*slot_state);
++        qkv_trace_publish(*slot_state);
+         stamp_ready_queue(*slot_state);
+         ResourceShape shape = slot_state->active_mask.to_shape();
+         if (shape == ResourceShape::DUMMY ||
+@@ -792,7 +886,7 @@ struct SchedulerState {
+         } else if (slot_state->task_attrs.requires_sync_start()) {
+             ready_queue_for(*slot_state, shape, true).push(slot_state);
+         } else {
+-            ready_queue_for(*slot_state, shape, false).push(slot_state);
++            if (!push_streaming_ready(*slot_state)) ready_queue_for(*slot_state, shape, false).push(slot_state);
+         }
+     }
+ 
+@@ -1379,7 +1473,7 @@ struct SchedulerState {
+         } else if (slot_state.task_attrs.requires_sync_start()) {
+             ready_queue_for(slot_state, shape, true).push(&slot_state);
+         } else {
+-            ready_queue_for(slot_state, shape, false).push(&slot_state);
++            if (!push_streaming_ready(slot_state)) ready_queue_for(slot_state, shape, false).push(&slot_state);
+         }
+         return true;
+     }
+@@ -1429,7 +1523,8 @@ struct SchedulerState {
+         } else if (slot_state.task_attrs.requires_sync_start()) {
+             ready_queue_for(slot_state, shape, true).push(&slot_state, atomic_count, push_wait);
+         } else {
+-            ready_queue_for(slot_state, shape, false).push(&slot_state, atomic_count, push_wait);
++            if (!push_streaming_ready(slot_state))
++                ready_queue_for(slot_state, shape, false).push(&slot_state, atomic_count, push_wait);
+         }
+         return true;
+     }
+diff --git a/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler_dispatch.cpp b/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler_dispatch.cpp
+index 3341d79dc..36a2fe468 100644
+--- a/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler_dispatch.cpp
++++ b/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler_dispatch.cpp
+@@ -95,6 +95,59 @@ bool SchedulerContext::has_idle_in_other_threads(int32_t self_thread_idx, Resour
+ int SchedulerContext::pop_ready_tasks_batch(
+     ChipReadyQueue *queues, ResourceShape shape, int32_t thread_idx, ChipTaskSlotState **out, int max_count
+ ) {
++    if (sched_->qkv.mode >= 7 && sched_->qkv.mode <= 9 && queues == sched_->ready_queues &&
++        static_cast<int>(shape) < 2) {
++        auto &stats = sched_->qkv.trace.streaming[thread_idx];
++        int count = 0;
++        bool sample = sched_->qkv.trace.level && (stats.pops & 31) == 0;
++        uint64_t begin = sample ? get_sys_cnt_aicpu() : 0;
++        ++stats.pops;
++        ChipReadyQueue *lanes[3] = {
++            &sched_->streaming_lane(shape, 0), &sched_->streaming_lane(shape, 1), &sched_->streaming_lane(shape, 2)
++        };
++        for (int bi = 0; bi < max_count; ++bi) {
++            ChipReadyQueue::HeadToken heads[3];
++            int best = -1, visible = 0;
++            uint64_t oldest = UINT64_MAX;
++            for (int q = 0; q < 3; ++q) {
++                if (!lanes[q]->observe_head(heads[q])) continue;
++                ++visible;
++                uint64_t ready = 0;
++                if (heads[q].record && heads[q].record <= simpler::tmr::QKV_TRACE_TASKS)
++                    ready = sched_->qkv.trace.tasks[heads[q].record - 1].ready.load(std::memory_order_acquire);
++                if (best < 0 || ready < oldest) {
++                    best = q;
++                    oldest = ready;
++                }
++            }
++            stats.heads += visible;
++            if (best < 0) {
++                ++stats.empty;
++                break;
++            }
++            if (visible == 1) ++stats.single;
++            else {
++                ++stats.multiple;
++                if (sched_->qkv.mode != 7) ++stats.no_calibration;
++            }
++            // No class passed locality admission. C/D retain the common B
++            // default; an uncalibrated action difference cannot grant an override.
++            auto *owned = lanes[best]->consume_exact(heads[best]);
++            if (!owned) {
++                ++stats.race;
++                break;
++            }
++            if (heads[best].record && heads[best].record <= simpler::tmr::QKV_TRACE_TASKS) {
++                const auto &record = sched_->qkv.trace.tasks[heads[best].record - 1];
++                always_assert(record.task == TaskId::to_uint64(owned->task->task_id));
++                always_assert(owned->payload->placement.group == heads[best].record);
++            }
++            out[count++] = owned;
++            ++stats.claimed;
++        }
++        if (sample && stats.sample_count < 2048) stats.samples[stats.sample_count++] = get_sys_cnt_aicpu() - begin;
++        return count;
++    }
+ #if SIMPLER_DFX
+     auto &chip_swimlane = sched_chip_swimlane_[thread_idx];
+ #if SIMPLER_SCHED_PROFILING
+@@ -118,13 +171,55 @@ int SchedulerContext::pop_ready_tasks_batch(
+     (void)thread_idx;
+     int count = sched_->get_ready_tasks_batch(queues, shape, out, max_count);
+ #endif
++    if (sched_->qkv.trace.level == 2 && queues == sched_->ready_queues && static_cast<int>(shape) < 2) {
++        for (int i = 0; i < count; ++i) {
++            auto &task = *out[i];
++            if (task.logical_block_num != 1 || task.task_attrs.requires_sync_start() ||
++                task.task_attrs.has_predicate() || task.task->target_aicpu_cluster >= 0)
++                continue;
++            auto *record = sched_->qkv_record(task);
++            if (record == nullptr || record->observation_ts) continue;
++            record->observation_ts = get_sys_cnt_aicpu();
++            record->captured_epoch = sched_->qkv.trace.published_epoch.load(std::memory_order_acquire);
++            uint64_t overflow_epoch = record->successor_overflow.load(std::memory_order_acquire);
++            if (overflow_epoch && overflow_epoch <= record->captured_epoch) record->visibility_state = 3;
++            else
++                for (int k = 0; k < 2; ++k) {
++                    uint32_t index = record->successors[k].load(std::memory_order_acquire);
++                    if (!index || index > simpler::tmr::QKV_TRACE_TASKS) continue;
++                    const auto &join = sched_->qkv.trace.tasks[index - 1];
++                    // The successor index may publish before submission metadata commits.
++                    if (join.submit_epoch > record->captured_epoch) continue;
++                    uint64_t registered = join.registered_epoch.load(std::memory_order_acquire);
++                    record->observed_successor[k] = index;
++                    record->observed_registration[k] = registered <= record->captured_epoch ? registered : 0;
++                    if (!registered || registered > record->captured_epoch) {
++                        record->visibility_state = record->visibility_state ? record->visibility_state : 1;
++                        continue;
++                    }
++                    record->observed_successor[k] = index;
++                    record->observed_registration[k] = registered;
++                    if (join.predecessor_count <= 4) {
++                        record->visibility_state = 2;
++                        record->visible_join = index;
++                        break;
++                    }
++                    record->visibility_state = 4;  // complete but exceeds the explicit fanin budget
++                }
++        }
++    }
+     return count;
+ }
+ 
+ void SchedulerContext::init_qkv(Runtime *runtime, SchedulerState *state) {
+     auto &q = state->qkv;
+     q.mode = runtime->dev.qkv_batch;
+-    q.enabled = q.mode != 0;
++    q.enabled = q.mode > 0 && q.mode < 7;
++    for (int r = 0; r < 2; ++r) {
++        state->ready_queues[r].observe_metadata = q.mode >= 7 && q.mode <= 9;
++        for (int c = 0; c < 2; ++c)
++            state->streaming_preference_queues[c][r].observe_metadata = q.mode >= 7 && q.mode <= 9;
++    }
+     q.trace.level = runtime->dev.qkv_trace_level;
+     q.schedulers = sched_thread_num_;
+     if (!q.enabled && !q.trace.level) return;
+@@ -308,6 +403,38 @@ SchedulerContext::PublishHandle SchedulerContext::prepare_subtask_to_core(
+     CoreTracker &tracker = core_trackers_[thread_idx];
+     auto core_id = tracker.get_core_id_by_offset(core_offset);
+     auto *qkv_record = sched_->qkv_record(slot_state);
++    if (qkv_record && slot_state.logical_block_num == 1 && qkv_record->shape < 2) {
++        int group_aic = tracker.get_core_id_by_offset((core_offset / 3) * 3);
++#if SIMPLER_DFX
++        int physical = physical_core_ids_[group_aic];
++#else
++        int physical = core_exec_states_[group_aic].physical_core_id;
++#endif
++        qkv_record->physical_group.store(physical);
++    }
++    if (qkv_record && sched_->qkv.trace.level == 3 && qkv_record->shape < 2) {
++        auto shape = static_cast<ResourceShape>(qkv_record->shape);
++        qkv_record->features[0][0] = tracker.resource_capacity(shape);
++        qkv_record->features[0][1] = tracker.get_dispatchable_cores(shape, CoreTracker::DispatchPhase::IDLE).count();
++        qkv_record->features[0][2] = tracker.get_dispatchable_cores(shape, CoreTracker::DispatchPhase::PENDING).count();
++        qkv_record->features[0][3] = to_pending;
++        qkv_record->features[0][4] = static_cast<int>(subslot);
++        uint64_t oldest = get_sys_cnt_aicpu();
++        bool valid = true;
++        for (int t = 0; t < sched_->qkv.schedulers; ++t) {
++            auto &row = sched_->qkv.threads[t];
++            uint64_t stamp = row.stamp.load(std::memory_order_acquire);
++            int side = sched_->qkv.side[t];
++            for (int resource = 0; resource < 2; ++resource) {
++                uint64_t word = row.resources[resource].load(std::memory_order_acquire);
++                qkv_record->features[1][resource * 2 + side] += (word >> 16) & 255;
++                if (!stamp || !word) valid = false;
++            }
++            if (stamp < oldest) oldest = stamp;
++        }
++        qkv_record->summary_age = get_sys_cnt_aicpu() - oldest;
++        qkv_record->features[1][4] = valid;
++    }
+     bool qkv_start_now =
+         !to_pending && !force_gate &&
+         slot_state.payload->early_dispatch_state.load(std::memory_order_relaxed) != EARLY_DISPATCH_STAGING;
+@@ -610,6 +737,13 @@ void SchedulerContext::dispatch_shape(
+             int32_t start = 0;
+             int32_t claim = slot_state->claim_block_range(slot_state->logical_block_num, available, start);
+             if (claim == 0) continue;
++            if (sched_->qkv.mode >= 7 && sched_->qkv.mode <= 9 && static_cast<int>(shape) < 2 &&
++                slot_state->logical_block_num == 1 && !slot_state->task_attrs.requires_sync_start() &&
++                !slot_state->task_attrs.has_predicate() && slot_state->task->target_aicpu_cluster < 0 &&
++                !slot_state->payload->placement.scope)
++                ++sched_->qkv.trace.streaming[thread_idx].eligible_claimed;
++            if (auto *record = sched_->qkv_record(*slot_state))
++                simpler::tmr::QkvTaskTrace::first(record->claim, get_sys_cnt_aicpu());
+             if (slot_state->payload->placement.reserved == 2) {
+                 auto &row = sched_->qkv.threads[thread_idx];
+                 int side = slot_state->task->target_aicpu_cluster;
+diff --git a/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/shared/runtime_init.cpp b/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/shared/runtime_init.cpp
+index fc0571b19..f046a7899 100644
+--- a/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/shared/runtime_init.cpp
++++ b/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/shared/runtime_init.cpp
+@@ -59,6 +59,7 @@ bool ready_queue_init_data_from_layout(ChipReadyQueue *queue, DeviceArena &arena
+     // Address the slots region for data writes without storing the pointer in
+     // queue->slots — that field is set by ready_queue_wire_arena_pointers.
+     auto *slots_arena = static_cast<ChipReadyQueueSlot *>(arena.region_ptr(slots_off));
++    queue->observe_metadata = 0;
+     queue->capacity = capacity;
+     queue->mask = capacity - 1;
+     queue->enqueue_pos.store(0, std::memory_order_relaxed);
+@@ -67,6 +68,7 @@ bool ready_queue_init_data_from_layout(ChipReadyQueue *queue, DeviceArena &arena
+     for (uint64_t i = 0; i < capacity; i++) {
+         slots_arena[i].sequence.store((int64_t)i, std::memory_order_relaxed);
+         slots_arena[i].slot_state = nullptr;
++        slots_arena[i].observation.store(0, std::memory_order_relaxed);
+     }
+ 
+     return true;
+@@ -147,6 +149,9 @@ SchedulerState::reserve_layout(DeviceArena &arena, const int32_t dep_pool_capaci
+         for (int i = 0; i < NUM_RESOURCE_SHAPES; i++) {
+             layout.off_cluster_ready_queue_slots[c][i] = ready_queue_reserve_layout(arena, CHIP_READY_QUEUE_SIZE);
+             layout.off_auto_ready_queue_slots[c][i] = ready_queue_reserve_layout(arena, CHIP_READY_QUEUE_SIZE);
++            if (i < 2)
++                layout.off_streaming_preference_slots[c][i] =
++                    ready_queue_reserve_layout(arena, SchedulerState::STREAM_PREFERENCE_CAPACITY);
+         }
+         layout.off_cluster_dummy_queue_slots[c] = ready_queue_reserve_layout(arena, CHIP_READY_QUEUE_SIZE);
+     }
+@@ -218,6 +223,13 @@ bool SchedulerState::init_data_from_layout(const SchedulerLayout &layout, Device
+                 return false;
+             }
+         }
++        for (int r = 0; r < 2; ++r) {
++            if (!ready_queue_init_data_from_layout(
++                    &sched->streaming_preference_queues[c][r], arena, layout.off_streaming_preference_slots[c][r],
++                    SchedulerState::STREAM_PREFERENCE_CAPACITY
++                ))
++                return false;
++        }
+         if (!ready_queue_init_data_from_layout(
+                 &sched->cluster_dummy_queues[c], arena, layout.off_cluster_dummy_queue_slots[c],
+                 layout.ready_queue_capacity
+@@ -280,6 +292,8 @@ void SchedulerState::reset_for_reuse(const SchedulerLayout &layout, void *sm_dev
+             sched->cluster_ready_queues[c][i].reset_for_reuse();
+             sched->auto_ready_queues[c][i].reset_for_reuse();
+         }
++        for (int r = 0; r < 2; ++r)
++            sched->streaming_preference_queues[c][r].reset_for_reuse();
+         sched->cluster_dummy_queues[c].reset_for_reuse();
+     }
+     for (int i = 0; i < NUM_RESOURCE_SHAPES; i++) {
+@@ -310,6 +324,10 @@ void SchedulerState::wire_arena_pointers(const SchedulerLayout &layout, DeviceAr
+                 &sched->cluster_ready_queues[c][i], arena, layout.off_cluster_ready_queue_slots[c][i]
+             );
+         }
++        for (int r = 0; r < 2; ++r)
++            ready_queue_wire_arena_pointers(
++                &sched->streaming_preference_queues[c][r], arena, layout.off_streaming_preference_slots[c][r]
++            );
+         ready_queue_wire_arena_pointers(
+             &sched->cluster_dummy_queues[c], arena, layout.off_cluster_dummy_queue_slots[c]
+         );
+@@ -344,6 +362,7 @@ void SchedulerState::destroy() {
+         for (int i = 0; i < NUM_RESOURCE_SHAPES; i++) {
+             ready_queue_destroy(&sched->cluster_ready_queues[c][i]);
+             ready_queue_destroy(&sched->auto_ready_queues[c][i]);
++            if (i < 2) ready_queue_destroy(&sched->streaming_preference_queues[c][i]);
+         }
+         ready_queue_destroy(&sched->cluster_dummy_queues[c]);
+     }
+diff --git a/tests/ut/cpp/a2a3/runtime/tensormap_and_ringbuffer/test_scheduler_state.cpp b/tests/ut/cpp/a2a3/runtime/tensormap_and_ringbuffer/test_scheduler_state.cpp
+index b3afd3a79..9988a1b24 100644
+--- a/tests/ut/cpp/a2a3/runtime/tensormap_and_ringbuffer/test_scheduler_state.cpp
++++ b/tests/ut/cpp/a2a3/runtime/tensormap_and_ringbuffer/test_scheduler_state.cpp
+@@ -26,6 +26,7 @@
+ #include "scheduler/scheduler_types.h"
+ #include "scheduler/scheduler.h"
+ #include "qkv_learned.h"
++#include "streaming_action.h"
+ 
+ TEST(AsyncWaitDiagnosticsTest, SeparatesTaskBodyAndCompletionPendingAndGuardsMailboxUnderflow) {
+     auto wait_list = std::make_unique<AsyncWaitList>();
+@@ -1039,3 +1040,187 @@ TEST(QkvLearned, FrozenProjectionMatchesTorchAndMissingSpecUsesFormula) {
+     EXPECT_EQ(qkv_learned_choose(s, 1, 1, 2, missing, .1, a, fallback), formula.choose(s, 1, 1, .1, b));
+     EXPECT_EQ(a[0][1], b[0][1]);
+ }
++
++TEST(StreamingQueueTest, ObservationDoesNotClaimAndOldTicketCannotConsumeRecycledSlot) {
++    ChipReadyQueue queue{};
++    ChipReadyQueueSlot slots[2];
++    queue.slots = slots;
++    queue.capacity = 2;
++    queue.mask = 1;
++    for (int i = 0; i < 2; ++i)
++        slots[i].sequence.store(i);
++    ChipTaskSlotState items[4]{};
++    ASSERT_TRUE(queue.push(&items[0]));
++    ChipReadyQueue::HeadToken old;
++    ASSERT_TRUE(queue.observe_head(old));
++    EXPECT_EQ(queue.size(), 1u);
++    EXPECT_EQ(queue.consume_exact(old), &items[0]);
++    ASSERT_TRUE(queue.push(&items[1]));
++    EXPECT_EQ(queue.pop(), &items[1]);
++    ASSERT_TRUE(queue.push(&items[2]));
++    EXPECT_EQ(queue.consume_exact(old), nullptr);
++    EXPECT_EQ(queue.pop(), &items[2]);
++    EXPECT_EQ(queue.pop(), nullptr);
++}
++
++TEST(StreamingQueueTest, CompetingConsumersAcquireExactlyOneTicket) {
++    ChipReadyQueue queue{};
++    ChipReadyQueueSlot slots[2];
++    queue.slots = slots;
++    queue.capacity = 2;
++    queue.mask = 1;
++    for (int i = 0; i < 2; ++i)
++        slots[i].sequence.store(i);
++    ChipTaskSlotState item{};
++    ASSERT_TRUE(queue.push(&item));
++    ChipReadyQueue::HeadToken token;
++    ASSERT_TRUE(queue.observe_head(token));
++    std::atomic<int> wins{0};
++    std::thread a([&] {
++        if (queue.consume_exact(token)) ++wins;
++    });
++    std::thread b([&] {
++        if (queue.consume_exact(token)) ++wins;
++    });
++    a.join();
++    b.join();
++    EXPECT_EQ(wins.load(), 1);
++    EXPECT_EQ(queue.size(), 0u);
++}
++
++TEST(StreamingQueueTest, FullFallbackPublishesOnlyToOneQueue) {
++    ChipReadyQueue queues[2]{};
++    ChipReadyQueueSlot slots[2][2];
++    ChipTaskSlotState items[3]{};
++    for (int q = 0; q < 2; ++q) {
++        queues[q].slots = slots[q];
++        queues[q].capacity = 2;
++        queues[q].mask = 1;
++        for (int i = 0; i < 2; ++i)
++            slots[q][i].sequence.store(i);
++    }
++    ASSERT_TRUE(queues[1].push(&items[0]));
++    ASSERT_TRUE(queues[1].push(&items[1]));
++    if (!queues[1].push(&items[2])) ASSERT_TRUE(queues[0].push(&items[2]));
++    EXPECT_EQ(queues[0].pop(), &items[2]);
++    EXPECT_EQ(queues[0].pop(), nullptr);
++    EXPECT_EQ(queues[1].pop(), &items[0]);
++    EXPECT_EQ(queues[1].pop(), &items[1]);
++    EXPECT_EQ(queues[1].pop(), nullptr);
++}
++
++TEST(StreamingQueueTest, ConcurrentObservationSurvivesWrapAndOrdinaryConsumers) {
++    ChipReadyQueue queue{};
++    ChipReadyQueueSlot slots[8];
++    ChipTaskSlotState items[8]{};
++    auto payloads = std::make_unique<TaskPayload[]>(8);
++    queue.slots = slots;
++    queue.capacity = 8;
++    queue.mask = 7;
++    queue.observe_metadata = 1;
++    for (int i = 0; i < 8; ++i) {
++        slots[i].sequence.store(i);
++        items[i].payload = &payloads[i];
++        payloads[i].placement.group = i + 1;
++    }
++    constexpr int total = 20000;
++    std::atomic<int> consumed{0}, bad_record{0};
++    std::thread producer([&] {
++        for (int i = 0; i < total; ++i)
++            while (!queue.push(&items[i % 8])) {}
++    });
++    std::thread observer([&] {
++        while (consumed.load() < total) {
++            ChipReadyQueue::HeadToken token;
++            if (!queue.observe_head(token)) continue;
++            auto *owned = queue.consume_exact(token);
++            if (owned) {
++                if (owned->payload->placement.group != token.record) ++bad_record;
++                ++consumed;
++            }
++        }
++    });
++    std::thread ordinary([&] {
++        while (consumed.load() < total)
++            if (queue.pop()) ++consumed;
++    });
++    producer.join();
++    observer.join();
++    ordinary.join();
++    EXPECT_EQ(consumed.load(), total);
++    EXPECT_EQ(bad_record.load(), 0);
++    EXPECT_EQ(queue.size(), 0u);
++}
++
++TEST(StreamingActionTest, VisibleDiamondChangesChoiceButUnknownAndIncompleteDoNot) {
++    using namespace simpler::tmr;
++    StreamCandidate tasks[2] = {{1, 0, {2, 10}, 0}, {2, 0, {4, 14}, 0}};
++    StreamSlot slots[2] = {{14, 0, 0}, {0, 1, 0}};
++    StreamJoin unknown;
++    auto local = stream_compare(tasks, 2, 1, slots, 2, 1, 0, unknown);
++    ASSERT_TRUE(local.valid);
++    EXPECT_DOUBLE_EQ(local.default_end, 24);
++    EXPECT_DOUBLE_EQ(local.alternative_end, 16);
++    EXPECT_TRUE(stream_admit(local.gain, 0, 30, 0));
++    StreamJoin pending;
++    pending.count = 2;
++    pending.candidate[0] = 1;
++    pending.committed_finish_us[1] = 30;
++    auto incomplete = stream_compare(tasks, 2, 1, slots, 2, 1, 0, pending);
++    EXPECT_DOUBLE_EQ(incomplete.gain, local.gain);
++    pending.complete = true;
++    auto slow = stream_compare(tasks, 2, 1, slots, 2, 1, 0, pending);
++    EXPECT_DOUBLE_EQ(slow.gain, 0);
++    EXPECT_TRUE(slow.used_join);
++    EXPECT_FALSE(stream_admit(slow.gain, 0, 30, 0));
++    pending.committed_finish_us[1] = 12;
++    auto fast = stream_compare(tasks, 2, 1, slots, 2, 1, 0, pending);
++    EXPECT_DOUBLE_EQ(fast.gain, 8);
++    EXPECT_FALSE(stream_admit(fast.gain, 0, 6, 0));
++}
++
++TEST_F(SchedulerStateTest, StreamingFastReadyAndNotificationHaveOnePublicationOwner) {
++    sched.qkv.mode = 7;
++    alignas(64) ChipTaskSlotState slot;
++    init_slot(slot, CHIP_TASK_PENDING, 1, 1);
++    slot.task->task_id = TaskId::make(0, 1);
++    sched.qkv_trace_create(slot);
++    sched.qkv_registration_complete(slot);
++    sched.push_ready_routed(&slot);
++    sched.push_ready_routed(&slot);
++    EXPECT_FALSE(sched.route_ready_once(slot));
++    EXPECT_EQ(sched.ready_queues[0].size(), 1u);
++    EXPECT_EQ(sched.qkv.eligible.load(), 1u);
++    EXPECT_GT(sched.qkv.trace.tasks[0].registered_epoch.load(), sched.qkv.trace.tasks[0].submit_epoch);
++    EXPECT_EQ(sched.ready_queues[0].pop(), &slot);
++    int32_t start = -1;
++    EXPECT_EQ(slot.claim_block_range(1, 1, start), 1);
++    EXPECT_EQ(slot.claim_block_range(1, 1, start), 0);
++}
++
++TEST_F(SchedulerStateTest, StreamingPreservesStrictAndSyncQueues) {
++    sched.qkv.mode = 7;
++    alignas(64) ChipTaskSlotState strict, sync;
++    init_slot(strict, CHIP_TASK_PENDING, 1, 1);
++    init_slot(sync, CHIP_TASK_PENDING, 1, 1);
++    strict.task->target_aicpu_cluster = 1;
++    sync.task_attrs.set_sync_start();
++    sched.push_ready_routed(&strict);
++    sched.push_ready_routed(&sync);
++    EXPECT_EQ(sched.cluster_ready_queues[1][0].pop(), &strict);
++    EXPECT_EQ(sched.ready_sync_queues[0].pop(), &sync);
++    EXPECT_EQ(sched.ready_queues[0].size(), 0u);
++    EXPECT_EQ(sched.qkv.eligible.load(), 0u);
++}
++
++TEST_F(SchedulerStateTest, StreamingPreferenceCannotConsumeLegacyAutomaticWork) {
++    sched.qkv.mode = 7;
++    alignas(64) ChipTaskSlotState legacy;
++    init_slot(legacy, CHIP_TASK_PENDING, 1, 1);
++    legacy.payload->placement.scope = 1;
++    legacy.task->target_aicpu_cluster = 1;
++    ASSERT_TRUE(sched.auto_ready_queues[1][0].push(&legacy));
++    ChipReadyQueue::HeadToken token;
++    EXPECT_FALSE(sched.streaming_lane(ResourceShape::AIC, 2).observe_head(token));
++    EXPECT_EQ(sched.auto_ready_queues[1][0].size(), 1u);
++}
+diff --git a/examples/a2a3/tensormap_and_ringbuffer/benchmark_streaming_action/analyze.py b/examples/a2a3/tensormap_and_ringbuffer/benchmark_streaming_action/analyze.py
+new file mode 100644
+index 000000000..15e27e48c
+--- /dev/null
++++ b/examples/a2a3/tensormap_and_ringbuffer/benchmark_streaming_action/analyze.py
+@@ -0,0 +1,188 @@
++#!/usr/bin/env python3
++# Copyright (c) PyPTO Contributors.
++# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
++# CANN Open Software License Agreement Version 2.0 (the "License").
++# Please refer to the License for details. You may not use this file except in compliance with the License.
++# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
++# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
++# See LICENSE in the root of the software repository for the full text of the License.
++# -----------------------------------------------------------------------------------------------------------
++"""Audit prefix visibility and paired placement spans without inventing actual starts."""
++
++import argparse
++import json
++import re
++import statistics
++from collections import Counter, defaultdict
++from pathlib import Path
++
++NAMES = (
++    "task created ready pending_pop publish dispatch start_proxy first_fin fin completed "
++    "k0 k1 k2 blocks shape mask sync selected actual_side proxy_kind scheduler fanout "
++    "dummy_begin dummy_end summary_age"
++).split()
++
++
++def read_trace(folder):
++    logs = sorted((folder / "ascend").rglob("*.log"))
++    text = "\n".join(p.read_text(errors="replace") for p in logs)
++    rows = []
++    for match in re.finditer(r"QKV_R2_TASKS ([^\n]+)", text):
++        for record in match[1].split(";")[:-1]:
++            fields = record.split(",")
++            if len(fields) != 35:
++                raise ValueError("unknown task schema")
++            rows.append(dict(zip(NAMES, map(int, fields[:25]))))
++    visible = {}
++    for line in text.splitlines():
++        if "STREAM_VIS " in line:
++            values = {key: int(value) for key, value in re.findall(r"(\w+)=(-?\d+)", line.split("STREAM_VIS ", 1)[1])}
++            visible[values["task"]] = values
++    if len({r["task"] for r in rows}) != len(rows):
++        raise ValueError("multiple launches or duplicate task records")
++    if rows and len(visible) != len(rows):
++        raise ValueError("incomplete visibility schema")
++    meta = re.findall(r"QKV_R2_META level=(\d+) tasks=(\d+) edges=(\d+) dropped=(\d+)", text)
++    if len(meta) != 1 or int(meta[0][1]) != len(rows) or int(meta[0][3]):
++        raise ValueError("truncated or multiple-launch trace")
++    host = (folder / "host.log").read_text()
++    freq = set(map(int, re.findall(r"dev_cnt_hz=(\d+)", host)))
++    if freq != {50000000}:
++        raise ValueError(f"unverified tick frequency: {freq}")
++    for r in rows:
++        r.update({"visibility": visible[r["task"]]})
++    return rows
++
++
++def visibility_summary(rows):
++    observed = [r for r in rows if r["visibility"]["observed"]]
++    count = Counter(r["visibility"]["state"] for r in observed)
++    return {
++        "tasks": len(rows),
++        "observed_normal_single_block_claims": len(observed),
++        "denominator": "actual Shared batch-pop observations; not three-queue comparison opportunities",
++        "unknown": count[0],
++        "registering": count[1],
++        "usable_bounded_join": count[2],
++        "index_overflow": count[3],
++        "complete_fanin_over_budget": count[4],
++        "usable_fraction": count[2] / len(observed) if observed else None,
++        "ranking_change": "not measured by this observational hook",
++    }
++
++
++def calibration(rows):
++    tasks = [r for r in rows if r["shape"] == 1]
++    if len(tasks) != 6048:
++        raise ValueError(f"expected 6048 calibration tasks, got {len(tasks)}")
++    labelled, samples = [], defaultdict(list)
++    cursor = 0
++    for period in range(6):
++        for size in (4096, 65536, 1048576):
++            for reuse in (1, 8):
++                for producer_side in (0, 1):
++                    for arm in (0, 1):
++                        cross = 1 - arm if period % 2 else arm
++                        for repeat in range(21):
++                            for consumer in (0, 1):
++                                task = dict(tasks[cursor])
++                                cursor += 1
++                                expected = 1 - producer_side if consumer and cross else producer_side
++                                if task["actual_side"] != expected:
++                                    raise ValueError("strict placement violated")
++                                task.update(
++                                    period=period,
++                                    bytes=size,
++                                    reuse=reuse,
++                                    cross=cross,
++                                    repeat=repeat,
++                                    consumer=consumer,
++                                    warmup=repeat == 0,
++                                )
++                                task["span_us"] = (
++                                    (task["fin"] - task["start_proxy"]) / 50.0
++                                    if task["proxy_kind"] == 1 and task["fin"] > task["start_proxy"]
++                                    else None
++                                )
++                                labelled.append(task)
++                                if consumer and repeat and task["span_us"] is not None:
++                                    group = task["visibility"]["physical_group"]
++                                    samples[period, size, reuse, expected, group, cross].append(task["span_us"])
++    comparisons = paired_periods(samples)
++    return labelled, comparisons, summarize_pairs(comparisons)
++
++
++def paired_periods(samples):
++    comparisons = []
++    for period in range(6):
++        for size in (4096, 65536, 1048576):
++            for reuse in (1, 8):
++                for side in (0, 1):
++                    group_diffs = []
++                    groups = sorted({k[4] for k in samples if k[:4] == (period, size, reuse, side)})
++                    for group in groups:
++                        same = samples[period, size, reuse, side, group, 0]
++                        cross = samples[period, size, reuse, side, group, 1]
++                        if len(same) >= 2 and len(cross) >= 2:
++                            diff = statistics.median(cross) - statistics.median(same)
++                            group_diffs.append(diff)
++                    comparisons.append(
++                        {
++                            "period": period,
++                            "bytes": size,
++                            "reuse": reuse,
++                            "consumer_side": side,
++                            "matched_groups": len(group_diffs),
++                            "cross_minus_same_us": statistics.median(group_diffs) if group_diffs else None,
++                        }
++                    )
++    return comparisons
++
++
++def summarize_pairs(comparisons):
++    summary = []
++    for size in (4096, 65536, 1048576):
++        for reuse in (1, 8):
++            for side in (0, 1):
++                values = [
++                    r["cross_minus_same_us"]
++                    for r in comparisons
++                    if r["bytes"] == size
++                    and r["reuse"] == reuse
++                    and r["consumer_side"] == side
++                    and r["cross_minus_same_us"] is not None
++                ]
++                summary.append(
++                    {
++                        "bytes": size,
++                        "reuse": reuse,
++                        "consumer_side": side,
++                        "paired_periods": len(values),
++                        "period_differences_us": values,
++                        "median_difference_us": statistics.median(values) if values else None,
++                        "consistent_nonzero_direction": len(values) == 6
++                        and (all(x > 0 for x in values) or all(x < 0 for x in values)),
++                        "scope": "combined producer-side/physical-group placement; custom reuse kernel only",
++                    }
++                )
++    return summary
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("kind", choices=("calibration", "visibility"))
++    parser.add_argument("folder", type=Path)
++    args = parser.parse_args()
++    rows = read_trace(args.folder)
++    if args.kind == "calibration":
++        labelled, comparisons, summary = calibration(rows)
++        (args.folder / "labelled-tasks.jsonl").write_text("".join(json.dumps(r) + "\n" for r in labelled))
++        (args.folder / "paired-periods.json").write_text(json.dumps(comparisons, indent=2))
++    else:
++        summary = visibility_summary(rows)
++    (args.folder / "summary.json").write_text(json.dumps(summary, indent=2))
++    print(json.dumps(summary, indent=2))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/examples/a2a3/tensormap_and_ringbuffer/benchmark_streaming_action/analyze_diagnostics.py b/examples/a2a3/tensormap_and_ringbuffer/benchmark_streaming_action/analyze_diagnostics.py
+new file mode 100644
+index 000000000..cabd50085
+--- /dev/null
++++ b/examples/a2a3/tensormap_and_ringbuffer/benchmark_streaming_action/analyze_diagnostics.py
+@@ -0,0 +1,93 @@
++#!/usr/bin/env python3
++# Copyright (c) PyPTO Contributors.
++# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
++# CANN Open Software License Agreement Version 2.0 (the "License").
++# Please refer to the License for details. You may not use this file except in compliance with the License.
++# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
++# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
++# See LICENSE in the root of the software repository for the full text of the License.
++# -----------------------------------------------------------------------------------------------------------
++"""Audit the final build's full traces and sampled queue-observation costs."""
++
++import argparse
++import json
++import re
++from pathlib import Path
++
++import numpy as np
++from analyze import visibility_summary
++from qwen_pair_analyze import launches
++from visibility_budget import calculate
++
++
++def distribution(values):
++    return {
++        "n": len(values),
++        "median_us": float(np.median(values)) if values else None,
++        "p95_us": float(np.quantile(values, 0.95)) if values else None,
++    }
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("folder", type=Path)
++    args = parser.parse_args()
++    runs = launches(args.folder)
++    labels = json.loads((args.folder / "manifest.json").read_text())["schedule"]
++    if len(runs) != len(labels):
++        raise ValueError("incomplete diagnostic launches")
++    records = []
++    for path in (args.folder / "ascend").rglob("*.log"):
++        for line in path.read_text(errors="replace").splitlines():
++            if any(tag in line for tag in ("STREAM_RUN ", "STREAM_THREAD ", "STREAM_COST ")):
++                stamp = re.search(r"\d{4}-\d\d-\d\d-\d\d:\d\d:\d\d\.\d+\.\d+", line)
++                if stamp:
++                    records.append((stamp[0], line))
++    costs, threads, mode = {}, {}, None
++    for _, line in sorted(records):
++        if "STREAM_RUN " in line:
++            mode = int(re.search(r"mode=(\d+)", line)[1])
++            costs[mode], threads[mode] = [], []
++        elif "STREAM_COST " in line:
++            costs[mode].append(int(re.search(r"ticks=(\d+)", line)[1]) / 50)
++        else:
++            threads[mode].append({k: int(v) for k, v in re.findall(r"(\w+)=(\d+)", line.split("STREAM_THREAD ", 1)[1])})
++    summary = {"scope": "diagnostic only; all device_wall excluded from ordinary measurements", "policies": {}}
++    for label, run in zip(labels, runs):
++        rows = run["tasks"]
++        if len(rows) != run["meta"]["tasks"] or run["meta"]["dropped"] or len({r["task"] for r in rows}) != len(rows):
++            raise ValueError("task record audit")
++        for row in rows:
++            row["visibility"] = run["visible"][row["task"]]
++        eligible = [r for r in rows if r["shape"] < 2 and r["blocks"] == 1 and r["ready"] and r["visibility"]["claim"]]
++        mode = {"shared": 0, "structure": 7, "C_guarded": 8, "D_guarded": 9}[label["mode"]]
++        summary["policies"][label["mode"]] = {
++            "tasks": len(rows),
++            "edges": run["meta"]["edges"],
++            "ready_to_claim": distribution(
++                [
++                    (r["visibility"]["claim"] - r["ready"]) / 50
++                    for r in eligible
++                    if r["visibility"]["claim"] >= r["ready"]
++                ]
++            ),
++            "claim_to_dispatch": distribution(
++                [
++                    (r["dispatch"] - r["visibility"]["claim"]) / 50
++                    for r in eligible
++                    if r["dispatch"] >= r["visibility"]["claim"]
++                ]
++            ),
++            "queue_pop_cost_including_empty_and_batch_calls": distribution(costs[mode]),
++            "queue_pop_cost_sampling": "every 32nd invocation, at most 2048 records per S; not model inference latency",
++            "thread_counters": threads[mode],
++        }
++        if mode == 0:
++            summary["shared_visibility"] = visibility_summary(rows)
++            summary["shared_visibility_budget_sensitivity"] = calculate(rows)
++    (args.folder / "diagnostic-summary.json").write_text(json.dumps(summary, indent=2))
++    print(json.dumps(summary, indent=2))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/examples/a2a3/tensormap_and_ringbuffer/benchmark_streaming_action/calibrate_spans.py b/examples/a2a3/tensormap_and_ringbuffer/benchmark_streaming_action/calibrate_spans.py
+new file mode 100644
+index 000000000..44a3d61ed
+--- /dev/null
++++ b/examples/a2a3/tensormap_and_ringbuffer/benchmark_streaming_action/calibrate_spans.py
+@@ -0,0 +1,78 @@
++#!/usr/bin/env python3
++# Copyright (c) PyPTO Contributors.
++# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
++# CANN Open Software License Agreement Version 2.0 (the "License").
++# Please refer to the License for details. You may not use this file except in compliance with the License.
++# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
++# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
++# See LICENSE in the root of the software repository for the full text of the License.
++# -----------------------------------------------------------------------------------------------------------
++"""Estimate factual execution spans and conditional residual life; never action gains."""
++
++import argparse
++import json
++from collections import defaultdict
++from pathlib import Path
++
++import numpy as np
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("folder", type=Path)
++    args = parser.parse_args()
++    rows = [
++        json.loads(line)
++        for path in sorted(args.folder.glob("period*/labelled.jsonl"))
++        for line in path.read_text().splitlines()
++    ]
++    if not rows or any(r["proxy_kind"] != 7 for r in rows):
++        raise ValueError("requires validated AICore timing labels")
++    train = [r for r in rows if r["period"] < 4 and not r["warmup"]]
++    test = [r for r in rows if r["period"] == 5 and not r["warmup"]]
++    groups = defaultdict(list)
++    for row in train:
++        groups[row["kernel"], row["actual_side"]].append(row["span_us"])
++    table = []
++    for (kernel, side), values in sorted(groups.items()):
++        remaining = []
++        for elapsed in np.quantile(values, [0, 0.25, 0.5, 0.75, 0.9]):
++            tail = [d - elapsed for d in values if d > elapsed]
++            remaining.append(
++                {
++                    "elapsed_us": float(elapsed),
++                    "survivors": len(tail),
++                    "remaining_p50_us": float(np.median(tail)) if tail else None,
++                }
++            )
++        table.append(
++            {
++                "kernel": kernel,
++                "side": side,
++                "n": len(values),
++                "p50_us": float(np.median(values)),
++                "p90_us": float(np.quantile(values, 0.9)),
++                "conditional_remaining": remaining,
++            }
++        )
++    errors = [abs(r["span_us"] - np.median(groups[r["kernel"], r["actual_side"]])) for r in test]
++    result = {
++        "label": "AICore post-ACK to post-kernel/pre-FIN dispatcher interval",
++        "scope": "first tile per layer of kernels 31..34, block=1, controlled decode placement",
++        "split": {"train_periods": [0, 1, 2, 3], "reserved_calibration_period": 4, "test_period": 5},
++        "independent_unit": "complete run/period; layers are correlated, not independent replicates",
++        "table": table,
++        "test": {
++            "n": len(errors),
++            "mae_us": float(np.mean(errors)),
++            "absolute_error_p95_us": float(np.quantile(errors, 0.95)),
++        },
++        "runtime_admitted": False,
++        "reason": "factual execution-span calibration does not calibrate two-action gain or optimism",
++    }
++    (args.folder / "span-calibration.json").write_text(json.dumps(result, indent=2))
++    print(json.dumps(result["test"], indent=2))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/examples/a2a3/tensormap_and_ringbuffer/benchmark_streaming_action/check_diamond.py b/examples/a2a3/tensormap_and_ringbuffer/benchmark_streaming_action/check_diamond.py
+new file mode 100644
+index 000000000..0900278e4
+--- /dev/null
++++ b/examples/a2a3/tensormap_and_ringbuffer/benchmark_streaming_action/check_diamond.py
+@@ -0,0 +1,62 @@
++#!/usr/bin/env python3
++# Copyright (c) PyPTO Contributors.
++# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
++# CANN Open Software License Agreement Version 2.0 (the "License").
++# Please refer to the License for details. You may not use this file except in compliance with the License.
++# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
++# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
++# See LICENSE in the root of the software repository for the full text of the License.
++# -----------------------------------------------------------------------------------------------------------
++"""Verify real early/late registered joins without treating future edges as visible."""
++
++import argparse
++import json
++from pathlib import Path
++
++from qwen_pair_analyze import launches
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("folder", type=Path)
++    args = parser.parse_args()
++    runs = launches(args.folder)
++    if len(runs) != 4:
++        raise ValueError("expected four diamond launches")
++    report = []
++    for ordinal, run in enumerate(runs):
++        late, slow = divmod(ordinal, 2)
++        tasks = run["tasks"]
++        if run["meta"]["dropped"] or len({t["task"] for t in tasks}) != len(tasks):
++            raise ValueError("dropped or duplicate records")
++        t = next(t for t in tasks if 1 in (t["k0"], t["k1"], t["k2"]))
++        j = next(t for t in tasks if 2 in (t["k0"], t["k1"], t["k2"]))
++        sibling = [t for t in tasks if 0 in (t["k0"], t["k1"], t["k2"])][1]
++        info = run["visible"][t["task"]]
++        expected = 0 if late else 2
++        if info["state"] != expected or not info["observed"]:
++            raise ValueError(f"visibility differs from submission protocol: {info}")
++        if bool(sibling["fin"] > t["fin"]) != bool(slow):
++            raise ValueError("fast/slow branch did not establish intended FIN order")
++        report.append(
++            {
++                "late": bool(late),
++                "slow": bool(slow),
++                "observed_state": info["state"],
++                "captured_epoch": info["epoch"],
++                "t_claim": info["claim"],
++                "t_fin": t["fin"],
++                "g_fin": sibling["fin"],
++                "j_registered": run["visible"][j["task"]]["registered"],
++                "j_ready": j["ready"],
++                "j_completed": j["completed"],
++                "all_tasks": len(tasks),
++                "scope": "Shared visibility, not active C/D action gain",
++            }
++        )
++    (args.folder / "checked.json").write_text(json.dumps(report, indent=2))
++    print(json.dumps(report, indent=2))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/examples/a2a3/tensormap_and_ringbuffer/benchmark_streaming_action/expected_counts.py b/examples/a2a3/tensormap_and_ringbuffer/benchmark_streaming_action/expected_counts.py
+new file mode 100644
+index 000000000..3fb821ee6
+--- /dev/null
++++ b/examples/a2a3/tensormap_and_ringbuffer/benchmark_streaming_action/expected_counts.py
+@@ -0,0 +1,35 @@
++#!/usr/bin/env python3
++# Copyright (c) PyPTO Contributors.
++# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
++# CANN Open Software License Agreement Version 2.0 (the "License").
++# Please refer to the License for details. You may not use this file except in compliance with the License.
++# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
++# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
++# See LICENSE in the root of the software repository for the full text of the License.
++# -----------------------------------------------------------------------------------------------------------
++"""Derive expected AICore block invocations from an independent complete trace."""
++
++import argparse
++import json
++from pathlib import Path
++
++from analyze import read_trace
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("trace", type=Path)
++    parser.add_argument("output", type=Path)
++    args = parser.parse_args()
++    rows = read_trace(args.trace)
++    counts = {
++        str(r["task"]): r["blocks"] * r["mask"].bit_count() for r in rows if any(r[k] >= 0 for k in ("k0", "k1", "k2"))
++    }
++    if not counts or not all(counts.values()):
++        raise ValueError("invalid compute-task resource masks")
++    args.output.write_text(json.dumps(counts, indent=2))
++    print("tokens", len(counts), "block invocations", sum(counts.values()))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/examples/a2a3/tensormap_and_ringbuffer/benchmark_streaming_action/kernels/calibration.cpp b/examples/a2a3/tensormap_and_ringbuffer/benchmark_streaming_action/kernels/calibration.cpp
+new file mode 100644
+index 000000000..ba16550fe
+--- /dev/null
++++ b/examples/a2a3/tensormap_and_ringbuffer/benchmark_streaming_action/kernels/calibration.cpp
+@@ -0,0 +1,51 @@
++/*
++ * Copyright (c) PyPTO Contributors.
++ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
++ * CANN Open Software License Agreement Version 2.0 (the "License").
++ * Please refer to the License for details. You may not use this file except in compliance with the License.
++ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
++ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
++ * See LICENSE in the root of the software repository for the full text of the License.
++ * -----------------------------------------------------------------------------------------------------------
++ */
++
++
++#include "orchestration_api.h"
++extern "C" {
++__attribute__((visibility("default"))) OrchestrationConfig aicpu_orchestration_config(const ChipTaskArgs &) {
++    return OrchestrationConfig{.expected_arg_count = 1};
++}
++__attribute__((visibility("default"))) void aicpu_orchestration_entry(const ChipTaskArgs &args) {
++    const auto &output = args.tensor(0).ref();
++    const int sizes[3] = {1024, 16384, 262144};
++    for (int period = 0; period < 6; ++period) {
++        for (int size = 0; size < 3; ++size) {
++            for (int reuse = 0; reuse < 2; ++reuse) {
++                for (int direction = 0; direction < 2; ++direction) {
++                    for (int arm = 0; arm < 2; ++arm) {
++                        int cross = (period & 1) ? 1 - arm : arm;
++                        int lane = size * 2 + reuse;
++                        uint32_t shape[1] = {static_cast<uint32_t>(sizes[size])};
++                        uint32_t offset[1] = {static_cast<uint32_t>(lane * 262144)};
++                        auto region = output.view(shape, offset);
++                        for (int repeat = 0; repeat < 21; ++repeat) {
++                            for (int consumer = 0; consumer < 2; ++consumer) {
++                                CoreTaskArgs task;
++                                task.add_inout(region);
++                                task.add_scalar(int64_t(sizes[size]));
++                                task.add_scalar(int64_t(consumer && reuse ? 8 : 1));
++                                task.add_scalar(int64_t(consumer ? 0 : 1));
++                                task.set_aicpu_cluster(consumer && cross ? 1 - direction : direction);
++                                task.launch_spec.set_block_num(1);
++                                rt_submit_aiv_task(0, task);
++                            }
++                        }
++                        uint32_t first[1] = {0};
++                        (void)get_tensor_data<float>(region, 1, first);
++                    }
++                }
++            }
++        }
++    }
++}
++}
+diff --git a/examples/a2a3/tensormap_and_ringbuffer/benchmark_streaming_action/kernels/diamond.cpp b/examples/a2a3/tensormap_and_ringbuffer/benchmark_streaming_action/kernels/diamond.cpp
+new file mode 100644
+index 000000000..f9fefab02
+--- /dev/null
++++ b/examples/a2a3/tensormap_and_ringbuffer/benchmark_streaming_action/kernels/diamond.cpp
+@@ -0,0 +1,58 @@
++/*
++ * Copyright (c) PyPTO Contributors.
++ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
++ * CANN Open Software License Agreement Version 2.0 (the "License").
++ * Please refer to the License for details. You may not use this file except in compliance with the License.
++ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
++ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
++ * See LICENSE in the root of the software repository for the full text of the License.
++ * -----------------------------------------------------------------------------------------------------------
++ */
++
++
++
++#include "orchestration_api.h"
++extern "C" {
++__attribute__((visibility("default"))) OrchestrationConfig aicpu_orchestration_config(const ChipTaskArgs &) {
++    return OrchestrationConfig{.expected_arg_count = 2};
++}
++__attribute__((visibility("default"))) void aicpu_orchestration_entry(const ChipTaskArgs &args) {
++    const auto &storage = args.tensor(0).ref();
++    const auto &control = args.tensor(1).ref();
++    uint32_t index[1] = {0};
++    int late = get_tensor_data<int32_t>(control, 1, index);
++    index[0] = 1;
++    int slow = get_tensor_data<int32_t>(control, 1, index);
++    uint32_t shape[1] = {16384}, offset[1] = {0};
++    auto a = storage.view(shape, offset);
++    offset[0] = 16384;
++    auto t = storage.view(shape, offset);
++    offset[0] = 32768;
++    auto g = storage.view(shape, offset);
++    offset[0] = 49152;
++    auto j = storage.view(shape, offset);
++    CoreTaskArgs producer;
++    producer.add_inout(a);
++    producer.add_scalar(int64_t(1000));
++    rt_submit_aiv_task(0, producer);
++    CoreTaskArgs branch;
++    branch.add_input(a);
++    branch.add_output(t);
++    branch.add_scalar(1.0f);
++    branch.add_scalar(int64_t(16384));
++    rt_submit_aiv_task(1, branch);
++    CoreTaskArgs sibling;
++    sibling.add_inout(g);
++    sibling.add_scalar(int64_t(slow ? 2000 : 200));
++    rt_submit_aiv_task(0, sibling);
++    if (late) {
++        index[0] = 0;
++        (void)get_tensor_data<float>(t, 1, index);
++    }
++    CoreTaskArgs join;
++    join.add_input(t);
++    join.add_input(g);
++    join.add_output(j);
++    rt_submit_aiv_task(2, join);
++}
++}
+diff --git a/examples/a2a3/tensormap_and_ringbuffer/benchmark_streaming_action/kernels/hold.cpp b/examples/a2a3/tensormap_and_ringbuffer/benchmark_streaming_action/kernels/hold.cpp
+new file mode 100644
+index 000000000..95dcc7ea7
+--- /dev/null
++++ b/examples/a2a3/tensormap_and_ringbuffer/benchmark_streaming_action/kernels/hold.cpp
+@@ -0,0 +1,39 @@
++/*
++ * Copyright (c) PyPTO Contributors.
++ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
++ * CANN Open Software License Agreement Version 2.0 (the "License").
++ * Please refer to the License for details. You may not use this file except in compliance with the License.
++ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
++ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
++ * See LICENSE in the root of the software repository for the full text of the License.
++ * -----------------------------------------------------------------------------------------------------------
++ */
++
++
++
++#include <cstdint>
++#include <pto/pto-inst.hpp>
++#include "tensor.h"
++#include "pipe_sync.h"
++#include "intrinsic.h"
++extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
++    auto *tensor = reinterpret_cast<__gm__ Tensor *>(args[0]);
++    auto *data = reinterpret_cast<__gm__ float *>(tensor->buffer.addr) + tensor->start_offset;
++    uint64_t begin = static_cast<uint64_t>(get_sys_cnt());
++    uint64_t ticks = static_cast<uint64_t>(args[1]) * 50;
++    while (static_cast<uint64_t>(get_sys_cnt()) - begin < ticks) {}
++    using Shape = pto::Shape<1, 1, 1, 32, 32>;
++    using Stride = pto::Stride<1, 1, 1, 32, 1>;
++    using Global = pto::GlobalTensor<float, Shape, Stride>;
++    using Tile = pto::Tile<pto::TileType::Vec, float, 32, 32, pto::BLayout::RowMajor, -1, -1>;
++    Tile value(32, 32);
++    pto::TASSIGN(value, 0);
++    pto::TEXPANDS(value, 1.0f);
++    for (int offset = 0; offset < 16384; offset += 1024) {
++        Global out(data + offset);
++        set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
++        wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
++        pto::TSTORE(out, value);
++        pipe_sync();
++    }
++}
+diff --git a/examples/a2a3/tensormap_and_ringbuffer/benchmark_streaming_action/kernels/reuse.cpp b/examples/a2a3/tensormap_and_ringbuffer/benchmark_streaming_action/kernels/reuse.cpp
+new file mode 100644
+index 000000000..372d5625e
+--- /dev/null
++++ b/examples/a2a3/tensormap_and_ringbuffer/benchmark_streaming_action/kernels/reuse.cpp
+@@ -0,0 +1,46 @@
++/*
++ * Copyright (c) PyPTO Contributors.
++ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
++ * CANN Open Software License Agreement Version 2.0 (the "License").
++ * Please refer to the License for details. You may not use this file except in compliance with the License.
++ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
++ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
++ * See LICENSE in the root of the software repository for the full text of the License.
++ * -----------------------------------------------------------------------------------------------------------
++ */
++
++
++#include <cstdint>
++#include <pto/pto-inst.hpp>
++#include "tensor.h"
++#include "pipe_sync.h"
++
++extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
++    auto *tensor = reinterpret_cast<__gm__ Tensor *>(args[0]);
++    auto *data = reinterpret_cast<__gm__ float *>(tensor->buffer.addr) + tensor->start_offset;
++    const int64_t elements = args[1], repeats = args[2];
++    using Shape = pto::Shape<1, 1, 1, 32, 32>;
++    using Stride = pto::Stride<1, 1, 1, 32, 1>;
++    using Global = pto::GlobalTensor<float, Shape, Stride>;
++    using Tile = pto::Tile<pto::TileType::Vec, float, 32, 32, pto::BLayout::RowMajor, -1, -1>;
++    Tile input(32, 32), output(32, 32);
++    pto::TASSIGN(input, 0);
++    pto::TASSIGN(output, 4096);
++    for (int64_t repeat = 0; repeat < repeats; ++repeat) {
++        for (int64_t offset = 0; offset < elements; offset += 1024) {
++            Global region(data + offset);
++            if (args[3]) {
++                pto::TEXPANDS(output, 1.0f);
++            } else {
++                pto::TLOAD(input, region);
++                set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
++                wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
++                pto::TADDS(output, input, 1.0f);
++            }
++            set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
++            wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
++            pto::TSTORE(region, output);
++            pipe_sync();
++        }
++    }
++}
+diff --git a/examples/a2a3/tensormap_and_ringbuffer/benchmark_streaming_action/prefix_replay.py b/examples/a2a3/tensormap_and_ringbuffer/benchmark_streaming_action/prefix_replay.py
+new file mode 100644
+index 000000000..1ec1d642c
+--- /dev/null
++++ b/examples/a2a3/tensormap_and_ringbuffer/benchmark_streaming_action/prefix_replay.py
+@@ -0,0 +1,155 @@
++#!/usr/bin/env python3
++# Copyright (c) PyPTO Contributors.
++# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
++# CANN Open Software License Agreement Version 2.0 (the "License").
++# Please refer to the License for details. You may not use this file except in compliance with the License.
++# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
++# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
++# See LICENSE in the root of the software repository for the full text of the License.
++# -----------------------------------------------------------------------------------------------------------
++"""Discrete-event CPU validation. Future submission events never enter policy inputs."""
++
++import heapq
++from collections import deque
++from dataclasses import dataclass, replace
++
++from reference import Gate, Join, Prefix, Snapshot, Task, compare, conditional_remaining
++
++
++@dataclass(frozen=True)
++class SubmittedTask:
++    task: Task
++    submit: float
++    predecessors: tuple = ()
++    registration_delay: float = 0.0
++    fixed_side: int = -1
++    actual_spans: tuple | None = None
++
++
++def validate_definitions(definitions):
++    if len({d.task.task_id for d in definitions}) != len(definitions):
++        raise ValueError("duplicate task identity")
++
++
++def predicted_snapshot(prefix, slots, running, completed, now, local):
++    predicted_slots = []
++    known = dict(completed)
++    reliable = True
++    for k, slot in enumerate(slots):
++        free = now
++        if k in running:
++            tid, start, _ = running[k]
++            duration = prefix.tasks[tid].spans[slot.side]
++            remaining = conditional_remaining([duration], now - start)
++            if remaining is None:
++                free = float("inf")
++                if slot.resource == slots[local].resource:
++                    reliable = False
++            else:
++                free = now + remaining
++                known[tid] = free
++        predicted_slots.append(replace(slot, available=free))
++    return Snapshot(now, tuple(predicted_slots), local, initialized=reliable, predecessor_finish=tuple(known.items()))
++
++
++def replay(definitions, policy, physical_slots, fixture_gate=Gate(0.0, 30)):
++    """Perfect calibrated spans are a synthetic fixture, not board causal labels."""
++    validate_definitions(definitions)
++    future, serial = [], 0
++    # The event engine holds the source graph; compare() receives Prefix only.
++    for definition in definitions:
++        heapq.heappush(future, (definition.submit, serial, "submit", definition))
++        serial += 1
++    prefix, visible, registered, completed = Prefix(), {}, set(), {}
++    lanes = {slot.resource: [deque() for _ in range(3)] for slot in physical_slots}
++    published, claims, finishes, decisions = set(), {}, {}, []
++    slots = list(physical_slots)
++    running = {}
++    now = 0.0
++
++    def event(when, kind, value):
++        nonlocal serial
++        heapq.heappush(future, (when, serial, kind, value))
++        serial += 1
++
++    def publish_ready():
++        for tid, definition in visible.items():
++            if tid in published or tid not in registered:
++                continue
++            if all(p in completed for p in definition.predecessors):
++                task = replace(definition.task, ready=now)
++                prefix.tasks[tid] = task
++                lanes[task.resource][task.preference + 1].append(tid)
++                published.add(tid)
++
++    def process_event(kind, value):
++        if kind == "submit":
++            d = value
++            prefix.submit(replace(d.task, ready=None))
++            visible[d.task.task_id] = d
++            if d.predecessors:
++                prefix.register_join(Join(d.task.task_id, d.predecessors, False))
++            event(now + d.registration_delay, "registered", d.task.task_id)
++        elif kind == "registered":
++            registered.add(value)
++            d = visible[value]
++            if d.predecessors:
++                prefix.register_join(Join(value, d.predecessors, True))
++        else:
++            slot_index, tid = value
++            if tid in completed:
++                raise AssertionError("duplicate completion")
++            completed[tid] = now
++            running.pop(slot_index)
++
++    while future:
++        now = future[0][0]
++        while future and future[0][0] == now:
++            _, _, kind, value = heapq.heappop(future)
++            process_event(kind, value)
++            publish_ready()
++        for slot_index, physical in enumerate(slots):
++            if slot_index in running:
++                continue
++            heads = []
++            for lane in lanes[physical.resource]:
++                if not lane:
++                    continue
++                tid = lane[0]
++                task, definition = prefix.tasks[tid], visible[tid]
++                if task.resource == physical.resource and definition.fixed_side in (-1, physical.side):
++                    heads.append(task)
++            if not heads:
++                continue
++            if policy == "A":
++                selected = min(heads, key=lambda t: (t.ready, t.task_id)).task_id
++            else:
++                snap = predicted_snapshot(prefix, slots, running, completed, now, slot_index)
++                decision = compare(prefix, heads, snap, policy=policy, gate=fixture_gate)
++                decisions.append({"time": now, "side": physical.side, "decision": decision})
++                selected = decision.task_id
++            if selected is None:
++                continue
++            task = prefix.tasks[selected]
++            lane = lanes[task.resource][task.preference + 1]
++            if lane.popleft() != selected or selected in claims:
++                raise AssertionError("non-head or duplicate claim")
++            if not all(p in completed for p in visible[selected].predecessors):
++                raise AssertionError("dependency violation")
++            claims[selected] = (now, physical.side)
++            predicted = now + task.spans[physical.side]
++            factual = visible[selected].actual_spans or task.spans
++            finish = now + factual[physical.side]
++            running[slot_index] = (selected, now, predicted)
++            finishes[selected] = finish
++            event(finish, "finish", (slot_index, selected))
++    if any(q for queues in lanes.values() for q in queues) or running or len(completed) != len(definitions):
++        raise AssertionError("unfinished work or queue not drained")
++    return {
++        "makespan_us": now,
++        "claims": claims,
++        "finishes": finishes,
++        "decisions": decisions,
++        "completed": completed,
++        "published": len(published),
++    }
+diff --git a/examples/a2a3/tensormap_and_ringbuffer/benchmark_streaming_action/qwen_pair.py b/examples/a2a3/tensormap_and_ringbuffer/benchmark_streaming_action/qwen_pair.py
+new file mode 100644
+index 000000000..1e09bc0f1
+--- /dev/null
++++ b/examples/a2a3/tensormap_and_ringbuffer/benchmark_streaming_action/qwen_pair.py
+@@ -0,0 +1,81 @@
++#!/usr/bin/env python3
++# Copyright (c) PyPTO Contributors.
++# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
++# CANN Open Software License Agreement Version 2.0 (the "License").
++# Please refer to the License for details. You may not use this file except in compliance with the License.
++# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
++# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
++# See LICENSE in the root of the software repository for the full text of the License.
++# -----------------------------------------------------------------------------------------------------------
++"""Controlled placement of an actual Qwen producer/consumer pair."""
++
++import torch
++
++from simpler_setup.goldens.qwen3_14b_decode import ParamSpec
++
++
++def generate_orchestration(original, destination):
++    text = original.read_text()
++    text = text.replace("rt_submit_aic_task(", "pair_submit_aic(")
++    text = text.replace("rt_submit_aiv_task(", "pair_submit_aiv(")
++    text = text.replace(".expected_arg_count = 20", ".expected_arg_count = 21")
++    helper = r"""
++static int pair_producer_side, pair_consumer_side;
++static uint32_t pair_seen_33, pair_seen_34;
++static TaskOutputTensors pair_submit_aiv(int kernel, CoreTaskArgs &args) {
++    if (kernel == 33 && (pair_seen_33++ % 17u) == 0) args.set_aicpu_cluster(pair_producer_side);
++    return rt_submit_aiv_task(kernel, args);
++}
++static TaskOutputTensors pair_submit_aic(int kernel, CoreTaskArgs &args) {
++    if (kernel == 34 && (pair_seen_34++ % 85u) == 0) args.set_aicpu_cluster(pair_consumer_side);
++    return rt_submit_aic_task(kernel, args);
++}
++"""
++    text = text.replace('#include "orchestration_api.h"', '#include "orchestration_api.h"\n' + helper, 1)
++    entry = "void aicpu_orchestration_entry(const ChipTaskArgs &orch_args) {"
++    setup = r"""
++    const auto &control = orch_args.tensor(20).ref();
++    uint32_t index[1] = {0};
++    pair_producer_side = get_tensor_data<int32_t>(control, 1, index);
++    index[0] = 1;
++    pair_consumer_side = get_tensor_data<int32_t>(control, 1, index);
++    pair_seen_33 = pair_seen_34 = 0;
++"""
++    if entry not in text:
++        raise ValueError("unexpected Qwen orchestration entry")
++    destination.parent.mkdir(parents=True, exist_ok=True)
++    destination.write_text(text.replace(entry, entry + setup, 1))
++
++
++def install(driver, state, manifest):
++    original_specs = driver.param_specs
++    original_upload = driver._upload_fixture
++    original_spec = driver._chip_spec
++
++    def specs(n_layers=40):
++        return original_specs(n_layers) + [ParamSpec("pair_control", (2,), "INT32")]
++
++    def spec(*args, **kwargs):
++        result = original_spec(*args, **kwargs)
++        result["orchestration"]["source"] = manifest["orchestration_source"]
++        result["orchestration"]["signature"].append(driver.D.IN)
++        return result
++
++    def upload(child, signature, **kwargs):
++        driver.param_specs = original_specs
++        try:
++            original_upload(child, signature[:-1], **kwargs)
++        finally:
++            driver.param_specs = specs
++        child.add("pair_control", torch.zeros(2, dtype=torch.int32), driver.D.IN)
++        state["child"] = child
++
++    driver.param_specs = specs
++    driver._chip_spec = spec
++    driver._upload_fixture = upload
++
++
++def update_control(worker, child, row):
++    worker.copy_to(
++        child.buffers["pair_control"], torch.tensor([row["producer_side"], row["consumer_side"]], dtype=torch.int32)
++    )
+diff --git a/examples/a2a3/tensormap_and_ringbuffer/benchmark_streaming_action/qwen_pair_analyze.py b/examples/a2a3/tensormap_and_ringbuffer/benchmark_streaming_action/qwen_pair_analyze.py
+new file mode 100644
+index 000000000..83c6e86e3
+--- /dev/null
++++ b/examples/a2a3/tensormap_and_ringbuffer/benchmark_streaming_action/qwen_pair_analyze.py
+@@ -0,0 +1,237 @@
++#!/usr/bin/env python3
++# Copyright (c) PyPTO Contributors.
++# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
++# CANN Open Software License Agreement Version 2.0 (the "License").
++# Please refer to the License for details. You may not use this file except in compliance with the License.
++# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
++# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
++# See LICENSE in the root of the software repository for the full text of the License.
++# -----------------------------------------------------------------------------------------------------------
++"""Matched real-kernel spans; factual placement contrasts are not action-gain labels."""
++
++import argparse
++import json
++import re
++import statistics
++from collections import Counter, defaultdict
++from pathlib import Path
++
++import numpy as np
++from analyze import NAMES
++
++
++def launches(folder):
++    lines = []
++    for path in sorted((folder / "ascend").rglob("*.log")):
++        for line in path.read_text(errors="replace").splitlines():
++            if not any(tag in line for tag in ("QKV_R2_META ", "QKV_R2_TASKS ", "STREAM_VIS ")):
++                continue
++            stamp = re.search(r"\d{4}-\d\d-\d\d-\d\d:\d\d:\d\d\.\d+\.\d+", line)
++            if stamp:
++                lines.append((stamp[0], line))
++    result, current = [], None
++    for _, line in sorted(lines, key=lambda x: x[0]):
++        if "QKV_R2_META " in line:
++            if current is not None:
++                result.append(current)
++            meta = dict((k, int(v)) for k, v in re.findall(r"(level|tasks|edges|dropped)=(\d+)", line))
++            current = {"meta": meta, "tasks": [], "visible": {}}
++        elif "QKV_R2_TASKS " in line:
++            for raw in line.split("QKV_R2_TASKS ", 1)[1].split(";")[:-1]:
++                cols = raw.split(",")
++                row = dict(zip(NAMES, map(int, cols[:25])))
++                row["local"] = list(map(float, cols[25:30]))
++                row["global"] = list(map(float, cols[30:35]))
++                current["tasks"].append(row)
++        else:
++            fields = {k: int(v) for k, v in re.findall(r"(\w+)=(-?\d+)", line.split("STREAM_VIS ", 1)[1])}
++            current["visible"][fields["task"]] = fields
++    if current is not None:
++        result.append(current)
++    return result
++
++
++def parse_period(folder):
++    manifest = json.loads((folder / "manifest.json").read_text())
++    runs = launches(folder)
++    if len(runs) != len(manifest["schedule"]):
++        raise ValueError(f"missing launches: {folder}: {len(runs)}")
++    expected_path = folder.parent / "expected_compute_counts.json"
++    expected_counts = json.loads(expected_path.read_text()) if expected_path.exists() else None
++    labelled = []
++    for label, run in zip(manifest["schedule"], runs):
++        if run["meta"] != {"level": 3, "tasks": 160, "edges": 0, "dropped": 0}:
++            raise ValueError(run["meta"])
++        core_records = None
++        if manifest.get("profile_root"):
++            profile = folder / "core_records" / f"run{label['ordinal']:04d}/chip_swimlane_records.json"
++            data = json.loads(profile.read_text())
++            if data["metadata"]["clock_freq_hz"] != 50000000:
++                raise ValueError("AICore clock frequency")
++            core_records = defaultdict(list)
++            for entry in data["aicore_tasks"]:
++                if len(entry) != 7 or entry[4] < entry[3]:
++                    raise ValueError("AICore record schema")
++                core_records[entry[1]].append(entry)
++            if expected_counts is None or {str(k): len(v) for k, v in core_records.items()} != expected_counts:
++                raise ValueError("AICore task/block counts differ from complete baseline trace")
++        counts = Counter()
++        for task in run["tasks"]:
++            kernel = next(task[k] for k in ("k0", "k1", "k2") if task[k] >= 0)
++            layer = counts[kernel]
++            counts[kernel] += 1
++            info = run["visible"][task["task"]]
++            if kernel in (33, 34):
++                side = label["producer_side"] if kernel == 33 else label["consumer_side"]
++                if task["actual_side"] != side:
++                    raise ValueError("controlled side was not honored")
++            if task["blocks"] != 1:
++                raise ValueError("non-single-block sample")
++            task.update(label)
++            task.update(kernel=kernel, layer=layer, physical_group=info["physical_group"], claim=info["claim"])
++            task["span_us"] = (
++                (task["fin"] - task["start_proxy"]) / 50.0
++                if task["proxy_kind"] in (1, 2) and task["fin"] > task["start_proxy"]
++                else None
++            )
++            task["cpu_proxy_kind"] = task["proxy_kind"]
++            task["cpu_span_us"] = task["span_us"]
++            if core_records is not None:
++                entries = core_records[task["task"]]
++                if len(entries) != 1:
++                    raise ValueError("selected single-block kernel has duplicate records")
++                entry = entries[0]
++                task["aicore_start"] = entry[3]
++                task["aicore_end"] = entry[4]
++                task["aicore_core"] = entry[0]
++                task["span_us"] = (entry[4] - entry[3]) / 50.0
++                task["proxy_kind"] = 7
++            labelled.append(task)
++        if counts != {31: 40, 32: 40, 33: 40, 34: 40}:
++            raise ValueError(counts)
++    (folder / "labelled.jsonl").write_text("".join(json.dumps(row) + "\n" for row in labelled))
++    return labelled
++
++
++def contrasts(rows, strict):
++    paired = defaultdict(dict)
++    for row in rows:
++        if row["kernel"] == 34 and not row["warmup"] and row["span_us"] is not None:
++            paired[row["period"], row["repeat"], row["consumer_side"], row["layer"]][row["cross"]] = row
++    pairs, missing = [], Counter()
++    for identity, arms in paired.items():
++        if len(arms) != 2:
++            missing["missing_idle_proxy_arm"] += 1
++            continue
++        same, cross = arms[0], arms[1]
++        if (
++            same["task"] != cross["task"]
++            or (same["physical_group"], same["scheduler"])
++            != (
++                cross["physical_group"],
++                cross["scheduler"],
++            )
++            or same.get("aicore_core", same["local"][4]) != cross.get("aicore_core", cross["local"][4])
++        ):
++            missing["different_consumer_group"] += 1
++            continue
++        if same["proxy_kind"] != cross["proxy_kind"]:
++            missing["different_start_proxy_kind"] += 1
++            continue
++        if strict and (
++            same["local"][:3] != cross["local"][:3]
++            or [int(x) // 4 for x in same["global"][:4]] != [int(x) // 4 for x in cross["global"][:4]]
++        ):
++            missing["different_occupancy"] += 1
++            continue
++        pairs.append(
++            {
++                "period": identity[0],
++                "repeat": identity[1],
++                "consumer_side": identity[2],
++                "layer": identity[3],
++                "proxy_kind": same["proxy_kind"],
++                "same_us": same["span_us"],
++                "cross_us": cross["span_us"],
++                "difference_us": cross["span_us"] - same["span_us"],
++            }
++        )
++    return pairs, dict(missing)
++
++
++def summarize(pairs):
++    summary = []
++    for side in (0, 1):
++        for proxy in sorted({r["proxy_kind"] for r in pairs}):
++            periods = []
++            for period in range(6):
++                by_run = defaultdict(list)
++                for row in pairs:
++                    if row["consumer_side"] == side and row["period"] == period and row["proxy_kind"] == proxy:
++                        by_run[row["repeat"]].append(row["difference_us"])
++                values = [statistics.median(v) for v in by_run.values()]
++                periods.append(
++                    {
++                        "period": period,
++                        "matched_run_pairs": len(values),
++                        "median_difference_us": statistics.median(values) if values else None,
++                    }
++                )
++            values = [p["median_difference_us"] for p in periods if p["median_difference_us"] is not None]
++            summary.append(
++                {
++                    "consumer_side": side,
++                    "proxy_kind": proxy,
++                    "periods": periods,
++                    "matched_periods": len(values),
++                    "median_difference_us": statistics.median(values) if values else None,
++                    "stable_above_half_us": len(values) == 6
++                    and (all(v > 0.5 for v in values) or all(v < -0.5 for v in values)),
++                }
++            )
++    return summary
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("folder", type=Path)
++    args = parser.parse_args()
++    rows = []
++    for folder in sorted(args.folder.glob("period*")):
++        if not (folder / "samples.json").exists():
++            raise ValueError(f"collection incomplete: {folder}")
++        rows.extend(parse_period(folder))
++    summary = {
++        "scope": "33->34 first tile; placement contrasts, not two-action gain labels",
++        "timing": "AICore post-ACK to post-kernel/pre-FIN dispatcher interval"
++        if any(r["proxy_kind"] == 7 for r in rows)
++        else "CPU publication/pending-promotion to FIN-observed proxies; families kept separate",
++        "start_time_alignment": "absolute CPU/AICore timestamps not assumed interchangeable",
++    }
++    core = [r for r in rows if r["proxy_kind"] == 7]
++    if core:
++        summary["clock_audit"] = {
++            "selected_records": len(core),
++            "dispatch_after_aicore_start": sum(r["dispatch"] > r["aicore_start"] for r in core),
++            "fin_seen_before_aicore_end": sum(r["fin"] < r["aicore_end"] for r in core),
++            "cpu_minus_aicore_interval_us": {},
++        }
++        for kind in sorted({r["cpu_proxy_kind"] for r in core}):
++            selected = [r for r in core if r["cpu_proxy_kind"] == kind]
++            differences = [(r["fin"] - r["start_proxy"] - r["aicore_end"] + r["aicore_start"]) / 50 for r in selected]
++            summary["clock_audit"]["cpu_minus_aicore_interval_us"][str(kind)] = {
++                "n": len(selected),
++                "median": float(np.median(differences)),
++                "p95": float(np.quantile(differences, 0.95)),
++                "valid_cpu_duration_label": kind in (1, 2),
++            }
++    for name, strict in (("physical_group", False), ("physical_and_occupancy", True)):
++        pairs, excluded = contrasts(rows, strict)
++        (args.folder / f"{name}-pairs.json").write_text(json.dumps(pairs, indent=2))
++        summary[name] = {"pairs": len(pairs), "excluded": excluded, "by_side": summarize(pairs)}
++    (args.folder / "summary.json").write_text(json.dumps(summary, indent=2))
++    print(json.dumps(summary, indent=2))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/examples/a2a3/tensormap_and_ringbuffer/benchmark_streaming_action/qwen_pair_study.py b/examples/a2a3/tensormap_and_ringbuffer/benchmark_streaming_action/qwen_pair_study.py
+new file mode 100644
+index 000000000..d8541e02b
+--- /dev/null
++++ b/examples/a2a3/tensormap_and_ringbuffer/benchmark_streaming_action/qwen_pair_study.py
+@@ -0,0 +1,133 @@
++#!/usr/bin/env python3
++# Copyright (c) PyPTO Contributors.
++# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
++# CANN Open Software License Agreement Version 2.0 (the "License").
++# Please refer to the License for details. You may not use this file except in compliance with the License.
++# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
++# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
++# See LICENSE in the root of the software repository for the full text of the License.
++# -----------------------------------------------------------------------------------------------------------
++"""Interleaved, same-input placement calibration of Qwen kernels 33 -> 34."""
++
++import argparse
++import importlib.util
++import json
++import os
++import subprocess
++import sys
++from pathlib import Path
++
++from qwen_pair import generate_orchestration
++from run_interleaved import ROOT, parse_host, read_device
++
++
++def run_period(folder, source, period, smoke, core=False):
++    rows = []
++    for repeat in range(1 if smoke else (6 if core else 21)):
++        for side in (0, 1):
++            for arm in (0, 1):
++                cross = 1 - arm if (repeat + period) % 2 else arm
++                rows.append(
++                    {
++                        "mode": "shared",
++                        "period": period,
++                        "repeat": repeat,
++                        "warmup": repeat == 0,
++                        "consumer_side": side,
++                        "producer_side": 1 - side if cross else side,
++                        "cross": cross,
++                        "ordinal": len(rows),
++                    }
++                )
++    manifest = {
++        "phase": "qwen_pair_calibration",
++        "seq_len": 3500,
++        "qwen_pair": True,
++        "orchestration_source": str(source),
++        "schedule": rows,
++        "golden_ordinals": list(range(4)) if period == 0 and not smoke and not core else [],
++    }
++    if core:
++        manifest["profile_root"] = str(folder / "core_records")
++    folder.mkdir(parents=True, exist_ok=False)
++    (folder / "ascend").mkdir()
++    path = folder / "manifest.json"
++    path.write_text(json.dumps(manifest, indent=2))
++    env = os.environ.copy()
++    env.update(
++        SIMPLER_TMR_QKV_TRACE="3",
++        ASCEND_PROCESS_LOG_PATH=str(folder / "ascend"),
++        OMP_NUM_THREADS="2",
++        MKL_NUM_THREADS="2",
++        OPENBLAS_NUM_THREADS="2",
++        PYTHONPATH=f"{ROOT}/python:{ROOT}",
++    )
++    cmd = [sys.executable, str(Path(__file__).with_name("run_interleaved.py")), "_worker", str(path)]
++    (folder / "command.json").write_text(json.dumps(cmd, indent=2))
++    print("START Qwen-pair period", period, "runs", len(rows), flush=True)
++    with (folder / "host.log").open("w") as log:
++        run = subprocess.run(cmd, check=False, cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT, timeout=1800)
++    (folder / "exit.json").write_text(json.dumps({"returncode": run.returncode}))
++    if run.returncode:
++        raise RuntimeError(folder)
++    samples = parse_host((folder / "host.log").read_text(), rows, require_timing=not core)
++    actual = read_device(folder)
++    if len(actual) != len(samples) or any(r["mode"] != 0 or r["tasks"] != 160 or r["dropped"] for r in actual):
++        raise ValueError(f"incomplete sparse trace: {len(actual)} launches")
++    (folder / "samples.json").write_text(json.dumps(samples, indent=2))
++    print("PASS Qwen-pair period", period, flush=True)
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("phase", choices=("smoke", "collect", "core-smoke", "core"))
++    parser.add_argument("--output", type=Path, required=True)
++    parser.add_argument("--expected-counts", type=Path)
++    args = parser.parse_args()
++    folder = args.output.resolve()
++    folder.mkdir(parents=True, exist_ok=False)
++    if args.phase.startswith("core"):
++        if args.expected_counts is None:
++            parser.error("core calibration requires --expected-counts from the full baseline trace")
++        counts = json.loads(args.expected_counts.read_text())
++        (folder / "expected_compute_counts.json").write_text(json.dumps(counts, indent=2))
++    baseline_path = ROOT / "examples/a2a3/tensormap_and_ringbuffer/benchmark_qkv/run_study.py"
++    spec = importlib.util.spec_from_file_location("qwen_pair_baseline", baseline_path)
++    baseline = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(baseline)
++    source = ROOT / "build_output/streaming-qwen-pair/decode_controlled.cpp"
++    original = (
++        ROOT
++        / "examples/a2a3/tensormap_and_ringbuffer/benchmark_qwen_cluster/kernels/orchestration/decode_fwd_layers.cpp"
++    )
++    generate_orchestration(original, source)
++    before = baseline.fingerprint()
++    (folder / "frozen.json").write_text(
++        json.dumps(
++            {
++                "hardware": baseline.preflight(3),
++                "fingerprints": before,
++                "original_orchestration_sha256": baseline.digest(original),
++                "controlled_orchestration_sha256": baseline.digest(source),
++                "record_scope": "first tile per layer; actual Qwen kernels and matched physical groups",
++                "uncertainty": "placement under the actual decode background; not an isolated hardware-transfer label",
++            },
++            indent=2,
++        )
++    )
++    for period in range(1 if args.phase in ("smoke", "core-smoke") else 6):
++        if baseline.fingerprint() != before:
++            raise ValueError("runtime changed")
++        run_period(
++            folder / f"period{period}",
++            source,
++            period,
++            args.phase in ("smoke", "core-smoke"),
++            core=args.phase.startswith("core"),
++        )
++    if baseline.fingerprint() != before:
++        raise ValueError("runtime changed during collection")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/examples/a2a3/tensormap_and_ringbuffer/benchmark_streaming_action/reference.py b/examples/a2a3/tensormap_and_ringbuffer/benchmark_streaming_action/reference.py
+new file mode 100644
+index 000000000..7de7b17e5
+--- /dev/null
++++ b/examples/a2a3/tensormap_and_ringbuffer/benchmark_streaming_action/reference.py
+@@ -0,0 +1,234 @@
++#!/usr/bin/env python3
++# Copyright (c) PyPTO Contributors.
++# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
++# CANN Open Software License Agreement Version 2.0 (the "License").
++# Please refer to the License for details. You may not use this file except in compliance with the License.
++# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
++# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
++# See LICENSE in the root of the software repository for the full text of the License.
++# -----------------------------------------------------------------------------------------------------------
++"""Prefix-only reference policy. Times are microseconds; this is not an NPU timing model."""
++
++from dataclasses import dataclass, replace
++from enum import Enum
++from math import inf, isfinite
++from statistics import median
++
++
++class Visibility(str, Enum):
++    UNKNOWN = "unknown"
++    REGISTERING = "registering"
++    USABLE = "usable"
++
++
++@dataclass(frozen=True)
++class Task:
++    task_id: int
++    resource: str
++    spans: tuple  # calibrated span by execution side, not observed future duration
++    ready: float | None = None
++    preference: int = -1
++    blocks: int = 1
++    claimed: int = 0
++    special: bool = False
++    generation: int = 0
++
++    @property
++    def eligible(self):
++        return self.resource in ("AIC", "AIV") and self.blocks == 1 and not self.claimed and not self.special
++
++
++@dataclass(frozen=True)
++class Join:
++    task_id: int
++    predecessors: tuple
++    registered: bool = False
++    completion_gated: bool = True
++
++
++class Prefix:
++    """Only submit/register methods can make graph information visible."""
++
++    def __init__(self):
++        self.tasks = {}
++        self.joins = {}
++        self.successors = {}
++        self.epoch = 0
++
++    def submit(self, task):
++        if task.task_id in self.tasks:
++            raise ValueError("duplicate task generation")
++        self.tasks[task.task_id] = task
++        self.epoch += 1
++
++    def register_join(self, join):
++        if join.task_id not in self.tasks:
++            raise ValueError("unsubmitted successor")
++        if any(p not in self.tasks for p in join.predecessors):
++            raise ValueError("unsubmitted predecessor")
++        old = self.joins.get(join.task_id)
++        if old is not None and (old.registered or old.predecessors != join.predecessors):
++            raise ValueError("immutable registration")
++        self.joins[join.task_id] = join
++        for p in join.predecessors:
++            self.successors.setdefault(p, set()).add(join.task_id)
++        self.epoch += 1
++
++    def successor_state(self, task_id):
++        known = self.successors.get(task_id, ())
++        if not known:
++            return Visibility.UNKNOWN
++        return Visibility.USABLE if any(self.joins[j].registered for j in known) else Visibility.REGISTERING
++
++    def usable_join(self, affected):
++        # An overflowing index cannot silently erase a predecessor or successor.
++        candidates = set().union(*(self.successors.get(x, set()) for x in affected))
++        if len(candidates) > 2:
++            return None
++        for jid in sorted(candidates):
++            j = self.joins[jid]
++            if j.registered and j.completion_gated and len(j.predecessors) <= 4:
++                return j
++        return None
++
++
++@dataclass(frozen=True)
++class Slot:
++    side: int
++    resource: str
++    available: float
++    group: int
++
++
++@dataclass(frozen=True)
++class Snapshot:
++    now: float
++    slots: tuple
++    local_slot: int
++    summary_age: float = 0.0
++    initialized: bool = True
++    # Predicted finish or real release for visible committed/completed predecessors.
++    predecessor_finish: tuple = ()
++
++
++@dataclass(frozen=True)
++class Decision:
++    task_id: int | None
++    gain: float
++    reason: str
++    default: int | None
++    alternative: int | None
++    endpoint_ids: tuple = ()
++    a0: float | None = None
++    a1: float | None = None
++    epoch: int = 0
++
++
++def conditional_remaining(spans, elapsed):
++    alive = [x - elapsed for x in spans if x > elapsed]
++    return median(alive) if alive else None
++
++
++@dataclass(frozen=True)
++class Gate:
++    optimism: float | None = None
++    independent_blocks: int = 0
++    extra_cost: float = 0.0
++    delta: float = 0.5
++
++    def permits(self, gain):
++        return (
++            self.independent_blocks >= 30
++            and self.optimism is not None
++            and gain > self.optimism + self.extra_cost + self.delta
++        )
++
++
++def action_finish(tasks, first, snapshot):
++    """Same physical first slot; place each known task once under B continuation."""
++    slots = list(snapshot.slots)
++    finish = {}
++    first_slot = slots[snapshot.local_slot]
++    order = [first] + sorted((t for t in tasks if t.task_id != first.task_id), key=lambda t: (t.ready, t.task_id))
++    for i, task in enumerate(order):
++        choices = (
++            [snapshot.local_slot] if i == 0 else [k for k, slot in enumerate(slots) if slot.resource == task.resource]
++        )
++        if not choices:
++            return None
++
++        def completion(k):
++            s = slots[k]
++            span = task.spans[s.side]
++            return max(snapshot.now, task.ready, s.available) + span if span is not None else inf
++
++        # Default claiming is work-conserving: choose earliest start, not a
++        # faster future slot that would leave an idle compatible slot unused.
++        choices = [k for k in choices if task.spans[slots[k].side] is not None]
++        if not choices:
++            return None
++        k = min(
++            choices, key=lambda k: (max(snapshot.now, task.ready, slots[k].available), slots[k].side, slots[k].group)
++        )
++        end = completion(k)
++        if not isfinite(end) or (i == 0 and first_slot.resource != task.resource):
++            return None
++        finish[task.task_id] = end
++        slots[k] = replace(slots[k], available=end)
++    return finish
++
++
++def compare(prefix, heads, snapshot, policy="D", gate=Gate(), expiry=10.0, max_age=5.0):
++    # heads are already legal published queue heads, at most one per logical lane.
++    if len(heads) > 3:
++        raise ValueError("head budget exceeded")
++    for t in heads:
++        if t.task_id not in prefix.tasks or prefix.tasks[t.task_id] != t or t.ready is None:
++            raise ValueError("head is not visible and ready")
++    ordered = sorted(heads, key=lambda t: (t.ready, t.preference + 1, t.generation, t.task_id))
++    if not ordered:
++        return Decision(None, 0, "empty", None, None, epoch=prefix.epoch)
++    u = ordered[0]
++
++    def default(reason, t=None):
++        return Decision(u.task_id, 0, reason, u.task_id, t.task_id if t else None, epoch=prefix.epoch)
++
++    if policy == "B":
++        return default("structure")
++    if not u.eligible:
++        return default("ineligible_default")
++    other = [t for t in ordered[1:] if t.eligible and t.resource == u.resource]
++    if not other:
++        return default("single_candidate")
++    t = other[0]
++    if max(snapshot.now - u.ready, snapshot.now - t.ready) >= expiry:
++        return default("expired", t)
++    if not snapshot.initialized:
++        return default("uninitialized", t)
++    if snapshot.summary_age > max_age:
++        return default("stale", t)
++    local = snapshot.slots[snapshot.local_slot]
++    if local.available > snapshot.now or local.resource != u.resource:
++        return Decision(None, 0, "no_idle_slot", u.task_id, t.task_id, epoch=prefix.epoch)
++    tasks = [x for x in ordered if x.eligible and x.resource == u.resource]
++    f0 = action_finish(tasks, u, snapshot)
++    f1 = action_finish(tasks, t, snapshot)
++    if f0 is None or f1 is None:
++        return default("unknown_span_or_capacity", t)
++    endpoints = tuple(x.task_id for x in tasks)
++    if policy == "D":
++        join = prefix.usable_join(endpoints)
++        known = dict(snapshot.predecessor_finish)
++        if join and all(p in f0 or p in known for p in join.predecessors):
++
++            def join_ready(f):
++                return max(f[p] if p in f else known[p] for p in join.predecessors)
++
++            f0[join.task_id] = join_ready(f0)
++            f1[join.task_id] = join_ready(f1)
++            endpoints = tuple(p for p in endpoints if p not in join.predecessors) + (join.task_id,)
++    m0, m1 = max(f0[p] for p in endpoints), max(f1[p] for p in endpoints)
++    gain = m0 - m1
++    chosen = t if gate.permits(gain) else u
++    reason = "override" if chosen is t else ("uncalibrated_gate" if gate.independent_blocks < 30 else "below_gate")
++    return Decision(chosen.task_id, gain, reason, u.task_id, t.task_id, endpoints, m0, m1, prefix.epoch)
+diff --git a/examples/a2a3/tensormap_and_ringbuffer/benchmark_streaming_action/run_interleaved.py b/examples/a2a3/tensormap_and_ringbuffer/benchmark_streaming_action/run_interleaved.py
+new file mode 100644
+index 000000000..f3e9ae6af
+--- /dev/null
++++ b/examples/a2a3/tensormap_and_ringbuffer/benchmark_streaming_action/run_interleaved.py
+@@ -0,0 +1,281 @@
++#!/usr/bin/env python3
++# Copyright (c) PyPTO Contributors.
++# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
++# CANN Open Software License Agreement Version 2.0 (the "License").
++# Please refer to the License for details. You may not use this file except in compliance with the License.
++# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
++# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
++# See LICENSE in the root of the software repository for the full text of the License.
++# -----------------------------------------------------------------------------------------------------------
++"""Same-process policy switching, poison goldens, and frozen blocked measurements."""
++
++import argparse
++import importlib.util
++import json
++import multiprocessing
++import os
++import re
++import subprocess
++import sys
++from collections import Counter
++from pathlib import Path
++
++import qwen_pair
++import torch
++
++from simpler_setup.goldens.qwen3_14b_decode import CACHE_ROWS, HEAD_DIM, N_LAYERS, NUM_KV_HEADS
++
++ROOT = Path(__file__).resolve().parents[4]
++MODES = {"shared": 0, "structure": 7, "C_guarded": 8, "D_guarded": 9}
++
++
++def schedule(phase):
++    modes = list(MODES)
++    if phase in ("smoke", "golden", "diagnose"):
++        order = modes + (["shared"] if phase == "smoke" else [])
++        return [{"mode": mode, "period": -1, "warmup": False, "ordinal": i} for i, mode in enumerate(order)]
++    result = []
++    periods = 12 if phase == "formal" else 1
++    for period in range(periods):
++        order = modes[period % 4 :] + modes[: period % 4]
++        if (period // 4) % 2:
++            order = order[::-1]
++        for mode in order:
++            for sample in range(6):
++                result.append({"mode": mode, "period": period, "warmup": sample == 0, "ordinal": len(result)})
++    return result
++
++
++def poison_golden(worker, child, golden):
++    # Only current-token rows are outputs of this decode. All context rows retain
++    # the original fixture. Poisoning catches skipped writes even across policies.
++    poison = torch.full((NUM_KV_HEADS, HEAD_DIM), float("nan"), dtype=golden.k_cache.dtype)
++    size = poison.numel() * poison.element_size()
++    for layer in range(N_LAYERS):
++        for token_slot in golden.slot_mapping.tolist():
++            row = layer * CACHE_ROWS + token_slot * NUM_KV_HEADS
++            offset = row * HEAD_DIM * poison.element_size()
++            for name in ("k_cache", "v_cache"):
++                worker.copy_to(child.buffers[name], poison, dst_offset=offset, nbytes=size)
++    worker.copy_to(child.buffers["out"], torch.full_like(golden.out, float("nan")))
++
++
++def worker_main(manifest):
++    multiprocessing.cpu_count = lambda: 2
++    torch.set_num_threads(2)
++    spec = importlib.util.spec_from_file_location(
++        "streaming_qwen_driver", ROOT / "examples/a2a3/tensormap_and_ringbuffer/benchmark_qwen_cluster/main.py"
++    )
++    driver = importlib.util.module_from_spec(spec)
++    sys.modules[spec.name] = driver
++    spec.loader.exec_module(driver)
++    driver.configure_logging("info")
++    original_compare = driver._compare_tensor
++
++    def compare_tensor(name, actual, expected):
++        # Exact equality implies the original allclose predicate. Every element
++        # is checked; non-identical chunks retain the original tolerances.
++        a, b = actual.reshape(-1), expected.reshape(-1)
++        for offset in range(0, a.numel(), 1 << 20):
++            ac, bc = a[offset : offset + (1 << 20)], b[offset : offset + (1 << 20)]
++            if not torch.equal(ac, bc):
++                original_compare(f"{name}[{offset}:]", ac, bc)
++
++    driver._compare_tensor = compare_tensor
++    original_run = driver.Worker.run
++    original_build = driver.ChildMemoryTaskArgs.build_args
++    original_generate = driver._decode_generate_inputs
++    state = {"index": 0, "verified": set()}
++    rows = manifest["schedule"]
++    golden_ordinals = set(manifest.get("golden_ordinals", range(len(rows)) if manifest["phase"] == "golden" else []))
++    original_copy_compare = driver._copy_and_compare
++
++    def copy_and_compare(worker, buffers, golden):
++        if state["index"] == len(rows) and len(state["verified"]) == len(rows):
++            return
++        original_copy_compare(worker, buffers, golden)
++
++    driver._copy_and_compare = copy_and_compare
++    if manifest.get("qwen_pair"):
++        qwen_pair.install(driver, state, manifest)
++
++    def build_args(child, *args, **kwargs):
++        state["child"] = child
++        return original_build(child, *args, **kwargs)
++
++    def generate(*args, **kwargs):
++        state["golden"] = original_generate(*args, **kwargs)
++        return state["golden"]
++
++    def run(worker, *args, **kwargs):
++        i = state["index"]
++        row = rows[i]
++        os.environ["SIMPLER_TMR_QKV_BATCH"] = str(MODES[row["mode"]])
++        if manifest.get("profile_root"):
++            cfg = args[2]
++            cfg.enable_chip_swimlane = 1
++            prefix = Path(manifest["profile_root"]) / f"run{i:04d}"
++            prefix.mkdir(parents=True, exist_ok=True)
++            cfg.output_prefix = str(prefix)
++        if manifest.get("qwen_pair"):
++            qwen_pair.update_control(worker, state["child"], row)
++        if i in golden_ordinals:
++            poison_golden(worker, state["child"], state["golden"])
++        print("STREAM_SAMPLE_BEGIN " + json.dumps(row), flush=True)
++        result = original_run(worker, *args, **kwargs)
++        if i in golden_ordinals:
++            driver._copy_and_compare(worker, state["child"].buffers, state["golden"])
++            state["verified"].add(i)
++            print("STREAM_GOLDEN_PASS " + json.dumps({"mode": row["mode"], "layers": 40, "poisoned": True}), flush=True)
++        print("STREAM_SAMPLE_END " + str(i), flush=True)
++        state["index"] += 1
++        return result
++
++    driver.ChildMemoryTaskArgs.build_args = build_args
++    driver._decode_generate_inputs = generate
++    driver.Worker.run = run
++    try:
++        rc = driver.run(
++            [0],
++            "a2a3",
++            runtime="tensormap_and_ringbuffer",
++            rounds=len(rows),
++            skip_golden=not bool(golden_ordinals),
++            seed=1234,
++            seq_len=manifest["seq_len"],
++            compile_workers=2,
++        )
++        if rc or state["index"] != len(rows):
++            raise RuntimeError("incomplete schedule")
++    finally:
++        driver.Worker.run = original_run
++        driver.ChildMemoryTaskArgs.build_args = original_build
++        driver._decode_generate_inputs = original_generate
++        driver._compare_tensor = original_compare
++        driver._copy_and_compare = original_copy_compare
++
++
++def parse_host(text, expected, require_timing=True):
++    samples = []
++    active = None
++    for line in text.splitlines():
++        if line.startswith("STREAM_SAMPLE_BEGIN "):
++            if active is not None:
++                raise ValueError("overlapping runs")
++            active = json.loads(line.split(" ", 1)[1])
++            active["values_ms"] = []
++        match = re.search(r"name=chip\.run\.runner_run\.device_wall ts=\d+ dur=(\d+)\b", line)
++        if match:
++            if active is None:
++                raise ValueError("unlabelled device timing")
++            active["values_ms"].append(int(match[1]) / 1e6)
++        if line.startswith("STREAM_SAMPLE_END "):
++            if (
++                active is None
++                or active["ordinal"] != int(line.split()[1])
++                or len(active["values_ms"]) > 1
++                or (require_timing and len(active["values_ms"]) != 1)
++            ):
++                raise ValueError("sample/timing mismatch")
++            values = active.pop("values_ms")
++            active["device_wall_ms"] = values[0] if values else None
++            samples.append(active)
++            active = None
++    if active is not None or len(samples) != len(expected):
++        raise ValueError("truncated host samples")
++    return samples
++
++
++def read_device(folder):
++    lines = []
++    for path in (folder / "ascend").rglob("*.log"):
++        for line in path.read_text(errors="replace").splitlines():
++            if "STREAM_RUN " in line:
++                stamp = re.search(r"\d{4}-\d\d-\d\d-\d\d:\d\d:\d\d\.\d+\.\d+", line)
++                if stamp is None:
++                    raise ValueError("device log clock format")
++                fields = {k: int(v) for k, v in re.findall(r"(\w+)=(-?\d+)", line.split("STREAM_RUN ", 1)[1])}
++                lines.append((stamp[0], fields))
++    return [fields for _, fields in sorted(lines, key=lambda x: x[0])]
++
++
++def controller(args):
++    path = ROOT / "examples/a2a3/tensormap_and_ringbuffer/benchmark_qkv/run_study.py"
++    spec = importlib.util.spec_from_file_location("streaming_baseline_helpers", path)
++    baseline = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(baseline)
++    fingerprint, preflight = baseline.fingerprint, baseline.preflight
++
++    folder = args.output.resolve()
++    folder.mkdir(parents=True, exist_ok=False)
++    (folder / "ascend").mkdir()
++    manifest = {
++        "phase": args.phase,
++        "seq_len": args.seq_len,
++        "schedule": schedule(args.phase),
++        "modes": MODES,
++        "admitted_locality_classes": [],
++        "C_D_active": False,
++        "reason": "No Qwen paired locality/action calibration admitted; neutral queues and default-only C/D",
++        "hardware": preflight(3),
++        "fingerprints": fingerprint(),
++    }
++    manifest_path = folder / "manifest.json"
++    manifest_path.write_text(json.dumps(manifest, indent=2))
++    env = os.environ.copy()
++    env.update(
++        SIMPLER_TMR_QKV_TRACE="2" if args.phase == "diagnose" else "0",
++        ASCEND_PROCESS_LOG_PATH=str(folder / "ascend"),
++        OMP_NUM_THREADS="2",
++        MKL_NUM_THREADS="2",
++        OPENBLAS_NUM_THREADS="2",
++        PYTHONPATH=f"{ROOT}/python:{ROOT}",
++    )
++    cmd = [sys.executable, str(Path(__file__).resolve()), "_worker", str(manifest_path)]
++    (folder / "command.json").write_text(json.dumps(cmd, indent=2))
++    with (folder / "host.log").open("w") as log:
++        result = subprocess.run(cmd, check=False, env=env, cwd=ROOT, stdout=log, stderr=subprocess.STDOUT, timeout=1800)
++    (folder / "exit.json").write_text(json.dumps({"returncode": result.returncode}))
++    if result.returncode:
++        raise RuntimeError(f"worker failed; see {folder / 'host.log'}")
++    if fingerprint() != manifest["fingerprints"]:
++        raise ValueError("runtime changed during collection")
++    samples = parse_host((folder / "host.log").read_text(), manifest["schedule"])
++    actual = read_device(folder)
++    if [r["mode"] for r in actual] != [MODES[r["mode"]] for r in samples]:
++        raise ValueError(f"device did not honor same-process mode switching: {Counter(r['mode'] for r in actual)}")
++    for sample, counters in zip(samples, actual):
++        sample["counters"] = counters
++        if counters["mode"] and (counters["eligible"] != counters["eligible_claimed"] or counters["dropped"]):
++            raise ValueError(f"eligible coverage or trace capacity failed: {counters}")
++    hashes = dict(re.findall(r"func_id=(\d+).*?code_fnv1a64=(0x[0-9a-f]+)", (folder / "host.log").read_text()))
++    if len(hashes) != 37:
++        raise ValueError("missing loaded kernel fingerprints")
++    (folder / "kernel-hashes.json").write_text(json.dumps(hashes, indent=2))
++    (folder / "samples.json").write_text(json.dumps(samples, indent=2))
++    print(
++        json.dumps(
++            {
++                "phase": args.phase,
++                "n": len(samples),
++                "actual_modes": Counter(r["mode"] for r in actual),
++                "device_wall_ms": [s["device_wall_ms"] for s in samples[:8]],
++            }
++        ),
++        flush=True,
++    )
++
++
++def main():
++    if len(sys.argv) == 3 and sys.argv[1] == "_worker":
++        worker_main(json.loads(Path(sys.argv[2]).read_text()))
++        return
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("phase", choices=("smoke", "golden", "diagnose", "pilot", "formal"))
++    parser.add_argument("--output", type=Path, required=True)
++    parser.add_argument("--seq-len", type=int, default=3500)
++    controller(parser.parse_args())
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/examples/a2a3/tensormap_and_ringbuffer/benchmark_streaming_action/run_scene.py b/examples/a2a3/tensormap_and_ringbuffer/benchmark_streaming_action/run_scene.py
+new file mode 100644
+index 000000000..df2ab8977
+--- /dev/null
++++ b/examples/a2a3/tensormap_and_ringbuffer/benchmark_streaming_action/run_scene.py
+@@ -0,0 +1,76 @@
++#!/usr/bin/env python3
++# Copyright (c) PyPTO Contributors.
++# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
++# CANN Open Software License Agreement Version 2.0 (the "License").
++# Please refer to the License for details. You may not use this file except in compliance with the License.
++# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
++# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
++# See LICENSE in the root of the software repository for the full text of the License.
++# -----------------------------------------------------------------------------------------------------------
++"""Run a focused scene with bounded compilation and isolated diagnostic logs."""
++
++import argparse
++import json
++import os
++import subprocess
++import sys
++from pathlib import Path
++
++from run_interleaved import ROOT
++
++WRAPPER = """import multiprocessing,runpy,sys,torch
++multiprocessing.cpu_count=lambda:2
++torch.set_num_threads(2)
++sys.argv=sys.argv[1:]
++runpy.run_path(sys.argv[0],run_name="__main__")
++"""
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("script", type=Path)
++    parser.add_argument("--platform", choices=("a2a3", "a2a3sim"), default="a2a3")
++    parser.add_argument("--output", type=Path, required=True)
++    parser.add_argument("--mode", type=int, default=0)
++    parser.add_argument("--trace", type=int, default=2)
++    args = parser.parse_args()
++    folder = args.output.resolve()
++    folder.mkdir(parents=True, exist_ok=False)
++    (folder / "ascend").mkdir()
++    env = os.environ.copy()
++    env.update(
++        SIMPLER_TMR_QKV_BATCH=str(args.mode),
++        SIMPLER_TMR_QKV_TRACE=str(args.trace),
++        ASCEND_PROCESS_LOG_PATH=str(folder / "ascend"),
++        OMP_NUM_THREADS="2",
++        OPENBLAS_NUM_THREADS="2",
++        MKL_NUM_THREADS="2",
++        PYTHONPATH=f"{ROOT}/python:{ROOT}",
++    )
++    command = [
++        sys.executable,
++        "-c",
++        WRAPPER,
++        str(args.script.resolve()),
++        "-p",
++        args.platform,
++        "-d",
++        "0",
++        "--manual",
++        "include",
++        "--log-level",
++        "info",
++    ]
++    (folder / "command.json").write_text(json.dumps(command, indent=2))
++    with (folder / "host.log").open("w") as log:
++        result = subprocess.run(
++            command, cwd=ROOT, env=env, check=False, stdout=log, stderr=subprocess.STDOUT, timeout=900
++        )
++    (folder / "exit.json").write_text(json.dumps({"returncode": result.returncode}))
++    if result.returncode or "PASSED" not in (folder / "host.log").read_text():
++        raise RuntimeError(folder / "host.log")
++    print("PASS", args.script, args.platform, flush=True)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/examples/a2a3/tensormap_and_ringbuffer/benchmark_streaming_action/summarize.py b/examples/a2a3/tensormap_and_ringbuffer/benchmark_streaming_action/summarize.py
+new file mode 100644
+index 000000000..f14a8218e
+--- /dev/null
++++ b/examples/a2a3/tensormap_and_ringbuffer/benchmark_streaming_action/summarize.py
+@@ -0,0 +1,82 @@
++#!/usr/bin/env python3
++# Copyright (c) PyPTO Contributors.
++# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
++# CANN Open Software License Agreement Version 2.0 (the "License").
++# Please refer to the License for details. You may not use this file except in compliance with the License.
++# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
++# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
++# See LICENSE in the root of the software repository for the full text of the License.
++# -----------------------------------------------------------------------------------------------------------
++"""Summarize frozen blocked measurements; the independent unit is a period."""
++
++import argparse
++import json
++from collections import defaultdict
++from pathlib import Path
++
++import numpy as np
++
++
++def summarize(folder):
++    manifest = json.loads((folder / "manifest.json").read_text())
++    samples = json.loads((folder / "samples.json").read_text())
++    grouped = defaultdict(list)
++    by_period = defaultdict(dict)
++    for row in samples:
++        if row["device_wall_ms"] is None:
++            raise ValueError("diagnostic/profile samples cannot be ordinary timing samples")
++        if not row["warmup"]:
++            grouped[row["mode"]].append(row["device_wall_ms"])
++    for mode in grouped:
++        for period in range(12):
++            values = [
++                r["device_wall_ms"] for r in samples if not r["warmup"] and r["mode"] == mode and r["period"] == period
++            ]
++            if len(values) != 5:
++                raise ValueError("expected five measurements per policy per period")
++            by_period[mode][period] = float(np.median(values))
++    if any(len(v) != 60 for v in grouped.values()):
++        raise ValueError("expected 60 ordinary samples per policy")
++    baseline = float(np.median(grouped["shared"]))
++    summary = {
++        "seq_len": manifest["seq_len"],
++        "formal_samples": 60,
++        "warmups_per_policy": 12,
++        "periods": 12,
++        "p95_method": "numpy linear quantile",
++        "bootstrap": "10000 resamples of 12 paired period medians, seed 1234",
++        "C_D_active": manifest["C_D_active"],
++        "policies": {},
++    }
++    for mode, values in grouped.items():
++        contrasts = np.array([100 * (by_period[mode][p] / by_period["shared"][p] - 1) for p in range(12)])
++        rng = np.random.default_rng(1234)
++        draws = np.median(contrasts[rng.integers(0, 12, (10000, 12))], axis=1)
++        counters = [r["counters"] for r in samples if r["mode"] == mode and not r["warmup"]]
++        summary["policies"][mode] = {
++            "median_ms": float(np.median(values)),
++            "p95_ms": float(np.quantile(values, 0.95)),
++            "median_relative_shared_percent": 100 * (float(np.median(values)) / baseline - 1),
++            "period_relative_shared_percent": contrasts.tolist(),
++            "paired_period_median_percent": float(np.median(contrasts)),
++            "paired_period_bootstrap_95_percent": np.quantile(draws, [0.025, 0.975]).tolist(),
++            "eligible_tasks_total": sum(c["eligible"] for c in counters),
++            "actual_eligible_block_claims_total": sum(c["eligible_claimed"] for c in counters),
++            "alternative_comparisons_total": sum(c["multi"] for c in counters),
++            "overrides_total": sum(c["overrides"] for c in counters),
++            "claim_races_total": sum(c["race"] for c in counters),
++        }
++    (folder / "summary.json").write_text(json.dumps(summary, indent=2))
++    return summary
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("folders", type=Path, nargs="+")
++    args = parser.parse_args()
++    for folder in args.folders:
++        print(json.dumps(summarize(folder), indent=2))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/examples/a2a3/tensormap_and_ringbuffer/benchmark_streaming_action/test_calibration.py b/examples/a2a3/tensormap_and_ringbuffer/benchmark_streaming_action/test_calibration.py
+new file mode 100644
+index 000000000..88be2af02
+--- /dev/null
++++ b/examples/a2a3/tensormap_and_ringbuffer/benchmark_streaming_action/test_calibration.py
+@@ -0,0 +1,44 @@
++#!/usr/bin/env python3
++# Copyright (c) PyPTO Contributors.
++# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
++# CANN Open Software License Agreement Version 2.0 (the "License").
++# Please refer to the License for details. You may not use this file except in compliance with the License.
++# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
++# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
++# See LICENSE in the root of the software repository for the full text of the License.
++# -----------------------------------------------------------------------------------------------------------
++"""Paired physical-placement calibration; no learned scheduling is active."""
++
++import torch
++from simpler.task_interface import ArgDirection as D
++
++from simpler_setup import SceneTestCase, TaskArgsBuilder, TensorArg, scene_test
++
++
++@scene_test(level=2, runtime="tensormap_and_ringbuffer")
++class TestStreamingCalibration(SceneTestCase):
++    CALLABLE = {
++        "orchestration": {
++            "source": "kernels/calibration.cpp",
++            "function_name": "aicpu_orchestration_entry",
++            "signature": [D.INOUT],
++        },
++        "incores": [{"func_id": 0, "source": "kernels/reuse.cpp", "core_type": "aiv", "signature": [D.INOUT]}],
++    }
++    CASES = [
++        {"name": "paired_locality", "platforms": ["a2a3sim", "a2a3"], "params": {}, "config": {"aicpu_thread_num": 6}}
++    ]
++
++    def generate_args(self, params):
++        return TaskArgsBuilder(TensorArg("output", torch.zeros(6 * 262144, dtype=torch.float32)))
++
++    def compute_golden(self, args, params):
++        sizes = (1024, 16384, 262144)
++        for size, elements in enumerate(sizes):
++            for reuse in range(2):
++                lane = size * 2 + reuse
++                args.output[lane * 262144 : lane * 262144 + elements] = 1 + (8 if reuse else 1)
++
++
++if __name__ == "__main__":
++    SceneTestCase.run_module(__name__)
+diff --git a/examples/a2a3/tensormap_and_ringbuffer/benchmark_streaming_action/test_diamond.py b/examples/a2a3/tensormap_and_ringbuffer/benchmark_streaming_action/test_diamond.py
+new file mode 100644
+index 000000000..42475b079
+--- /dev/null
++++ b/examples/a2a3/tensormap_and_ringbuffer/benchmark_streaming_action/test_diamond.py
+@@ -0,0 +1,69 @@
++#!/usr/bin/env python3
++# Copyright (c) PyPTO Contributors.
++# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
++# CANN Open Software License Agreement Version 2.0 (the "License").
++# Please refer to the License for details. You may not use this file except in compliance with the License.
++# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
++# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
++# See LICENSE in the root of the software repository for the full text of the License.
++# -----------------------------------------------------------------------------------------------------------
++"""Real submission-time visibility checks; Shared dispatch remains the baseline."""
++
++from pathlib import Path
++
++import torch
++from simpler.task_interface import ArgDirection as D
++
++from simpler_setup import SceneTestCase, TaskArgsBuilder, TensorArg, scene_test
++
++VECTOR = Path(__file__).resolve().parent.parent / "vector_example/kernels/aiv"
++
++
++@scene_test(level=2, runtime="tensormap_and_ringbuffer")
++class TestStreamingDiamond(SceneTestCase):
++    CALLABLE = {
++        "orchestration": {
++            "source": "kernels/diamond.cpp",
++            "function_name": "aicpu_orchestration_entry",
++            "signature": [D.INOUT, D.IN],
++        },
++        "incores": [
++            {"func_id": 0, "source": "kernels/hold.cpp", "core_type": "aiv", "signature": [D.INOUT]},
++            {
++                "func_id": 1,
++                "source": str(VECTOR / "kernel_add_scalar.cpp"),
++                "core_type": "aiv",
++                "signature": [D.IN, D.OUT],
++            },
++            {
++                "func_id": 2,
++                "source": str(VECTOR / "kernel_add.cpp"),
++                "core_type": "aiv",
++                "signature": [D.IN, D.IN, D.OUT],
++            },
++        ],
++    }
++    CASES = [
++        {
++            "name": f"{'Late' if late else 'Early'}{'Slow' if slow else 'Fast'}",
++            "platforms": ["a2a3"],
++            "params": {"late": late, "slow": slow},
++            "config": {"aicpu_thread_num": 6},
++        }
++        for late in (False, True)
++        for slow in (False, True)
++    ]
++
++    def generate_args(self, params):
++        return TaskArgsBuilder(
++            TensorArg("output", torch.zeros(4 * 16384, dtype=torch.float32)),
++            TensorArg("control", torch.tensor([params["late"], params["slow"]], dtype=torch.int32)),
++        )
++
++    def compute_golden(self, args, params):
++        for lane, value in enumerate((1, 2, 1, 3)):
++            args.output[lane * 16384 : (lane + 1) * 16384] = value
++
++
++if __name__ == "__main__":
++    SceneTestCase.run_module(__name__)
+diff --git a/examples/a2a3/tensormap_and_ringbuffer/benchmark_streaming_action/test_reference.py b/examples/a2a3/tensormap_and_ringbuffer/benchmark_streaming_action/test_reference.py
+new file mode 100644
+index 000000000..e831651b0
+--- /dev/null
++++ b/examples/a2a3/tensormap_and_ringbuffer/benchmark_streaming_action/test_reference.py
+@@ -0,0 +1,198 @@
++#!/usr/bin/env python3
++# Copyright (c) PyPTO Contributors.
++# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
++# CANN Open Software License Agreement Version 2.0 (the "License").
++# Please refer to the License for details. You may not use this file except in compliance with the License.
++# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
++# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
++# See LICENSE in the root of the software repository for the full text of the License.
++# -----------------------------------------------------------------------------------------------------------
++"""Deterministic prefix, work-conservation and two-action objective checks."""
++
++import unittest
++from dataclasses import replace
++
++from prefix_replay import SubmittedTask, replay
++from reference import Gate, Join, Prefix, Slot, Snapshot, Task, Visibility, compare, conditional_remaining
++
++
++class StreamingReferenceTest(unittest.TestCase):
++    def fixture(self):
++        p = Prefix()
++        u = Task(1, "AIC", (2.0, 10.0), ready=0.0)
++        t = Task(2, "AIC", (4.0, 14.0), ready=0.0, preference=0)
++        p.submit(u)
++        p.submit(t)
++        s = Snapshot(0.0, (Slot(0, "AIC", 14.0, 0), Slot(1, "AIC", 0.0, 1)), 1)
++        return p, [u, t], s
++
++    def decision(self, p, h, s, **kw):
++        return compare(p, h, s, gate=Gate(0.0, 30), **kw)
++
++    def add_join(self, p, registered=True):
++        p.submit(Task(3, "AIC", (1.0, 1.0)))
++        p.submit(Task(4, "AIC", (1.0, 1.0)))
++        p.register_join(Join(4, (2, 3), registered))
++
++    def test_both_tasks_limit_gain(self):
++        p, h, s = self.fixture()
++        d = self.decision(p, h, s)
++        self.assertEqual((d.a0, d.a1, d.gain, d.task_id), (24.0, 16.0, 8.0, 2))
++
++    def test_slow_visible_sibling_masks_gain(self):
++        p, h, s = self.fixture()
++        self.add_join(p)
++        d = self.decision(p, h, replace(s, predecessor_finish=((3, 30.0),)))
++        self.assertEqual((d.a0, d.a1, d.gain, d.task_id), (30.0, 30.0, 0.0, 1))
++
++    def test_fast_visible_sibling_keeps_net_two(self):
++        p, h, s = self.fixture()
++        self.add_join(p)
++        d = self.decision(p, h, replace(s, predecessor_finish=((3, 12.0),)))
++        self.assertEqual((d.a0, d.a1, d.gain), (24.0, 16.0, 8.0))
++
++    def test_same_prefix_different_future(self):
++        a, ha, sa = self.fixture()
++        b, hb, sb = self.fixture()
++        before_a = self.decision(a, ha, sa)
++        before_b = self.decision(b, hb, sb)
++        self.assertEqual(before_a, before_b)
++        self.add_join(a)
++        b.submit(Task(99, "AIV", (1.0, 1.0)))
++        self.assertEqual(before_a, before_b)
++
++    def test_diamond_submission_timing(self):
++        p, h, s = self.fixture()
++        self.assertEqual(self.decision(p, h, s).task_id, 2)
++        self.add_join(p)
++        s = replace(s, predecessor_finish=((3, 30.0),))
++        self.assertEqual(self.decision(p, h, s).task_id, 1)
++        self.assertEqual(self.decision(p, h, s, policy="C").task_id, 2)
++
++    def test_incomplete_join_not_used(self):
++        p, h, s = self.fixture()
++        self.add_join(p, registered=False)
++        self.assertEqual(p.successor_state(2), Visibility.REGISTERING)
++        self.assertEqual(self.decision(p, h, replace(s, predecessor_finish=((3, 30.0),))).task_id, 2)
++        p.register_join(Join(4, (2, 3), True))
++        self.assertEqual(p.successor_state(2), Visibility.USABLE)
++
++    def test_unknown_is_not_absent(self):
++        p, _, _ = self.fixture()
++        self.assertEqual(p.successor_state(2), Visibility.UNKNOWN)
++
++    def test_single_preference_head_dispatches_with_stale_peer(self):
++        p, h, s = self.fixture()
++        self.assertEqual(compare(p, [h[1]], replace(s, summary_age=1000)).task_id, 2)
++
++    def test_stale_summary_defaults(self):
++        p, h, s = self.fixture()
++        d = self.decision(p, h, replace(s, summary_age=6.0))
++        self.assertEqual((d.task_id, d.reason), (1, "stale"))
++
++    def test_missing_summary_defaults(self):
++        p, h, s = self.fixture()
++        self.assertEqual(self.decision(p, h, replace(s, initialized=False)).reason, "uninitialized")
++
++    def test_expiry_vetoes_override_without_sleep(self):
++        p, h, s = self.fixture()
++        self.assertEqual(self.decision(p, h, replace(s, now=10)).reason, "expired")
++
++    def test_pending_is_not_idle(self):
++        p, h, s = self.fixture()
++        slots = (s.slots[0], replace(s.slots[1], available=1.0))
++        d = self.decision(p, h, replace(s, slots=slots))
++        self.assertEqual((d.task_id, d.reason), (None, "no_idle_slot"))
++
++    def test_conditional_remaining_and_censoring(self):
++        self.assertEqual(conditional_remaining([6, 8, 10, 15, 17], 11), 5)
++        self.assertIsNone(conditional_remaining([6, 8], 11))
++
++    def test_insufficient_independent_blocks_never_override(self):
++        p, h, s = self.fixture()
++        d = compare(p, h, s, gate=Gate(0, 6))
++        self.assertEqual((d.task_id, d.reason), (1, "uncalibrated_gate"))
++
++    def test_optimism_and_extra_cost_are_paid(self):
++        p, h, s = self.fixture()
++        self.assertEqual(compare(p, h, s, gate=Gate(7.0, 30, 0.5)).task_id, 1)
++
++    def test_illegal_unpublished_head_is_rejected(self):
++        p, h, s = self.fixture()
++        with self.assertRaises(ValueError):
++            self.decision(p, h + [Task(99, "AIC", (1, 1), ready=0)], s)
++
++    def test_sync_default_is_not_skipped(self):
++        p, h, s = self.fixture()
++        h[0] = replace(h[0], special=True)
++        p.tasks[1] = h[0]
++        d = self.decision(p, h, s)
++        self.assertEqual((d.task_id, d.reason), (1, "ineligible_default"))
++
++    def test_fanin_overflow_does_not_truncate_max(self):
++        p, h, s = self.fixture()
++        for i in range(3, 8):
++            p.submit(Task(i, "AIC", (1, 1)))
++        p.register_join(Join(7, (2, 3, 4, 5, 6), True))
++        s = replace(s, predecessor_finish=tuple((i, 100.0) for i in range(3, 7)))
++        self.assertEqual(self.decision(p, h, s).gain, 8.0)
++
++    def test_empty(self):
++        self.assertIsNone(compare(Prefix(), [], Snapshot(0, (), 0)).task_id)
++
++
++class PrefixReplayTest(unittest.TestCase):
++    def fixture(self, sibling=30.0, submit_join=0.0, alternate_future=False):
++        tasks = [
++            SubmittedTask(Task(0, "AIC", (14, 14), special=True), 0, fixed_side=0),
++            SubmittedTask(Task(1, "AIC", (2, 10)), 0),
++            SubmittedTask(Task(2, "AIC", (4, 14), preference=0), 0),
++            SubmittedTask(Task(3, "AIV", (sibling, sibling), special=True), 0, fixed_side=0),
++            SubmittedTask(Task(4, "AIC", (1, 1)), submit_join, predecessors=(1 if alternate_future else 2, 3)),
++        ]
++        slots = (Slot(0, "AIV", 0, 2), Slot(0, "AIC", 0, 0), Slot(1, "AIC", 0, 1))
++        return tasks, slots
++
++    def test_recomputed_ready_and_resources(self):
++        definitions, slots = self.fixture(sibling=12)
++        b = replay(definitions, "B", slots)
++        c = replay(definitions, "C", slots)
++        d = replay(definitions, "D", slots)
++        self.assertEqual((b["makespan_us"], c["makespan_us"], d["makespan_us"]), (25, 16, 16))
++        self.assertEqual((b["claims"][4][0], d["claims"][4][0]), (24, 14))
++        self.assertEqual(len(d["claims"]), len(definitions))
++
++    def test_slow_join_masks_local_override(self):
++        definitions, slots = self.fixture()
++        c = replay(definitions, "C", slots)
++        d = replay(definitions, "D", slots)
++        self.assertEqual(c["claims"][2][0], 0)
++        self.assertEqual(d["claims"][1][0], 0)
++        self.assertEqual((c["makespan_us"], d["makespan_us"]), (31, 31))
++
++    def test_late_future_is_invisible(self):
++        a, slots = self.fixture(submit_join=19)
++        b, _ = self.fixture(submit_join=19, alternate_future=True)
++        ra = replay(a, "D", slots)
++        rb = replay(b, "D", slots)
++        da = [x for x in ra["decisions"] if x["time"] < 19]
++        db = [x for x in rb["decisions"] if x["time"] < 19]
++        self.assertEqual(da, db)
++
++    def test_actual_future_duration_is_not_a_policy_feature(self):
++        definitions, slots = self.fixture()
++        changed = [replace(d, actual_spans=(40, 40)) if d.task.task_id == 3 else d for d in definitions]
++        a = replay(definitions, "D", slots)
++        b = replay(changed, "D", slots)
++        self.assertEqual([x for x in a["decisions"] if x["time"] == 0], [x for x in b["decisions"] if x["time"] == 0])
++
++    def test_all_groups_dispatch_once(self):
++        definitions, slots = self.fixture(sibling=12)
++        for mode in ("A", "B", "C", "D"):
++            result = replay(definitions, mode, slots)
++            self.assertEqual(result["published"], 5)
++            self.assertEqual(set(result["completed"]), set(range(5)))
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/examples/a2a3/tensormap_and_ringbuffer/benchmark_streaming_action/visibility_budget.py b/examples/a2a3/tensormap_and_ringbuffer/benchmark_streaming_action/visibility_budget.py
+new file mode 100644
+index 000000000..ccecbb9ad
+--- /dev/null
++++ b/examples/a2a3/tensormap_and_ringbuffer/benchmark_streaming_action/visibility_budget.py
+@@ -0,0 +1,64 @@
++#!/usr/bin/env python3
++# Copyright (c) PyPTO Contributors.
++# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
++# CANN Open Software License Agreement Version 2.0 (the "License").
++# Please refer to the License for details. You may not use this file except in compliance with the License.
++# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
++# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
++# See LICENSE in the root of the software repository for the full text of the License.
++# -----------------------------------------------------------------------------------------------------------
++"""Post-hoc state-budget sensitivity using only successor indices observed at each epoch."""
++
++import argparse
++import json
++from collections import Counter
++from pathlib import Path
++
++from analyze import read_trace
++
++
++def calculate(rows):
++    hist, observed = Counter(), 0
++    for row in rows:
++        info = row["visibility"]
++        if not info["observed"]:
++            continue
++        observed += 1
++        if info["state"] == 3:
++            continue
++        fanins = []
++        for suffix in (0, 1):
++            index, epoch = info[f"succ{suffix}"], info[f"reg{suffix}"]
++            if index and epoch and epoch <= info["epoch"]:
++                fanins.append(rows[index - 1]["visibility"]["fanin"])
++        if fanins:
++            hist[min(fanins)] += 1
++    result = {
++        "observed": observed,
++        "denominator": "ordinary Shared queue-pop observations",
++        "scope": "post-hoc sensitivity, not an online performance or action-ranking result",
++        "prefix_rule": (
++            "only recorded successor indices with 0 < registered_epoch <= captured_epoch; "
++            "successor-index overflow excluded"
++        ),
++        "minimum_registered_fanin_histogram": dict(sorted(hist.items())),
++        "budgets": [],
++    }
++    for budget in (4, 8, 16, 32, 64, 128, 256):
++        count = sum(v for k, v in hist.items() if k <= budget)
++        result["budgets"].append({"max_fanin": budget, "usable": count, "fraction": count / observed})
++    return result
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("folder", type=Path)
++    args = parser.parse_args()
++    rows = read_trace(args.folder)
++    result = calculate(rows)
++    (args.folder / "visibility-budgets-reproduced.json").write_text(json.dumps(result, indent=2))
++    print(json.dumps(result, indent=2))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/streaming_action.h b/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/streaming_action.h
+new file mode 100644
+index 000000000..f5c0dbbac
+--- /dev/null
++++ b/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/streaming_action.h
+@@ -0,0 +1,116 @@
++/*
++ * Copyright (c) PyPTO Contributors.
++ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
++ * CANN Open Software License Agreement Version 2.0 (the "License").
++ * Please refer to the License for details. You may not use this file except in compliance with the License.
++ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
++ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
++ * See LICENSE in the root of the software repository for the full text of the License.
++ * -----------------------------------------------------------------------------------------------------------
++ */
++#pragma once
++#include <cmath>
++#include <cstdint>
++
++namespace simpler::tmr {
++constexpr int STREAM_MAX_HEADS = 3;
++constexpr int STREAM_MAX_SLOTS = 72;
++struct StreamCandidate {
++    uint64_t id{0};
++    double ready_us{0}, span_us[2]{0, 0};
++    int resource{0};
++};
++struct StreamSlot {
++    double available_us{0};
++    int side{0}, resource{0}, group{0};
++};
++struct StreamJoin {
++    bool complete{false};
++    int count{0};
++    int candidate[4]{-1, -1, -1, -1};
++    double committed_finish_us[4]{};
++};
++struct StreamPairResult {
++    bool valid{false}, used_join{false};
++    double default_end{0}, alternative_end{0}, gain{0};
++};
++inline bool stream_action_finish(
++    const StreamCandidate *tasks, int n, int first, const StreamSlot *initial, int slots, int local, double now,
++    double finish[STREAM_MAX_HEADS]
++) {
++    if (n < 2 || n > STREAM_MAX_HEADS || slots < 1 || slots > STREAM_MAX_SLOTS || local < 0 || local >= slots ||
++        initial[local].available_us > now)
++        return false;
++    double free_at[STREAM_MAX_SLOTS];
++    for (int i = 0; i < slots; ++i)
++        free_at[i] = initial[i].available_us;
++    // Input heads follow the common B ordering; both actions process each once.
++    for (int step = 0; step < n; ++step) {
++        int index = step == 0 ? first : (step <= first ? step - 1 : step);
++        const auto &task = tasks[index];
++        int best = -1;
++        double end = INFINITY, earliest = INFINITY;
++        for (int k = 0; k < slots; ++k) {
++            if ((step == 0 && k != local) || initial[k].resource != task.resource) continue;
++            double duration = task.span_us[initial[k].side];
++            if (!(duration > 0) || !std::isfinite(duration)) continue;
++            double start = now > free_at[k] ? now : free_at[k];
++            if (task.ready_us > start) start = task.ready_us;
++            double candidate = start + duration;
++            if (start < earliest ||
++                (start == earliest && best >= 0 &&
++                 (initial[k].side < initial[best].side ||
++                  (initial[k].side == initial[best].side && initial[k].group < initial[best].group)))) {
++                earliest = start;
++                end = candidate;
++                best = k;
++            }
++        }
++        if (best < 0) return false;
++        finish[index] = end;
++        free_at[best] = end;
++    }
++    return true;
++}
++inline StreamPairResult stream_compare(
++    const StreamCandidate *tasks, int n, int alternative, const StreamSlot *slots, int count, int local, double now,
++    const StreamJoin &join
++) {
++    StreamPairResult result;
++    if (alternative <= 0 || alternative >= n) return result;
++    double f[2][STREAM_MAX_HEADS]{};
++    if (!stream_action_finish(tasks, n, 0, slots, count, local, now, f[0]) ||
++        !stream_action_finish(tasks, n, alternative, slots, count, local, now, f[1]))
++        return result;
++    bool usable = join.complete && join.count > 0 && join.count <= 4;
++    for (int p = 0; p < join.count && usable; ++p) {
++        int i = join.candidate[p];
++        if (i >= n || i < -1 || (i == -1 && !std::isfinite(join.committed_finish_us[p]))) usable = false;
++    }
++    double endpoints[2]{};
++    for (int a = 0; a < 2; ++a) {
++        for (int i = 0; i < n; ++i) {
++            bool dominated = false;
++            if (usable)
++                for (int p = 0; p < join.count; ++p)
++                    if (join.candidate[p] == i) dominated = true;
++            if (!dominated && f[a][i] > endpoints[a]) endpoints[a] = f[a][i];
++        }
++        if (usable) {
++            for (int p = 0; p < join.count; ++p) {
++                double value = join.candidate[p] >= 0 ? f[a][join.candidate[p]] : join.committed_finish_us[p];
++                if (value > endpoints[a]) endpoints[a] = value;
++            }
++        }
++    }
++    result.valid = true;
++    result.used_join = usable;
++    result.default_end = endpoints[0];
++    result.alternative_end = endpoints[1];
++    result.gain = endpoints[0] - endpoints[1];
++    return result;
++}
++inline bool stream_admit(double gain, double optimism, int independent_blocks, double extra, double delta = 0.5) {
++    return independent_blocks >= 30 && optimism >= 0 && gain > optimism + extra + delta;
++}
++}  // namespace simpler::tmr

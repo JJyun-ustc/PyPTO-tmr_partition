@@ -1,0 +1,23 @@
+{
+  "excluded_from_formal_timing": {
+    "all_diagnostics": "DFX, trace, profiling, custom microbenchmarks, golden checks and pilot are excluded",
+    "calibration-initial.log": "custom kernel numerical check without complete colocated trace",
+    "calibration": "periods were not drained, overlap invalidates period contrasts",
+    "calibration-drained": "same/cross arms use different addresses; superseded by matched addresses",
+    "visibility": "superseded visibility classification conflated complete/high-fanin and incomplete",
+    "switch-smoke": "claim counter counted dequeue/requeue rather than unique block claims",
+    "golden-3500": "pre-isolation build: superseded by final-golden-3500",
+    "qwen-core-smoke": "host parser originally required device_wall, but per-run profiling suppresses it; four actual NPU runs passed and profiles complete. Samples recovered with null ordinary time; see parser-recovery.json",
+    "simulation-sync": "compile failed: g++-15 is absent. Native/CPU and onboard results are separate."
+  },
+  "no_deletion": "Failed and superseded attempts remain in this directory. No diagnostic measurement is promoted to an ordinary timing sample.",
+  "phase_snapshots": {
+    "harness-freeze.json": "earlier calibration snapshot, superseded by formal-freeze.json",
+    "phase1-frozen-source.json": "earlier visibility instrumentation snapshot; final-diagnose-3500 is the primary visibility result from the formal runtime build"
+  },
+  "formal_parser": {
+    "failure": "final-formal-3500 collector exited after all 288 worker runs passed because positional log association saw 0/2 timing records at neighboring Python boundaries",
+    "resolution": "all three formal folders independently validated by unique native invocation ID and complete chip.run sequence; no run dropped/replaced; frozen collector unchanged",
+    "reproduction": "recover_formal_parser.py collect wraps the original collector; parser-recovery.json retains the association evidence"
+  }
+}

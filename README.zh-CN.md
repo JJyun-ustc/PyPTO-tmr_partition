@@ -1,8 +1,20 @@
 # PyPTO TMR：AICPU cluster 放置研究
 
+## 最新实测：流式 TMR 基础设施与可见性
+
+Shared 中位数/p95 **36.650/36.731 ms**；B 基础设施组 **38.207/38.350 ms（中位数慢 4.25%）**。
+三种序列长度的 720 个正式样本、144 个预热全部保留，12 次输出与全部 40 层 KV golden 通过。
+**主动 C/D 派发尚未实现，实际改派为 0，新收益模型未训练；这不是已完成的主动 A–D 对照。**
+
+- [中文结果](docs/zh/experiments/tmr-cluster/streaming-action-results.md) · [English](docs/en/experiments/tmr-cluster/streaming-action-results.md)
+- [实际机制与限制](docs/zh/experiments/tmr-cluster/streaming-action-mechanism.md) · [复现命令](docs/zh/experiments/tmr-cluster/streaming-action-reproduce.md)
+- [全部样本和完整原始归档](official-results/streaming-action-20261127/)
+
+`runtime` 子模块固定到 `runtime-streaming-action-20261127` 的源码快照 `153ba8ae4`；测量起点是 `8ebbff773` 加已保留补丁。
+
 ## 下一轮方案：流式 TMR 动作调度
 
-**仅为设计提案，尚无新实现或测量。** S 有真实空槽时，仅用可见事件前缀比较默认领取与替代领取；先完成 A–D 和菱形提交时序验证，再决定是否训练残差模型。
+**目标规格；已有部分实测，尚未全部实现。** S 有真实空槽时，仅用可见事件前缀比较默认领取与替代领取；先完成 A–D 和菱形提交时序验证，再决定是否训练残差模型。
 
 - [中文方案](docs/zh/experiments/tmr-cluster/streaming-action-plan.md)
 - [English plan](docs/en/experiments/tmr-cluster/streaming-action-plan.md)
@@ -23,7 +35,7 @@ Qwen 的同步 attention 保留原协议，性能回退与失败尝试全部保�
 - [English report](docs/en/experiments/tmr-cluster/qkv-round2.md)
 - [全部样本、训练权重、校准表、回放、诊断与复现命令](official-results/qkv-round2-20261125/)
 
-`runtime` 子模块固定到 `8ebbff773`；数据于 2026-11-25 采集，2026-11-26 发布。
+第二轮运行时快照为 `8ebbff773`；数据于 2026-11-25 采集，2026-11-26 发布。
 
 ## 历史实验：QKV 初版
 
@@ -37,7 +49,7 @@ p95 从 **36.829 增至 39.463 ms（回退 7.15%）**，每种模式各 30 个�
 - [English mechanism and workflow](docs/en/experiments/tmr-cluster/algorithm-qkv-ready-batch.md)
 - [原始证据与冻结指纹](official-results/qkv-ready-batch-20261125/)
 
-`runtime` 子模块固定到 `runtime-qkv-ready-batch`。策略冻结，本轮不补调参或消融。
+初版运行时分支为 `runtime-qkv-ready-batch`。策略冻结，本轮不补调参或消融。
 发布不包含二进制、venv、缓存及通用驱动日志。
 
 ## 历史实验：v14

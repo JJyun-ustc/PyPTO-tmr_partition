@@ -1,0 +1,250 @@
+{
+  "phase": "qwen_pair_calibration",
+  "seq_len": 3500,
+  "qwen_pair": true,
+  "orchestration_source": "${RUNTIME_ROOT}/build_output/streaming-qwen-pair/decode_controlled.cpp",
+  "schedule": [
+    {
+      "mode": "shared",
+      "period": 4,
+      "repeat": 0,
+      "warmup": true,
+      "consumer_side": 0,
+      "producer_side": 0,
+      "cross": 0,
+      "ordinal": 0
+    },
+    {
+      "mode": "shared",
+      "period": 4,
+      "repeat": 0,
+      "warmup": true,
+      "consumer_side": 0,
+      "producer_side": 1,
+      "cross": 1,
+      "ordinal": 1
+    },
+    {
+      "mode": "shared",
+      "period": 4,
+      "repeat": 0,
+      "warmup": true,
+      "consumer_side": 1,
+      "producer_side": 1,
+      "cross": 0,
+      "ordinal": 2
+    },
+    {
+      "mode": "shared",
+      "period": 4,
+      "repeat": 0,
+      "warmup": true,
+      "consumer_side": 1,
+      "producer_side": 0,
+      "cross": 1,
+      "ordinal": 3
+    },
+    {
+      "mode": "shared",
+      "period": 4,
+      "repeat": 1,
+      "warmup": false,
+      "consumer_side": 0,
+      "producer_side": 1,
+      "cross": 1,
+      "ordinal": 4
+    },
+    {
+      "mode": "shared",
+      "period": 4,
+      "repeat": 1,
+      "warmup": false,
+      "consumer_side": 0,
+      "producer_side": 0,
+      "cross": 0,
+      "ordinal": 5
+    },
+    {
+      "mode": "shared",
+      "period": 4,
+      "repeat": 1,
+      "warmup": false,
+      "consumer_side": 1,
+      "producer_side": 0,
+      "cross": 1,
+      "ordinal": 6
+    },
+    {
+      "mode": "shared",
+      "period": 4,
+      "repeat": 1,
+      "warmup": false,
+      "consumer_side": 1,
+      "producer_side": 1,
+      "cross": 0,
+      "ordinal": 7
+    },
+    {
+      "mode": "shared",
+      "period": 4,
+      "repeat": 2,
+      "warmup": false,
+      "consumer_side": 0,
+      "producer_side": 0,
+      "cross": 0,
+      "ordinal": 8
+    },
+    {
+      "mode": "shared",
+      "period": 4,
+      "repeat": 2,
+      "warmup": false,
+      "consumer_side": 0,
+      "producer_side": 1,
+      "cross": 1,
+      "ordinal": 9
+    },
+    {
+      "mode": "shared",
+      "period": 4,
+      "repeat": 2,
+      "warmup": false,
+      "consumer_side": 1,
+      "producer_side": 1,
+      "cross": 0,
+      "ordinal": 10
+    },
+    {
+      "mode": "shared",
+      "period": 4,
+      "repeat": 2,
+      "warmup": false,
+      "consumer_side": 1,
+      "producer_side": 0,
+      "cross": 1,
+      "ordinal": 11
+    },
+    {
+      "mode": "shared",
+      "period": 4,
+      "repeat": 3,
+      "warmup": false,
+      "consumer_side": 0,
+      "producer_side": 1,
+      "cross": 1,
+      "ordinal": 12
+    },
+    {
+      "mode": "shared",
+      "period": 4,
+      "repeat": 3,
+      "warmup": false,
+      "consumer_side": 0,
+      "producer_side": 0,
+      "cross": 0,
+      "ordinal": 13
+    },
+    {
+      "mode": "shared",
+      "period": 4,
+      "repeat": 3,
+      "warmup": false,
+      "consumer_side": 1,
+      "producer_side": 0,
+      "cross": 1,
+      "ordinal": 14
+    },
+    {
+      "mode": "shared",
+      "period": 4,
+      "repeat": 3,
+      "warmup": false,
+      "consumer_side": 1,
+      "producer_side": 1,
+      "cross": 0,
+      "ordinal": 15
+    },
+    {
+      "mode": "shared",
+      "period": 4,
+      "repeat": 4,
+      "warmup": false,
+      "consumer_side": 0,
+      "producer_side": 0,
+      "cross": 0,
+      "ordinal": 16
+    },
+    {
+      "mode": "shared",
+      "period": 4,
+      "repeat": 4,
+      "warmup": false,
+      "consumer_side": 0,
+      "producer_side": 1,
+      "cross": 1,
+      "ordinal": 17
+    },
+    {
+      "mode": "shared",
+      "period": 4,
+      "repeat": 4,
+      "warmup": false,
+      "consumer_side": 1,
+      "producer_side": 1,
+      "cross": 0,
+      "ordinal": 18
+    },
+    {
+      "mode": "shared",
+      "period": 4,
+      "repeat": 4,
+      "warmup": false,
+      "consumer_side": 1,
+      "producer_side": 0,
+      "cross": 1,
+      "ordinal": 19
+    },
+    {
+      "mode": "shared",
+      "period": 4,
+      "repeat": 5,
+      "warmup": false,
+      "consumer_side": 0,
+      "producer_side": 1,
+      "cross": 1,
+      "ordinal": 20
+    },
+    {
+      "mode": "shared",
+      "period": 4,
+      "repeat": 5,
+      "warmup": false,
+      "consumer_side": 0,
+      "producer_side": 0,
+      "cross": 0,
+      "ordinal": 21
+    },
+    {
+      "mode": "shared",
+      "period": 4,
+      "repeat": 5,
+      "warmup": false,
+      "consumer_side": 1,
+      "producer_side": 0,
+      "cross": 1,
+      "ordinal": 22
+    },
+    {
+      "mode": "shared",
+      "period": 4,
+      "repeat": 5,
+      "warmup": false,
+      "consumer_side": 1,
+      "producer_side": 1,
+      "cross": 0,
+      "ordinal": 23
+    }
+  ],
+  "golden_ordinals": [],
+  "profile_root": "${RUNTIME_ROOT}/results/streaming-action-20261127/qwen-core-calibration/period4/core_records"
+}

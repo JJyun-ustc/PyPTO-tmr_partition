@@ -1,0 +1,49 @@
+{
+  "phase": "qwen_pair_calibration",
+  "seq_len": 3500,
+  "qwen_pair": true,
+  "orchestration_source": "${RUNTIME_ROOT}/build_output/streaming-qwen-pair/decode_controlled.cpp",
+  "schedule": [
+    {
+      "mode": "shared",
+      "period": 0,
+      "repeat": 0,
+      "warmup": true,
+      "consumer_side": 0,
+      "producer_side": 0,
+      "cross": 0,
+      "ordinal": 0
+    },
+    {
+      "mode": "shared",
+      "period": 0,
+      "repeat": 0,
+      "warmup": true,
+      "consumer_side": 0,
+      "producer_side": 1,
+      "cross": 1,
+      "ordinal": 1
+    },
+    {
+      "mode": "shared",
+      "period": 0,
+      "repeat": 0,
+      "warmup": true,
+      "consumer_side": 1,
+      "producer_side": 1,
+      "cross": 0,
+      "ordinal": 2
+    },
+    {
+      "mode": "shared",
+      "period": 0,
+      "repeat": 0,
+      "warmup": true,
+      "consumer_side": 1,
+      "producer_side": 0,
+      "cross": 1,
+      "ordinal": 3
+    }
+  ],
+  "golden_ordinals": []
+}

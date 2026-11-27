@@ -1,0 +1,425 @@
+{
+  "scope": "diagnostic only; all device_wall excluded from ordinary measurements",
+  "policies": {
+    "shared": {
+      "tasks": 11166,
+      "edges": 23605,
+      "ready_to_claim": {
+        "n": 9962,
+        "median_us": 23.74,
+        "p95_us": 122.03899999999999
+      },
+      "claim_to_dispatch": {
+        "n": 9962,
+        "median_us": 1.22,
+        "p95_us": 3.6
+      },
+      "queue_pop_cost_including_empty_and_batch_calls": {
+        "n": 0,
+        "median_us": null,
+        "p95_us": null
+      },
+      "queue_pop_cost_sampling": "every 32nd invocation, at most 2048 records per S; not model inference latency",
+      "thread_counters": []
+    },
+    "structure": {
+      "tasks": 11166,
+      "edges": 23605,
+      "ready_to_claim": {
+        "n": 9962,
+        "median_us": 30.869999999999997,
+        "p95_us": 130.41799999999995
+      },
+      "claim_to_dispatch": {
+        "n": 9962,
+        "median_us": 1.54,
+        "p95_us": 4.1
+      },
+      "queue_pop_cost_including_empty_and_batch_calls": {
+        "n": 2098,
+        "median_us": 0.04,
+        "p95_us": 0.78
+      },
+      "queue_pop_cost_sampling": "every 32nd invocation, at most 2048 records per S; not model inference latency",
+      "thread_counters": [
+        {
+          "t": 0,
+          "pops": 10885,
+          "heads": 2632,
+          "single": 2632,
+          "multi": 0,
+          "race": 287,
+          "empty": 9855,
+          "comparisons": 0,
+          "overrides": 0,
+          "uncalibrated": 0,
+          "samples": 341,
+          "claimed": 2345,
+          "eligible_claimed": 1807
+        },
+        {
+          "t": 1,
+          "pops": 11895,
+          "heads": 2805,
+          "single": 2805,
+          "multi": 0,
+          "race": 308,
+          "empty": 10780,
+          "comparisons": 0,
+          "overrides": 0,
+          "uncalibrated": 0,
+          "samples": 372,
+          "claimed": 2497,
+          "eligible_claimed": 2003
+        },
+        {
+          "t": 2,
+          "pops": 14558,
+          "heads": 3171,
+          "single": 3171,
+          "multi": 0,
+          "race": 433,
+          "empty": 13191,
+          "comparisons": 0,
+          "overrides": 0,
+          "uncalibrated": 0,
+          "samples": 455,
+          "claimed": 2738,
+          "eligible_claimed": 2102
+        },
+        {
+          "t": 3,
+          "pops": 14523,
+          "heads": 3243,
+          "single": 3243,
+          "multi": 0,
+          "race": 435,
+          "empty": 13079,
+          "comparisons": 0,
+          "overrides": 0,
+          "uncalibrated": 0,
+          "samples": 454,
+          "claimed": 2808,
+          "eligible_claimed": 2191
+        },
+        {
+          "t": 4,
+          "pops": 15223,
+          "heads": 2732,
+          "single": 2732,
+          "multi": 0,
+          "race": 393,
+          "empty": 13909,
+          "comparisons": 0,
+          "overrides": 0,
+          "uncalibrated": 0,
+          "samples": 476,
+          "claimed": 2339,
+          "eligible_claimed": 1859
+        },
+        {
+          "t": 5,
+          "pops": 0,
+          "heads": 0,
+          "single": 0,
+          "multi": 0,
+          "race": 0,
+          "empty": 0,
+          "comparisons": 0,
+          "overrides": 0,
+          "uncalibrated": 0,
+          "samples": 0,
+          "claimed": 0,
+          "eligible_claimed": 0
+        }
+      ]
+    },
+    "C_guarded": {
+      "tasks": 11166,
+      "edges": 23605,
+      "ready_to_claim": {
+        "n": 9962,
+        "median_us": 28.810000000000002,
+        "p95_us": 128.71699999999993
+      },
+      "claim_to_dispatch": {
+        "n": 9962,
+        "median_us": 1.52,
+        "p95_us": 4.12
+      },
+      "queue_pop_cost_including_empty_and_batch_calls": {
+        "n": 2067,
+        "median_us": 0.04,
+        "p95_us": 0.8
+      },
+      "queue_pop_cost_sampling": "every 32nd invocation, at most 2048 records per S; not model inference latency",
+      "thread_counters": [
+        {
+          "t": 0,
+          "pops": 10783,
+          "heads": 2648,
+          "single": 2648,
+          "multi": 0,
+          "race": 273,
+          "empty": 9754,
+          "comparisons": 0,
+          "overrides": 0,
+          "uncalibrated": 0,
+          "samples": 337,
+          "claimed": 2375,
+          "eligible_claimed": 1859
+        },
+        {
+          "t": 1,
+          "pops": 11408,
+          "heads": 2775,
+          "single": 2775,
+          "multi": 0,
+          "race": 283,
+          "empty": 10317,
+          "comparisons": 0,
+          "overrides": 0,
+          "uncalibrated": 0,
+          "samples": 357,
+          "claimed": 2492,
+          "eligible_claimed": 1913
+        },
+        {
+          "t": 2,
+          "pops": 13865,
+          "heads": 3163,
+          "single": 3163,
+          "multi": 0,
+          "race": 417,
+          "empty": 12505,
+          "comparisons": 0,
+          "overrides": 0,
+          "uncalibrated": 0,
+          "samples": 434,
+          "claimed": 2746,
+          "eligible_claimed": 2162
+        },
+        {
+          "t": 3,
+          "pops": 14838,
+          "heads": 3154,
+          "single": 3154,
+          "multi": 0,
+          "race": 400,
+          "empty": 13477,
+          "comparisons": 0,
+          "overrides": 0,
+          "uncalibrated": 0,
+          "samples": 464,
+          "claimed": 2754,
+          "eligible_claimed": 2173
+        },
+        {
+          "t": 4,
+          "pops": 15183,
+          "heads": 2700,
+          "single": 2700,
+          "multi": 0,
+          "race": 373,
+          "empty": 13893,
+          "comparisons": 0,
+          "overrides": 0,
+          "uncalibrated": 0,
+          "samples": 475,
+          "claimed": 2327,
+          "eligible_claimed": 1855
+        },
+        {
+          "t": 5,
+          "pops": 0,
+          "heads": 0,
+          "single": 0,
+          "multi": 0,
+          "race": 0,
+          "empty": 0,
+          "comparisons": 0,
+          "overrides": 0,
+          "uncalibrated": 0,
+          "samples": 0,
+          "claimed": 0,
+          "eligible_claimed": 0
+        }
+      ]
+    },
+    "D_guarded": {
+      "tasks": 11166,
+      "edges": 23605,
+      "ready_to_claim": {
+        "n": 9962,
+        "median_us": 34.68,
+        "p95_us": 129.31599999999992
+      },
+      "claim_to_dispatch": {
+        "n": 9962,
+        "median_us": 1.54,
+        "p95_us": 4.08
+      },
+      "queue_pop_cost_including_empty_and_batch_calls": {
+        "n": 2074,
+        "median_us": 0.04,
+        "p95_us": 0.92
+      },
+      "queue_pop_cost_sampling": "every 32nd invocation, at most 2048 records per S; not model inference latency",
+      "thread_counters": [
+        {
+          "t": 0,
+          "pops": 10582,
+          "heads": 2582,
+          "single": 2582,
+          "multi": 0,
+          "race": 261,
+          "empty": 9582,
+          "comparisons": 0,
+          "overrides": 0,
+          "uncalibrated": 0,
+          "samples": 331,
+          "claimed": 2321,
+          "eligible_claimed": 1827
+        },
+        {
+          "t": 1,
+          "pops": 12063,
+          "heads": 2771,
+          "single": 2771,
+          "multi": 0,
+          "race": 289,
+          "empty": 10975,
+          "comparisons": 0,
+          "overrides": 0,
+          "uncalibrated": 0,
+          "samples": 377,
+          "claimed": 2482,
+          "eligible_claimed": 1926
+        },
+        {
+          "t": 2,
+          "pops": 13985,
+          "heads": 3164,
+          "single": 3164,
+          "multi": 0,
+          "race": 453,
+          "empty": 12615,
+          "comparisons": 0,
+          "overrides": 0,
+          "uncalibrated": 0,
+          "samples": 438,
+          "claimed": 2711,
+          "eligible_claimed": 2155
+        },
+        {
+          "t": 3,
+          "pops": 14580,
+          "heads": 3200,
+          "single": 3200,
+          "multi": 0,
+          "race": 416,
+          "empty": 13158,
+          "comparisons": 0,
+          "overrides": 0,
+          "uncalibrated": 0,
+          "samples": 456,
+          "claimed": 2784,
+          "eligible_claimed": 2189
+        },
+        {
+          "t": 4,
+          "pops": 15092,
+          "heads": 2723,
+          "single": 2723,
+          "multi": 0,
+          "race": 372,
+          "empty": 13803,
+          "comparisons": 0,
+          "overrides": 0,
+          "uncalibrated": 0,
+          "samples": 472,
+          "claimed": 2351,
+          "eligible_claimed": 1865
+        },
+        {
+          "t": 5,
+          "pops": 0,
+          "heads": 0,
+          "single": 0,
+          "multi": 0,
+          "race": 0,
+          "empty": 0,
+          "comparisons": 0,
+          "overrides": 0,
+          "uncalibrated": 0,
+          "samples": 0,
+          "claimed": 0,
+          "eligible_claimed": 0
+        }
+      ]
+    }
+  },
+  "shared_visibility": {
+    "tasks": 11166,
+    "observed_normal_single_block_claims": 9962,
+    "denominator": "actual Shared batch-pop observations; not three-queue comparison opportunities",
+    "unknown": 68,
+    "registering": 2,
+    "usable_bounded_join": 52,
+    "index_overflow": 920,
+    "complete_fanin_over_budget": 8920,
+    "usable_fraction": 0.005219835374422807,
+    "ranking_change": "not measured by this observational hook"
+  },
+  "shared_visibility_budget_sensitivity": {
+    "observed": 9962,
+    "denominator": "ordinary Shared queue-pop observations",
+    "scope": "post-hoc sensitivity, not an online performance or action-ranking result",
+    "prefix_rule": "only recorded successor indices with 0 < registered_epoch <= captured_epoch; successor-index overflow excluded",
+    "minimum_registered_fanin_histogram": {
+      "1": 41,
+      "2": 11,
+      "7": 320,
+      "10": 800,
+      "11": 4400,
+      "87": 3400
+    },
+    "budgets": [
+      {
+        "max_fanin": 4,
+        "usable": 52,
+        "fraction": 0.005219835374422807
+      },
+      {
+        "max_fanin": 8,
+        "usable": 372,
+        "fraction": 0.037341899217024695
+      },
+      {
+        "max_fanin": 16,
+        "usable": 5572,
+        "fraction": 0.5593254366593053
+      },
+      {
+        "max_fanin": 32,
+        "usable": 5572,
+        "fraction": 0.5593254366593053
+      },
+      {
+        "max_fanin": 64,
+        "usable": 5572,
+        "fraction": 0.5593254366593053
+      },
+      {
+        "max_fanin": 128,
+        "usable": 8972,
+        "fraction": 0.9006223649869504
+      },
+      {
+        "max_fanin": 256,
+        "usable": 8972,
+        "fraction": 0.9006223649869504
+      }
+    ]
+  }
+}

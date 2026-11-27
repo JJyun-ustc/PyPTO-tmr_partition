@@ -1,0 +1,92 @@
+{
+  "formal_runs": 864,
+  "ordinary_runs": 720,
+  "warmups": 144,
+  "golden_checks": [
+    {
+      "seq_len": 3500,
+      "mode": "shared",
+      "layers": 40,
+      "poisoned": true
+    },
+    {
+      "seq_len": 3500,
+      "mode": "structure",
+      "layers": 40,
+      "poisoned": true
+    },
+    {
+      "seq_len": 3500,
+      "mode": "C_guarded",
+      "layers": 40,
+      "poisoned": true
+    },
+    {
+      "seq_len": 3500,
+      "mode": "D_guarded",
+      "layers": 40,
+      "poisoned": true
+    },
+    {
+      "seq_len": 2250,
+      "mode": "shared",
+      "layers": 40,
+      "poisoned": true
+    },
+    {
+      "seq_len": 2250,
+      "mode": "structure",
+      "layers": 40,
+      "poisoned": true
+    },
+    {
+      "seq_len": 2250,
+      "mode": "C_guarded",
+      "layers": 40,
+      "poisoned": true
+    },
+    {
+      "seq_len": 2250,
+      "mode": "D_guarded",
+      "layers": 40,
+      "poisoned": true
+    },
+    {
+      "seq_len": 5000,
+      "mode": "shared",
+      "layers": 40,
+      "poisoned": true
+    },
+    {
+      "seq_len": 5000,
+      "mode": "structure",
+      "layers": 40,
+      "poisoned": true
+    },
+    {
+      "seq_len": 5000,
+      "mode": "C_guarded",
+      "layers": 40,
+      "poisoned": true
+    },
+    {
+      "seq_len": 5000,
+      "mode": "D_guarded",
+      "layers": 40,
+      "poisoned": true
+    }
+  ],
+  "loaded_compute_kernels": 37,
+  "same_kernels": true,
+  "same_source_and_binaries": true,
+  "actual_overrides": 0,
+  "claim_count_matches": true,
+  "CPP_tests": 55,
+  "CPU_reference_tests": 24,
+  "onboard_regression_groups": 6,
+  "onboard_diamond_cases": 4,
+  "active_C_D": false,
+  "new_gain_models_trained": false,
+  "publication": "local only; no push",
+  "format_check": "one scheduler.h comment-alignment violation retained while runtime source was frozen"
+}

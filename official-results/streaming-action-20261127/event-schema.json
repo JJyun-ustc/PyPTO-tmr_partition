@@ -1,0 +1,82 @@
+{
+  "clock_hz": 50000000,
+  "cpu_clock": "get_sys_cnt_aicpu",
+  "aicore_clock": "get_sys_cnt",
+  "clock_checks": "23040 selected task records: dispatch <= AICore start and AICore end <= CPU FIN observation; same 50 MHz system-counter scale",
+  "qkv_task_columns": [
+    "task",
+    "created",
+    "ready",
+    "pending_pop",
+    "publish",
+    "dispatch",
+    "start_proxy",
+    "first_fin",
+    "fin",
+    "completed",
+    "k0",
+    "k1",
+    "k2",
+    "blocks",
+    "shape",
+    "mask",
+    "sync",
+    "selected",
+    "actual_side",
+    "proxy_kind",
+    "scheduler",
+    "fanout",
+    "dummy_begin",
+    "dummy_end",
+    "summary_age",
+    "local0",
+    "local1",
+    "local2",
+    "local3",
+    "local4",
+    "global0",
+    "global1",
+    "global2",
+    "global3",
+    "global4"
+  ],
+  "local_features": [
+    "capacity",
+    "idle_before_prepare",
+    "pending_free_before_prepare",
+    "to_pending",
+    "subslot"
+  ],
+  "global_features": [
+    "side0_idle_AIC",
+    "side1_idle_AIC",
+    "side0_idle_AIV",
+    "side1_idle_AIV",
+    "valid"
+  ],
+  "visibility_states": {
+    "0": "unknown",
+    "1": "successor submitted, registration incomplete",
+    "2": "complete visible successor within fixed fanin budget",
+    "3": "successor-index capacity exceeded",
+    "4": "registered successor, fanin exceeds online budget"
+  },
+  "epochs": "O allocates monotonically increasing submit/registration epochs and release-publishes completed work. S captures a published epoch before observing successors and rejects larger epochs. Indices point to immutable per-launch task records.",
+  "aicore_record": [
+    "core_id",
+    "task_token",
+    "register_task_id",
+    "start_post_ACK",
+    "end_post_kernel_pre_FIN",
+    "receive_to_start",
+    "run_epoch"
+  ],
+  "proxy_kinds": {
+    "1": "publication-to-FIN-seen proxy",
+    "2": "pending promotion-to-FIN-seen proxy",
+    "4": "censored: unknown prior start, not a duration label",
+    "7": "analysis-only AICore dispatcher interval"
+  },
+  "unknown_location": "neutral; no hardware transfer assumed",
+  "visibility_denominator": "actual ordinary Shared queue pops, not three-queue action comparison opportunities"
+}

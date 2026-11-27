@@ -1,0 +1,203 @@
+{
+  "scope": "33->34 first tile; placement contrasts, not two-action gain labels",
+  "timing": "AICore post-ACK to post-kernel/pre-FIN dispatcher interval",
+  "start_time_alignment": "absolute CPU/AICore timestamps not assumed interchangeable",
+  "clock_audit": {
+    "selected_records": 23040,
+    "dispatch_after_aicore_start": 0,
+    "fin_seen_before_aicore_end": 0,
+    "cpu_minus_aicore_interval_us": {
+      "1": {
+        "n": 6025,
+        "median": 4.72,
+        "p95": 13.86,
+        "valid_cpu_duration_label": true
+      },
+      "2": {
+        "n": 17006,
+        "median": 0.02,
+        "p95": 8.295,
+        "valid_cpu_duration_label": true
+      },
+      "4": {
+        "n": 9,
+        "median": -40.92,
+        "p95": -39.176,
+        "valid_cpu_duration_label": false
+      }
+    }
+  },
+  "physical_group": {
+    "pairs": 261,
+    "excluded": {
+      "different_consumer_group": 2139
+    },
+    "by_side": [
+      {
+        "consumer_side": 0,
+        "proxy_kind": 7,
+        "periods": [
+          {
+            "period": 0,
+            "matched_run_pairs": 5,
+            "median_difference_us": -1.0599999999999987
+          },
+          {
+            "period": 1,
+            "matched_run_pairs": 5,
+            "median_difference_us": 0.9299999999999962
+          },
+          {
+            "period": 2,
+            "matched_run_pairs": 5,
+            "median_difference_us": -0.9600000000000009
+          },
+          {
+            "period": 3,
+            "matched_run_pairs": 5,
+            "median_difference_us": -0.370000000000001
+          },
+          {
+            "period": 4,
+            "matched_run_pairs": 5,
+            "median_difference_us": -0.8800000000000026
+          },
+          {
+            "period": 5,
+            "matched_run_pairs": 5,
+            "median_difference_us": -0.9600000000000009
+          }
+        ],
+        "matched_periods": 6,
+        "median_difference_us": -0.9200000000000017,
+        "stable_above_half_us": false
+      },
+      {
+        "consumer_side": 1,
+        "proxy_kind": 7,
+        "periods": [
+          {
+            "period": 0,
+            "matched_run_pairs": 5,
+            "median_difference_us": -0.03999999999999915
+          },
+          {
+            "period": 1,
+            "matched_run_pairs": 5,
+            "median_difference_us": 0.08999999999999986
+          },
+          {
+            "period": 2,
+            "matched_run_pairs": 5,
+            "median_difference_us": 0.33999999999999986
+          },
+          {
+            "period": 3,
+            "matched_run_pairs": 5,
+            "median_difference_us": -2.759999999999998
+          },
+          {
+            "period": 4,
+            "matched_run_pairs": 4,
+            "median_difference_us": -1.7100000000000009
+          },
+          {
+            "period": 5,
+            "matched_run_pairs": 5,
+            "median_difference_us": -2.2699999999999996
+          }
+        ],
+        "matched_periods": 6,
+        "median_difference_us": -0.875,
+        "stable_above_half_us": false
+      }
+    ]
+  },
+  "physical_and_occupancy": {
+    "pairs": 43,
+    "excluded": {
+      "different_consumer_group": 2139,
+      "different_occupancy": 218
+    },
+    "by_side": [
+      {
+        "consumer_side": 0,
+        "proxy_kind": 7,
+        "periods": [
+          {
+            "period": 0,
+            "matched_run_pairs": 3,
+            "median_difference_us": 1.8200000000000003
+          },
+          {
+            "period": 1,
+            "matched_run_pairs": 2,
+            "median_difference_us": -0.9099999999999966
+          },
+          {
+            "period": 2,
+            "matched_run_pairs": 2,
+            "median_difference_us": -4.829999999999998
+          },
+          {
+            "period": 3,
+            "matched_run_pairs": 2,
+            "median_difference_us": -2.83
+          },
+          {
+            "period": 4,
+            "matched_run_pairs": 2,
+            "median_difference_us": -0.22000000000000064
+          },
+          {
+            "period": 5,
+            "matched_run_pairs": 3,
+            "median_difference_us": 0.759999999999998
+          }
+        ],
+        "matched_periods": 6,
+        "median_difference_us": -0.5649999999999986,
+        "stable_above_half_us": false
+      },
+      {
+        "consumer_side": 1,
+        "proxy_kind": 7,
+        "periods": [
+          {
+            "period": 0,
+            "matched_run_pairs": 3,
+            "median_difference_us": -1.3599999999999994
+          },
+          {
+            "period": 1,
+            "matched_run_pairs": 2,
+            "median_difference_us": 3.849999999999998
+          },
+          {
+            "period": 2,
+            "matched_run_pairs": 2,
+            "median_difference_us": 0.48999999999999844
+          },
+          {
+            "period": 3,
+            "matched_run_pairs": 3,
+            "median_difference_us": -0.7999999999999972
+          },
+          {
+            "period": 4,
+            "matched_run_pairs": 1,
+            "median_difference_us": -2.3000000000000007
+          },
+          {
+            "period": 5,
+            "matched_run_pairs": 2,
+            "median_difference_us": -1.6400000000000006
+          }
+        ],
+        "matched_periods": 6,
+        "median_difference_us": -1.0799999999999983,
+        "stable_above_half_us": false
+      }
+    ]
+  }
+}

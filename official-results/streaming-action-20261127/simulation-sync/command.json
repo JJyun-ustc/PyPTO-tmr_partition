@@ -1,0 +1,14 @@
+[
+  "${RUNTIME_ROOT}/.venv/bin/python",
+  "-c",
+  "import multiprocessing,runpy,sys,torch\nmultiprocessing.cpu_count=lambda:2\ntorch.set_num_threads(2)\nsys.argv=sys.argv[1:]\nrunpy.run_path(sys.argv[0],run_name=\"__main__\")\n",
+  "${RUNTIME_ROOT}/tests/st/a2a3/tensormap_and_ringbuffer/qkv_sync_coexist/test_qkv_sync_coexist.py",
+  "-p",
+  "a2a3sim",
+  "-d",
+  "0",
+  "--manual",
+  "include",
+  "--log-level",
+  "info"
+]

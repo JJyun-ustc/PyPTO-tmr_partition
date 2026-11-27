@@ -1,8 +1,20 @@
 # PyPTO TMR: AICPU cluster placement study
 
+## Latest measurements: streaming TMR infrastructure and visibility
+
+Shared median/p95 **36.650/36.731 ms**; B infrastructure **38.207/38.350 ms (+4.25% median)**.
+All 720 ordinary samples and 144 warm-ups across three sequence lengths are retained; 12 complete output/40-layer KV golden checks pass.
+**Active C/D dispatch is not implemented, overrides are zero, and new gain models are not trained. This is not a completed active A–D comparison.**
+
+- [English results](docs/en/experiments/tmr-cluster/streaming-action-results.md) · [中文报告](docs/zh/experiments/tmr-cluster/streaming-action-results.md)
+- [Actual mechanism and limits](docs/en/experiments/tmr-cluster/streaming-action-mechanism.md) · [Reproduce](docs/en/experiments/tmr-cluster/streaming-action-reproduce.md)
+- [Samples and complete raw archive](official-results/streaming-action-20261127/)
+
+The `runtime` submodule pins source snapshot `153ba8ae4` on `runtime-streaming-action-20261127`; measured base is `8ebbff773` plus the retained patch.
+
 ## Next experiment plan: streaming TMR action scheduling
 
-**Proposal only; no new implementation or measurements.** Compare default and alternative claims at a real idle slot using only the visible event prefix. Validate A–D and diamond submission timing before residual training.
+**Target specification; partially measured, not fully implemented.** Compare default and alternative claims at a real idle slot using only the visible event prefix. Validate A–D and diamond submission timing before residual training.
 
 - [English plan](docs/en/experiments/tmr-cluster/streaming-action-plan.md)
 - [中文方案](docs/zh/experiments/tmr-cluster/streaming-action-plan.md)
@@ -26,7 +38,7 @@ Qwen synchronous attention retains its protocol. Regressions and failed attempts
 - [Chinese report](docs/zh/experiments/tmr-cluster/qkv-round2.md)
 - [Samples, weights, calibration, replay, diagnostics and commands](official-results/qkv-round2-20261125/)
 
-The `runtime` submodule pins `8ebbff773`. Data collected 2026-11-25; published 2026-11-26.
+The round-two runtime snapshot was `8ebbff773`. Data collected 2026-11-25; published 2026-11-26.
 
 ## Historical experiment: first QKV prototype
 
@@ -41,7 +53,7 @@ multi-task batches. All samples, warmups and failed collection attempts remain a
 - [Chinese mechanism and workflow](docs/zh/experiments/tmr-cluster/algorithm-qkv-ready-batch.md)
 - [Raw evidence and frozen fingerprints](official-results/qkv-ready-batch-20261125/)
 
-The `runtime` submodule pins `runtime-qkv-ready-batch`. The policy is frozen;
+The first-round runtime branch was `runtime-qkv-ready-batch`. The policy is frozen;
 no additional tuning or ablation follows this result. Compiled binaries,
 virtual environments, caches and generic driver logs are excluded from publication.
 
